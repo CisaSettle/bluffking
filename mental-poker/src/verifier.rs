@@ -18,8 +18,9 @@ use crate::transcript::{Transcript, TranscriptEvent};
 use serde_json::Value;
 use thiserror::Error;
 
-/// Whether the proof systems a verified transcript *declares* are the real,
-/// cryptographically-sound schemes or dev-only **mocks**.
+/// Whether the proof systems a verified transcript *declares* are the real
+/// (cryptographically sound, up to the interim shuffle's stated ~2⁻²⁶ soundness
+/// bound — see `crypto_real::shuffle`) schemes or dev-only **mocks**.
 ///
 /// This is the crux of BUG-108: the production `mental_poker_prefer` policy deals
 /// eligible all-human hands with the **mock** crypto suite (`mock-shuffle-v1` +
@@ -32,10 +33,13 @@ use thiserror::Error;
 /// claim cryptographic fairness for a [`SchemeSoundness::DevMock`] result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchemeSoundness {
-    /// Every proof system is the real (cryptographically sound) scheme: the real re-encryption
-    /// shuffle, real threshold-ElGamal/Chaum–Pedersen decryption, and asymmetric
-    /// Ed25519 signing. A `verify()` `Ok` here *is* a cryptographic fairness
-    /// guarantee.
+    /// Every proof system is the real (cryptographically sound) scheme: the real
+    /// re-encryption shuffle, real threshold-ElGamal/Chaum–Pedersen decryption,
+    /// and asymmetric Ed25519 signing. A `verify()` `Ok` here establishes
+    /// fairness up to the interim argument's stated soundness bound — the
+    /// re-encryption shuffle is the sigma-based *interim* (~2⁻²⁶ at N=52, NOT the
+    /// negligible-soundness Bayer–Groth; see `crypto_real::shuffle`), and the path
+    /// holds up to the interim shuffle's stated ~2⁻²⁶ soundness bound — not an unconditional guarantee.
     Sound,
     /// At least one proof system is a DEV-ONLY MOCK (e.g. `mock-shuffle-v1`,
     /// `mock-decrypt-v1`, or the mock HMAC signing envelope). The transcript

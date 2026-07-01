@@ -20,9 +20,11 @@
 //!
 //! Two crypto suites live here. The default `Mock*` implementations are
 //! **dev-grade — not cryptographically sound** (they only replay consistently,
-//! `SchemeSoundness::DevMock`). The real suite (`crypto_real`) IS sound and,
-//! since **ADR-070 (2026-06-23)**, runs in production for the engine-blind table
-//! class — cross-vendor AI-audited (ADR-076/077/078), open-source + verifiable. The runtime
+//! `SchemeSoundness::DevMock`). The real suite (`crypto_real`) is sound up to its
+//! stated bounds (the interim re-encryption-shuffle argument's soundness error is
+//! ~2⁻²⁶ at N=52, not negligible — see `crypto_real::shuffle`) and, since
+//! **ADR-070 (2026-06-23)**, runs in production for the engine-blind table class —
+//! cross-vendor AI-audited (ADR-076/077/078), open-source + verifiable. The runtime
 //! guard [`guard_provider_allowed`] keeps the explicit mock provider out of
 //! production and rejects the generic `mental_poker_production` provider
 //! (engine-blind selects real crypto via `resolve_mp_crypto_mode`).

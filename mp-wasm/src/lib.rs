@@ -106,6 +106,15 @@ impl WasmParty {
         let mut rng = OsRng;
         let q = point_from_hex(&q_hex).ok_or("bad q_hex")?;
         let wires: Vec<CtWire> = serde_json::from_str(&deck_json).map_err(|e| e.to_string())?;
+        // The deck comes from the untrusted coordinator (ADR-063/068
+        // T-ACTIVE-COORDINATOR). Validate its length BEFORE proving: an empty deck
+        // would underflow `prod_blind[n - 1]` in the permutation prover and TRAP
+        // the whole wasm instance instead of returning `Err`, and an over-large
+        // deck is O(n) needless work. The shuffle only ever operates on the full
+        // 52-card deck, so require exactly that.
+        if wires.len() != DECK_SIZE {
+            return Err(format!("deck must have {DECK_SIZE} cards, got {}", wires.len()));
+        }
         let input = wires_to_deck(&wires)?;
         let sh = Shuffle::perform(input, &q, &mut rng);
         let proof = sh.prove(&self.inner.party_id, round, &mut rng);

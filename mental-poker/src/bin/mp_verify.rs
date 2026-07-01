@@ -7,7 +7,8 @@
 //! ```
 //!
 //! Exit codes:
-//!   0 = verified AND provably fair (real sound crypto)
+//!   0 = verified AND provably fair (real crypto — sound up to the interim
+//!       shuffle's stated ~2⁻²⁶ bound)
 //!   1 = verification failed (the transcript does not replay consistently)
 //!   2 = usage / IO error
 //!   3 = replays consistently but NOT provably fair (dev-only mock crypto)

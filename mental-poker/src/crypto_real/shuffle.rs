@@ -20,11 +20,13 @@
 //!     D_out[k] = reencrypt( D_in[π(k)], ρ_k )      for every k
 //! ```
 //!
-//! i.e. `D_out` is exactly `D_in` permuted and re-encrypted — **no card is
-//! swapped, replaced, dropped, or duplicated** (threat T5). A malicious shuffler
-//! that mutates any output ciphertext, or applies a non-permutation map, makes
-//! `verify_shuffle` return `false`. This is the exact attack the
-//! `MockShuffleProofProvider` fails to catch.
+//! i.e. `D_out` is exactly `D_in` permuted and re-encrypted — no card is
+//! swapped, replaced, dropped, or duplicated (threat T5). A malicious shuffler
+//! that mutates any output ciphertext, or applies a non-permutation map, is
+//! rejected by `verify_shuffle` **except with the interim argument's soundness
+//! error** — ~2⁻²⁶ at N=52, NOT cryptographically negligible (see "Honest
+//! caveats"). It catches the exact attack the `MockShuffleProofProvider` cannot,
+//! but that residual margin is an external-audit item, not a closed guarantee.
 //!
 //! ## Soundness mechanism (why a card swap is caught)
 //!
@@ -68,15 +70,25 @@
 //!
 //! ## Honest caveats (read before trusting this)
 //!
-//! - **Interim, not Bayer–Groth.** This is the sound sigma-based interim the spec
-//!   §3.6 explicitly permits, not the succinct Bayer–Groth argument. Proof size is
-//!   `O(N)` (it carries the `f` commitments) rather than `O(√N)`; that is a perf
-//!   trade-off the Milestone-B bench measures, not a soundness gap.
+//! - **Interim, not Bayer–Groth — and its soundness margin is not negligible.**
+//!   This is the sound sigma-based interim the spec §3.6 explicitly permits, not
+//!   the succinct Bayer–Groth argument. Two consequences, both external-audit
+//!   items: (1) proof size is `O(N)` (it carries the `f` commitments) rather than
+//!   `O(√N)` — a perf trade-off the Milestone-B bench measures; and (2) card
+//!   integrity (Part A) rests on ONE random linear combination, and because cards
+//!   are encoded as small consecutive multiples of `G` (`ec::card_point` =
+//!   `(id+1)·G`), the message-integrity check collapses to a single
+//!   small-coefficient scalar relation whose statistical soundness error is
+//!   ≈ `N!/ℓ` ≈ **2⁻²⁶ at N=52** — far above cryptographic negligibility
+//!   (Bayer–Groth would be ~2⁻²⁵²). No efficient algorithm to exploit this margin
+//!   is known, so it is a soundness-*margin* weakness, not a turnkey false-accept;
+//!   closing it (independent multi-challenge Part A, hash-to-curve message points,
+//!   or full Bayer–Groth) is an external-audit item.
 //! - **Zero-knowledge of the permutation** is argued informally here (the `f`
 //!   commitments and `R`/`x`-polynomial blinders hide `π`); a rigorous ZK proof
 //!   and a constant-time review are **follow-up hardening items**, not increment-1
 //!   claims. The *soundness* property (a swap is rejected) is what the TR-1/2/3
-//!   tests gate and is the non-negotiable for this increment.
+//!   tests gate, up to the ~2⁻²⁶ interim bound noted above.
 //! - **Cross-vendor AI-audited (ADR-076/077/078); open-source + verifiable.** GA'd
 //!   for the engine-blind table class by ADR-070 (which lifted the ADR-063 cage); in
 //!   production reachable ONLY for engine-blind sessions via
