@@ -1,0 +1,56 @@
+[workspace]
+members = ["engine", "mental-poker", "server", "gto-solver"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["BluffKing Contributors"]
+
+[workspace.dependencies]
+# Shared across workspace members
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Rust review standard (L0/L1): in-repo Clippy policy so a bare `cargo clippy`
+# is strict locally and matches the `-D warnings` CI gate. Crates opt in with
+# `[lints] workspace = true`.
+# NOTE: do NOT add `pedantic`/`nursery`/`restriction` here — the CI gate runs
+# `clippy -- -D warnings`, which would promote those (noisy, allow-by-default)
+# groups to hard errors. Keep this aligned with the gate: `all` only.
+[workspace.lints.clippy]
+all = "deny"
+
+[profile.dev]
+opt-level = 0
+
+[profile.test]
+debug = 0
+
+[profile.release]
+opt-level = 3
+# ThinLTO (not fat `lto = true`). Fat LTO merges every crate's LLVM IR into ONE
+# whole-program module for the final link, and that single optimizer/codegen
+# pass is a large, single-threaded memory SPIKE — on a memory-constrained Docker
+# build VM (the local prod-parity gate runs on a ~3.8 GiB colima VM) rustc got
+# OOM-killed mid-link (`signal: 9, SIGKILL`) during exactly that step, so the
+# `server/Dockerfile` image never built (BUG-107). ThinLTO keeps modules
+# separate and optimizes via cross-module function summaries in bounded, parallel
+# partitions, so peak RSS stays low enough to build inside that VM. ThinLTO still
+# performs cross-module inlining via per-module function summaries, so the runtime
+# cost vs fat LTO on our CPU-bound hot paths (the Monte-Carlo equity/coach solver
+# in `engine`, argon2 login) is small — typically low-single-digit %, sometimes
+# zero or faster — a tradeoff we deliberately accept here for a release build that
+# fits the constrained parity VM, and it usually links faster too. (NOTE: do not
+# read "thin" as "perf-neutral because the server is IO-bound" — the game server
+# is NOT purely IO-bound; the solver/auth paths are genuinely CPU-bound. The
+# justification is the small-and-acceptable delta, not perf-equivalence.) The
+# prod-parity guarantee holds because CI and the local gate build from the SAME
+# Dockerfile, so both get the identical ThinLTO binary. Regression-guarded by
+# scripts/tests/release-profile-memory-guard.sh — do NOT revert to `lto = true`.
+lto = "thin"
