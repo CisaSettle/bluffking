@@ -17,15 +17,15 @@ English · [中文](#中文)
 ## English
 
 > [!NOTE]
-> **This is the open-source subset of [BluffKing](https://bluffking.ai)** — the free, **no-real-money** Texas Hold'em study product. These crates are the poker **engine**, the **verifiable ("mental poker") dealing**, and the **postflop CFR solver** behind it; the game server, web/mobile clients, and website stay closed-source. Running at **[bluffking.ai](https://bluffking.ai)**, which offers this repo as the AGPL §13 Corresponding Source for the solver it serves. The `mental-poker` real-cryptography path (`crypto_real`) is a **prototype pending external audit** — do not rely on it for real-stakes play.
+> **This is the open-source subset of [BluffKing](https://bluffking.ai)** — the free, **no-real-money** Texas Hold'em study product. These crates are the poker **engine**, the **verifiable ("mental poker") dealing**, and the **postflop CFR solver** behind it; the game server, web/mobile clients, and website stay closed-source. Running at **[bluffking.ai](https://bluffking.ai)**, which offers this repo as the AGPL §13 Corresponding Source for the solver it serves. Its real server-blind cryptography (`crypto_real`) is **live in production for opt-in all-human "engine-blind" tables** (the server can't see your folded or pre-showdown cards) — cross-vendor AI-audited (Claude + OpenAI Codex) and open-source, but **not** yet audited by a paid cryptography firm, and play-money only: verifiable, not "unriggable." (A separate, experimental *co-shuffle* toggle uses mock crypto and is disabled in production.)
 
 ### What's here
 
 | Crate | What it is |
 |---|---|
 | [`engine/`](engine) | Pure poker-logic crate. `GameHand` plays one complete hand end-to-end (blinds → flop/turn/river → side pots → result). Also hosts a Monte-Carlo **equity** estimator and a local **post-hand solver/coach**. No IO, no async, no DB — the same ruleset drives live play, tests, and deterministic replay. |
-| [`mental-poker/`](mental-poker) | Verifiable, commit–reveal dealing: a commit–reveal scheme plus a signed, append-only hash-chain transcript and **offline verifiers** (`pf_verify`, `mp-verify`). Also includes a **prototype** server-blind crypto path (re-encryption-mixnet shuffle + threshold decryption). Depends on `engine` only for the `Card` type. |
-| [`mp-wasm/`](mp-wasm) | A `wasm-bindgen` surface over `mental_poker::crypto_real` (the **prototype** server-blind path) so a browser can run the verifiable dealing locally. A detached crate with its own workspace. |
+| [`mental-poker/`](mental-poker) | Verifiable, commit–reveal dealing: a commit–reveal scheme plus a signed, append-only hash-chain transcript and **offline verifiers** (`pf_verify`, `mp-verify`). Also includes the real **server-blind** crypto path (n-of-n re-encryption-mixnet shuffle + threshold decryption) that powers the live *engine-blind* tables (cross-vendor-audited, not yet paid-firm-audited). Depends on `engine` only for the `Card` type. |
+| [`mp-wasm/`](mp-wasm) | A `wasm-bindgen` surface over `mental_poker::crypto_real` (the real server-blind path) so a browser can run the verifiable dealing locally. A detached crate with its own workspace. |
 | [`gto-solver/`](gto-solver) | Wraps the open-source **AGPL-3.0** `postflop-solver` (Discounted-CFR) behind BluffKing engine types (ADR-012); powers the free public `POST /api/tools/poker/solve` study tool. Its AGPL dependency is why this repo is AGPL-3.0. |
 
 ### Why verifiable dealing
@@ -37,8 +37,7 @@ a signed, append-only hash-chain transcript: the dealer commits before the hand,
 reveals after, and anyone can re-run the offline verifier to confirm the deal
 followed from the committed inputs (tamper-evidence + reproducibility). The
 stronger guarantee — a server that deals cards it cannot read (server-blind, so it
-cannot manipulate what it cannot see) — is the `crypto_real` path, a **prototype
-pending external audit**. Open-sourcing this is the point: fairness you can verify
+cannot manipulate what it cannot see) — is the `crypto_real` path — **live for the engine-blind table class** (ADR-070), cross-vendor AI-audited but not yet audited by a paid cryptography firm, play-money only. Open-sourcing this is the point: fairness you can verify
 beats fairness you are told to trust.
 
 ### Build &amp; test
@@ -89,15 +88,15 @@ section) and [`SECURITY.md`](SECURITY.md).
 ## 中文
 
 > [!NOTE]
-> **这是 [BluffKing](https://bluffking.ai) 的开源子集** —— 免费、**不涉及真钱** 的德州扑克学习产品。这些 crate 是它背后的扑克 **引擎**、**可验证("mental poker")发牌** 与 **翻后 CFR 求解器**;游戏服务器、Web/移动客户端与官网保持闭源。线上运行于 **[bluffking.ai](https://bluffking.ai)**,该站将本仓库作为其求解器的 AGPL §13 对应源码对外提供。`mental-poker` 的真实密码学路径(`crypto_real`)是 **待外部审计的原型**,请勿用于真实赌注。
+> **这是 [BluffKing](https://bluffking.ai) 的开源子集** —— 免费、**不涉及真钱** 的德州扑克学习产品。这些 crate 是它背后的扑克 **引擎**、**可验证("mental poker")发牌** 与 **翻后 CFR 求解器**;游戏服务器、Web/移动客户端与官网保持闭源。线上运行于 **[bluffking.ai](https://bluffking.ai)**,该站将本仓库作为其求解器的 AGPL §13 对应源码对外提供。它的真实服务端盲发密码学(`crypto_real`)已在生产环境 **为可选的全真人「engine-blind」牌桌启用**(服务器看不到你已弃牌或摊牌前的底牌)——经 AI 跨厂商独立审计(Claude + OpenAI Codex)、开源可复核,但**尚未**经付费密码学公司审计,且仅限 play-money:可验证,而非「不可作弊」。(另有一个独立的实验性 *co-shuffle* 开关使用 mock 加密,生产环境已禁用。)
 
 ### 仓库内容
 
 | Crate | 说明 |
 |---|---|
 | [`engine/`](engine) | 纯逻辑扑克引擎。`GameHand` 端到端打完一手牌(盲注 → 翻牌/转牌/河牌 → 边池 → 结算)。内含蒙特卡洛 **胜率(equity)** 估算与本地 **牌后求解器/教练**。无 IO、无 async、无数据库——同一套规则驱动实战、测试与确定性回放。 |
-| [`mental-poker/`](mental-poker) | 可验证发牌(commit–reveal):commit–reveal 承诺-揭示方案 + 签名的只追加哈希链 transcript + **离线验证器**(`pf_verify`、`mp-verify`)。另含 **原型** 的服务端盲发路径(重加密混洗 + 门限解密)。仅依赖 `engine` 的 `Card` 类型。 |
-| [`mp-wasm/`](mp-wasm) | 对 `mental_poker::crypto_real`(**原型** 服务端盲发路径)的 `wasm-bindgen` 封装,让浏览器本地运行可验证发牌。独立 crate,自带 workspace。 |
+| [`mental-poker/`](mental-poker) | 可验证发牌(commit–reveal):commit–reveal 承诺-揭示方案 + 签名的只追加哈希链 transcript + **离线验证器**(`pf_verify`、`mp-verify`)。另含真实的**服务端盲发**路径(n-of-n 重加密混洗 + 门限解密),驱动线上 *engine-blind* 牌桌(经跨厂商审计,尚未经付费密码学公司审计)。仅依赖 `engine` 的 `Card` 类型。 |
+| [`mp-wasm/`](mp-wasm) | 对 `mental_poker::crypto_real`(真实服务端盲发路径)的 `wasm-bindgen` 封装,让浏览器本地运行可验证发牌。独立 crate,自带 workspace。 |
 | [`gto-solver/`](gto-solver) | 封装开源 **AGPL-3.0** 的 `postflop-solver`(Discounted-CFR),隐藏在 BluffKing engine 类型之后(ADR-012);为免费公开的 `POST /api/tools/poker/solve` 学习工具提供支持。它的 AGPL 依赖是本仓库采用 AGPL 的原因。 |
 
 ### 为什么"可验证"发牌
@@ -106,7 +105,7 @@ section) and [`SECURITY.md`](SECURITY.md).
 ——而不是无条件信任运营方。`mental-poker` 提供 commit–reveal 协议与签名的只追加
 哈希链 transcript:发牌方开局前承诺、牌后揭示,任何人都能离线重跑验证器,确认发牌
 确由已承诺输入推导(防篡改 + 可复现)。更强的保证——服务器发出它自己都读不到的牌
-(服务端盲发,读不到就无法操纵)——是 `crypto_real` 路径,**待外部审计的原型**。
+(服务端盲发,读不到就无法操纵)——是 `crypto_real` 路径——**已为 engine-blind 牌桌启用**(ADR-070),经 AI 跨厂商审计但尚未经付费密码学公司审计,仅限 play-money。
 把这部分开源正是重点:可被验证的公平,胜过让你信任的公平。
 
 ### 构建与测试
