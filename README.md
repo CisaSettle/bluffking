@@ -111,8 +111,9 @@ cargo deny check                         # 供应链门禁(漏洞 + 许可证)
 - **代码:** AGPL-3.0-only,见 [`LICENSE`](LICENSE)。
 - **品牌:** **BluffKing** 名称、logo 与视觉识别 **不** 随代码授权,见
   [`TRADEMARKS.md`](TRADEMARKS.md);fork 必须更名换标。
-- **依赖:** 全部为宽松许可(MIT / Apache-2.0 / BSD-3-Clause),见
-  [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md)。
+- **依赖:** 大部分为宽松许可(MIT / Apache-2.0 / BSD-3-Clause),有一个 copyleft
+  例外——`gto-solver` crate 依赖 **AGPL-3.0** 的 `postflop-solver`(固定 commit),这
+  正是本仓库采用 AGPL-3.0 的原因。见 [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md)。
 
 > 使用这些 crate 的线上服务是 **闭源** 的独立产品。作为唯一版权持有者,作者可在该闭源
 > 产品中使用本代码并可双重授权;第三方仅获得 AGPL 授权——根据 AGPL §13,若你将修改版

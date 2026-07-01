@@ -160,9 +160,19 @@ fn max_concurrent_solves() -> usize {
 /// non-cancellable (F3), a wall-clock timeout does NOT free them. A single source
 /// could then keep both global permits busy back-to-back and make the public
 /// solver return `solver_busy` to everyone else, all within its 15/window rate
-/// bucket. Capping each IP to ONE concurrent solve means a second IP always has a
-/// free global permit. Set strictly BELOW `MAX_CONCURRENT_SOLVES` so the per-IP
-/// guard can never alone monopolize global capacity.
+/// bucket. Capping each IP to ONE concurrent solve means that WHENEVER
+/// `max_concurrent_solves() > 1` a second IP always has a free global permit —
+/// strictly BELOW the global cap so the per-IP guard can never alone monopolize
+/// global capacity.
+///
+/// DEGENERATE prod case `SOLVER_MAX_CONCURRENT=1` (the 2c/4GB host, chosen so at
+/// most one ~1 GB solve runs at a time): with a SINGLE global slot this
+/// anti-monopoly property cannot hold — one IP holding the sole slot makes others
+/// get `solver_busy` until it finishes. That is bounded and acceptable: a solve
+/// is wall-clock-capped (12 s), memory-gated, cached, and each IP is limited to
+/// 15/window, so no IP can sit on the slot indefinitely and no data is exposed.
+/// A fair per-IP queue is a future enhancement if single-slot contention ever
+/// becomes real in practice.
 const MAX_INFLIGHT_PER_IP: usize = 1;
 
 /// The PUBLIC-tier memory cap. 1.0 GB — below the default 1.5 GB so a single

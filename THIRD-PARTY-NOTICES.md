@@ -69,11 +69,24 @@ tools (equity / outs / pot-odds / scare-card / Spot Analyzer) are backed only by
 permissive-licensed code (MIT / Apache-2.0 / BSD) and stay public
 unconditionally.
 
-The full AGPL §13 source-availability path for **our own** crates — the
-login-free, build-SHA-pinned "Source code (AGPL-3.0)" link in the running UI —
-is specified in ADR-072 §3 and is **deferred** by ADR-071 until the public
-engine repository exists (per ADR-072 §D4, shipping that link before the repo
-exists would be a failed §13 offer). Enabling `ENABLE_POSTFLOP_SOLVER` in
-production is therefore an **architect + counsel decision**, not a default, and
-must be reconciled with the ADR-072/071 deferral before the solver is exposed to
-the public.
+**Update 2026-07-01 — the public repo now exists and the solver is enabled.**
+The owner authorized publishing the AGPL public subset early (ahead of the
+ADR-071 10k-user gate) specifically to enable the free postflop solver; the one
+hard blocker (preflop-data provenance) was resolved by the clean-room
+regeneration (`engine/examples/gen_preflop_ranges.rs`; `_source` = clean-room,
+no third-party charts). The Corresponding Source of the deployed combined work
+is published, login-free, covering ALL FOUR parts of the §3a definition: (1) the
+pinned AGPL `postflop-solver` (via the published `gto-solver/Cargo.toml` +
+`Cargo.lock`), (2) the `gto-solver/` wrapper crate, (3) the exact deployed
+endpoint `server/src/handlers/gto_solve.rs` (published at
+`server-integration/gto_solve.rs`), and (4) the `engine/` crate the wrapper
+links. It is pinned to an **immutable tag** so the offer matches the exact
+deployed version:
+**https://github.com/CisaSettle/bluffking/tree/solver-src-2026-07-01**.
+`POSTFLOP_SOLVER_SOURCE_URL` points there and `ENABLE_POSTFLOP_SOLVER=true` in
+production, so `/api/tools/poker/solve` mounts and every response + the
+`GET /solve/source` endpoint offer that link (the web UI renders a visible
+"Source code (AGPL-3.0)" link on the solver page). This satisfies the AGPL §13
+network-user offer for the solver endpoint per ADR-072 §3a. The broader ADR-072
+§3 engine-wide footer/About "Source code" link (build-SHA-pinned, covering the
+whole deployed engine) remains a follow-up and is tracked in ADR-072.
