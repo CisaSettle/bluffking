@@ -32,7 +32,7 @@ use thiserror::Error;
 /// claim cryptographic fairness for a [`SchemeSoundness::DevMock`] result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchemeSoundness {
-    /// Every proof system is the audited real scheme: the real re-encryption
+    /// Every proof system is the real (cryptographically sound) scheme: the real re-encryption
     /// shuffle, real threshold-ElGamal/Chaum–Pedersen decryption, and asymmetric
     /// Ed25519 signing. A `verify()` `Ok` here *is* a cryptographic fairness
     /// guarantee.
@@ -255,10 +255,10 @@ pub fn verify(transcript: &Transcript) -> Result<VerifyReport, VerifyError> {
         // re-encryption shuffle. Verification is self-contained — the prover's
         // ciphertext decks + the sigma argument travel in `ShuffleProof.attestation`
         // and are bound to the event's `input_hash`/`output_hash` (deck-hash check).
-        // This recognizes a real-crypto transcript for replay; it does NOT un-gate
-        // production dealing (`guard_provider_allowed` still rejects
-        // `mental_poker_production`; no production call site constructs it — the
-        // ADR-063 cage).
+        // This recognizes a real-crypto transcript for replay; the verifier is
+        // offline and independent of dealing. In production the real providers run
+        // only for the engine-blind table class (`resolve_mp_crypto_mode`, ADR-070);
+        // the generic `mental_poker_production` provider stays rejected.
         crate::crypto_real::shuffle::SCHEME => {
             Box::new(crate::crypto_real::shuffle::RealShuffleProofProvider::verifier())
         }
@@ -277,8 +277,9 @@ pub fn verify(transcript: &Transcript) -> Result<VerifyReport, VerifyError> {
         // from the transcript's `key_registered` events (`shuffle_pubkey` field),
         // the same trusted, contributor-signed source F2 sums into the joint key.
         // This makes an exported real-crypto transcript end-to-end checkable
-        // offline; it does NOT un-gate production (the ADR-063 cage stands —
-        // guard_provider_allowed still rejects mental_poker_production).
+        // offline and independent of dealing. In production real dealing runs only
+        // for the engine-blind table class (ADR-070); guard_provider_allowed still
+        // rejects the generic mental_poker_production provider.
         crate::crypto_real::decrypt::SCHEME => {
             let party_pubkeys = collect_party_pubkeys(transcript)?;
             // F3 (mp-phase4 audit — DEFENSIVE, decouple from the shuffle scheme):
@@ -318,11 +319,11 @@ pub fn verify(transcript: &Transcript) -> Result<VerifyReport, VerifyError> {
     //   that previously returned "no asymmetric verifier available"; Phase-4
     //   increment 1 fills it in.
     //
-    // PROTOTYPE: the Ed25519 arm is reachable from `verify()` so transcripts
-    // signed with real keys can be replayed/checked, but it does NOT un-gate
-    // production dealing — `guard_provider_allowed` still rejects
-    // `mental_poker_production`, and no production call site constructs the real
-    // providers (ADR-063 cage).
+    // The Ed25519 arm is reachable from `verify()` so transcripts signed with real
+    // keys can be replayed/checked; the verifier is offline and independent of
+    // dealing. In production the real providers run only for the engine-blind table
+    // class (`resolve_mp_crypto_mode`, ADR-070); the generic `mental_poker_production`
+    // provider stays rejected.
     let sig: Box<dyn SignatureProvider> = if transcript.key_directory.is_mock {
         match MockSignatureProvider::from_directory(&transcript.key_directory) {
             Some(p) => Box::new(p),
@@ -565,7 +566,7 @@ pub fn verify(transcript: &Transcript) -> Result<VerifyReport, VerifyError> {
         final_phase: state.phase,
         num_players: state.num_players,
         revealed_card_ids: state.opened_card_ids.clone(),
-        // BUG-108: record whether the proof systems are the audited real schemes
+        // BUG-108: record whether the proof systems are the real (sound) schemes
         // or dev-only mocks, so no consumer mistakes a consistent mock-crypto
         // replay for a cryptographic fairness guarantee. The schemes were already
         // validated/dispatched above; classify from the transcript's declarations.

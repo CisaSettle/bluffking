@@ -11,22 +11,24 @@
 //!   [`shuffle::RealShuffleProofProvider`], a sound sigma-based verifiable
 //!   re-encryption shuffle (component 3).
 //!
-//! ## Status: NOT audited, NOT shipped, NOT wired into production
+//! ## Status: GA'd for engine-blind (ADR-070); NOT paid-firm-audited
 //!
-//! This is a **Milestone-B decision-gate prototype** and a future
-//! **external-audit artifact** — it is explicitly **not** "audited / shipped /
-//! server-blind in production". The hard cage of ADR-063 §"CAGE" stands:
+//! ADR-070 (2026-06-23) lifted the ADR-063 cage **for the engine-blind table
+//! class**: these real providers now run in production for engine-blind (n-of-n
+//! server-blind, opt-in all-human) sessions. Still true:
 //!
-//! - [`guard_provider_allowed`](crate::guard_provider_allowed) keeps
-//!   `mental_poker_production` **rejected at startup everywhere**;
-//! - [`select_provider`](crate::select_provider) returns `None` for it;
-//! - there is **no** new `DealingProviderKind` variant;
-//! - the real providers in this module are reachable **only** from
-//!   `#[cfg(test)]`, benches, and dev examples — **never** from `session.rs` or
-//!   any other live production-path call site.
+//! - the GA gate was a clean cross-vendor AI audit (ADR-076/077/078); a **paid
+//!   external cryptography-firm audit is optional and not yet done** — treat as
+//!   prototype-grade until then, play-money only;
+//! - [`guard_provider_allowed`](crate::guard_provider_allowed) keeps the generic
+//!   `mental_poker_production` provider **rejected at startup**;
+//! - [`select_provider`](crate::select_provider) returns `None` for it, and there
+//!   is **no** new `DealingProviderKind` variant — engine-blind selects the real
+//!   crypto via `resolve_mp_crypto_mode` + the engine-blind session path, NOT via
+//!   the generic provider.
 //!
-//! Un-gating production is the **external audit's** job (ADR-062 Milestone E),
-//! not this workflow's.
+//! Un-gating the GENERIC provider stays the external-audit's job (ADR-062
+//! Milestone E); ADR-070 already un-caged the specific engine-blind composition.
 
 pub mod decrypt;
 pub mod dkg;

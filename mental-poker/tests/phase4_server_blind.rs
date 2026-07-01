@@ -1,10 +1,11 @@
 //! Phase-4 server-blind core — integration tests + KAT vector emission.
 //!
-//! **PROTOTYPE, pending external audit (ADR-063 §4, spec §4 / §8).** These tests
+//! **Pending a paid external cryptography-firm audit (ADR-063 §4).** These tests
 //! exercise the real threshold-ElGamal / DKG / Chaum–Pedersen path
 //! (`mental_poker::crypto_real`) end to end, with **all parties simulated
-//! locally using the real OS CSPRNG** — never wired into production
-//! (`guard_provider_allowed` keeps `mental_poker_production` rejected).
+//! locally using the real OS CSPRNG**. In production the real path runs only for
+//! the engine-blind table class (ADR-070); the generic `mental_poker_production`
+//! provider stays rejected.
 //!
 //! No database required: `cargo test -p mental-poker`.
 

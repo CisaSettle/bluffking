@@ -7,7 +7,7 @@
 //! ```
 //!
 //! Exit codes:
-//!   0 = verified AND provably fair (real audited crypto)
+//!   0 = verified AND provably fair (real sound crypto)
 //!   1 = verification failed (the transcript does not replay consistently)
 //!   2 = usage / IO error
 //!   3 = replays consistently but NOT provably fair (dev-only mock crypto)

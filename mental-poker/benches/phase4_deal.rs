@@ -33,11 +33,11 @@
 //!
 //! ## Status
 //!
-//! NOT a correctness gate (the TR-*/RT-* tests are). NOT audited, NOT shipped,
-//! NOT wired into production — the providers are reachable only from this bench
-//! / tests / dev-examples (`guard_provider_allowed` keeps
-//! `mental_poker_production` rejected at startup). This is a decision-gate
-//! latency measurement + a future external-audit perf artifact.
+//! NOT a correctness gate (the TR-*/RT-* tests are). NOT paid-firm-audited;
+//! GA'd for the engine-blind table class by ADR-070. This bench simulates all
+//! parties locally (`guard_provider_allowed` keeps the generic
+//! `mental_poker_production` provider rejected at startup). A latency
+//! measurement + a future external-audit perf artifact.
 //!
 //! ## Run
 //!

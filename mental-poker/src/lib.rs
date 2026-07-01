@@ -18,10 +18,14 @@
 //!
 //! ## Safety
 //!
-//! The crypto *interfaces* are production-shaped; the *implementations* here
-//! are **dev-only mocks** (`Mock*`) — not cryptographically sound. The runtime
+//! Two crypto suites live here. The default `Mock*` implementations are
+//! **dev-grade — not cryptographically sound** (they only replay consistently,
+//! `SchemeSoundness::DevMock`). The real suite (`crypto_real`) IS sound and,
+//! since **ADR-070 (2026-06-23)**, runs in production for the engine-blind table
+//! class — cross-vendor AI-audited but not yet paid-firm-audited. The runtime
 //! guard [`guard_provider_allowed`] keeps the explicit mock provider out of
-//! production and rejects `mental_poker_production` until audited crypto lands.
+//! production and rejects the generic `mental_poker_production` provider
+//! (engine-blind selects real crypto via `resolve_mp_crypto_mode`).
 //! `mental_poker_prefer` may run in production as a best-effort transcript mode,
 //! but it must not be described as server-blind cryptographic Mental Poker. See
 //! `docs/mental-poker-dealing-refactor.md`.
@@ -35,15 +39,18 @@
 
 pub mod card_id;
 pub mod crypto;
-/// Real cryptography — **PROTOTYPE, pending external audit (ADR-063)**.
+/// Real cryptography (ADR-063 primitives) — **GA'd for the engine-blind table
+/// class by ADR-070 (2026-06-23), pending a paid external cryptography-firm
+/// audit** (the GA gate was a clean cross-vendor AI audit — ADR-076/077/078; a
+/// paid-firm audit is optional and not yet done, so treat it as prototype-grade).
 ///
-/// Houses the real `ed25519-dalek`-backed [`SignatureProvider`] (and, in later
-/// increments, the verifiable-shuffle and threshold-decryption providers) that
-/// replace the dev-only `Mock*` crypto behind the existing trait seams. These
-/// are reachable only from tests / benches / dev examples — **never** from the
-/// live production provider-selection path. [`guard_provider_allowed`] keeps
-/// `mental_poker_production` rejected at startup; un-gating is the external
-/// audit's job (ADR-063 cage; ADR-062 Milestone E).
+/// Houses the real `ed25519-dalek`-backed [`SignatureProvider`] plus the
+/// verifiable-shuffle and threshold-decryption providers that replace the
+/// dev-only `Mock*` crypto behind the existing trait seams. In production these
+/// are selected ONLY for the engine-blind table class (n-of-n server-blind
+/// dealing, opt-in all-human rooms), via `resolve_mp_crypto_mode`;
+/// [`guard_provider_allowed`] still keeps the generic `mental_poker_production`
+/// provider rejected at startup. Play-money only.
 pub mod crypto_real;
 pub mod events;
 pub mod existing;

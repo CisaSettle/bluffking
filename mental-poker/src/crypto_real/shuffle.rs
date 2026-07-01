@@ -77,9 +77,11 @@
 //!   and a constant-time review are **external-audit items**, not increment-1
 //!   claims. The *soundness* property (a swap is rejected) is what the TR-1/2/3
 //!   tests gate and is the non-negotiable for this increment.
-//! - **NOT audited, NOT shipped, NOT wired into production** (ADR-063 cage). The
-//!   provider is reachable only from `#[cfg(test)]` / bench / dev-example;
-//!   `guard_provider_allowed` keeps `mental_poker_production` rejected at startup.
+//! - **NOT audited by a paid external cryptography firm.** GA'd for the
+//!   engine-blind table class by ADR-070 (which lifted the ADR-063 cage); in
+//!   production reachable ONLY for engine-blind sessions via
+//!   `resolve_mp_crypto_mode`. `guard_provider_allowed` still keeps the generic
+//!   `mental_poker_production` provider rejected at startup.
 
 use crate::crypto::{ShuffleProof, ShuffleProofProvider};
 use crate::crypto_real::dkg::challenge_scalar;

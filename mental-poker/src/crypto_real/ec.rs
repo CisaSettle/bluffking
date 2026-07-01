@@ -20,7 +20,9 @@
 //!
 //! ## Status
 //!
-//! NOT audited, NOT shipped, NOT wired into production (ADR-063 cage).
+//! NOT audited by a paid external cryptography firm. GA'd for the engine-blind
+//! table class by ADR-070 (which lifted the ADR-063 cage); in production these
+//! run ONLY for engine-blind sessions (`resolve_mp_crypto_mode`).
 
 use crate::hash::ds_hash;
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT as G;

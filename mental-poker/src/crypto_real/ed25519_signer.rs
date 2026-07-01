@@ -34,9 +34,10 @@
 //!
 //! ## Status
 //!
-//! PROTOTYPE — pending external audit. Reachable only from tests / benches /
-//! dev examples; never wired into the production provider-selection path
-//! (ADR-063 cage). `ed25519-dalek` itself is an audited lineage (Quarkslab
+//! Pending a paid external cryptography-firm audit. GA'd for the engine-blind
+//! table class by ADR-070; in production selected ONLY for engine-blind sessions
+//! (`resolve_mp_crypto_mode`) — the generic `mental_poker_production` provider
+//! stays rejected. `ed25519-dalek` itself is an audited lineage (Quarkslab
 //! 2019 scope, fiat-crypto formally-verified field backend), but the *Phase-4
 //! integration* as a whole is the artifact for the external audit.
 
