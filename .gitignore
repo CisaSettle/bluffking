@@ -1,0 +1,12 @@
+# Rust build output
+/target
+**/target
+
+# Coverage / profiling
+*.profraw
+
+# wasm-pack output
+mp-wasm/pkg/
+
+# macOS
+.DS_Store

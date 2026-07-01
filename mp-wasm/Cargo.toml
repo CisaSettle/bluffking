@@ -1,0 +1,41 @@
+[package]
+name = "mp-wasm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Phase-4 server-blind WEB crypto client (ADR-063) — PROTOTYPE, pending external
+# audit. A thin wasm-bindgen wrapper over `mental_poker::crypto_real`, so the
+# browser can run DKG / verifiable shuffle / threshold decryption locally (the
+# server only ever sees ciphertext). Detached from the parent workspace.
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+mental-poker = { path = "../mental-poker" }
+wasm-bindgen = "0.2"
+curve25519-dalek = { version = "4.1.3", features = ["rand_core"] }
+rand = "0.8"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# ADR-078 — the per-hand Ed25519 showdown-attestation signer. Already a
+# `mental-poker` dep (the audited Ed25519SignatureProvider); mp-wasm re-exposes
+# it at the wasm boundary via WasmSigner. Keygen rides the existing OsRng →
+# getrandom (js/wasm_js) path; signing is RFC-8032 deterministic.
+ed25519-dalek = "2.2"
+
+# WASM CSPRNG plumbing (browser/node crypto.getRandomValues):
+#   rand 0.8 → getrandom 0.2  ⇒ "js" feature
+#   transitive getrandom 0.3  ⇒ "wasm_js" feature + the cfg in .cargo/config.toml
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+# `mental-poker` pulls in `uuid` (workspace pin), which on wasm32 refuses to
+# build without an explicit randomness source. Enable the `js` feature here so
+# Cargo's feature-unification gives the transitive uuid a browser CSPRNG. We do
+# NOT touch the shared workspace `mental-poker` Cargo.toml (it must stay
+# native-only for the server build). Mirrors the getrandom js plumbing above.
+uuid = { version = "1", features = ["v4", "v7", "serde", "js"] }

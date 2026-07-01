@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>为什么每个 AI 编码 agent 都该有自己的 git worktree / Why every AI coding agent needs its own git worktree</title>
+<meta name="description" content="把两个 agent 指向同一个 checkout，它们会互相破坏。这是解法。Point two agents at one checkout and they corrupt each other — here's the fix.">
+<!-- Canonical live post is the marketing site; this GitHub Pages mirror defers to it. -->
+<link rel="canonical" href="https://bluffking.ai/zh/blog/why-worktrees/">
+<link rel="alternate" hreflang="zh" href="https://bluffking.ai/zh/blog/why-worktrees/">
+<link rel="alternate" hreflang="en" href="https://bluffking.ai/en/blog/why-worktrees/">
+<link rel="alternate" hreflang="x-default" href="https://bluffking.ai/zh/blog/why-worktrees/">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Why every AI coding agent needs its own git worktree / 为什么每个 AI 编码 agent 都该有自己的 git worktree">
+<meta property="og:url" content="https://bluffking.ai/zh/blog/why-worktrees/">
+<style>
+  :root{--green:#0b5d3b;--green2:#0f7a4e;--ink:#14201b;--muted:#5b6b63;--line:#dce5e0;--bg:#f5f8f6;--card:#fff;--code:#0d1b14;}
+  *{box-sizing:border-box}
+  body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;color:var(--ink);background:var(--bg);line-height:1.72}
+  header{background:linear-gradient(135deg,var(--green),var(--green2));color:#fff;padding:24px 24px;display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:14px}
+  header h1{margin:0;font-size:19px;font-weight:650}
+  header .sub{opacity:.85;font-size:12.5px;margin-top:5px}
+  .toggle{display:flex;background:rgba(255,255,255,.18);border-radius:999px;padding:3px}
+  .langbtn{border:0;background:transparent;color:#fff;padding:7px 16px;border-radius:999px;cursor:pointer;font-size:14px;font-weight:600;opacity:.8}
+  .langbtn.active{background:#fff;color:var(--green);opacity:1}
+  main{max-width:820px;margin:0 auto;padding:30px 22px 70px}
+  section[data-lang]{display:none}
+  .atitle{font-size:25px;font-weight:680;line-height:1.25;margin:4px 0 6px}
+  .dek{color:var(--muted);font-size:14.5px;font-style:italic;margin:0 0 10px}
+  section[id]{margin:8px 0}
+  section[id]+section[id]{border-top:1px solid var(--line);margin-top:28px;padding-top:8px}
+  h2{font-size:18.5px;margin:24px 0 12px;padding-bottom:7px;border-bottom:2px solid var(--line)}
+  p{margin:11px 0}
+  ul,ol{margin:11px 0;padding-left:22px}
+  li{margin:7px 0}
+  table{width:100%;border-collapse:collapse;margin:15px 0;font-size:14px}
+  th,td{border:1px solid var(--line);padding:8px 11px;text-align:left;vertical-align:top}
+  th{background:#eef4f1} td:nth-child(2),td:nth-child(3),th:nth-child(2),th:nth-child(3){text-align:center;width:130px}
+  code{background:#eaf1ed;padding:.12em .4em;border-radius:5px;font-size:.9em;font-family:"SF Mono",ui-monospace,Menlo,monospace}
+  pre{background:#eef4f1;border:1px solid var(--line);border-radius:10px;padding:12px 14px;overflow:auto;font-family:"SF Mono",ui-monospace,"Noto Sans Mono CJK SC",Menlo,monospace;font-size:13px;line-height:1.5;margin:14px 0}
+  pre code{background:none;padding:0;color:var(--code)}
+
+  .wt-svg{display:block;width:100%;max-width:720px;height:auto;margin:16px auto 4px;border:1px solid var(--line);border-radius:12px;background:#fff;padding:8px}
+  .wt-svg text{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
+  .figcap{color:var(--muted);font-size:12px;text-align:center;margin:0 0 16px}
+  pre.term{background:#0d1b14;color:#cdeadb;border:0;border-radius:12px;padding:14px 16px;overflow:auto;font-family:"SF Mono",ui-monospace,"Noto Sans Mono CJK SC",Menlo,monospace;font-size:12px;line-height:1.55;margin:15px 0 4px}
+  pre.term .bad{color:#ff8f7a}
+  pre.term .ok{color:#7fe0a8}
+  pre.term .dim{color:#789a8a}
+  .termwrap{margin:16px 0 4px;border-radius:12px;overflow:hidden;border:1px solid #09120c;box-shadow:0 2px 10px rgba(20,40,30,.14)}
+  .termbar{background:#1b2a21;padding:8px 12px;display:flex;align-items:center;gap:7px}
+  .termbar .dot{width:11px;height:11px;border-radius:50%}
+  .termbar .r{background:#ff5f56}.termbar .y{background:#ffbd2e}.termbar .g{background:#27c93f}
+  .termbar .lbl{margin-left:8px;color:#9fbfae;font-size:11.5px;font-family:"SF Mono",ui-monospace,Menlo,monospace}
+  .termwrap pre.term{margin:0;border-radius:0;border:0}
+  strong{font-weight:650} a{color:var(--green2)}
+  footer{max-width:820px;margin:0 auto;padding:18px 22px 50px;color:var(--muted);font-size:12.5px;border-top:1px solid var(--line)}
+</style></head><body>
+<header><div><h1>Git Worktrees &times; Claude Code / Codex</h1>
+<div class="sub">并发 AI agent 的隔离 &middot; isolation for concurrent AI agents</div></div>
+<div class="toggle"><button class="langbtn" data-l="zh">中文</button><button class="langbtn" data-l="en">English</button></div></header>
+<main>
+<section data-lang="zh"><h1 class="atitle">为什么每个 AI 编码 agent 都该有自己的 git worktree</h1><p class="dek">把两个 agent 指向同一个 checkout，它们会互相破坏。这是解法——以及怎么让它自动发生。</p>
+<section id="s1"><h2>问题</h2>
+<p>我几乎全程用 AI 编码 agent 做开发——常常同时开着四个 Claude Code 或 Codex 会话，每个还会派生 sub-agent。有很长一段时间它们全在同一个 checkout 里干活。这就是那个陷阱。</p>
+<p>一个 git 工作目录只有一个 HEAD：一个分支、一个 index、磁盘上一套文件。在里面跑多个 agent，它们不是在协作——而是在没有任何锁的情况下互相覆盖同一批物理文件。三起真实事故：</p>
+<ul>
+<li><strong>一个 agent 在构建中途 <code>git switch</code>。</strong>另一个 agent 的 <code>cargo</code> 正在编译，读到了撕裂的源码——一半旧分支、一半新分支——带着指向谁都没碰过的代码的幽灵报错失败。</li>
+<li><strong>两个 agent 改同一批文件。</strong>一个正改到一半，另一个也动了同样的文件，差点把对方未提交的工作 stash 掉。</li>
+<li><strong>一个会话一直住在共享的 <code>main</code> 树里</strong>，手里攥着未提交的改动。别人合并后 <code>main</code> 在它脚下前进；<code>git switch main</code> 被挡住（同一个分支只能在一处被 check out）；一个无法合并的 <code>.pbxproj</code> 炸成了冲突。</li>
+</ul>
+<p><strong>不同分支也救不了你</strong>——这正是大多数人忽略的地方。分支只是共享历史里的一个标签；一个工作目录在同一时刻仍然只能 check out 一个分支。所以共用一个目录的两个 agent 只能不停地把它 <code>git switch</code> 来回切，而这一切换正是制造损坏的那一下。（未提交的改动根本不在任何分支上——它就是共享目录里的文件。）bug 活在磁盘上，分支活在历史里；解药必须落在磁盘上：磁盘上的第二套文件。</p>
+<p>这就是 <strong>worktree</strong>：<code>git worktree add</code> 把一个分支 check out 到它<em>自己的目录</em>，配自己的 HEAD 和 index，共享同一个仓库。每个 agent 拿到私有的文件，在物理上无法碰撞。「一个分支在它自己的目录里」本身就是 worktree——救你的是这个，而不是分支。</p>
+<svg class="wt-svg" viewBox="0 0 720 224" role="img" aria-label="problem vs fix">
+<defs>
+<marker id="arR" markerWidth="9" markerHeight="9" refX="6.5" refY="3" orient="auto"><path d="M0 0L6.5 3L0 6Z" fill="#c0392b"/></marker>
+<marker id="arG" markerWidth="9" markerHeight="9" refX="6.5" refY="3" orient="auto"><path d="M0 0L6.5 3L0 6Z" fill="#0f7a4e"/></marker>
+</defs>
+<line x1="360" y1="16" x2="360" y2="214" stroke="#dce5e0" stroke-dasharray="4 4"/>
+<text x="20" y="26" font-size="15" font-weight="700" fill="#c0392b">✗  陷阱</text>
+<text x="20" y="44" font-size="11" fill="#5b6b63">一个 checkout，多个 agent</text>
+<g fill="#eef4f1" stroke="#cfe0d8"><rect x="24" y="56" width="74" height="26" rx="5"/><rect x="138" y="56" width="74" height="26" rx="5"/><rect x="252" y="56" width="74" height="26" rx="5"/></g>
+<g font-size="12" fill="#14201b" text-anchor="middle"><text x="61" y="73">agent</text><text x="175" y="73">agent</text><text x="289" y="73">agent</text></g>
+<g stroke="#c0392b" fill="none" stroke-width="1.4"><line x1="61" y1="84" x2="168" y2="120" marker-end="url(#arR)"/><line x1="175" y1="84" x2="175" y2="120" marker-end="url(#arR)"/><line x1="289" y1="84" x2="182" y2="120" marker-end="url(#arR)"/></g>
+<rect x="62" y="124" width="226" height="40" rx="7" fill="#fff" stroke="#c0392b" stroke-width="1.5"/>
+<text x="175" y="142" font-size="12.5" font-weight="650" fill="#14201b" text-anchor="middle">one checkout (main)</text>
+<text x="175" y="157" font-size="10.5" fill="#5b6b63" text-anchor="middle">一个 HEAD · 一套文件</text>
+<text x="20" y="190" font-size="11" fill="#b4521a">git switch 切到一半 → 另一个 agent 的构建读到撕裂</text>
+<text x="20" y="206" font-size="11" fill="#b4521a">源码；未提交的工作还被冲掉。</text>
+<text x="384" y="26" font-size="15" font-weight="700" fill="#0f7a4e">✓  解法</text>
+<text x="384" y="44" font-size="11" fill="#5b6b63">每个 agent 一个 worktree</text>
+<g fill="#eef4f1" stroke="#cfe0d8"><rect x="388" y="56" width="74" height="26" rx="5"/><rect x="498" y="56" width="74" height="26" rx="5"/><rect x="608" y="56" width="74" height="26" rx="5"/></g>
+<g font-size="12" fill="#14201b" text-anchor="middle"><text x="425" y="73">agent</text><text x="535" y="73">agent</text><text x="645" y="73">agent</text></g>
+<g stroke="#0f7a4e" fill="none" stroke-width="1.4"><line x1="425" y1="84" x2="425" y2="102" marker-end="url(#arG)"/><line x1="535" y1="84" x2="535" y2="102" marker-end="url(#arG)"/><line x1="645" y1="84" x2="645" y2="102" marker-end="url(#arG)"/></g>
+<g fill="#fff" stroke="#0f7a4e" stroke-width="1.3"><rect x="388" y="106" width="74" height="26" rx="5"/><rect x="498" y="106" width="74" height="26" rx="5"/><rect x="608" y="106" width="74" height="26" rx="5"/></g>
+<g font-size="11" fill="#14201b" text-anchor="middle"><text x="425" y="123">worktree</text><text x="535" y="123">worktree</text><text x="645" y="123">worktree</text></g>
+<g stroke="#0f7a4e" fill="none" stroke-width="1.4"><line x1="425" y1="134" x2="523" y2="168" marker-end="url(#arG)"/><line x1="535" y1="134" x2="535" y2="168" marker-end="url(#arG)"/><line x1="645" y1="134" x2="547" y2="168" marker-end="url(#arG)"/></g>
+<rect x="406" y="172" width="258" height="40" rx="7" fill="#e7f3ec" stroke="#0f7a4e" stroke-width="1.5"/>
+<text x="535" y="190" font-size="12.5" font-weight="650" fill="#14201b" text-anchor="middle">one shared repo (.git)</text>
+<text x="535" y="205" font-size="10.5" fill="#5b6b63" text-anchor="middle">共享历史 · 私有文件</text>
+</svg>
+<p class="figcap">同样的 agent，两种布局：共用一个 checkout（互相碰撞） vs 各自一个 worktree（互不干扰）。</p>
+</section>
+
+<section id="s2"><h2>怎么配置</h2>
+<p>你根本不碰 git，也不开终端。你在编辑器或 App 里用自然语言描述需求——「加一个加注滑块；在单独的 worktree 里做，做绿了再合并回来」——agent 替你跑 git（你只需批准那条命令）。Claude Code 和 Codex 都是会执行 shell 的 agent，所以「建 worktree」是它们做的事，不是你做的。配上下面的 hook，你连「在 worktree 里」都不用说。</p>
+<h3>Claude Code —— 一等公民支持</h3>
+<p>Claude Code 内置 worktree：你开口要一个（或者在 CLI 上用 <code>--worktree</code> flag 启动），它就跑 <code>git worktree add</code>、在你默认分支上拉出新树、在里面干活，做绿后合并回来。给 sub-agent 加 <code>isolation: worktree</code>，它会拿到一个一次性 worktree，没有改动地收尾时自动移除。你全程都在说人话。</p>
+<h3>Codex —— 思路一样，注意 sandbox</h3>
+<p>Codex 没有内置 worktree 功能，但它也是会跑 shell 的 agent：你同样开口，它会自己跑 <code>git worktree add</code>。唯一一个真实的坑——在 <code>workspace-write</code> 下，Codex 只能写它被启动的那个目录，所以 worktree 也得落在那里面。最省事：把它放在仓库里（比如 <code>.worktrees/&lt;name&gt;</code>），或者从仓库的父目录启动 Codex；放在启动目录之外的兄弟目录会被 sandbox 挡掉。</p>
+<h3>新问题：怎么让每个新 session 和子 agent 都遵守这条规则</h3>
+<p>到这里，worktree 还是在你或 agent「记得开口」时才被建出来。可一旦有几十个 session 和 sub-agent，「记得」必然失守。解法是用 hook 把它变成结构性的——让 worktree 成为默认路径，而不是要记住的事：</p>
+<ul>
+<li>一个 <strong>SessionStart</strong> hook：在共享 <code>main</code> 树里打开的会话，会收到「先建 worktree 再编辑」的提醒。</li>
+<li>一个 <strong>PreToolUse</strong> hook：当编辑目标落在 <code>main</code> 树里时，硬阻断编辑工具（Edit/Write/MultiEdit）——于是 agent 对 <code>main</code> 的编辑被拒绝，被逼上 worktree。（覆盖：<code>ALLOW_MAIN_EDIT=1</code>。）</li>
+<li><strong>提交/合并闸门</strong>（一个 <code>pre-commit</code> hook 加一个 Bash PreToolUse hook），让工作只能经受认可的合并进入 <code>main</code>。</li>
+</ul>
+<p>hook 把常规的编辑/提交/合并路径卡住；两个封装脚本把剩下的也变成一步——一个建 worktree（链接 <code>.env</code>、分配备用端口让两套 dev 栈不打架），一个做 <code>--no-ff</code> 合并并移除它、树脏就拒绝。</p>
+</section><section id="s3"><h2>底层怎么运作</h2>
+<p>主仓库的 <code>.git</code> 下只有一个对象数据库、一套 ref。每个链接的 worktree 在 <code>.git/worktrees/&lt;name&gt;/</code> 有一个小管理目录，存自己的 HEAD 和 index；它的工作目录里放的是一个 <code>.git</code> <em>文件</em>（一行指针指回去），而不是目录。</p>
+<table><thead><tr><th>状态</th><th>逐 worktree</th><th>共享</th></tr></thead><tbody>
+<tr><td>HEAD、index、工作文件、进行中的 merge/rebase</td><td>✓</td><td></td></tr>
+<tr><td>对象、ref（分支/tag）、config、hooks、stash</td><td></td><td>✓</td></tr>
+</tbody></table>
+<p>这种拆分就是机制所在——也是为什么分支和 worktree 不可互换：<strong>分支是共享历史里的一个标签；worktree 是磁盘上的一个私有槽位，把某一个标签落地成真实文件。</strong>因为每个 worktree 拥有自己的 HEAD 和文件，两个可以同时停在不同分支；因为它们共享对象和 ref，一个里的 commit 在另一个里立刻可见。两个坑：<strong>stash 是仓库全局的</strong>（在一个里 push 的 stash 在所有里都看得到），以及<strong>同一个分支不能被 check out 两次</strong>——git 会拒绝，也会拒绝任何会去更新「别处已 check out 的分支」的操作。磁盘开销是<em>工作集</em>，而非历史：每个 worktree 重复 check out 的文件和构建产物（<code>target/</code>、<code>node_modules/</code>），所以 N 个 worktree ≈ N 倍工作集。</p></section>
+
+<section id="s4"><h2>诚实的边界</h2>
+<ul>
+<li><strong>worktree 不消除合并冲突。</strong>隔离不等于协调：两个 worktree 改同几行，合并时照样冲突——worktree 只是把碰撞从「无声的线上损坏」挪成「一次你有意去解决的显式合并」。让分支小、短命，勤集成。</li>
+<li><strong>磁盘和重新构建的时间。</strong>每个 worktree 一次冷启动的 <code>cargo build</code> / <code>npm install</code> 是实打实的若干 GB 和几分钟。</li>
+<li><strong>本地配置逐 worktree。</strong>新 worktree 没有你任何被 gitignore 的配置；把它链接进来。（server 二进制从 shell 读环境变量，而非 <code>.env</code>；<code>cargo test</code> 需要 <code>DATABASE_URL</code>，<code>build</code>/<code>check</code> 不需要。）</li>
+<li><strong>清理纪律。</strong>用 <code>git worktree remove</code>，别 <code>rm -rf</code>（会留下陈旧条目）；<code>git worktree prune</code> 清扫。</li>
+</ul></section>
+
+<section id="s5"><h2>实用建议</h2>
+<ul>
+<li>每个 agent 一个 worktree 是<strong>默认</strong>，不是「并行工作」时的特例。</li>
+<li>让主树空闲停在干净的 <code>main</code> 上，作为合并目标。</li>
+<li>给每个 worktree 自己的备用端口 dev 栈和自己的 <code>node_modules</code>——别 symlink 到主仓库（Vite 的 <code>fs.allow</code> 会 403 掉 worktree 之外的字体）。</li>
+<li>用 hook 强制，而不是靠自觉。塑造我们做法的那条洞察：一个后台 sub-agent 曾在明确的「不要合并」下合并到了 <code>main</code>，而<em>没有</em>任何环境变量能区分 sub-agent 和主线程——所以闸门必须默认拒绝，而不是一次信任检查。</li>
+<li>收尾 = 合并，然后 <code>git worktree remove</code>，再 prune。</li>
+</ul></section>
+
+<section id="s6"><h2>总结</h2>
+<ol>
+<li><strong>问题：</strong>一个 checkout + 多个 agent = 互相破坏（撕裂的构建、被冲掉的未提交工作）。不同分支救不了——分支只是共享历史里的一个名字，bug 在磁盘上。</li>
+<li><strong>解法：</strong>worktree = 把一个分支 check out 到它自己的目录（自己的 HEAD 和文件），架在共享仓库上——物理隔离，互不碰撞。</li>
+<li><strong>怎么用：</strong>别敲 git——用自然语言描述任务，agent 自己建 worktree。真正关键的 hook 不是「保护 main」（那是标配）——而是让<em>每个新 session 和子 agent 都自动走 worktree</em>：一进 main 树就被提醒、想改 main 就被拒，于是 worktree 成了唯一默认，谁都不用记得。</li>
+<li><strong>边界：</strong>worktree 消除的是工作树竞态，不是合并冲突——合并冲突靠「分支切小、勤合并」来压住。</li>
+</ol></section>
+</section>
+<section data-lang="en"><h1 class="atitle">Why every AI coding agent needs its own git worktree</h1><p class="dek">Point two agents at one checkout and they corrupt each other. Here's the fix — and how to make it automatic.</p>
+<section id="s1"><h2>The problem</h2>
+<p>I build with AI coding agents — often four Claude Code or Codex sessions at once, each spawning sub-agents. For a while they all worked in one checkout. That is the trap.</p>
+<p>A git working directory has one HEAD: one branch, one index, one set of files on disk. Run several agents in it and they aren't collaborating — they're overwriting the same physical files with no lock. Three real incidents:</p>
+<ul>
+<li><strong>One agent <code>git switch</code>es mid-build.</strong> Another agent's <code>cargo</code> was compiling and read torn source — half the old branch, half the new — and failed with phantom errors pointing at code nobody had touched.</li>
+<li><strong>Two agents edit the same files.</strong> One was mid-rewrite; the other started on the same file; they nearly stashed each other's uncommitted work away.</li>
+<li><strong>A session lived in the shared <code>main</code> tree</strong> with uncommitted work. Others merged, so <code>main</code> advanced underfoot; <code>git switch main</code> was blocked because a branch can only be checked out in one place; and an un-mergeable <code>.pbxproj</code> blew up in conflict.</li>
+</ul>
+<p><strong>Different branches don't save you</strong> — the part people miss. A branch is only a label in shared history; a working directory can still check out just one branch at a time. So two agents sharing one directory must keep <code>git switch</code>-ing it back and forth, and that switch is the corrupting move. (Uncommitted work isn't on any branch at all — it's just files in the shared directory.) The bug lives on disk; branches live in history. The fix has to be on disk: a second set of files.</p>
+<p>That's a <strong>worktree</strong>: <code>git worktree add</code> checks a branch out into its <em>own directory</em>, with its own HEAD and index, over the one shared repo. Each agent gets private files; they physically can't collide. A branch in its own directory <em>is</em> a worktree — and that, not the branch, is what saves you.</p>
+<svg class="wt-svg" viewBox="0 0 720 224" role="img" aria-label="problem vs fix">
+<defs>
+<marker id="arR" markerWidth="9" markerHeight="9" refX="6.5" refY="3" orient="auto"><path d="M0 0L6.5 3L0 6Z" fill="#c0392b"/></marker>
+<marker id="arG" markerWidth="9" markerHeight="9" refX="6.5" refY="3" orient="auto"><path d="M0 0L6.5 3L0 6Z" fill="#0f7a4e"/></marker>
+</defs>
+<line x1="360" y1="16" x2="360" y2="214" stroke="#dce5e0" stroke-dasharray="4 4"/>
+<text x="20" y="26" font-size="15" font-weight="700" fill="#c0392b">✗  The trap</text>
+<text x="20" y="44" font-size="11" fill="#5b6b63">one checkout, many agents</text>
+<g fill="#eef4f1" stroke="#cfe0d8"><rect x="24" y="56" width="74" height="26" rx="5"/><rect x="138" y="56" width="74" height="26" rx="5"/><rect x="252" y="56" width="74" height="26" rx="5"/></g>
+<g font-size="12" fill="#14201b" text-anchor="middle"><text x="61" y="73">agent</text><text x="175" y="73">agent</text><text x="289" y="73">agent</text></g>
+<g stroke="#c0392b" fill="none" stroke-width="1.4"><line x1="61" y1="84" x2="168" y2="120" marker-end="url(#arR)"/><line x1="175" y1="84" x2="175" y2="120" marker-end="url(#arR)"/><line x1="289" y1="84" x2="182" y2="120" marker-end="url(#arR)"/></g>
+<rect x="62" y="124" width="226" height="40" rx="7" fill="#fff" stroke="#c0392b" stroke-width="1.5"/>
+<text x="175" y="142" font-size="12.5" font-weight="650" fill="#14201b" text-anchor="middle">one checkout (main)</text>
+<text x="175" y="157" font-size="10.5" fill="#5b6b63" text-anchor="middle">one HEAD · one set of files</text>
+<text x="20" y="190" font-size="11" fill="#b4521a">git switch mid-build feeds another agent's build torn</text>
+<text x="20" y="206" font-size="11" fill="#b4521a">source; uncommitted work gets clobbered.</text>
+<text x="384" y="26" font-size="15" font-weight="700" fill="#0f7a4e">✓  The fix</text>
+<text x="384" y="44" font-size="11" fill="#5b6b63">one worktree per agent</text>
+<g fill="#eef4f1" stroke="#cfe0d8"><rect x="388" y="56" width="74" height="26" rx="5"/><rect x="498" y="56" width="74" height="26" rx="5"/><rect x="608" y="56" width="74" height="26" rx="5"/></g>
+<g font-size="12" fill="#14201b" text-anchor="middle"><text x="425" y="73">agent</text><text x="535" y="73">agent</text><text x="645" y="73">agent</text></g>
+<g stroke="#0f7a4e" fill="none" stroke-width="1.4"><line x1="425" y1="84" x2="425" y2="102" marker-end="url(#arG)"/><line x1="535" y1="84" x2="535" y2="102" marker-end="url(#arG)"/><line x1="645" y1="84" x2="645" y2="102" marker-end="url(#arG)"/></g>
+<g fill="#fff" stroke="#0f7a4e" stroke-width="1.3"><rect x="388" y="106" width="74" height="26" rx="5"/><rect x="498" y="106" width="74" height="26" rx="5"/><rect x="608" y="106" width="74" height="26" rx="5"/></g>
+<g font-size="11" fill="#14201b" text-anchor="middle"><text x="425" y="123">worktree</text><text x="535" y="123">worktree</text><text x="645" y="123">worktree</text></g>
+<g stroke="#0f7a4e" fill="none" stroke-width="1.4"><line x1="425" y1="134" x2="523" y2="168" marker-end="url(#arG)"/><line x1="535" y1="134" x2="535" y2="168" marker-end="url(#arG)"/><line x1="645" y1="134" x2="547" y2="168" marker-end="url(#arG)"/></g>
+<rect x="406" y="172" width="258" height="40" rx="7" fill="#e7f3ec" stroke="#0f7a4e" stroke-width="1.5"/>
+<text x="535" y="190" font-size="12.5" font-weight="650" fill="#14201b" text-anchor="middle">one shared repo (.git)</text>
+<text x="535" y="205" font-size="10.5" fill="#5b6b63" text-anchor="middle">shared history · private files</text>
+</svg>
+<p class="figcap">Same agents, two layouts: one shared checkout (they collide) vs one worktree each (isolated).</p>
+</section>
+
+<section id="s2"><h2>How to set it up</h2>
+<p>You never touch git or a terminal. You describe the change in your editor or app — "add a raise slider; do it in its own worktree and merge back when it's green" — and the agent runs the git for you (you just approve the command). Both Claude Code and Codex are agents that execute shell, so creating the worktree is something they do, not you. And with the hooks below, you don't even have to say "in a worktree."</p>
+<h3>Claude Code — first-class support</h3>
+<p>Claude Code has built-in worktrees: ask for one (or, on the CLI, launch with the <code>--worktree</code> flag) and it runs <code>git worktree add</code> off your default branch, works there, and merges back when it's green. A sub-agent given <code>isolation: worktree</code> gets its own throwaway worktree, auto-removed if it ends with no changes. You stay in plain language the whole time.</p>
+<h3>Codex — same idea, mind the sandbox</h3>
+<p>Codex has no built-in worktree feature, but it's a shell-running agent too: ask it the same way and it runs <code>git worktree add</code> itself. The one real catch — in <code>workspace-write</code> Codex can only write inside the directory you launched it in, so the worktree has to live there too. Easiest: put it under the repo (e.g. <code>.worktrees/&lt;name&gt;</code>) or launch Codex from the repo's parent; a sibling dir outside the launch directory gets blocked by the sandbox.</p>
+<h3>The new problem: making every session and sub-agent follow the rule</h3>
+<p>So far a worktree gets made only when you — or the agent — remember to ask. Across dozens of sessions and sub-agents, "remember" fails. The fix is to make it structural with hooks, so a worktree is the default path rather than a thing to remember:</p>
+<ul>
+<li>A <strong>SessionStart</strong> hook: a session that opens in the shared <code>main</code> tree gets a reminder to spin up a worktree before editing.</li>
+<li>A <strong>PreToolUse</strong> hook: hard-blocks the edit tools (Edit/Write/MultiEdit) when the target is in the <code>main</code> tree — so an agent's edits to <code>main</code> are refused, pushing it onto a worktree. (Override: <code>ALLOW_MAIN_EDIT=1</code>.)</li>
+<li><strong>Commit/merge gates</strong> (a <code>pre-commit</code> hook plus a Bash PreToolUse hook) keep work off <code>main</code> except through the sanctioned merge.</li>
+</ul>
+<p>The hooks gate the normal edit/commit/merge path; two wrapper scripts make the rest one step — one creates the worktree (linking <code>.env</code>, assigning alt ports so two dev stacks don't collide), one does the <code>--no-ff</code> merge and removes it, refusing if the tree is dirty.</p>
+</section><section id="s3"><h2>How it works</h2>
+<p>There's one object database and one set of refs under the main repo's <code>.git</code>. Each linked worktree gets a small admin dir at <code>.git/worktrees/&lt;name&gt;/</code> holding its own HEAD and index; its working directory holds a <code>.git</code> <em>file</em> (a one-line pointer back), not a directory.</p>
+<table><thead><tr><th>State</th><th>Per-worktree</th><th>Shared</th></tr></thead><tbody>
+<tr><td>HEAD, index, working files, in-progress merge/rebase</td><td>✓</td><td></td></tr>
+<tr><td>Objects, refs (branches/tags), config, hooks, stash</td><td></td><td>✓</td></tr>
+</tbody></table>
+<p>That split is the mechanism — and why a branch and a worktree aren't interchangeable: <strong>a branch is a label in shared history; a worktree is a private slot on disk where one label becomes real files.</strong> Because each worktree owns its HEAD and files, two can sit on different branches at once; because they share objects and refs, a commit in one is instantly visible in the others. Two gotchas: the <strong>stash is repo-global</strong> (a stash pushed in one shows up in all), and <strong>the same branch can't be checked out twice</strong> — git refuses, and rejects any operation that would update a branch checked out elsewhere. Disk cost is the <em>working set</em>, not history: each worktree duplicates the checked-out files and build artifacts (<code>target/</code>, <code>node_modules/</code>), so N worktrees ≈ N× working set.</p></section>
+
+<section id="s4"><h2>The honest limits</h2>
+<ul>
+<li><strong>Worktrees don't prevent merge conflicts.</strong> Isolation isn't coordination: two worktrees editing the same lines still conflict at merge — the worktree just moves the collision from a silent, live corruption to an explicit merge you resolve on purpose. Keep branches small and short-lived, integrate often.</li>
+<li><strong>Disk and rebuild time.</strong> A cold <code>cargo build</code> / <code>npm install</code> per worktree is real gigabytes and minutes.</li>
+<li><strong>Local config is per-worktree.</strong> A fresh worktree has none of your gitignored setup; link it in. (The server binary reads env from the shell, not <code>.env</code>; <code>cargo test</code> needs <code>DATABASE_URL</code>, <code>build</code>/<code>check</code> don't.)</li>
+<li><strong>Cleanup discipline.</strong> Use <code>git worktree remove</code>, not <code>rm -rf</code> (which leaves a stale entry); <code>git worktree prune</code> sweeps them.</li>
+</ul></section>
+
+<section id="s5"><h2>Practical tips</h2>
+<ul>
+<li>One worktree per agent is the <strong>default</strong>, not a special case for "parallel work."</li>
+<li>Keep the main tree idle on a clean <code>main</code> as the merge target.</li>
+<li>Give each worktree its own alt-port dev stack and its own <code>node_modules</code> — don't symlink to main (Vite's <code>fs.allow</code> 403s fonts served from outside the worktree).</li>
+<li>Enforce with hooks, not willpower. The insight that shaped ours: a background sub-agent once merged to <code>main</code> against an explicit "do not merge," and there is <em>no</em> env var that tells a sub-agent from the main thread — so the gate must be default-deny, not a trust check.</li>
+<li>Finish = merge, then <code>git worktree remove</code>, then prune.</li>
+</ul></section>
+
+<section id="s6"><h2>Recap</h2>
+<ol>
+<li><strong>The problem:</strong> one checkout + many agents = corruption (torn builds, clobbered uncommitted work). Different branches don't fix it — a branch is just a name in shared history; the bug is on disk.</li>
+<li><strong>The fix:</strong> a worktree = a branch checked out into its own directory (its own HEAD and files) over one shared repo — physical isolation, no collisions.</li>
+<li><strong>How to use it:</strong> don't type git — describe the task and the agent makes its own worktree. The hook that matters isn't "protect main" (that's standard) — it's the one that puts <em>every new session and sub-agent</em> on a worktree automatically: nudged on entering the main tree, refused if it edits main, so a worktree is the only default and no one has to remember.</li>
+<li><strong>The caveat:</strong> worktrees remove the working-tree race, not merge conflicts — you keep those small by keeping branches small and merging often.</li>
+</ol></section>
+</section></main>
+<footer>Claude Code &times; OpenAI Codex · 内容已由 Claude 撰写、Codex 跨模型复核 / written by Claude, cross-checked by Codex.</footer>
+<script>
+function setLang(l){document.querySelectorAll('section[data-lang]').forEach(function(s){s.style.display=(s.getAttribute('data-lang')===l)?'block':'none';});
+document.querySelectorAll('.langbtn').forEach(function(b){b.classList.toggle('active',b.getAttribute('data-l')===l);});
+try{localStorage.setItem('tc-wt-lang',l);}catch(e){}document.documentElement.lang=l;}
+document.querySelectorAll('.langbtn').forEach(function(b){b.addEventListener('click',function(){setLang(b.getAttribute('data-l'));});});
+var saved='zh';try{saved=localStorage.getItem('tc-wt-lang')||'zh';}catch(e){}setLang(saved);
+</script></body></html>

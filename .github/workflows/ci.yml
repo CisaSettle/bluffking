@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: fmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: test
+        # engine + mental-poker are DB-free — no Postgres service needed.
+        run: cargo test --workspace
+
+      - name: mp-wasm (wasm32 build check)
+        # mp-wasm is a detached crate (own workspace, targets wasm32), so the
+        # root `--workspace` commands above don't cover it.
+        run: cd mp-wasm && cargo check --target wasm32-unknown-unknown
+
+      - name: cargo-deny (advisories + licenses + sources)
+        uses: EmbarkStudios/cargo-deny-action@v2
+
+      - name: pre-publish gate (advisory)
+        # Non-blocking until the repo is cleared for public release; see
+        # PUBLISH-BLOCKERS.md. Run `bash scripts/prepublish-check.sh` locally and
+        # make it exit 0 before pushing to a public remote.
+        run: bash scripts/prepublish-check.sh || echo "::warning::pre-publish gate not yet green — see PUBLISH-BLOCKERS.md"

@@ -1,0 +1,588 @@
+[
+  {
+    "expected": "c3c19ace11e8337f3052a4d005aef146721bde3046da4ced67d850ec91b975b6",
+    "input": {
+      "domain": "mp:test:v1",
+      "parts": [
+        "68656c6c6f"
+      ]
+    },
+    "kind": "ds_hash"
+  },
+  {
+    "expected": "b93a23b1e16f3b4e9fcbec3c85fd29f3ec6de68ffacaa00810a453b0363d18ed",
+    "input": {
+      "domain": "mp:test:v1",
+      "parts": [
+        "68656c6c6f",
+        "776f726c64"
+      ]
+    },
+    "kind": "ds_hash"
+  },
+  {
+    "expected": "9eab381e8f904412555b896c2ce60def6417703ee9c50445d4365edd1eb03f1d",
+    "input": {
+      "domain": "mp:deck-hash:v1",
+      "parts": []
+    },
+    "kind": "ds_hash"
+  },
+  {
+    "expected": "29e159e0b34edfd0a7ca6c0051cc9b53ae60baade46f04f363c7e66a101335bd",
+    "input": {
+      "domain": "mp:card-commit:v1",
+      "parts": [
+        "07",
+        "0101010101010101010101010101010101010101010101010101010101010101"
+      ]
+    },
+    "kind": "ds_hash"
+  },
+  {
+    "expected": "e660e28a987ed60a52e6662ff806724c393c4d03b669cad307fac6ef37e1492d",
+    "input": {
+      "domain": "mp:claim:v1",
+      "parts": [
+        "746573742d636c61696d2d626f6479"
+      ]
+    },
+    "kind": "ds_hash"
+  },
+  {
+    "expected": "{\"a\":2,\"b\":1,\"c\":3}",
+    "input": {
+      "a": 2,
+      "b": 1,
+      "c": 3
+    },
+    "kind": "canonical_json"
+  },
+  {
+    "expected": "{\"outer\":{\"x\":2,\"y\":1}}",
+    "input": {
+      "outer": {
+        "x": 2,
+        "y": 1
+      }
+    },
+    "kind": "canonical_json"
+  },
+  {
+    "expected": "[3,1,2]",
+    "input": [
+      3,
+      1,
+      2
+    ],
+    "kind": "canonical_json"
+  },
+  {
+    "expected": "{\"hand_id\":\"test-hand-1\",\"party_id\":\"party:0\",\"shuffle_pubkey\":\"eeff0011\",\"signing_pubkey\":\"aabbccdd\"}",
+    "input": {
+      "hand_id": "test-hand-1",
+      "party_id": "party:0",
+      "shuffle_pubkey": "eeff0011",
+      "signing_pubkey": "aabbccdd"
+    },
+    "kind": "canonical_json"
+  },
+  {
+    "expected": "a06cada2ca75bde47b3a9605fd831cc2c3f0012222338067132af39d13ff3f1f",
+    "input": {
+      "card_id": 0,
+      "salt": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "kind": "card_commit"
+  },
+  {
+    "expected": "29e159e0b34edfd0a7ca6c0051cc9b53ae60baade46f04f363c7e66a101335bd",
+    "input": {
+      "card_id": 7,
+      "salt": "0101010101010101010101010101010101010101010101010101010101010101"
+    },
+    "kind": "card_commit"
+  },
+  {
+    "expected": "1ab54d51aa47a5dafafb27a7e0cef8043e49305bf7e4773f894cb5759fcb4efb",
+    "input": {
+      "card_id": 51,
+      "salt": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    },
+    "kind": "card_commit"
+  },
+  {
+    "expected": "4953e6b6c4d8ef89803d7c10d395b072743c95aff5d660becd85fb977f768d76",
+    "input": {
+      "key": "746573742d6b65792d31",
+      "message": "746573742d6d6573736167652d31"
+    },
+    "kind": "mock_sign"
+  },
+  {
+    "expected": "d98eaaf216fd9037764f3f23c3a18da8cc9280ce1100bc4e6e2258e33aaba431",
+    "input": {
+      "key": "6d703a6d6f636b2d7369672d6b65793a7631",
+      "message": "736f6d652d686173682d6279746573"
+    },
+    "kind": "mock_sign"
+  },
+  {
+    "expected": "b613679a0814d9ec772f95d778c35fc5ff1697c493715653c6c712144292c5ad",
+    "input": {
+      "key": "0000000000000000000000000000000000000000000000000000000000000000",
+      "message": ""
+    },
+    "kind": "mock_sign"
+  },
+  {
+    "expected": "d13820c84235cf539450a3a1a7fb8a8e868d3fd363c4531d3c68efb00b86109d",
+    "input": {
+      "deck": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39,
+        40,
+        41,
+        42,
+        43,
+        44,
+        45,
+        46,
+        47,
+        48,
+        49,
+        50,
+        51
+      ]
+    },
+    "kind": "wire_deck_hash"
+  },
+  {
+    "expected": "534cf6ed3f3dfb8b77cc8c53d19ad113fa30fc584badf859df8a5dad573efac2",
+    "input": {
+      "deck": [
+        51,
+        50,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39,
+        40,
+        41,
+        42,
+        43,
+        44,
+        45,
+        46,
+        47,
+        48,
+        49,
+        1,
+        0
+      ]
+    },
+    "kind": "wire_deck_hash"
+  },
+  {
+    "expected": "de2fa4c7215e3614f271c478c2c008b12a0a31131c5b3b8db22cd70c9c99bb72",
+    "input": {
+      "input_deck_hash": "3dd4ab793009a99978d1457d9803db305781f0cca8a5411f2a1a0f6dbf356a50",
+      "output_deck_hash": "ae86aa5c25b4ec649f2dbe238cda49127825e0c75dce3d855617e4b39441e40e",
+      "party": "party:0",
+      "round": 0
+    },
+    "kind": "shuffle_proof_attestation"
+  },
+  {
+    "expected": "211769a24037f5105d50369ee919801ec7057d388d2c7cd8b013cd3e7a16e6b9",
+    "input": {
+      "input_deck_hash": "632a319fa0a92e23b6c59bd49a037e9dd56be92f02130c014284f4c7a555992b",
+      "output_deck_hash": "07c29a5cd98127d361064fdec3b51b247c114674e8eae4e0f1f74d09659f3208",
+      "party": "party:1",
+      "round": 1
+    },
+    "kind": "shuffle_proof_attestation"
+  },
+  {
+    "expected": "817c11097629060163bb319ffc50265ce1c275ab7df9d870f9a7e5f99fb5db03",
+    "input": {
+      "deck": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39,
+        40,
+        41,
+        42,
+        43,
+        44,
+        45,
+        46,
+        47,
+        48,
+        49,
+        50,
+        51
+      ],
+      "hand_id": "550e8400-e29b-41d4-a716-446655440000"
+    },
+    "kind": "commit_deck_hash"
+  },
+  {
+    "expected": "4069251c4041ac5b98d5fd27fa130d04e81b99ceb69af2bcdcb7d655fdfc624e",
+    "input": {
+      "deck": [
+        51,
+        50,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39,
+        40,
+        41,
+        42,
+        43,
+        44,
+        45,
+        46,
+        47,
+        48,
+        49,
+        1,
+        0
+      ],
+      "hand_id": "550e8400-e29b-41d4-a716-446655440000"
+    },
+    "kind": "commit_deck_hash"
+  },
+  {
+    "expected": [
+      {
+        "input_deck_hash": "d13820c84235cf539450a3a1a7fb8a8e868d3fd363c4531d3c68efb00b86109d",
+        "output_deck_hash": "be372a25d1f38c40a5a78e7f13a37c74278fece7856b7543b8103eb9db3bfe5c",
+        "round": 0
+      },
+      {
+        "input_deck_hash": "be372a25d1f38c40a5a78e7f13a37c74278fece7856b7543b8103eb9db3bfe5c",
+        "output_deck_hash": "4a4ca138dc22eed68f58728b1a9b3e4a45438629f60cad6761f945ab13658379",
+        "round": 1
+      },
+      {
+        "input_deck_hash": "4a4ca138dc22eed68f58728b1a9b3e4a45438629f60cad6761f945ab13658379",
+        "output_deck_hash": "22a65b0a2e294f061b6c5c633085de964d9d76208f5c3a2d9574750177dbe1f0",
+        "round": 2
+      }
+    ],
+    "input": {
+      "hand_id": "550e8400-e29b-41d4-a716-446655440000",
+      "n": 3,
+      "round_output_decks": [
+        [
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31,
+          32,
+          33,
+          34,
+          35,
+          36,
+          37,
+          38,
+          39,
+          40,
+          41,
+          42,
+          43,
+          44,
+          45,
+          46,
+          47,
+          48,
+          49,
+          50,
+          51,
+          0,
+          1,
+          2
+        ],
+        [
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31,
+          32,
+          33,
+          34,
+          35,
+          36,
+          37,
+          38,
+          39,
+          40,
+          41,
+          42,
+          43,
+          44,
+          45,
+          46,
+          47,
+          48,
+          49,
+          50,
+          51,
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12
+        ],
+        [
+          30,
+          31,
+          32,
+          33,
+          34,
+          35,
+          36,
+          37,
+          38,
+          39,
+          40,
+          41,
+          42,
+          43,
+          44,
+          45,
+          46,
+          47,
+          48,
+          49,
+          50,
+          51,
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29
+        ]
+      ]
+    },
+    "kind": "interactive_round_hashes"
+  }
+]

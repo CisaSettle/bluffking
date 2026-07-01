@@ -1,0 +1,36 @@
+[workspace]
+members = ["engine", "mental-poker", "gto-solver"]
+resolver = "2"
+
+# mp-wasm/ is intentionally NOT a workspace member — it declares its own
+# detached [workspace] and targets wasm32. Build it from inside mp-wasm/.
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+authors = ["BluffKing OSS Contributors"]
+
+[workspace.dependencies]
+# Only the deps these two crates actually reference via `{ workspace = true }`.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+
+# In-repo Clippy policy: a bare `cargo clippy` is strict locally and matches the
+# `-D warnings` CI gate. Crates opt in with `[lints] workspace = true`.
+# Do NOT add pedantic/nursery/restriction — the CI gate runs `clippy -- -D
+# warnings`, which would promote those (allow-by-default) groups to hard errors.
+[workspace.lints.clippy]
+all = "deny"
+
+[profile.dev]
+opt-level = 0
+
+[profile.test]
+debug = 0
+
+[profile.release]
+opt-level = 3
+lto = true

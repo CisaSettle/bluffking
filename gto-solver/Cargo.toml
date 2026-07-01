@@ -1,0 +1,49 @@
+[package]
+name = "gto-solver"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+publish = false
+
+# ── Why this is its OWN crate (not in `engine`, not in `server` directly) ──────
+#
+# `engine` is `forbid(unsafe)` (pure poker logic). The upstream
+# `postflop-solver` crate uses `unsafe` + compiler-auto-vectorized SIMD in its
+# CFR hot paths, so it CANNOT live under `engine` without breaking that
+# guarantee. We also keep it out of `server`'s own dep list so the AGPL-3.0
+# blast radius (and the scoped cargo-deny license exception + the `[sources]`
+# allow-git entry) is contained to exactly ONE workspace member. `server`
+# depends on THIS crate, and this crate wraps the solver behind our own engine
+# types per ADR-012 (Card/Rank/Suit/HoleCards in/out — `postflop_solver` and
+# `rs_poker` types never appear in our public signatures).
+#
+# ── HONESTY ───────────────────────────────────────────────────────────────────
+# What this crate produces is a REAL approximate Nash equilibrium: Discounted-CFR
+# over the unabstracted 2-player postflop game tree, with a MEASURED
+# exploitability the caller reports. It is "GTO for the inputs given" — the
+# equilibrium is only as meaningful as the assumed ranges + the (deliberately
+# limited, disclosed) bet-size set. The result is surfaced as
+# `SolveMethod::CfrEquilibrium`, NEVER overloaded onto the engine's existing
+# honestly-labeled `EquityHeuristic` / `PreflopChart`.
+
+[dependencies]
+engine = { path = "../engine" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+# Open-source postflop CFR solver (b-inary/postflop-solver), AGPL-3.0-or-later.
+# Pinned to a specific commit (the project's dev is suspended since Oct 2023, so
+# we own the maintenance burden; pinning insulates us from transitive churn).
+#
+# default-features = false is REQUIRED: the crate's manifest pins
+# `bincode = "2.0.0-rc.3"`, but Cargo resolves the released `bincode 2.0.1`
+# whose `Decode`/`BorrowDecode` traits gained a `Context` generic → 8 compile
+# errors in the crate's (default-on) bincode tree-serialization code. We do NOT
+# need bincode (on-demand solves never serialize a tree), so disabling default
+# features and opting into ONLY `rayon` sidesteps the bit-rot entirely and keeps
+# the crate building on our STABLE channel (the sole nightly gate is behind the
+# OFF-by-default `custom-alloc` feature).
+postflop-solver = { git = "https://github.com/b-inary/postflop-solver", rev = "9d1509fe5077d019825f833eed04b16d342dfda1", default-features = false, features = ["rayon"] }
+
+[lints]
+workspace = true

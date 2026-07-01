@@ -1,0 +1,67 @@
+[package]
+name = "mental-poker"
+version.workspace = true
+edition.workspace = true
+# Never published to a registry — internal workspace crate (cargo-deny private).
+publish = false
+
+[lints]
+workspace = true
+
+# Mental Poker card-dealing protocol: dealing abstraction, mock crypto,
+# signed hash-chain transcript, and an offline verifier.
+#
+# Pure crate — no async, no IO, no DB. `cargo test -p mental-poker` needs no
+# database. Depends on `engine` only for the `Card` type.
+
+[[bin]]
+name = "mp-verify"
+path = "src/bin/mp_verify.rs"
+
+# ADR-064 — offline commit-reveal verifier for existing_server hands.
+[[bin]]
+name = "pf_verify"
+path = "src/bin/pf_verify.rs"
+
+# ADR-064 — emits a real, end-to-end verifiable HandRecord (pf_verify fixture).
+[[bin]]
+name = "pf_demo_hand"
+path = "src/bin/pf_demo_hand.rs"
+
+# Milestone-B server-blind per-hand deal latency bench (ADR-063 §8 / ADR-062
+# §4 Gate-B). PROTOTYPE perf artifact — not a correctness gate, not wired into
+# production. `cargo bench -p mental-poker --bench phase4_deal`.
+[[bench]]
+name = "phase4_deal"
+harness = false
+
+[dependencies]
+engine = { path = "../engine" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+# pf_verify (ADR-064) parses the per-hand UUID into its 16 raw bytes to bind the
+# deck seed; the workspace already enables v4+v7+serde.
+uuid = { workspace = true }
+ed25519-dalek = { version = "2.2.0", features = ["rand_core", "zeroize"] }
+# Phase-4 server-blind crypto (ADR-063) — PROTOTYPE, pending external audit.
+# Reachable only behind the crypto_real trait seams + #[cfg(test)]/bench paths;
+# never wired into the production provider-selection path.
+curve25519-dalek = { version = "4.1.3", features = ["digest", "rand_core", "zeroize"] }
+merlin = "3"
+rand_core = "0.6"
+rand = "0.8"
+
+# WASM (Phase-4 web client, ADR-063): on wasm32-unknown-unknown the `rand 0.8 →
+# getrandom 0.2` chain needs the "js" backend (browser crypto.getRandomValues).
+# Target-gated — zero effect on the native server/test/bench builds.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
+[dev-dependencies]
+# Criterion for the Phase-4 Gate-B latency bench (offline-cached). PROTOTYPE
+# perf tooling only — never a production dependency.
+criterion = "0.8"

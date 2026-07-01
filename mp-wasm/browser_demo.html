@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>mp-wasm · Phase-4 server-blind crypto (real browser)</title>
+<style>
+  body{font-family:-apple-system,Menlo,monospace;background:#0d1b14;color:#cdeadb;padding:24px}
+  h1{font-size:16px;color:#7fe0aa}
+  pre{font-size:13px;line-height:1.6;white-space:pre-wrap}
+  .pass{color:#7fe0aa}.fail{color:#ff8b6a}
+</style>
+</head>
+<body>
+<h1>Phase-4 server-blind crypto · running in a REAL browser (crypto_real → wasm)</h1>
+<pre id="out">running…</pre>
+<script type="module">
+  import init, * as wasm from './pkg-web/mp_wasm.js';
+  const out = document.getElementById('out');
+  const log = [];
+  let pass = true;
+  const check = (name, got, want) => {
+    const ok = JSON.stringify(got) === JSON.stringify(want);
+    if (!ok) pass = false;
+    log.push(`${ok ? 'PASS' : 'FAIL'}  ${name}`);
+  };
+  try {
+    await init(); // fetch + instantiate the wasm module
+    const KAT = await (await fetch('../mental-poker/tests/vectors/mp_phase4_ec.json')).json();
+    check('KAT-1 pedersen_h', wasm.kat_pedersen_h(), KAT.kat1_pedersen_h);
+    check('KAT-2 card_points (52)', JSON.parse(wasm.kat_card_points()), KAT.kat2_card_points);
+    const ct = JSON.parse(wasm.kat_fixed_ct());
+    check('KAT-3 fixed ciphertext c1', ct.c1, KAT.kat3_fixed_ciphertext.c1);
+    check('KAT-3 fixed ciphertext c2', ct.c2, KAT.kat3_fixed_ciphertext.c2);
+    check('KAT-4 deck_hash v2', wasm.kat_deck_hash_v2(), KAT.kat4_deck_hash_v2);
+    const rt = wasm.selftest_roundtrip();
+    const rtOk = rt === 'ok:7';
+    if (!rtOk) pass = false;
+    log.push(`${rtOk ? 'PASS' : 'FAIL'}  roundtrip DKG→encrypt→threshold-open (real crypto.getRandomValues) → ${rt}`);
+  } catch (e) {
+    pass = false;
+    log.push('EXCEPTION: ' + (e && e.stack ? e.stack : e));
+  }
+  log.push(pass
+    ? '\n✅ ALL PASS — the real Phase-4 crypto runs in a real browser, byte-identical to Rust.'
+    : '\n❌ FAIL');
+  out.textContent = log.join('\n');
+  out.className = pass ? 'pass' : 'fail';
+  window.__result = { pass, log };
+  document.title = pass ? 'PARITY-PASS' : 'PARITY-FAIL';
+</script>
+</body>
+</html>

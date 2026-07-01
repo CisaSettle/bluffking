@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BluffKing · 工程笔记 / Build Notes</title>
+<meta name="description" content="用 AI 编码 agent 造 BluffKing 的中英双语工程笔记 — agent 编排、Rust、确定性扑克。Bilingual engineering notes from building an AI-built poker app.">
+<!-- Canonical live blog is the marketing site; this GitHub Pages mirror defers to it. -->
+<link rel="canonical" href="https://bluffking.ai/zh/blog/">
+<link rel="alternate" hreflang="zh" href="https://bluffking.ai/zh/blog/">
+<link rel="alternate" hreflang="en" href="https://bluffking.ai/en/blog/">
+<link rel="alternate" hreflang="x-default" href="https://bluffking.ai/zh/blog/">
+<meta property="og:type" content="website">
+<meta property="og:title" content="BluffKing · 工程笔记 / Build Notes">
+<meta property="og:description" content="用 AI 编码 agent 造扑克 App 的中英双语工程笔记。Bilingual engineering notes from building an AI-built poker app.">
+<meta property="og:url" content="https://bluffking.ai/zh/blog/">
+<style>
+  :root{--green:#0b5d3b;--green2:#0f7a4e;--ink:#14201b;--muted:#5b6b63;--line:#dce5e0;--bg:#f5f8f6;--card:#fff;}
+  *{box-sizing:border-box}
+  body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;color:var(--ink);background:var(--bg);line-height:1.7}
+  header{background:linear-gradient(135deg,var(--green),var(--green2));color:#fff;padding:26px 24px;display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:14px}
+  header h1{margin:0;font-size:20px;font-weight:650;letter-spacing:.2px}
+  header .sub{opacity:.85;font-size:13px;margin-top:4px}
+  .toggle{display:flex;background:rgba(255,255,255,.18);border-radius:999px;padding:3px}
+  .langbtn{border:0;background:transparent;color:#fff;padding:7px 16px;border-radius:999px;cursor:pointer;font-size:14px;font-weight:600;opacity:.8}
+  .langbtn.active{background:#fff;color:var(--green);opacity:1}
+  main{max-width:760px;margin:0 auto;padding:30px 22px 70px}
+  section[data-lang]{display:none}
+  .intro{color:var(--muted);font-size:15px;margin:0 0 22px}
+  a.post{display:block;text-decoration:none;color:inherit;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px 20px;margin:14px 0;box-shadow:0 1px 2px rgba(20,40,30,.04);transition:border-color .15s,transform .15s}
+  a.post:hover{border-color:var(--green2);transform:translateY(-1px)}
+  .post .date{color:var(--muted);font-size:12.5px;font-variant-numeric:tabular-nums}
+  .post h2{margin:6px 0 6px;font-size:18px;color:var(--green)}
+  .post p{margin:0;color:var(--ink);font-size:14.5px}
+  .tags{margin-top:10px}
+  .tag{display:inline-block;background:#eef4f1;color:var(--muted);border-radius:999px;padding:2px 10px;font-size:11.5px;margin-right:6px}
+  footer{max-width:760px;margin:0 auto;padding:18px 22px 50px;color:var(--muted);font-size:12.5px;border-top:1px solid var(--line)}
+  footer a{color:var(--green2)}
+</style></head><body>
+<header><div><h1>BluffKing · Build Notes</h1><div class="sub">用 AI agent 造扑克 App 的工程笔记 · engineering notes from building an AI-built poker app</div></div>
+<div class="toggle"><button class="langbtn" data-l="zh">中文</button><button class="langbtn" data-l="en">English</button></div></header>
+<main>
+<section data-lang="zh">
+  <p class="intro">关于用 AI 编码 agent 造 BluffKing 的工程笔记——agent 编排、Rust、确定性扑克。每篇都是中英双语，点右上角切换。</p>
+  <a class="post" href="./why-worktrees.html">
+    <span class="date">2026-06-20</span>
+    <h2>为什么每个 AI 编码 agent 都该有自己的 git worktree</h2>
+    <p>把两个 agent 指向同一个 checkout，它们会互相破坏。这是解法——以及怎么用 hook 让它自动发生。</p>
+    <div class="tags"><span class="tag">git worktree</span><span class="tag">Claude Code</span><span class="tag">Codex</span><span class="tag">agent 编排</span></div>
+  </a>
+</section>
+<section data-lang="en">
+  <p class="intro">Engineering notes from building BluffKing with AI coding agents — agent orchestration, Rust, deterministic poker. Every post is bilingual; toggle at the top right.</p>
+  <a class="post" href="./why-worktrees.html">
+    <span class="date">2026-06-20</span>
+    <h2>Why every AI coding agent needs its own git worktree</h2>
+    <p>Point two agents at one checkout and they corrupt each other. Here's the fix — and how to make it automatic with hooks.</p>
+    <div class="tags"><span class="tag">git worktree</span><span class="tag">Claude Code</span><span class="tag">Codex</span><span class="tag">agent orchestration</span></div>
+  </a>
+</section>
+</main>
+<footer>BluffKing · <a href="https://bluffking.ai">bluffking.ai</a> · <a href="https://x.com/BluffKingAI">@BluffKingAI</a></footer>
+<script>
+function setLang(l){document.querySelectorAll('section[data-lang]').forEach(function(s){s.style.display=(s.getAttribute('data-lang')===l)?'block':'none';});
+document.querySelectorAll('.langbtn').forEach(function(b){b.classList.toggle('active',b.getAttribute('data-l')===l);});
+try{localStorage.setItem('bk-blog-lang',l);}catch(e){}document.documentElement.lang=l;}
+document.querySelectorAll('.langbtn').forEach(function(b){b.addEventListener('click',function(){setLang(b.getAttribute('data-l'));});});
+var saved='zh';try{saved=localStorage.getItem('bk-blog-lang')||'zh';}catch(e){}setLang(saved);
+</script></body></html>

@@ -1,0 +1,69 @@
+# cargo-deny supply-chain policy gate.
+# Run:  cargo deny check         (advisories + licenses + bans + sources)
+# CI:   EmbarkStudios/cargo-deny-action (see .github/workflows/ci.yml)
+#
+# Philosophy: advisories & licenses are HARD gates; duplicate versions WARN
+# (the ecosystem routinely carries 2 majors of small crates); sources are
+# locked to crates.io. Keep the license allow-list permissive-only — adding a
+# copyleft (GPL/LGPL/AGPL/MPL-strong) license here must be a deliberate review.
+# (Our own AGPL workspace crates carry `publish = false` and are skipped via
+# `private.ignore` below, so AGPL must NOT appear in the allow-list.)
+
+[graph]
+# Evaluate every target so the gate matches a whole-Cargo.lock scan, not just
+# the host triple.
+all-features = true
+
+[advisories]
+version = 2
+# RustSec advisory DB. Vulnerabilities fail the gate. cargo-deny is GRAPH-AWARE
+# (it resolves features) so it only flags advisories on actually-activated deps.
+ignore = []
+
+[licenses]
+version = 2
+# Confidence required when inferring a license from text (0.0–1.0).
+confidence-threshold = 0.8
+# Permissive licenses only. Multi-licensed crates ("A OR B") pass if any ONE of
+# their options is allowed.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-1-Clause",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "ISC",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "Zlib",
+  "Unlicense",
+  "CC0-1.0",
+]
+# Our own workspace crates (engine / mental-poker) are AGPL-3.0-only and carry
+# `publish = false`; skip them so they don't trip the permissive allow-list.
+private = { ignore = true }
+
+# `postflop-solver` (AGPL-3.0-or-later) — the CFR postflop solver wrapped by the
+# `gto-solver` crate (public `POST /api/tools/poker/solve` study tool). AGPL stays
+# OUT of the permissive `allow` list; this per-crate exception permits EXACTLY this
+# one copyleft dep while any other future copyleft dep still fails the gate.
+# Rationale (ADR-072): our own crates are AGPL-3.0 + sole copyright holder, so an
+# AGPL dep is license-compatible; §13 is satisfied via THIRD-PARTY-NOTICES + the
+# in-repo Corresponding Source + the runtime "Source code (AGPL-3.0)" offer.
+exceptions = [{ name = "postflop-solver", allow = ["AGPL-3.0-or-later"] }]
+
+[bans]
+# Duplicate major versions are noise, not a defect — warn, don't block.
+multiple-versions = "warn"
+wildcards = "warn"
+
+[sources]
+# Supply-chain source pinning: only crates.io.
+unknown-registry = "deny"
+unknown-git = "deny"
+# `postflop-solver` is a pinned-commit git dependency (its crates.io release
+# bit-rotted; upstream dev suspended Oct 2023). This is the ONE allowed git
+# source; every OTHER git dep stays a hard failure = a deliberate review.
+allow-git = ["https://github.com/b-inary/postflop-solver"]
