@@ -94,8 +94,42 @@ pub fn classify(hole: HoleCards, board: &BoardCards) -> HandStrength {
 
     // ---- Detect made hands top-down ----
 
+    // `is_full_house_plus` / `is_two_pair` count pairs/trips across the hole+board
+    // union with no requirement that hero's cards improve the PAIR STRUCTURE. On a
+    // paired / double-paired board a hero whose cards don't strengthen the boat /
+    // top-two pairs merely "plays the board" (near-zero relative equity — any
+    // opponent card that re-pairs the board makes a hand that dominates it), yet
+    // was labelled FullHousePlus / TwoPair. Compare hero+board against the board
+    // alone: credit the strong band only when hero strengthens the pair structure
+    // (a higher boat, or a higher top-two pair — a bare pocket pair below the
+    // board's pairs, or a mere kicker, does NOT count); otherwise → `PairWeak`
+    // (weak dominated made hand, still has chop value, so not a pure bluff).
+    // `is_set` / `classify_pair` already require a hero contribution.
+    // OSS dual-AI review 2026-07-01 (finding C1).
+    let combined_counts = rank_counts(&all_cards);
+    let board_counts = rank_counts(&board_cards);
     if is_full_house_plus(&all_cards) {
-        return HandStrength::FullHousePlus;
+        // Quads and straight flushes are near-nut even when hero "plays the board":
+        // unlike a plain full house (which any opponent card re-pairing the board
+        // beats), they are not dominated, so they always keep the strong band —
+        // this also covers hero MAKING quads on a full-house board (e.g. Kc7d on
+        // KsKhKdQcQs). Otherwise it is a plain full house: credit hero only when
+        // hero's boat is strictly better than the board's own boat.
+        let near_nut = is_straight_flush(&all_cards) || combined_counts.iter().any(|&n| n >= 4);
+        let hero_improves = near_nut
+            || match (
+                full_house_key(&combined_counts),
+                full_house_key(&board_counts),
+            ) {
+                (Some(hero), Some(board_alone)) => hero > board_alone,
+                (Some(_), None) => true,
+                (None, _) => true,
+            };
+        return if hero_improves {
+            HandStrength::FullHousePlus
+        } else {
+            HandStrength::PairWeak
+        };
     }
     if is_flush(&all_cards) {
         return HandStrength::Flush;
@@ -107,7 +141,19 @@ pub fn classify(hole: HoleCards, board: &BoardCards) -> HandStrength {
         return HandStrength::Set;
     }
     if is_two_pair(&all_cards) {
-        return HandStrength::TwoPair;
+        let hero_improves = match (
+            top_two_pair_ranks(&combined_counts),
+            top_two_pair_ranks(&board_counts),
+        ) {
+            (Some(hero), Some(board_alone)) => hero > board_alone,
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        return if hero_improves {
+            HandStrength::TwoPair
+        } else {
+            HandStrength::PairWeak
+        };
     }
 
     // Pair classification.
@@ -254,6 +300,26 @@ fn is_set(hole: HoleCards, board: &[Card]) -> bool {
 fn is_two_pair(cards: &[Card]) -> bool {
     let counts = rank_counts(cards);
     counts.iter().filter(|c| **c >= 2).count() >= 2
+}
+
+/// The two highest paired ranks (count ≥ 2), highest first, if at least two
+/// exist — i.e. the two-pair a hand makes. Comparing this for hole+board vs the
+/// board alone tells us whether hero's cards strengthen the two pair or merely
+/// play the board's (OSS dual-AI review 2026-07-01, finding C1).
+fn top_two_pair_ranks(counts: &[u8; 13]) -> Option<(usize, usize)> {
+    let pairs: Vec<usize> = (0..13).rev().filter(|&r| counts[r] >= 2).collect();
+    (pairs.len() >= 2).then(|| (pairs[0], pairs[1]))
+}
+
+/// The `(trips_rank, pair_rank)` of the best full house makeable from `counts`
+/// via pair counts (full house or quads; straight flushes are handled
+/// separately). Highest trips, then the highest OTHER rank paired. `None` when
+/// there is no full house. Comparing hole+board vs the board alone tells us
+/// whether hero strengthens the boat or merely plays the board's.
+fn full_house_key(counts: &[u8; 13]) -> Option<(usize, usize)> {
+    let trip = (0..13).rev().find(|&r| counts[r] >= 3)?;
+    let pair = (0..13).rev().find(|&r| r != trip && counts[r] >= 2)?;
+    Some((trip, pair))
 }
 
 fn top_board_rank(board: &[Card]) -> Rank {
@@ -646,5 +712,112 @@ mod tests {
         let mut deduped = sorted.clone();
         deduped.dedup();
         assert_eq!(deduped.len(), 13, "all variants must be unique");
+    }
+
+    // OSS dual-AI review 2026-07-01 (finding C1): a hero who does not contribute
+    // to the board's pairing merely "plays the board" and must NOT be shown at a
+    // strong made-hand band.
+    #[test]
+    fn plays_the_board_double_pair_is_not_hero_two_pair() {
+        // 7♦2♣ on K♠K♥Q♦Q♣3♠: hero's cards pair nothing; hero plays the board's
+        // two pair (any K/Q makes a boat that dominates it) → weak, not TwoPair.
+        let hole = h(c(Rank::Seven, Suit::Diamonds), c(Rank::Two, Suit::Clubs));
+        let board = b5(
+            c(Rank::King, Suit::Spades),
+            c(Rank::King, Suit::Hearts),
+            c(Rank::Queen, Suit::Diamonds),
+            c(Rank::Queen, Suit::Clubs),
+            c(Rank::Three, Suit::Spades),
+        );
+        assert_eq!(classify(hole, &board), HandStrength::PairWeak);
+    }
+
+    #[test]
+    fn plays_the_board_boat_is_not_hero_full_house() {
+        // 7♦2♣ on K♠K♥K♦Q♣Q♠: the board is itself a full house; hero contributes
+        // nothing → must be downgraded from FullHousePlus.
+        let hole = h(c(Rank::Seven, Suit::Diamonds), c(Rank::Two, Suit::Clubs));
+        let board = b5(
+            c(Rank::King, Suit::Spades),
+            c(Rank::King, Suit::Hearts),
+            c(Rank::King, Suit::Diamonds),
+            c(Rank::Queen, Suit::Clubs),
+            c(Rank::Queen, Suit::Spades),
+        );
+        assert_ne!(classify(hole, &board), HandStrength::FullHousePlus);
+    }
+
+    #[test]
+    fn hero_contributed_two_pair_still_two_pair() {
+        // Contrast: Q♣ pairs the board's Q, so hero genuinely makes two pair
+        // (KK + QQ using hero's Q) — must remain TwoPair, not be downgraded.
+        let hole = h(c(Rank::Queen, Suit::Clubs), c(Rank::Jack, Suit::Diamonds));
+        let board = b5(
+            c(Rank::King, Suit::Spades),
+            c(Rank::King, Suit::Hearts),
+            c(Rank::Queen, Suit::Diamonds),
+            c(Rank::Three, Suit::Spades),
+            c(Rank::Eight, Suit::Clubs),
+        );
+        assert_eq!(classify(hole, &board), HandStrength::TwoPair);
+    }
+
+    // Codex round-3 catch: a LOW pocket pair below the board's pairs still just
+    // plays the board — it must NOT be credited the strong band.
+    #[test]
+    fn low_pocket_pair_below_board_pairs_plays_the_board() {
+        // 2♠2♥ on K♠K♥Q♦Q♣3♠: best five is the board's KKQQ3; the 22 never plays.
+        let hole = h(c(Rank::Two, Suit::Spades), c(Rank::Two, Suit::Hearts));
+        let two_pair_board = b5(
+            c(Rank::King, Suit::Spades),
+            c(Rank::King, Suit::Hearts),
+            c(Rank::Queen, Suit::Diamonds),
+            c(Rank::Queen, Suit::Clubs),
+            c(Rank::Three, Suit::Spades),
+        );
+        assert_eq!(classify(hole, &two_pair_board), HandStrength::PairWeak);
+        // 2♠2♥ on K♠K♥K♦Q♣Q♠ (board is itself a full house): 22 doesn't improve.
+        let boat_board = b5(
+            c(Rank::King, Suit::Spades),
+            c(Rank::King, Suit::Hearts),
+            c(Rank::King, Suit::Diamonds),
+            c(Rank::Queen, Suit::Clubs),
+            c(Rank::Queen, Suit::Spades),
+        );
+        assert_ne!(classify(hole, &boat_board), HandStrength::FullHousePlus);
+    }
+
+    #[test]
+    fn high_pocket_pair_above_board_pair_improves() {
+        // A♠A♥ on K♠K♥Q♦Q♣3♠: hero's AA is the top pair → two pair AA over KK,
+        // strictly better than the board's KKQQ → genuine TwoPair.
+        let hole = h(c(Rank::Ace, Suit::Spades), c(Rank::Ace, Suit::Hearts));
+        let board = b5(
+            c(Rank::King, Suit::Spades),
+            c(Rank::King, Suit::Hearts),
+            c(Rank::Queen, Suit::Diamonds),
+            c(Rank::Queen, Suit::Clubs),
+            c(Rank::Three, Suit::Spades),
+        );
+        assert_eq!(classify(hole, &board), HandStrength::TwoPair);
+    }
+
+    // Codex round-4 catch: hero MAKING quads on a full-house board is near-nut
+    // (not a dominated board-play) and must stay FullHousePlus.
+    #[test]
+    fn hero_quads_on_full_house_board_is_full_house_plus() {
+        let board = b5(
+            c(Rank::King, Suit::Spades),
+            c(Rank::King, Suit::Hearts),
+            c(Rank::King, Suit::Diamonds),
+            c(Rank::Queen, Suit::Clubs),
+            c(Rank::Queen, Suit::Spades),
+        );
+        // K♣ makes quad Kings.
+        let quad_kings = h(c(Rank::King, Suit::Clubs), c(Rank::Seven, Suit::Diamonds));
+        assert_eq!(classify(quad_kings, &board), HandStrength::FullHousePlus);
+        // Q♦Q♥ makes quad Queens (beats the board's KKKQQ full house).
+        let quad_queens = h(c(Rank::Queen, Suit::Diamonds), c(Rank::Queen, Suit::Hearts));
+        assert_eq!(classify(quad_queens, &board), HandStrength::FullHousePlus);
     }
 }

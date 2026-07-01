@@ -474,6 +474,24 @@ fn validate_stakes(req: &SolveRequest) -> Result<(), SolveError> {
             "effective_stack must be <= {MAX_STAKE}"
         )));
     }
+    // OSS dual-AI review 2026-07-01 (finding C4): bound the STAKE-to-POT ratio
+    // (SPR), not just each value independently. `ActionTree::new` + `with_config`
+    // build the game-tree node arena BEFORE the `memory_usage()` gate in
+    // `solve_spot`, and tree depth grows with SPR (≈ log₃(SPR) betting rounds
+    // before the force-all-in threshold). Bounding each of pot/stack to
+    // `MAX_STAKE` alone still permits SPR up to `MAX_STAKE` (e.g. pot=1,
+    // stack=100_000), whose pre-gate tree is not covered by `max_memory_bytes`.
+    // A generous cap keeps every realistic study spot (real postflop SPR is ≤ ~250
+    // even 500 bb deep) while capping the pathological pre-build tree. i64 math so
+    // `MAX_SPR * starting_pot` cannot overflow i32.
+    const MAX_SPR: i64 = 1_000;
+    if req.effective_stack as i64 > MAX_SPR * req.starting_pot as i64 {
+        return Err(SolveError::InvalidStakes(format!(
+            "effective_stack ({}) exceeds {MAX_SPR}× starting_pot ({}) — SPR too \
+             high for the study solver; lower the stack or raise the pot",
+            req.effective_stack, req.starting_pot
+        )));
+    }
     Ok(())
 }
 
@@ -830,6 +848,29 @@ mod tests {
             solving_player: Player::Oop,
             limits: SolveLimits::default(),
         }
+    }
+
+    // OSS dual-AI review 2026-07-01 (finding C4): bound SPR so the pre-memory-gate
+    // tree build in `solve_spot` cannot be driven arbitrarily deep by a tiny pot +
+    // huge stack, while every realistic study spot still passes.
+    #[test]
+    fn validate_stakes_rejects_pathological_spr() {
+        let mut req = small_flop_request();
+        // pot=1, stack=100_000 => SPR 100_000: each value is <= MAX_STAKE but the
+        // ratio is not, so the pre-gate tree is unbounded by max_memory_bytes.
+        req.starting_pot = 1;
+        req.effective_stack = 100_000;
+        assert!(
+            matches!(validate_stakes(&req), Err(SolveError::InvalidStakes(_))),
+            "SPR 100000 must be rejected"
+        );
+        // A very deep but realistic spot (pot 4, stack 1000 => SPR 250) must pass.
+        req.starting_pot = 4;
+        req.effective_stack = 1000;
+        assert!(
+            validate_stakes(&req).is_ok(),
+            "a realistic deep-stack spot (SPR 250) must still be accepted"
+        );
     }
 
     #[test]
