@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BluffKing — Cross-Vendor AI Audit &amp; Verifiability</title>
+<style>
+  :root{--bg:#0d1117;--panel:#161b22;--border:#2b3542;--ink:#e6edf3;--dim:#9fb0c3;--em:#58d3a8;--em2:#7cc4ff;--green:#34d399;--red:#f87171}
+  *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",Helvetica,Arial,sans-serif}
+  .wrap{max-width:860px;margin:0 auto;padding:28px 20px 90px}
+  header{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;border-bottom:1px solid var(--border);padding-bottom:14px}
+  h1{font-size:21px;margin:0}h2{font-size:18px;margin:30px 0 8px;padding-top:12px;border-top:1px solid var(--border);color:var(--em)}h3{font-size:15px;margin:16px 0 4px;color:var(--em2)}
+  p{margin:8px 0}code{background:#223041;padding:1px 6px;border-radius:5px;font:12.5px/1.5 "SF Mono",Menlo,Consolas,monospace;color:#cfe3ff}
+  .pill{display:inline-flex;border:1px solid var(--border);border-radius:999px;overflow:hidden}
+  .pill button{background:transparent;color:var(--dim);border:0;padding:6px 14px;font-size:13px;cursor:pointer}
+  .pill button.on{background:var(--em);color:#04140d;font-weight:600}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:14px 16px;margin:12px 0}
+  .good{border-color:#1f4d3a;background:#10201a}
+  ul,ol{margin:8px 0 8px 2px;padding-left:20px}li{margin:5px 0}
+  a{color:var(--em2)}small{color:var(--dim)}
+  .en{display:none}body.lang-en .zh{display:none}body.lang-en .en{display:block}
+  body.lang-en li.zh,body.lang-en span.zh{display:none}body.lang-en li.en,body.lang-en span.en{display:list-item}
+  .foot{margin-top:34px;border-top:1px solid var(--border);padding-top:12px;color:var(--dim);font-size:12.5px}
+  .tag{display:inline-block;font-size:11px;font-weight:700;padding:2px 8px;border-radius:6px;background:#0f2a20;color:var(--green);border:1px solid #1f4d3a}
+</style>
+</head>
+<body class="lang-zh">
+<div class="wrap">
+<header>
+  <div>
+    <h1><span class="zh">跨厂商 AI 审计 &amp; 可验证性</span><span class="en">Cross-Vendor AI Audit &amp; Verifiability</span></h1>
+    <p><small><span class="zh">BluffKing 的公平信任模型 · 事实可溯源到 ADR / 代码 / 可运行的验证器</span><span class="en">BluffKing's fairness trust model · every fact traces to an ADR / the code / a runnable verifier</span></small></p>
+  </div>
+  <div class="pill"><button id="b-zh" class="on" onclick="setLang('zh')">中文</button><button id="b-en" onclick="setLang('en')">English</button></div>
+</header>
+
+<div class="card good">
+  <p class="zh"><b>我们的信任模型不是"请相信我们",而是三件可以自己核的东西:</b></p>
+  <p class="en"><b>Our trust model is not "trust us." It's three things you can check yourself:</b></p>
+  <ol>
+    <li class="zh"><b>代码开源</b> —— 发牌加密全在这个仓库,你能直接读。</li>
+    <li class="en"><b>Open source</b> — the dealing crypto is in this repo; read it directly.</li>
+    <li class="zh"><b>跨厂商 AI 双审</b> —— 一家的模型(Claude)写,<b>另一家公司</b>的模型(OpenAI Codex, gpt-5.5)独立审,达成共识(OPEN 清单为空)才发布。不是自审。</li>
+    <li class="en"><b>Cross-vendor AI dual-audit</b> — one company's model (Claude) writes; a <b>different company's</b> model (OpenAI Codex, gpt-5.5) independently reviews; nothing ships until they reach consensus (empty OPEN list). Not self-review.</li>
+    <li class="zh"><b>可运行的离线验证器</b> —— 仓库里带了 demo transcript 和 KAT 向量;自己跑 <code>phase4_blind_demo</code> 看本地服务端盲发,或对内置 transcript 跑 <code>mp-verify</code> 得到 Sound / DevMock 判定。</li>
+    <li class="en"><b>A runnable offline verifier</b> — the repo ships demo transcripts + KAT vectors; run the <code>phase4_blind_demo</code> example to watch the server-blind deal locally, or run <code>mp-verify</code> on an included transcript for a Sound / DevMock verdict.</li>
+  </ol>
+</div>
+
+<h2><span class="zh">审了什么(engine-blind 服务端盲发)</span><span class="en">What was audited (engine-blind server-blind dealing)</span></h2>
+<p class="zh"><code>mental-poker/src/crypto_real/</code> 的 n-of-n 服务端盲发发牌:分布式密钥生成(DKG)、可验证重加密洗牌、门限 ElGamal / Chaum–Pedersen 解密、Ed25519 签名的摊牌见证。它在生产环境为<b>全真人 engine-blind 牌桌</b>上线运行(ADR-070,2026-06-23)——服务器看不到你已弃牌或摊牌前的底牌。</p>
+<p class="en"><code>mental-poker/src/crypto_real/</code> — the n-of-n server-blind deal: distributed key generation (DKG), verifiable re-encryption shuffle, threshold ElGamal / Chaum–Pedersen decryption, and an Ed25519-signed showdown attestation. It runs in production for <b>all-human engine-blind tables</b> (ADR-070, 2026-06-23) — the server cannot see your folded or pre-showdown hole cards.</p>
+
+<h3><span class="zh">审计记录(GA 门槛)</span><span class="en">Audit record (the GA gate)</span></h3>
+<ul>
+  <li class="zh"><span class="tag">CONSENSUS</span> ADR-070 上线门槛 = 一次<b>干净的独立跨厂商 Codex(gpt-5.5)审计</b>:5 轮设计共识(Codex thread <code>019eef65</code>,OPEN 清单为空)+ 一次干净的实现审计(thread <code>019ef015</code>,OPEN 清单为空)。</li>
+  <li class="en"><span class="tag">CONSENSUS</span> The ADR-070 GA gate = one <b>clean independent cross-vendor Codex (gpt-5.5) audit</b>: a 5-round design consensus (Codex thread <code>019eef65</code>, empty OPEN) + a clean implementation audit (thread <code>019ef015</code>, empty OPEN).</li>
+  <li class="zh"><b>reveal-gate 谱系 ADR-076 → 077 → 078:</b>跨厂商审计发现并砍掉了一个不成立的"first-mover"引导(会重新打开底牌泄露),换成 <b>Ed25519 DKG-绑定的签名摊牌见证</b>(ADR-078,Accepted,binding)。审计抓真问题的实证。</li>
+  <li class="en"><b>Reveal-gate lineage ADR-076 → 077 → 078:</b> the cross-vendor audit found and killed an unsound "first-mover" bootstrap (it re-opened the hole-card leak) and replaced it with an <b>Ed25519 DKG-bound signed showdown attestation</b> (ADR-078, Accepted, binding). Evidence the audit catches real problems.</li>
+  <li class="zh"><b>生产形态双人验收:</b>服务器持有 <b>0 / 52</b> 张牌的解密份额;ADR-078 的 <code>MpShowdownAttest</code> 签名见证在真实连线上触发。</li>
+  <li class="en"><b>Prod-shaped 2-human acceptance:</b> the server held <b>0 of 52</b> decryption shares; the ADR-078 <code>MpShowdownAttest</code> signed attestation fired over the live wire.</li>
+  <li class="zh"><b>不可能性也被诚实记录:</b>原设计里的 (t,n) 门限 + owner-blinding 机制被跨厂商审计判定为<b>密码学上不可能</b>,当场砍掉(ADR-070 §2 D5)——我们不藏砍掉的东西。</li>
+  <li class="en"><b>Even the impossibility is on record:</b> the original (t,n)-threshold + owner-blinding idea was ruled <b>cryptographically impossible</b> by the cross-vendor audit and dropped (ADR-070 §2 D5) — we don't hide what got cut.</li>
+</ul>
+
+<h2><span class="zh">诚实边界(我们说什么、不说什么)</span><span class="en">The honest ceiling (what we do and don't claim)</span></h2>
+<div class="card">
+  <p class="zh"><b>范围,直说:</b>服务端盲发只适用于<b>全真人 engine-blind 牌桌</b>(≥2 真人、无 bot)。在这些桌上,服务器看不到你已弃牌或摊牌前的底牌;<b>摊牌牌面按扑克规则公开</b>。默认发牌、任何带 bot 的牌桌、实验性的 co-shuffle、mobile 原生路径都<b>不是</b>服务端盲发。这是 play-money 学习产品。</p>
+  <p class="en"><b>Scope, stated plainly:</b> server-blind applies only to <b>all-human engine-blind tables</b> (≥2 humans, no bots). On those, the server can't see your folded or pre-showdown hole cards; <b>showdown cards are public by the rules of poker</b>. Default dealing, any table with bots, the experimental co-shuffle toggle, and native-mobile play are <b>not</b> server-blind. It's a play-money study product.</p>
+</div>
+
+<h2><span class="zh">你自己怎么核</span><span class="en">How to verify it yourself</span></h2>
+<ol>
+  <li class="zh"><b>读加密代码:</b> <code>mental-poker/src/crypto_real/</code>(dkg / shuffle / decrypt / ed25519_signer)。</li>
+  <li class="en"><b>Read the crypto:</b> <code>mental-poker/src/crypto_real/</code> (dkg / shuffle / decrypt / ed25519_signer).</li>
+  <li class="zh"><b>跑验证器:</b> <code>cargo run -p mental-poker --example phase4_blind_demo</code>(本地看真实盲发),以及对仓库内置 demo/fixture transcript 跑 <code>mp-verify</code> 得到 Sound / DevMock 判定(mock 路径 fail-closed,不会谎报公平)。</li>
+  <li class="en"><b>Run it:</b> <code>cargo run -p mental-poker --example phase4_blind_demo</code> (the real server-blind deal, locally), and run <code>mp-verify</code> on the repo's demo/fixture transcripts for a Sound / DevMock verdict (the mock path fails closed; it won't claim fairness for mock crypto).</li>
+  <li class="zh"><b>读决策记录:</b> ADR-070 / 076 / 077 / 078(私有仓库的架构决策;本页把可公开的结论摘录于此)。</li>
+  <li class="en"><b>Read the decision records:</b> ADR-070 / 076 / 077 / 078 (architecture decisions in the private repo; the public-safe conclusions are excerpted here).</li>
+</ol>
+
+<div class="foot">
+  <p class="zh">来源:ADR-070(engine-blind 生产 GA)、ADR-076/077/078(reveal-gate)、Codex 审计 thread 019eef65 / 019ef015。本页为可公开摘录;完整审计线程在私有决策记录中。方法论:Claude 写 → OpenAI Codex(gpt-5.5)独立审 → 共识后发布(<a href="https://bluffking.ai">bluffking.ai</a>)。</p>
+  <p class="en">Sources: ADR-070 (engine-blind production GA), ADR-076/077/078 (reveal-gate), Codex audit threads 019eef65 / 019ef015. This page is the public-safe excerpt; the full audit threads live in the private decision record. Methodology: Claude writes -> OpenAI Codex (gpt-5.5) independently reviews -> ship on consensus (<a href="https://bluffking.ai">bluffking.ai</a>).</p>
+</div>
+</div>
+<script>
+  function setLang(l){document.body.className='lang-'+l;document.getElementById('b-zh').classList.toggle('on',l==='zh');document.getElementById('b-en').classList.toggle('on',l==='en');try{localStorage.setItem('bk-audit-lang',l)}catch(e){}document.documentElement.lang=l}
+  (function(){var l='zh';try{l=localStorage.getItem('bk-audit-lang')||'zh'}catch(e){}setLang(l)})();
+</script>
+</body>
+</html>
