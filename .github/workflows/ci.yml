@@ -39,8 +39,9 @@ jobs:
       - name: cargo-deny (advisories + licenses + sources)
         uses: EmbarkStudios/cargo-deny-action@v2
 
-      - name: pre-publish gate (advisory)
-        # Non-blocking until the repo is cleared for public release; see
-        # PUBLISH-BLOCKERS.md. Run `bash scripts/prepublish-check.sh` locally and
-        # make it exit 0 before pushing to a public remote.
-        run: bash scripts/prepublish-check.sh || echo "::warning::pre-publish gate not yet green — see PUBLISH-BLOCKERS.md"
+      - name: pre-publish gate (secret / data-provenance scan)
+        # BLOCKING: this repo is public (see PUBLISH-BLOCKERS.md), and OSS-native
+        # files are committed here directly (not via the texas-h5 oss-sync gate),
+        # so this secret/provenance scan is the automated backstop for every push
+        # and external PR. It must exit 0.
+        run: bash scripts/prepublish-check.sh

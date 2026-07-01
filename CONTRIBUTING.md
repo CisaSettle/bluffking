@@ -1,13 +1,15 @@
 # Contributing
 
-Thanks for your interest. This repo is the open, logic-only core
-(`engine` + `mental-poker` + `mp-wasm`) of a larger product.
+Thanks for your interest. This repo is the open core of a larger product: the
+logic-only crates (`engine` + `mental-poker` + `mp-wasm`), the `gto-solver`
+crate, and the published source of the deployed solver endpoint
+(`server-integration/gto_solve.rs`).
 
 ## Build &amp; verify
 
 ```bash
 cargo build
-cargo test --workspace                    # engine + mental-poker, no DB needed
+cargo test --workspace                    # engine + mental-poker + gto-solver, no DB needed
 cargo clippy --workspace -- -D warnings
 cargo fmt --all -- --check
 cargo deny check                          # advisories + licenses + sources

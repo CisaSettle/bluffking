@@ -1,9 +1,11 @@
-# PUBLISH BLOCKERS — read before making this repository public
+# PUBLISH BLOCKERS — historical (this repository is now PUBLIC)
 
-This repo is **prepared but NOT yet cleared for public release.** It builds and
-its tests pass, but the items below must be resolved first. The gate
-[`scripts/prepublish-check.sh`](scripts/prepublish-check.sh) must exit `0` before
-you run `gh repo create … --public`.
+> **Status (2026-07-01): PUBLISHED.** This repo is public and the free postflop
+> solver is live (see `THIRD-PARTY-NOTICES.md` → Compliance status). All release
+> blockers below were resolved before publication; this file is kept as a record.
+> The [`scripts/prepublish-check.sh`](scripts/prepublish-check.sh) gate now runs
+> **blocking** in CI on every push (`.github/workflows/ci.yml`), not just as a
+> pre-`gh repo create` check.
 
 ---
 

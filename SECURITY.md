@@ -2,10 +2,15 @@
 
 ## Scope
 
-This repository contains **logic-only library crates** — `engine`,
-`mental-poker`, and `mp-wasm`. It has no server, database, authentication, or
-network surface of its own. Reports about a deployed service that *uses* these
-crates should go to that service's operator, not here.
+This repository is the open-source subset of BluffKing: the library crates
+`engine`, `mental-poker`, `mp-wasm`, and `gto-solver`, plus — as the AGPL §13
+Corresponding Source for the deployed solver — the exact endpoint handler
+`server-integration/gto_solve.rs`. Bugs in the **code here** are in scope,
+including a DoS / panic / resource-exhaustion / correctness issue in `gto-solver`
+or `server-integration/gto_solve.rs` (the source of the live `POST
+/api/tools/poker/solve` handler — published as a source offer, not a runnable
+server crate). Operational issues of the deployed service (infrastructure,
+availability, rate-limit tuning) go to the service operator, not here.
 
 ## Reporting a vulnerability
 
@@ -17,13 +22,17 @@ on the repository profile. We aim to acknowledge within a few business days.
 When reporting, please include: affected crate + version/commit, a minimal
 reproduction, and the impact you believe it has.
 
-## Prototype cryptography — not for production
+## Real cryptography — prototype-grade, play-money only
 
 `mental-poker`'s server-blind real-cryptography path (`crypto_real`, and its
-`mp-wasm` wrapper) is a **prototype pending external audit**. It is fenced off
-behind trait seams and is not wired into any production build. **Do not use it
-to protect real stakes.** Findings against it are welcome but it is, by its own
-disclaimer, unaudited.
+`mp-wasm` wrapper) runs in production **only for opt-in, all-human "engine-blind"
+tables** (ADR-070). It is **cross-vendor AI-audited (Claude + OpenAI Codex) but
+NOT yet audited by a paid external cryptography firm** — treat it as
+prototype-grade. Note in particular the interim re-encryption-shuffle argument's
+stated **~2⁻²⁶ soundness bound** at N=52 (see
+`mental-poker/src/crypto_real/shuffle.rs`), not cryptographic negligibility. It
+is **play-money only — do not rely on it to protect real stakes.** Findings
+against it are especially welcome.
 
 ## Supply chain
 
