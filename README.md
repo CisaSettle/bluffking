@@ -26,6 +26,7 @@ English · [中文](#中文)
 | [`engine/`](engine) | Pure poker-logic crate. `GameHand` plays one complete hand end-to-end (blinds → flop/turn/river → side pots → result). Also hosts a Monte-Carlo **equity** estimator and a local **post-hand solver/coach**. No IO, no async, no DB — the same ruleset drives live play, tests, and deterministic replay. |
 | [`mental-poker/`](mental-poker) | Provably-fair dealing: a commit–reveal scheme plus an Ed25519-signed hash-chain transcript and **offline verifiers** (`pf_verify`, `mp-verify`). Also includes a **prototype** server-blind crypto path (re-encryption-mixnet shuffle + threshold decryption). Depends on `engine` only for the `Card` type. |
 | [`mp-wasm/`](mp-wasm) | A `wasm-bindgen` wrapper over `mental-poker` so a browser can run the verifiable dealing locally. A detached crate (its own workspace); see [`mp-wasm/README.md`](mp-wasm/README.md). |
+| [`gto-solver/`](gto-solver) | Wraps the open-source **AGPL-3.0** `postflop-solver` (Discounted-CFR) behind BluffKing engine types (ADR-012); powers the free public `POST /api/tools/poker/solve` study tool. Its AGPL dependency is why this repo is AGPL-3.0. |
 
 ### Why "provably fair"
 
@@ -56,7 +57,9 @@ cargo deny check                         # supply-chain gate (advisories + licen
 - **Code:** AGPL-3.0-only — see [`LICENSE`](LICENSE).
 - **Brand:** the **BluffKing** name, logo, and visual identity are **not**
   licensed with the code — see [`TRADEMARKS.md`](TRADEMARKS.md). Forks must rebrand.
-- **Dependencies:** all permissive (MIT / Apache-2.0 / BSD-3-Clause) — see
+- **Dependencies:** mostly permissive (MIT / Apache-2.0 / BSD-3-Clause), with
+  ONE copyleft exception — the `gto-solver` crate depends on the **AGPL-3.0**
+  `postflop-solver` (pinned commit), which is why this repo is AGPL-3.0. See
   [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md).
 
 > The upstream service that uses these crates is a separate, **closed-source**
@@ -82,6 +85,7 @@ section) and [`SECURITY.md`](SECURITY.md).
 | [`engine/`](engine) | 纯逻辑扑克引擎。`GameHand` 端到端打完一手牌(盲注 → 翻牌/转牌/河牌 → 边池 → 结算)。内含蒙特卡洛 **胜率(equity)** 估算与本地 **牌后求解器/教练**。无 IO、无 async、无数据库——同一套规则驱动实战、测试与确定性回放。 |
 | [`mental-poker/`](mental-poker) | 可验证公平发牌:commit–reveal 承诺-揭示方案 + Ed25519 签名的哈希链 transcript + **离线验证器**(`pf_verify`、`mp-verify`)。另含 **原型** 的服务端盲发路径(重加密混洗 + 门限解密)。仅依赖 `engine` 的 `Card` 类型。 |
 | [`mp-wasm/`](mp-wasm) | 对 `mental-poker` 的 `wasm-bindgen` 封装,让浏览器本地运行可验证发牌。独立 crate(自带 workspace),见 [`mp-wasm/README.md`](mp-wasm/README.md)。 |
+| [`gto-solver/`](gto-solver) | 封装开源 **AGPL-3.0** 的 `postflop-solver`(Discounted-CFR),隐藏在 BluffKing engine 类型之后(ADR-012);为免费公开的 `POST /api/tools/poker/solve` 学习工具提供支持。它的 AGPL 依赖是本仓库采用 AGPL 的原因。 |
 
 ### 为什么"可验证公平"
 

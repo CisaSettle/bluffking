@@ -7,14 +7,18 @@ you run `gh repo create … --public`.
 
 ---
 
-## 1. Data provenance — `engine/data/preflop_v2.json` (HARD BLOCKER) 🔴
+## 1. Data provenance — `engine/data/preflop_v2.json` — ✅ RESOLVED (2026-07-01)
 
-**Problem.** The file's own `_source` field (and `engine/data/README.md`) state
-it is derived from third-party commercial poker-range products whose terms forbid
-commercial / via-third-party-app redistribution. Publishing the file would be a
-**self-documenting** redistribution of vendor-derived data. It is also a
-**compile-time hard dependency** (`include_str!` at
-`engine/src/solver/preflop_charts.rs:19`), so it cannot simply be deleted.
+**Resolved via Option B (clean-room regeneration).** The ranges are now generated
+by `engine/examples/gen_preflop_ranges.rs` from BluffKing's OWN equity engine +
+a CFR variant — reproducible byte-identically, with NO third-party charts/solver
+outputs. The file's `_source` reads "clean-room" and `engine/tests/
+preflop_chart_contract.rs` guards the provenance. The former problem (below) no
+longer applies; kept for history.
+
+> _Former problem:_ the `_source` once claimed derivation from third-party
+> commercial poker-range products — a redistribution risk. That data was
+> replaced by the clean-room generator above.
 
 **Resolve by ONE of:**
 - **Option B (recommended): regenerate** the ranges from a clean source — an
