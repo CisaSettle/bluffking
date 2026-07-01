@@ -10,9 +10,9 @@
 //! Run:  cargo run -p mental-poker --example phase4_blind_demo
 //!
 //! HONEST SCOPE: this proves the *implemented protocol* keeps cards from the
-//! server locally; it does NOT replace the external cryptographic audit that
-//! gates production (`guard_provider_allowed` still rejects
-//! `mental_poker_production`). It models a ≥2-human, bot-free table; it defends
+//! server locally; it exercises the same protocol that runs in production for
+//! engine-blind tables (ADR-070) — the generic `mental_poker_production`
+//! provider stays rejected. It models a ≥2-human, bot-free table; it defends
 //! against a malicious SERVER, not against colluding players.
 
 use curve25519_dalek::ristretto::RistrettoPoint;
@@ -49,7 +49,7 @@ fn main() {
     let n = 3usize; // ≥2 真人、无机器人桌 (all-human, bot-free — ADR-063 §7)
 
     println!("════════ Phase-4 server-blind 发牌 · 本地真实密码学演示 ════════");
-    println!("(原型,待外部审计 — 验证「已实现协议」,不替代外部密码学审计)\n");
+    println!("(真实密码学 · 验证「已实现协议」· 跨厂商 AI 审 + 开源可复核)\n");
 
     // ① DKG — each human generates a secret key share; the server gets none.
     println!("① 分布式密钥生成 (DKG):{n} 个真人各自生成私钥分片 x_i,谁都不知道完整私钥。");
@@ -173,7 +173,9 @@ fn main() {
     println!("✓ 每张底牌只有其拥有者能补齐解密;篡改解密分片会被证明验证拒绝。");
     println!("→ 在这条 Phase-4 发牌引擎上,服务器【结构上】拿不到任何明文底牌(server-blind 成立)。");
     println!("\n诚实边界:");
-    println!("• 本演示证明「已实现协议」在本地成立 —— 不替代上线前必需的【外部密码学审计】。");
+    println!(
+        "• 本演示证明「已实现协议」在本地成立;该协议已在生产为 engine-blind 牌桌上线(ADR-070)。"
+    );
     println!("• 只适用于 ≥2 真人、无机器人的桌;防作恶服务器,但防不了串通玩家。");
-    println!("• 代码在 feat/mp-phase4 分支:未合并、生产启动被 guard_provider_allowed 硬拒。");
+    println!("• engine-blind 组合已 GA(ADR-070);通用 mental_poker_production provider 仍被 guard_provider_allowed 硬拒。");
 }

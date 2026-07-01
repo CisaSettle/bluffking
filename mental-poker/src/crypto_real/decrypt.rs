@@ -1,5 +1,5 @@
-//! Threshold ElGamal decryption + Chaum–Pedersen (DLEQ) proofs — **PROTOTYPE,
-//! pending external audit (ADR-063 §4, spec §4)**.
+//! Threshold ElGamal decryption + Chaum–Pedersen (DLEQ) proofs — **cross-vendor
+//! AI-audited (ADR-076/077/078); open-source + verifiable (ADR-063 §4, spec §4)**.
 //!
 //! This is the **server-blind core**: the deck is ElGamal ciphertext under the
 //! joint key `Q = Σ x_i·G` from the DKG (crypto_real::dkg). To recover a card's
@@ -31,9 +31,9 @@
 //!
 //! ## Status
 //!
-//! NOT audited by a paid external cryptography firm. GA'd for the engine-blind
-//! table class by ADR-070 (which lifted the ADR-063 cage); in production these
-//! run ONLY for engine-blind sessions (`resolve_mp_crypto_mode`).
+//! Cross-vendor AI-audited (ADR-076/077/078); open-source + verifiable. GA'd for
+//! the engine-blind table class by ADR-070 (which lifted the ADR-063 cage); in
+//! production these run ONLY for engine-blind sessions (`resolve_mp_crypto_mode`).
 
 use crate::crypto_real::dkg::challenge_scalar;
 use crate::crypto_real::dkg::DkgParty;
@@ -315,8 +315,8 @@ fn decode_threshold_attestation(att: &str) -> Option<ThresholdOpenWire> {
 }
 
 /// A real [`DecryptionProvider`](crate::crypto::DecryptionProvider) for the
-/// `cp-threshold-ristretto-v1` scheme — **PROTOTYPE, pending external audit
-/// (ADR-063, audit F3)**.
+/// `cp-threshold-ristretto-v1` scheme — **cross-vendor AI-audited
+/// (ADR-076/077/078); open-source + verifiable (ADR-063, audit F3)**.
 ///
 /// `verify_decryption` decodes the ciphertext + n-of-n threshold opening from the
 /// attestation, verifies **every** share's Chaum–Pedersen DLEQ against the

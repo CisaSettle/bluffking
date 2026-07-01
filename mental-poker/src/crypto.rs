@@ -16,8 +16,8 @@
 //! - A mock decryption proof likewise binds to `(party, deck_index, card_id,
 //!   salt)` but does not prove a correct threshold partial decryption.
 //!
-//! Production requires an audited verifiable shuffle argument (e.g.
-//! Bayer–Groth) and threshold ElGamal decryption with Chaum–Pedersen proofs.
+//! The real path (`crypto_real/`) provides a verifiable re-encryption shuffle +
+//! threshold ElGamal / Chaum–Pedersen decryption; this Mock does not.
 
 use crate::card_id::CardId;
 use crate::hash::{ds_hash, hex_hash, Hash};

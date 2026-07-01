@@ -1,5 +1,5 @@
 //! Soundness + round-trip tests for the verifiable re-encryption shuffle —
-//! **PROTOTYPE, pending external audit (ADR-063 §3, spec §3 / §8)**.
+//! **Cross-vendor AI-audited (ADR-076/077/078); open-source + verifiable (ADR-063 §3, spec §3 / §8)**.
 //!
 //! These tests are the soundness gate (spec §8.2): a valid shuffle MUST verify,
 //! and a swapped / replaced / dropped / duplicated card MUST be rejected (the
@@ -456,7 +456,7 @@ fn verifier_only_cannot_prove() {
 /// This is a lightweight self-contained `std::time::Instant` timer rather than a
 /// criterion harness on purpose: criterion 0.8 pulls ~73 transitive crates
 /// (plotters / wasm-bindgen / cc) into the workspace lock — too heavy for a
-/// prototype whose bench is explicitly NOT a correctness gate. The numbers below
+/// bench that is explicitly NOT a correctness gate. The numbers below
 /// are real measurements (a full DKG + one full-deck shuffle prove + verify).
 #[test]
 #[ignore = "perf bench — run explicitly with --ignored --nocapture"]
@@ -467,7 +467,7 @@ fn shuffle_bench_per_hand_deal() {
 
     let mut rng = OsRng;
     let v = RealShuffleProofProvider::verifier();
-    println!("\n=== Phase-4 shuffle bench (prototype, ristretto255 + merlin) ===");
+    println!("\n=== Phase-4 shuffle bench (real, ristretto255 + merlin) ===");
     println!(
         "{:>3} | {:>12} | {:>12} | {:>14}",
         "n", "prove (ms)", "verify (ms)", "n-shuffles (ms)"

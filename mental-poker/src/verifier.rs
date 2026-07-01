@@ -18,7 +18,7 @@ use crate::transcript::{Transcript, TranscriptEvent};
 use serde_json::Value;
 use thiserror::Error;
 
-/// Whether the proof systems a verified transcript *declares* are the audited,
+/// Whether the proof systems a verified transcript *declares* are the real,
 /// cryptographically-sound schemes or dev-only **mocks**.
 ///
 /// This is the crux of BUG-108: the production `mental_poker_prefer` policy deals
@@ -251,7 +251,7 @@ pub fn verify(transcript: &Transcript) -> Result<VerifyReport, VerifyError> {
     // --- Select crypto providers from the transcript's declared schemes. ---
     let shuffle: Box<dyn ShuffleProofProvider> = match transcript.shuffle_scheme.as_str() {
         "mock-shuffle-v1" => Box::new(MockShuffleProofProvider),
-        // PROTOTYPE (ADR-063 §3 / spec §3.4): the real sound verifiable
+        // Real-crypto (ADR-063 §3 / spec §3.4): the real sound verifiable
         // re-encryption shuffle. Verification is self-contained — the prover's
         // ciphertext decks + the sigma argument travel in `ShuffleProof.attestation`
         // and are bound to the event's `input_hash`/`output_hash` (deck-hash check).
@@ -271,7 +271,7 @@ pub fn verify(transcript: &Transcript) -> Result<VerifyReport, VerifyError> {
     };
     let decryption: Box<dyn DecryptionProvider> = match transcript.decryption_scheme.as_str() {
         "mock-decrypt-v1" => Box::new(MockDecryptionProvider),
-        // PROTOTYPE (ADR-063 §4 / audit F3): the real threshold-ElGamal +
+        // Real-crypto (ADR-063 §4 / audit F3): the real threshold-ElGamal +
         // Chaum–Pedersen decryption scheme. To verify the n-of-n opens the
         // provider needs the DKG party public keys `Q_i`; we reconstruct them
         // from the transcript's `key_registered` events (`shuffle_pubkey` field),

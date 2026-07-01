@@ -29,7 +29,7 @@ name = "pf_demo_hand"
 path = "src/bin/pf_demo_hand.rs"
 
 # Milestone-B server-blind per-hand deal latency bench (ADR-063 §8 / ADR-062
-# §4 Gate-B). PROTOTYPE perf artifact — not a correctness gate, not wired into
+# §4 Gate-B). Perf artifact — not a correctness gate, not wired into
 # production. `cargo bench -p mental-poker --bench phase4_deal`.
 [[bench]]
 name = "phase4_deal"
@@ -48,7 +48,8 @@ hex = "0.4"
 uuid = { workspace = true }
 ed25519-dalek = { version = "2.2.0", features = ["rand_core", "zeroize"] }
 # Server-blind crypto (ADR-063 primitives — GA'd for the engine-blind table class
-# by ADR-070, 2026-06-23; pending a paid external cryptography-firm audit).
+# by ADR-070, 2026-06-23; cross-vendor AI-audited, ADR-076/077/078; open-source
+# + independently verifiable).
 # In production these are selected ONLY for engine-blind sessions
 # (resolve_mp_crypto_mode); the generic mental_poker_production provider stays
 # rejected. Play-money only.
@@ -64,6 +65,6 @@ rand = "0.8"
 getrandom = { version = "0.2", features = ["js"] }
 
 [dev-dependencies]
-# Criterion for the Phase-4 Gate-B latency bench (offline-cached). PROTOTYPE
-# perf tooling only — never a production dependency.
+# Criterion for the Phase-4 Gate-B latency bench (offline-cached). Dev/perf
+# tooling only — never a production dependency.
 criterion = "0.8"

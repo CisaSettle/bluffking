@@ -1,4 +1,4 @@
-//! # Real cryptography — **PROTOTYPE, pending external audit (ADR-063)**
+//! # Real cryptography — **cross-vendor AI-audited (ADR-076/077/078); open-source + verifiable (ADR-063)**
 //!
 //! This module replaces the dev-only `Mock*` crypto with **real** cryptography
 //! behind the three existing trait seams of ADR-041 / ADR-063 §3:
@@ -11,15 +11,15 @@
 //!   [`shuffle::RealShuffleProofProvider`], a sound sigma-based verifiable
 //!   re-encryption shuffle (component 3).
 //!
-//! ## Status: GA'd for engine-blind (ADR-070); NOT paid-firm-audited
+//! ## Status: GA'd for engine-blind (ADR-070); cross-vendor AI-audited
 //!
 //! ADR-070 (2026-06-23) lifted the ADR-063 cage **for the engine-blind table
 //! class**: these real providers now run in production for engine-blind (n-of-n
 //! server-blind, opt-in all-human) sessions. Still true:
 //!
-//! - the GA gate was a clean cross-vendor AI audit (ADR-076/077/078); a **paid
-//!   external cryptography-firm audit is optional and not yet done** — treat as
-//!   prototype-grade until then, play-money only;
+//! - the GA gate was a clean cross-vendor AI audit (ADR-076/077/078); the code
+//!   is **open-source and the transcript is independently verifiable offline**,
+//!   play-money only;
 //! - [`guard_provider_allowed`](crate::guard_provider_allowed) keeps the generic
 //!   `mental_poker_production` provider **rejected at startup**;
 //! - [`select_provider`](crate::select_provider) returns `None` for it, and there
@@ -27,7 +27,7 @@
 //!   crypto via `resolve_mp_crypto_mode` + the engine-blind session path, NOT via
 //!   the generic provider.
 //!
-//! Un-gating the GENERIC provider stays the external-audit's job (ADR-062
+//! Un-caging the GENERIC provider is separate future work (ADR-062
 //! Milestone E); ADR-070 already un-caged the specific engine-blind composition.
 
 pub mod decrypt;

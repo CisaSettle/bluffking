@@ -62,18 +62,18 @@ pub enum DealingProviderKind {
     /// Prefer the current interactive Mental Poker transcript mode on eligible
     /// all-human tables, falling back per hand to [`ExistingServer`].
     ///
-    /// This is an operational policy, not a claim that audited server-blind
-    /// crypto has landed. Successful hands still produce the current
+    /// This is an operational (mock-transcript) policy — NOT the cross-vendor-AI-audited
+    /// engine-blind path. Successful hands still produce the current
     /// `mental_poker_mock` transcript/provider string.
     PreferMentalPoker,
     /// Mental Poker protocol with **mock** crypto. Dev only.
     MentalPokerMock,
     /// Mental Poker protocol with **generic, UNAUDITED** real crypto. Rejected
-    /// everywhere by [`crate::guard_provider_allowed`] until an independent audit
-    /// lands. ADR-070 does NOT un-cage this generic path — only the specific
+    /// everywhere by [`crate::guard_provider_allowed`]; ADR-070 un-caged only the
+    /// cross-vendor-AI-audited engine-blind composition. ADR-070 does NOT un-cage this generic path — only the specific
     /// engine-blind composition ([`Self::MentalPokerEngineBlind`]).
     MentalPokerProduction,
-    /// The **audited engine-blind n-of-n composition** (ADR-066/067/068; crypto
+    /// The **cross-vendor-AI-audited engine-blind n-of-n composition** (ADR-066/067/068; crypto
     /// in `mental-poker/src/crypto_real/`). ADR-070 P5 permits this variant in
     /// production behind the clean-Codex audit gate. **NOTE:** the live
     /// engine-blind path is NOT selected via this `DealingProviderKind` — it is
@@ -81,7 +81,7 @@ pub enum DealingProviderKind {
     /// `engine_blind_routes_blind_coordinator`) and gated by
     /// `server::mp_dealing::resolve_mp_crypto_mode` (+ the Mock-void safety net).
     /// This variant exists so [`crate::guard_provider_allowed`] can record, as a
-    /// reviewable distinction, that the audited engine-blind composition is
+    /// reviewable distinction, that the cross-vendor-AI-audited engine-blind composition is
     /// prod-permitted while the generic [`Self::MentalPokerProduction`] stays
     /// caged. It is intentionally NOT parseable from `DEALING_PROVIDER`.
     MentalPokerEngineBlind,

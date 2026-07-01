@@ -1,5 +1,5 @@
 {
-  "_comment": "PROTOTYPE — pending external audit (ADR-063). Phase-4 server-blind EC KAT vectors; future 3-runtime (WASM/Dart) parity gate. Values are byte-pinned: a port must reproduce them.",
+  "_comment": "Phase-4 server-blind EC KAT vectors (ADR-063; cross-vendor AI-audited per ADR-076/077/078, open-source + verifiable); future 3-runtime (WASM/Dart) parity gate. Values are byte-pinned: a port must reproduce them.",
   "kat1_pedersen_h": "fa226d9dff677d2337efd2f0dd292a61fb8a97a0190a254eb98e15faeb55b571",
   "kat2_card_points": [
     "e2f2ae0a6abc4e71a884a961c500515f58e30b6aa582dd8db6a65945e08d2d76",

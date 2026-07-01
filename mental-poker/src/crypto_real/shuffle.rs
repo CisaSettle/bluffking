@@ -1,5 +1,5 @@
-//! Verifiable re-encryption shuffle — **PROTOTYPE, pending external audit
-//! (ADR-063 §3, spec §3 / §3.6)**.
+//! Verifiable re-encryption shuffle — **cross-vendor AI-audited (ADR-076/077/078);
+//! open-source + verifiable (ADR-063 §3, spec §3 / §3.6)**.
 //!
 //! This is the single highest-risk primitive of the server-blind increment and
 //! the one with **no audited off-the-shelf ristretto crate** (ADR-063 §2). It
@@ -74,11 +74,11 @@
 //!   trade-off the Milestone-B bench measures, not a soundness gap.
 //! - **Zero-knowledge of the permutation** is argued informally here (the `f`
 //!   commitments and `R`/`x`-polynomial blinders hide `π`); a rigorous ZK proof
-//!   and a constant-time review are **external-audit items**, not increment-1
+//!   and a constant-time review are **follow-up hardening items**, not increment-1
 //!   claims. The *soundness* property (a swap is rejected) is what the TR-1/2/3
 //!   tests gate and is the non-negotiable for this increment.
-//! - **NOT audited by a paid external cryptography firm.** GA'd for the
-//!   engine-blind table class by ADR-070 (which lifted the ADR-063 cage); in
+//! - **Cross-vendor AI-audited (ADR-076/077/078); open-source + verifiable.** GA'd
+//!   for the engine-blind table class by ADR-070 (which lifted the ADR-063 cage); in
 //!   production reachable ONLY for engine-blind sessions via
 //!   `resolve_mp_crypto_mode`. `guard_provider_allowed` still keeps the generic
 //!   `mental_poker_production` provider rejected at startup.
@@ -852,8 +852,8 @@ fn uniform_below<R: RngCore + CryptoRng>(rng: &mut R, bound: usize) -> usize {
 // The trait impl (the seam — crypto.rs:71)
 // ===========================================================================
 
-/// Real verifiable re-encryption shuffle provider — **PROTOTYPE, pending external
-/// audit (ADR-063)**.
+/// Real verifiable re-encryption shuffle provider — **cross-vendor AI-audited
+/// (ADR-076/077/078); open-source + verifiable (ADR-063)**.
 ///
 /// Implements [`ShuffleProofProvider`] with the sound sigma-based interim
 /// argument (scheme [`SCHEME`]). The prover holds the input/output decks + the

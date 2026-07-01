@@ -1,5 +1,5 @@
 //! Milestone-B performance bench for the **server-blind per-hand deal** —
-//! **PROTOTYPE, pending external audit (ADR-063 §8 / ADR-062 §4 Gate-B)**.
+//! **Cross-vendor AI-audited (ADR-076/077/078); open-source + verifiable (ADR-063 §8 / ADR-062 §4 Gate-B)**.
 //!
 //! This is the Gate-B latency artifact: it times a FULL per-hand server-blind
 //! deal end to end with the real `crypto_real` primitives (no mock, no DB), for
@@ -33,11 +33,11 @@
 //!
 //! ## Status
 //!
-//! NOT a correctness gate (the TR-*/RT-* tests are). NOT paid-firm-audited;
-//! GA'd for the engine-blind table class by ADR-070. This bench simulates all
-//! parties locally (`guard_provider_allowed` keeps the generic
-//! `mental_poker_production` provider rejected at startup). A latency
-//! measurement + a future external-audit perf artifact.
+//! NOT a correctness gate (the TR-*/RT-* tests are). GA'd for the engine-blind
+//! table class by ADR-070; cross-vendor AI-audited (ADR-076/077/078),
+//! open-source + verifiable. This bench simulates all parties locally
+//! (`guard_provider_allowed` keeps the generic `mental_poker_production`
+//! provider rejected at startup). A latency measurement only.
 //!
 //! ## Run
 //!

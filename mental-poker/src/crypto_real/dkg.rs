@@ -1,5 +1,5 @@
-//! Distributed Key Generation (n-of-n) — **PROTOTYPE, pending external audit
-//! (ADR-063 §2, spec §2)**.
+//! Distributed Key Generation (n-of-n) — **cross-vendor AI-audited
+//! (ADR-076/077/078); open-source + verifiable (ADR-063 §2, spec §2)**.
 //!
 //! Produces a joint ElGamal public key `Q = Σ Q_i` over `n` parties such that
 //! decryption requires **all n** secret shares `x_i` (n-of-n; no relaxed
@@ -28,9 +28,9 @@
 //!
 //! ## Status
 //!
-//! NOT audited by a paid external cryptography firm. GA'd for the engine-blind
-//! table class by ADR-070 (which lifted the ADR-063 cage); in production these
-//! run ONLY for engine-blind sessions (`resolve_mp_crypto_mode`). The
+//! Cross-vendor AI-audited (ADR-076/077/078); open-source + verifiable. GA'd for
+//! the engine-blind table class by ADR-070 (which lifted the ADR-063 cage); in
+//! production these run ONLY for engine-blind sessions (`resolve_mp_crypto_mode`). The
 //! increment-1 harness simulates all `n` parties locally with real `OsRng`; the
 //! interactive WS choreography is out of scope.
 

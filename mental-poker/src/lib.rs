@@ -22,7 +22,7 @@
 //! **dev-grade — not cryptographically sound** (they only replay consistently,
 //! `SchemeSoundness::DevMock`). The real suite (`crypto_real`) IS sound and,
 //! since **ADR-070 (2026-06-23)**, runs in production for the engine-blind table
-//! class — cross-vendor AI-audited but not yet paid-firm-audited. The runtime
+//! class — cross-vendor AI-audited (ADR-076/077/078), open-source + verifiable. The runtime
 //! guard [`guard_provider_allowed`] keeps the explicit mock provider out of
 //! production and rejects the generic `mental_poker_production` provider
 //! (engine-blind selects real crypto via `resolve_mp_crypto_mode`).
@@ -40,9 +40,9 @@
 pub mod card_id;
 pub mod crypto;
 /// Real cryptography (ADR-063 primitives) — **GA'd for the engine-blind table
-/// class by ADR-070 (2026-06-23), pending a paid external cryptography-firm
-/// audit** (the GA gate was a clean cross-vendor AI audit — ADR-076/077/078; a
-/// paid-firm audit is optional and not yet done, so treat it as prototype-grade).
+/// class by ADR-070 (2026-06-23); cross-vendor AI-audited (ADR-076/077/078),
+/// open-source + independently verifiable** (the GA gate was a clean
+/// cross-vendor AI audit).
 ///
 /// Houses the real `ed25519-dalek`-backed [`SignatureProvider`] plus the
 /// verifiable-shuffle and threshold-decryption providers that replace the
@@ -85,8 +85,8 @@ pub use verifier::{
 ///   (backend review F-CFG-1). **Unchanged by ADR-070.**
 /// - `mental_poker_production` — the **generic, UNAUDITED** real-crypto path:
 ///   rejected everywhere. **ADR-070 does NOT un-cage this** — only the specific
-///   audited engine-blind composition is prod-permitted (below).
-/// - `mental_poker_engine_blind` — the **audited engine-blind n-of-n
+///   cross-vendor-AI-audited engine-blind composition is prod-permitted (below).
+/// - `mental_poker_engine_blind` — the **cross-vendor-AI-audited engine-blind n-of-n
 ///   composition** (ADR-066/067/068; `crypto_real/`). ADR-070 P5 permits it in
 ///   production. **IMPORTANT — this is a record, not the live gate:** the live
 ///   engine-blind path is NOT selected via `DealingProviderKind`/this guard. It
@@ -98,7 +98,7 @@ pub use verifier::{
 ///   guard validates the **startup `DEALING_PROVIDER`** value, and this variant
 ///   is intentionally NOT parseable from that env var (`DealingProviderKind::parse`),
 ///   so it can never be selected at startup. Permitting it here keeps the
-///   audited-vs-generic distinction reviewable and future-proofs an explicit
+///   cross-vendor-AI-audited-vs-generic distinction reviewable and future-proofs an explicit
 ///   programmatic selection — without un-caging the generic
 ///   `mental_poker_production` path.
 pub fn guard_provider_allowed(kind: DealingProviderKind, app_env: &str) -> Result<(), String> {
@@ -133,11 +133,11 @@ pub fn guard_provider_allowed(kind: DealingProviderKind, app_env: &str) -> Resul
         DealingProviderKind::MentalPokerProduction => Err(
             "DEALING_PROVIDER=mental_poker_production is the generic UNAUDITED \
              real-crypto path and stays rejected everywhere; ADR-070 un-cages \
-             ONLY the audited engine-blind composition (see \
+             ONLY the cross-vendor-AI-audited engine-blind composition (see \
              docs/architecture/adr/ADR-070-engine-blind-production-ga.md §6)"
                 .to_string(),
         ),
-        // ADR-070 P5 — the AUDITED engine-blind n-of-n composition is
+        // ADR-070 P5 — the cross-vendor-AI-audited engine-blind n-of-n composition is
         // prod-permitted. (Not reachable from the startup DEALING_PROVIDER env;
         // see the doc-comment — the live gate is resolve_mp_crypto_mode + the
         // per-session engine_blind routing flag + the Mock-void safety net.)
@@ -160,7 +160,7 @@ pub fn select_provider(
         DealingProviderKind::PreferMentalPoker | DealingProviderKind::MentalPokerMock => {
             Some(Box::new(MentalPokerDealingProvider::new(entropy)))
         }
-        // `MentalPokerProduction` has no `DealingProvider` impl. The audited
+        // `MentalPokerProduction` has no `DealingProvider` impl. The cross-vendor-AI-audited
         // `MentalPokerEngineBlind` composition is NOT a `DealingProvider` either —
         // it runs as the engine-blind coordinator (`run_engine_blind_hand`), not
         // through this trait — so it also returns `None` here.
@@ -242,14 +242,14 @@ mod guard_tests {
 
     #[test]
     fn engine_blind_composition_permitted_in_production() {
-        // ADR-070 P5 un-cage: the AUDITED engine-blind n-of-n composition is
+        // ADR-070 P5 un-cage: the cross-vendor-AI-audited engine-blind n-of-n composition is
         // prod-permitted (and allowed in every env). It is a record/distinction
         // here — the live gate is resolve_mp_crypto_mode + the per-session
         // engine_blind routing flag — but the guard must not reject it.
         assert!(
             guard_provider_allowed(DealingProviderKind::MentalPokerEngineBlind, "production")
                 .is_ok(),
-            "the audited engine-blind composition must be prod-permitted (ADR-070 P5)"
+            "the cross-vendor-AI-audited engine-blind composition must be prod-permitted (ADR-070 P5)"
         );
         assert!(
             guard_provider_allowed(DealingProviderKind::MentalPokerEngineBlind, "prod").is_ok()

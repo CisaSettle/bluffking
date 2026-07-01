@@ -1,6 +1,7 @@
 //! Phase-4 server-blind core — integration tests + KAT vector emission.
 //!
-//! **Pending a paid external cryptography-firm audit (ADR-063 §4).** These tests
+//! **Cross-vendor AI-audited (ADR-076/077/078); open-source + independently
+//! verifiable (ADR-063 §4).** These tests
 //! exercise the real threshold-ElGamal / DKG / Chaum–Pedersen path
 //! (`mental_poker::crypto_real`) end to end, with **all parties simulated
 //! locally using the real OS CSPRNG**. In production the real path runs only for
@@ -934,7 +935,7 @@ fn emit_phase4_ec_kat_vectors() {
     let deck_hash_hex = hex::encode(mental_poker::crypto_real::ec::deck_hash(&deck));
 
     let vectors: Value = json!({
-        "_comment": "PROTOTYPE — pending external audit (ADR-063). Phase-4 server-blind EC KAT vectors; future 3-runtime (WASM/Dart) parity gate. Values are byte-pinned: a port must reproduce them.",
+        "_comment": "Phase-4 server-blind EC KAT vectors (ADR-063; cross-vendor AI-audited per ADR-076/077/078, open-source + verifiable); future 3-runtime (WASM/Dart) parity gate. Values are byte-pinned: a port must reproduce them.",
         "kat1_pedersen_h": h_hex,
         "kat2_card_points": card_points,
         "kat3_fixed_ciphertext": {

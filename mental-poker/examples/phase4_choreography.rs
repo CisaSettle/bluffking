@@ -1,7 +1,7 @@
 //! phase4_choreography — a full server-blind HAND dealt across N independent
 //! key-holding parties and a coordinator that holds ZERO secrets, plus the
 //! n-of-n LIVENESS / abort behaviour (the #1 UX risk per the go-live decision
-//! doc). PROTOTYPE, pending external audit (ADR-063).
+//! doc). Cross-vendor AI-audited (ADR-076/077/078); open-source + verifiable (ADR-063).
 //!
 //! Run:  cargo run -p mental-poker --example phase4_choreography
 //!
@@ -156,7 +156,7 @@ fn run_hand(n: usize, drop_party: Option<usize>) -> Result<HandOutcome, String> 
 
 fn main() {
     println!("════ Phase-4 server-blind 多方发牌编排 + 在线门槛(liveness)验证 ════");
-    println!("(原型,待外部审计;协调方 = 只转发密文/公钥/证明,零私钥分片)\n");
+    println!("(真实密码学;协调方 = 只转发密文/公钥/证明,零私钥分片)\n");
 
     // --- Happy path: a full 3-handed server-blind hand. ---
     let n = 3;

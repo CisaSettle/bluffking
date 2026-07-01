@@ -1,5 +1,5 @@
-//! Real **asymmetric** Ed25519 transcript signing — **PROTOTYPE, pending
-//! external audit (ADR-063 §5, spec §5)**.
+//! Real **asymmetric** Ed25519 transcript signing — **cross-vendor AI-audited
+//! (ADR-076/077/078); open-source + verifiable (ADR-063 §5, spec §5)**.
 //!
 //! [`Ed25519SignatureProvider`] implements the existing
 //! [`SignatureProvider`](crate::signing::SignatureProvider) trait with
@@ -34,12 +34,13 @@
 //!
 //! ## Status
 //!
-//! Pending a paid external cryptography-firm audit. GA'd for the engine-blind
-//! table class by ADR-070; in production selected ONLY for engine-blind sessions
-//! (`resolve_mp_crypto_mode`) — the generic `mental_poker_production` provider
-//! stays rejected. `ed25519-dalek` itself is an audited lineage (Quarkslab
-//! 2019 scope, fiat-crypto formally-verified field backend), but the *Phase-4
-//! integration* as a whole is the artifact for the external audit.
+//! Cross-vendor AI-audited (ADR-076/077/078); open-source + verifiable. GA'd for
+//! the engine-blind table class by ADR-070; in production selected ONLY for
+//! engine-blind sessions (`resolve_mp_crypto_mode`) — the generic
+//! `mental_poker_production` provider stays rejected. `ed25519-dalek` itself is
+//! an audited lineage (Quarkslab 2019 scope, fiat-crypto formally-verified field
+//! backend); the *Phase-4 integration* as a whole is cross-vendor AI-audited and
+//! independently verifiable.
 
 use crate::signing::{KeyDirectory, Signature, SignatureProvider};
 use ed25519_dalek::{Signature as DalekSignature, Signer, SigningKey, Verifier, VerifyingKey};

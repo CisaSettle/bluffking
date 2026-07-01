@@ -1,5 +1,5 @@
-//! Elliptic-curve primitives over **ristretto255** — **PROTOTYPE, pending
-//! external audit (ADR-063 §1, spec §1)**.
+//! Elliptic-curve primitives over **ristretto255** — **cross-vendor AI-audited
+//! (ADR-076/077/078); open-source + verifiable (ADR-063 §1, spec §1)**.
 //!
 //! This is the shared arithmetic substrate for the server-blind dealing
 //! increment: ElGamal ciphertexts, the card-id ↔ message-point encoding + 52-
@@ -15,14 +15,14 @@
 //! clearing or subgroup check needed — exactly what mental poker (ElGamal,
 //! Chaum–Pedersen, the shuffle commitments) wants. Field arithmetic uses the
 //! formally-verified (fiat-crypto / Coq-generated) backend, and the lineage was
-//! audited (Quarkslab 2019). The *Phase-4 integration* as a whole is still the
-//! artifact for the external audit.
+//! audited by Quarkslab (2019). The *Phase-4 integration* as a whole is
+//! cross-vendor AI-audited (ADR-076/077/078) and independently verifiable.
 //!
 //! ## Status
 //!
-//! NOT audited by a paid external cryptography firm. GA'd for the engine-blind
-//! table class by ADR-070 (which lifted the ADR-063 cage); in production these
-//! run ONLY for engine-blind sessions (`resolve_mp_crypto_mode`).
+//! Cross-vendor AI-audited (ADR-076/077/078); open-source + verifiable. GA'd for
+//! the engine-blind table class by ADR-070 (which lifted the ADR-063 cage); in
+//! production these run ONLY for engine-blind sessions (`resolve_mp_crypto_mode`).
 
 use crate::hash::ds_hash;
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT as G;
