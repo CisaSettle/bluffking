@@ -388,6 +388,9 @@ pub(crate) struct PostflopRuleCtx {
     pub spr: f32,
     pub hand_strength: HandStrength,
     pub to_call: u32,
+    /// Hero's stack before this action. Used to reject a physically impossible
+    /// Raise when calling already commits the whole stack (U20).
+    pub stack_before: u32,
     pub can_check: bool,
     pub is_aggressor: bool,
     pub street: Street,
@@ -402,16 +405,28 @@ pub(crate) fn recommend_postflop(ctx: &PostflopRuleCtx) -> SolverAction {
     let hs = ctx.hand_strength;
     let can_check = ctx.can_check;
     let is_aggressor = ctx.is_aggressor;
+    // When calling already commits hero's whole stack, a Raise is physically
+    // impossible — the only legal continuing action is the call-all-in. Map a
+    // would-be value raise to Call in that case (U20, dual-AI OSS review): there
+    // is nothing to raise, hero simply calls off.
+    let cannot_raise = ctx.stack_before > 0 && ctx.to_call >= ctx.stack_before;
+    let value_aggression = || {
+        if cannot_raise {
+            SolverAction::Call
+        } else {
+            SolverAction::Raise
+        }
+    };
 
     if equity_pct >= 85 && !can_check {
         // R0: value jam range
-        SolverAction::Raise
+        value_aggression()
     } else if equity_pct >= 65 && hs >= HandStrength::TwoPair && spr <= 3.0 && !can_check {
         // R1: commit threshold
         SolverAction::AllIn
     } else if equity_pct >= 65 && !can_check {
         // R2: standard value
-        SolverAction::Raise
+        value_aggression()
     } else if equity_pct >= 50 && can_check && is_aggressor {
         // R3: c-bet / barrel
         SolverAction::Raise
@@ -469,6 +484,7 @@ fn analyze_postflop(
         spr,
         hand_strength: hs,
         to_call: input.to_call,
+        stack_before: input.stack_before,
         can_check,
         is_aggressor,
         street: input.street,
@@ -1209,6 +1225,7 @@ mod tests {
                 spr: stack_to_pot_ratio(input.stack_before, input.pot_before),
                 hand_strength: classify(input.hero, &input.board),
                 to_call: input.to_call,
+                stack_before: input.stack_before,
                 can_check: input.to_call == 0,
                 is_aggressor: input.last_aggressor_seat == Some(input.hero_seat),
                 street: input.street,

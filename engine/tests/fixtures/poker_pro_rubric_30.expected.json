@@ -310,9 +310,7 @@
         "raise",
         "fold"
       ],
-      "rationale": "Set of 8s on 8d-5c-3d-Th-9d (straight + DIAMOND-flush possible: three diamonds 8d/3d/9d on board) facing a river overbet. to_call=2400 EXACTLY equals stack_before=2400, so the only legal continuing action is a call-all-in — RAISING IS PHYSICALLY IMPOSSIBLE (no chips left to put in beyond the call). SOLVER WEAKNESS: the postflop rule table (advisor.rs) never compares to_call against stack_before, so on equity 90 it advises an illegal `raise` here; that impossible action is FORBIDDEN as ground truth so the gate documents the missing all-in-vs-raise legality check rather than entrenching it. `call` (the only legal line) is the sole accepted action; folding a set getting this price would also be over-folding. `solver_actual` records that today's weak solver emits `raise` so the gate stays green while documenting the gap, yet a FIX (-> `call`) or any other drift is still scored.",
-      "solver_weakness": true,
-      "solver_actual": "raise"
+      "rationale": "Set of 8s on 8d-5c-3d-Th-9d (straight + DIAMOND-flush possible: three diamonds 8d/3d/9d on board) facing a river overbet. to_call=2400 EXACTLY equals stack_before=2400, so the only legal continuing action is a call-all-in — RAISING IS PHYSICALLY IMPOSSIBLE (no chips left to put in beyond the call). `call` (the only legal line) is the sole accepted action; `raise` is impossible and folding a set getting this price would be over-folding, so both are forbidden. FIXED by U20 (dual-AI OSS review): the postflop rule table now compares to_call against stack_before and emits `call` instead of an illegal `raise` when calling already commits the whole stack."
     },
     {
       "id": "R9",

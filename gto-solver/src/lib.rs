@@ -38,8 +38,8 @@
 //! secondarily by iteration count. [`solve_spot`] calls the solver's
 //! `memory_usage()` and REJECTS (without allocating) when the estimate exceeds
 //! [`SolveLimits::max_memory_bytes`]. The caller is additionally expected to
-//! impose a wall-clock timeout + a global concurrency cap (a flop solve is
-//! ~1.5 GB+).
+//! impose a wall-clock timeout + a global concurrency cap (a wide-range flop
+//! solve is ~1 GB — U27: measured figures in [`SolveLimits`]).
 
 use engine::card::Card;
 use engine::hand::HoleCards;
@@ -200,8 +200,10 @@ pub enum SolveStreet {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SolveLimits {
     /// Reject (before allocating) when the solver's estimated uncompressed
-    /// memory exceeds this. A flop with 1 bet size is ~1.5 GB; 2 bet sizes
-    /// blows past 7 GB and MUST be rejected on a shared public box.
+    /// memory exceeds this. U27 (dual-AI OSS review): the measured figures — a
+    /// wide-range flop with 1 bet size is ~0.96 GB; 2 bet sizes ~3.4 GB and
+    /// MUST be rejected on a shared public box. (Reproduce with the ignored
+    /// `measure_flagship_flop_memory` test.)
     pub max_memory_bytes: u64,
     /// Iteration cap — a safety net. Flop converges to <1% pot in well under
     /// 100 iters, so this rarely bites; it bounds a pathological non-converging
@@ -215,9 +217,12 @@ pub struct SolveLimits {
 impl Default for SolveLimits {
     fn default() -> Self {
         Self {
-            // 1.5 GB — a single flop solve with ONE bet size fits (~1.58 GB
-            // measured); two bet sizes (7 GB+) are rejected. Tunable by the
-            // caller.
+            // U27 (dual-AI OSS review): 1.5 GB — a wide-range flop solve with
+            // ONE bet size fits with headroom (~0.96 GB measured; an earlier
+            // comment claimed "~1.58 GB measured", which would have exceeded
+            // this very cap); two bet sizes (~3.4 GB measured) are rejected.
+            // Figures reproducible via the ignored `measure_flagship_flop_memory`
+            // test. Tunable by the caller.
             max_memory_bytes: 1_500_000_000,
             max_iterations: 1000,
             target_exploitability_pct_of_pot: 0.005,
@@ -497,7 +502,7 @@ fn validate_stakes(req: &SolveRequest) -> Result<(), SolveError> {
 
 /// Solve one fully-described postflop spot to an approximate Nash equilibrium.
 ///
-/// SYNCHRONOUS and CPU/RAM-heavy (a flop solve is ~1.5 GB / single-digit
+/// SYNCHRONOUS and CPU/RAM-heavy (a wide-range flop solve is ~1 GB / single-digit
 /// seconds). The server MUST call this inside `spawn_blocking` with a wall-clock
 /// timeout + a global concurrency cap. Validates every input and applies the
 /// [`SolveLimits`] memory cap BEFORE allocating; never panics on caller input
@@ -995,6 +1000,43 @@ mod tests {
             .is_none(),
             "a hand not in the solving player's range yields None"
         );
+    }
+
+    // U27 (dual-AI OSS review): provenance for the measured memory figures in
+    // the `SolveLimits` docs (~0.96 GB for a wide-range 1-bet-size flop, ~3.4 GB
+    // for 2 bet sizes). Uses the tiny-cap `TooLarge` path so the estimate is
+    // read WITHOUT allocating GBs. Ignored by default (it builds two full game
+    // trees); reproduce with:
+    //   cargo test -p gto-solver measure_flagship -- --ignored --nocapture
+    // Measured 2026-07-02: 963_463_880 bytes and 3_416_282_584 bytes.
+    #[test]
+    #[ignore = "measurement helper, not a regression test — run manually with --ignored"]
+    fn measure_flagship_flop_memory() {
+        let wide_oop = "66+,A8s+,A5s-A4s,AJo+,K9s+,KQo,QTs+,JTs,96s+,85s+,75s+,65s,54s";
+        let wide_ip = "QQ-22,AQs-A2s,ATo+,K5s+,KJo+,Q8s+,J8s+,T7s+,96s+,86s+,75s+,64s+,53s+";
+        for (label, bets, raises) in [
+            ("1 bet size (50%)", "50%", "2.5x"),
+            ("2 bet sizes (33%,75%)", "33%,75%", "2.5x"),
+        ] {
+            let mut req = small_flop_request();
+            req.oop_range = wide_oop.into();
+            req.ip_range = wide_ip.into();
+            req.starting_pot = 200;
+            req.effective_stack = 900;
+            req.bet_sizes = bets.into();
+            req.raise_sizes = raises.into();
+            req.limits.max_memory_bytes = 1; // force TooLarge → carries the estimate
+            match solve_spot(&req) {
+                Err(SolveError::TooLarge { estimated, .. }) => {
+                    println!(
+                        "{label}: estimated {} bytes (~{:.2} GB)",
+                        estimated,
+                        estimated as f64 / 1e9
+                    );
+                }
+                other => panic!("expected TooLarge, got {other:?}"),
+            }
+        }
     }
 
     #[test]

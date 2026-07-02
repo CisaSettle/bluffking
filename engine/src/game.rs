@@ -275,6 +275,10 @@ pub struct GameHand {
     /// `None` when no board is pending (plaintext mode always keeps this `None`,
     /// since it deals the board itself in `close_street_and_advance`).
     pending_board_street: Option<Street>,
+    /// The street the hand ended on, captured when the phase transitions to
+    /// `Done`. Lets `current_street()` report the real final street instead of a
+    /// `Preflop` sentinel for completed hands (U34, dual-AI OSS review).
+    finished_street: Option<Street>,
 }
 
 /// Why a blind-mode `finish_blind` / `inject_*` call could not complete.
@@ -359,6 +363,13 @@ pub enum BlindInjectError {
         /// The card that collided with one already known to the engine.
         card: crate::card::Card,
     },
+    /// A showdown reveal was injected for a seat that is already `Revealed` with
+    /// DIFFERENT cards. A verified reveal is immutable showdown evidence
+    /// (ADR-066); silently overwriting it would let a second injection mutate
+    /// accepted evidence. Idempotent re-injection of the identical cards is
+    /// accepted (returns `Ok`).
+    #[error("showdown reveal rejected: player {0:?} is already revealed with different cards")]
+    AlreadyRevealed(PlayerId),
 }
 
 impl GameHand {
@@ -435,6 +446,7 @@ impl GameHand {
             last_action: HashMap::new(),
             events: vec![],
             pending_board_street: None,
+            finished_street: None,
         }
     }
 
@@ -500,6 +512,7 @@ impl GameHand {
             last_action: HashMap::new(),
             events: vec![],
             pending_board_street: None,
+            finished_street: None,
         }
     }
 
@@ -570,7 +583,7 @@ impl GameHand {
                 amount: Chips(sb_blind_amount),
             },
         );
-        self.action_seq += 1; // P0 fix: SB blind must consume seq=0 before BB posts seq=1
+        self.action_seq = self.action_seq.saturating_add(1); // SB seq=0 before BB seq=1; saturating (U33)
 
         // Record BB action.
         let bb_action_seq = self.action_seq;
@@ -595,7 +608,7 @@ impl GameHand {
                 amount: Chips(bb_blind_amount),
             },
         );
-        self.action_seq += 1;
+        self.action_seq = self.action_seq.saturating_add(1); // saturating (U33)
 
         // Deal hole cards (two passes over all active seats).
         //
@@ -825,7 +838,7 @@ impl GameHand {
             pot_before,
             pot_after,
         });
-        self.action_seq += 1;
+        self.action_seq = self.action_seq.saturating_add(1); // saturating (U33)
         self.last_action
             .insert(player_id.inner(), recorded_action.clone());
 
@@ -896,11 +909,7 @@ impl GameHand {
                 .map(|r| r.pot_total())
                 .unwrap_or(Chips::ZERO);
             let total_pot = self.completed_pot.0 as u64 + current_round_pot.0 as u64;
-            let side_pots = self
-                .betting_round
-                .as_ref()
-                .map(|r| r.side_pots())
-                .unwrap_or_default();
+            let side_pots = self.merged_side_pots();
             // Snapshot all-in state at emit time so the translate layer can apply
             // the has_all_in guard without needing access to full engine state.
             let has_all_in = self.seats.iter().any(|s| s.all_in);
@@ -1214,7 +1223,7 @@ impl GameHand {
 
         // The board is unrecoverable → the hand ends now (no more streets).
         self.pending_board_street = None;
-        self.phase = Phase::Done;
+        self.set_done();
 
         let survivors: Vec<PlayerId> = self
             .seats
@@ -1458,11 +1467,7 @@ impl GameHand {
             .unwrap_or(Chips::ZERO);
         let pot = Chips(self.completed_pot.0 + round_pot.0);
 
-        let side_pots = self
-            .betting_round
-            .as_ref()
-            .map(|r| r.side_pots())
-            .unwrap_or_else(|| self.cumulative_side_pots.clone());
+        let side_pots = self.merged_side_pots();
 
         let players = self
             .seats
@@ -1685,7 +1690,17 @@ impl GameHand {
                 // A folded player never reveals — their cards stay sealed forever.
                 return Err(BlindInjectError::PlayerFolded(player_id));
             }
-            Some(_) => {}
+            // A verified reveal is immutable showdown evidence: reject a second
+            // reveal with DIFFERENT cards, but accept an identical re-injection
+            // idempotently (U32, dual-AI OSS review).
+            Some(seat) => {
+                if let HoleSlot::Revealed(existing) = seat.hole {
+                    if existing == hole_cards {
+                        return Ok(());
+                    }
+                    return Err(BlindInjectError::AlreadyRevealed(player_id));
+                }
+            }
         }
 
         // Uniqueness: a revealed hole card must not collide with any board card,
@@ -1825,8 +1840,20 @@ impl GameHand {
     fn current_street(&self) -> Street {
         match &self.phase {
             Phase::Betting(s) => *s,
-            Phase::NotStarted | Phase::Done => Street::Preflop,
+            // A finished hand reports the street it ended on (U34), not a Preflop
+            // sentinel. `finished_street` is set at every Done transition; it is
+            // only `None` for a hand that never started.
+            Phase::Done => self.finished_street.unwrap_or(Street::Preflop),
+            Phase::NotStarted => Street::Preflop,
         }
+    }
+
+    /// Record the final street and transition the hand to `Done` (U34). Capturing
+    /// here (while `self.phase` is still `Betting(s)`) is what lets a completed
+    /// hand report its real final street.
+    fn set_done(&mut self) {
+        self.finished_street = Some(self.current_street());
+        self.phase = Phase::Done;
     }
 
     /// Sync seat stacks from the betting round's current state.
@@ -1862,7 +1889,7 @@ impl GameHand {
         // Check if hand is over (only one non-folded player, or we've exhausted streets).
         let active_count = self.seats.iter().filter(|s| !s.folded).count();
         if active_count <= 1 {
-            self.phase = Phase::Done;
+            self.set_done();
             return Ok(self.snapshot());
         }
 
@@ -1876,7 +1903,7 @@ impl GameHand {
 
         match next_street {
             None => {
-                self.phase = Phase::Done;
+                self.set_done();
             }
             Some(street) => {
                 // Deal community cards and emit StreetRevealed.
@@ -2148,6 +2175,21 @@ impl GameHand {
         start % n
     }
 
+    /// The full side-pot decomposition visible right now: earlier streets'
+    /// absorbed layers (`cumulative_side_pots`) followed by the active betting
+    /// round's layers. U23 (dual-AI OSS review): reporting only the active
+    /// round's layers mid-hand dropped every prior-street layer from the snapshot
+    /// and `PotUpdated`, so a client could not see the real pot structure until
+    /// the hand ended. The two layer sets are disjoint (different streets'
+    /// contributions), so concatenation is the merged view.
+    fn merged_side_pots(&self) -> Vec<SidePot> {
+        let mut pots = self.cumulative_side_pots.clone();
+        if let Some(round) = &self.betting_round {
+            pots.extend(round.side_pots());
+        }
+        pots
+    }
+
     /// Accumulate new side pots into the running cumulative list.
     fn accumulate_pots(&mut self, new_pots: Vec<SidePot>) {
         if new_pots.is_empty() {
@@ -2167,7 +2209,15 @@ impl GameHand {
 ///
 /// In heads-up (n=2), the dealer is the SB and acts first pre-flop (WSOP/TDA
 /// rule). In 3+ player, the seat after the dealer is the SB.
+///
+/// A hand needs at least two seats to have blinds; `n < 2` has no meaningful
+/// blind assignment and returns `(0, 0)` rather than dividing by zero (U35,
+/// dual-AI OSS review — the public API must not panic on a degenerate seat
+/// count).
 pub fn blind_positions(dealer_idx: usize, n: usize) -> (usize, usize) {
+    if n < 2 {
+        return (0, 0);
+    }
     if n == 2 {
         // Heads-up: dealer is SB, other player is BB. Apply `% n` to the dealer
         // here too — `start()` indexes `self.seats[sb_idx]` BEFORE the `% n`

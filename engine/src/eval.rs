@@ -145,6 +145,16 @@ impl HandRank {
 /// 2-card preflop input yields a `HighCard`/`OnePair` rank. There is no
 /// insufficient-cards signal; callers that need one must check card counts
 /// themselves (the doc previously claimed a non-existent `None` return).
+///
+/// # Correctness — duplicate-free cards required (U22, dual-AI OSS review)
+///
+/// The hole + board cards MUST be pairwise distinct. A duplicate (e.g. a hole
+/// card colliding with a board card) is only caught by a `debug_assert!`: it
+/// **panics in debug builds** but in release builds the bitset-backed
+/// evaluator silently deduplicates and returns a **wrong rank**. There is
+/// deliberately no release-time check on this hot path — the engine
+/// guarantees the invariant internally (the deck deals unique cards; the
+/// solver pre-validates), so external callers must do the same.
 pub fn rank_hand(hole: &HoleCards, board: &BoardCards) -> HandRank {
     let mut all_cards: Vec<RsCard> = Vec::with_capacity(7);
     all_cards.push(card_to_rs(hole.card1));
@@ -209,7 +219,10 @@ pub fn rank_players(
 // `Copy`) and evaluate each player by copying that bitset and inserting only
 // their two hole cards — no heap allocation, no per-player board re-conversion.
 // `rs_poker` types stay INTERNAL (ADR-012: none may appear in a public
-// signature): `BoardEval` is `pub(crate)` and never leaves the engine crate.
+// signature): `BoardEval` is `pub` but wraps its `rs_poker` `Hand` in a
+// PRIVATE field, so no `rs_poker` type leaks into any public signature.
+// (U68, dual-AI OSS review: this comment previously contradicted the actual
+// `pub` visibility documented on the struct below.)
 
 /// A board pre-converted to an `rs_poker` bitset, reusable across the players in
 /// one Monte Carlo trial. The wrapped `rs_poker` type is a PRIVATE field, so no

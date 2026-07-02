@@ -449,7 +449,9 @@ pub struct PotOdds {
     pub pot_odds_pct: f64,
     /// Equity (%) hero needs to break even on the call, rounded to 1dp.
     pub equity_needed_pct: f64,
-    /// Simplified "reward:risk" ratio string, e.g. `"2:1"`.
+    /// Simplified pot-odds ratio string `pot : to_call` (reward : risk), e.g.
+    /// `"2:1"`. Consistent with [`Self::equity_needed_pct`] via the identity
+    /// `equity_needed = 1 / (X + 1)` — e.g. `2:1` ⇒ 33.3%, `3:1` ⇒ 25%.
     pub ratio: String,
     /// Hero equity supplied by the caller (echoed), if any.
     pub equity_pct: Option<f64>,
@@ -522,22 +524,23 @@ pub fn pot_odds(pot: f64, to_call: f64, equity_pct: Option<f64>) -> Result<PotOd
         to_call,
         pot_odds_pct: needed_r,
         equity_needed_pct: needed_r,
-        ratio: simplify_ratio(total, to_call),
+        ratio: simplify_ratio(pot, to_call),
         equity_pct: echo_equity,
         verdict,
         margin_pct: margin,
     })
 }
 
-/// Simplify a `reward:risk` ratio (`(pot+to_call) : to_call`) to a readable
+/// Simplify a pot-odds ratio `reward:risk` (`pot : to_call`) to a readable
 /// string.
 ///
-/// When both sides are (near-)integers AND the GCD reduces the ratio to a clean
-/// `a:1` (the risk side divides the reward evenly), it prints that — e.g.
-/// `150:50` → `"3:1"`, `125:25` → `"5:1"`. Otherwise (non-integer inputs, or a
-/// reduction that would leave an ugly coprime `a:b` like `133:33`) it falls back
-/// to the `"X:1"` form with the reward-per-unit-risk rounded to 1dp — the form
-/// poker players actually read.
+/// `reward` is the pot you stand to win, `risk` is your call — the canonical
+/// pot-odds framing where `equity_needed = 1 / (ratio + 1)`. When both sides are
+/// (near-)integers AND the GCD reduces the ratio to a clean `a:1` (the risk side
+/// divides the reward evenly), it prints that — e.g. `150:50` → `"3:1"`,
+/// `100:25` → `"4:1"`. Otherwise (non-integer inputs, or a reduction that would
+/// leave an ugly coprime `a:b`) it falls back to the `"X:1"` form with the
+/// reward-per-unit-risk rounded to 1dp — the form poker players actually read.
 fn simplify_ratio(reward: f64, risk: f64) -> String {
     if risk <= 0.0 {
         return "—".to_string();
@@ -1149,10 +1152,31 @@ mod tests {
             "call 50 into 100 needs 33.3%, got {}",
             po.equity_needed_pct
         );
-        assert_eq!(po.ratio, "3:1", "150:50 simplifies to 3:1");
+        // Canonical pot odds are pot:to_call = 100:50 = 2:1, and 1/(2+1) = 33.3%
+        // matches equity_needed — U18 (dual-AI OSS review) fixed the prior 3:1
+        // that implied 25% and disagreed with equity_needed.
+        assert_eq!(po.ratio, "2:1", "pot 100 : call 50 simplifies to 2:1");
         assert_eq!(po.pot_odds_pct, po.equity_needed_pct);
         assert!(po.verdict.is_none(), "no equity ⇒ no verdict");
         assert!(po.margin_pct.is_none());
+    }
+
+    #[test]
+    fn ratio_and_equity_needed_are_consistent() {
+        // U18: ratio X:1 must satisfy equity_needed = 1/(X+1) for clean spots.
+        for (pot, call, ratio, needed) in [
+            (150.0, 50.0, "3:1", 25.0),
+            (100.0, 50.0, "2:1", 33.3),
+            (100.0, 25.0, "4:1", 20.0),
+        ] {
+            let po = pot_odds(pot, call, None).unwrap();
+            assert_eq!(po.ratio, ratio, "pot {pot} call {call}");
+            assert!(
+                (po.equity_needed_pct - needed).abs() < 0.05,
+                "pot {pot} call {call}: needed {needed}, got {}",
+                po.equity_needed_pct
+            );
+        }
     }
 
     #[test]
@@ -1180,16 +1204,16 @@ mod tests {
 
     #[test]
     fn ratio_simplifies_via_gcd() {
-        // pot 100, call 25 → reward 125 : risk 25 = 5:1.
+        // pot 100, call 25 → reward 100 : risk 25 = 4:1 (needed 1/5 = 20%).
         let po = pot_odds(100.0, 25.0, None).unwrap();
-        assert_eq!(po.ratio, "5:1");
+        assert_eq!(po.ratio, "4:1");
     }
 
     #[test]
     fn ratio_non_integer_falls_back_to_x_to_1() {
-        // pot 100, call 33 → reward 133 : 33 = 4.0:1 (rounded).
+        // pot 100, call 33 → reward 100 : 33 = 3.0:1 (rounded).
         let po = pot_odds(100.0, 33.0, None).unwrap();
-        assert_eq!(po.ratio, "4:1");
+        assert_eq!(po.ratio, "3:1");
     }
 
     #[test]

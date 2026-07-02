@@ -166,8 +166,13 @@ pub fn classify(hole: HoleCards, board: &BoardCards) -> HandStrength {
     let hole_suits = [hole.card1.suit, hole.card2.suit];
     let flush_draw = has_flush_draw(&hole_suits, &board_suits);
 
-    let oesd = has_open_ended_straight_draw(&all_cards);
-    let gutshot = !oesd && has_gutshot(&all_cards);
+    // Hero must PARTICIPATE in a straight draw — a 4-run/gutshot window living
+    // entirely on the board plays every hand equally and is not hero's draw
+    // (mirrors the `hole_n >= 1` requirement in `has_flush_draw`). U19 (dual-AI
+    // OSS review): Ac2d on 5h6s7d8c must not read as an OESD.
+    let hole_bits = (1u16 << hole.card1.rank as u16) | (1u16 << hole.card2.rank as u16);
+    let oesd = has_open_ended_straight_draw(&all_cards, hole_bits);
+    let gutshot = !oesd && has_gutshot(&all_cards, hole_bits);
 
     if flush_draw || oesd {
         return HandStrength::DrawStrong;
@@ -338,7 +343,14 @@ fn classify_pair(hole: HoleCards, board: &[Card]) -> Option<HandStrength> {
         if pair_rank > top {
             return Some(HandStrength::Overpair);
         }
-        // Underpair to board — treat as PairWeak.
+        // A pocket pair below the top board card but ABOVE the second board rank
+        // plays like middle pair — it beats every board pair except the top one
+        // (U36, dual-AI OSS review). Only a pair at/below the second rank is weak.
+        let mut sorted: Vec<Rank> = board_ranks.clone();
+        sorted.sort_by(|a, b| b.cmp(a));
+        if board.len() >= 2 && pair_rank > sorted[1] {
+            return Some(HandStrength::PairMiddle);
+        }
         return Some(HandStrength::PairWeak);
     }
 
@@ -401,7 +413,7 @@ fn has_backdoor_flush(hole_suits: &[Suit; 2], board_suits: &[Suit]) -> bool {
     false
 }
 
-fn has_open_ended_straight_draw(cards: &[Card]) -> bool {
+fn has_open_ended_straight_draw(cards: &[Card], hole_bits: u16) -> bool {
     let mut bits: u16 = 0;
     for c in cards {
         bits |= 1u16 << (c.rank as u16);
@@ -426,7 +438,9 @@ fn has_open_ended_straight_draw(cards: &[Card]) -> bool {
             // `is_straight` upstream) rather than a draw — exclude that case.
             let has_low_ext = start > low_idx || (start == low_idx && !ace_present);
             let has_high_ext = start + 3 < high_idx;
-            if has_low_ext && has_high_ext {
+            // Hero must hold at least one card of the 4-run — a board-only run is
+            // not hero's draw (U19).
+            if has_low_ext && has_high_ext && (mask & hole_bits) != 0 {
                 return true;
             }
         }
@@ -434,14 +448,15 @@ fn has_open_ended_straight_draw(cards: &[Card]) -> bool {
     false
 }
 
-fn has_gutshot(cards: &[Card]) -> bool {
+fn has_gutshot(cards: &[Card], hole_bits: u16) -> bool {
     let mut bits: u16 = 0;
     for c in cards {
         bits |= 1u16 << (c.rank as u16);
     }
     let low_idx = Rank::Two as u16;
     let high_idx = Rank::Ace as u16;
-    // Any 5-rank window with exactly 4 bits set is a gutshot.
+    // Any 5-rank window with exactly 4 bits set is a gutshot, PROVIDED hero holds
+    // at least one of those ranks — a board-only gutshot is not hero's draw (U19).
     for start in low_idx..=high_idx - 4 {
         let window: u16 = (1 << start)
             | (1 << (start + 1))
@@ -449,7 +464,7 @@ fn has_gutshot(cards: &[Card]) -> bool {
             | (1 << (start + 3))
             | (1 << (start + 4));
         let present = (bits & window).count_ones();
-        if present == 4 {
+        if present == 4 && (window & hole_bits) != 0 {
             return true;
         }
     }
@@ -465,7 +480,7 @@ fn has_gutshot(cards: &[Card]) -> bool {
     for r in wheel_ranks.iter() {
         wheel_mask |= 1 << r;
     }
-    if (bits & wheel_mask).count_ones() == 4 {
+    if (bits & wheel_mask).count_ones() == 4 && (wheel_mask & hole_bits) != 0 {
         return true;
     }
     false
@@ -498,6 +513,46 @@ mod tests {
 
     fn h(c1: Card, c2: Card) -> HoleCards {
         HoleCards::new(c1, c2)
+    }
+
+    // U19 (dual-AI OSS review): a straight draw that lives entirely on the board
+    // is not hero's draw — the completing card plays every hand equally.
+    #[test]
+    fn board_only_oesd_does_not_credit_hero() {
+        // Ac2d on 5h6s7d8c: the board itself is the 5-6-7-8 OESD; hero's A,2 do
+        // not participate. Must NOT be DrawStrong.
+        let hole = h(c(Rank::Ace, Suit::Clubs), c(Rank::Two, Suit::Diamonds));
+        let board = b5(
+            c(Rank::Five, Suit::Hearts),
+            c(Rank::Six, Suit::Spades),
+            c(Rank::Seven, Suit::Diamonds),
+            c(Rank::Eight, Suit::Clubs),
+            c(Rank::King, Suit::Hearts),
+        );
+        assert_ne!(
+            classify(hole, &board),
+            HandStrength::DrawStrong,
+            "board-only 5-6-7-8 OESD must not credit hero with a straight draw"
+        );
+    }
+
+    #[test]
+    fn board_only_flush_draw_does_not_credit_hero() {
+        // Ah3d on KsQsJs4s: four spades on the board, hero holds none. Not a
+        // hero flush draw (has_flush_draw already requires hole participation).
+        let hole = h(c(Rank::Ace, Suit::Hearts), c(Rank::Three, Suit::Diamonds));
+        let board = b5(
+            c(Rank::King, Suit::Spades),
+            c(Rank::Queen, Suit::Spades),
+            c(Rank::Jack, Suit::Spades),
+            c(Rank::Four, Suit::Spades),
+            c(Rank::Two, Suit::Hearts),
+        );
+        assert_ne!(
+            classify(hole, &board),
+            HandStrength::DrawStrong,
+            "board-only four-flush must not credit hero with a flush draw"
+        );
     }
 
     #[test]

@@ -95,6 +95,18 @@ impl PokerRng {
     /// The 256-bit seed used to construct this RNG. Record this in the `hands`
     /// row (`deck_seed_b` BYTEA). For a [`PokerRng::from_seed`] RNG the low 8
     /// little-endian bytes recover the original `u64`.
+    ///
+    /// # Not a byte-level round-trip for `from_seed` (U67, dual-AI OSS review)
+    ///
+    /// For [`PokerRng::from_os`] / [`PokerRng::from_seed_bytes`] RNGs, feeding
+    /// this value back into [`PokerRng::from_seed_bytes`] reproduces the
+    /// identical stream (the bytes ARE the ChaCha20 key). For a
+    /// [`PokerRng::from_seed`] RNG it does **not**: `from_seed(u64)` expands the
+    /// `u64` via `ChaCha20Rng::seed_from_u64` (a hashed expansion), while the
+    /// stored seed is only the [`widen`]ed byte form — so
+    /// `from_seed_bytes(rng.seed())` yields a DIFFERENT deck. To reproduce a
+    /// `from_seed` stream, recover the `u64` from `seed()[..8]` (little-endian)
+    /// and call [`PokerRng::from_seed`] again.
     pub fn seed(&self) -> DeckSeed {
         self.seed
     }

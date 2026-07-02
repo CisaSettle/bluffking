@@ -26,15 +26,24 @@ use mental_poker::{
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let code = match args.get(1).map(String::as_str) {
+    std::process::exit(run(&args));
+}
+
+fn run(args: &[String]) -> i32 {
+    match args.get(1).map(String::as_str) {
         Some("--demo") => run_demo(args.get(2).map(String::as_str)),
-        Some("-h") | Some("--help") | None => {
+        // U66 (dual-AI OSS review): explicitly-requested help is a SUCCESS
+        // (exit 0); only a genuine usage error (no argument) exits 2.
+        Some("-h") | Some("--help") => {
+            print_usage();
+            0
+        }
+        None => {
             print_usage();
             2
         }
         Some(path) => verify_file(path),
-    };
-    std::process::exit(code);
+    }
 }
 
 fn print_usage() {
@@ -175,4 +184,25 @@ fn render_deck(deck: &[Card]) -> String {
 
 fn render_ids(ids: &[u8]) -> String {
     render_cards(ids.iter().filter_map(|&id| id_to_card(id)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run;
+
+    fn args(rest: &[&str]) -> Vec<String> {
+        std::iter::once("mp-verify")
+            .chain(rest.iter().copied())
+            .map(String::from)
+            .collect()
+    }
+
+    /// U66 (dual-AI OSS review): explicit `--help` / `-h` is a success (0);
+    /// a bare invocation with no argument stays a usage error (2).
+    #[test]
+    fn explicit_help_exits_zero_but_missing_arg_exits_two() {
+        assert_eq!(run(&args(&["--help"])), 0, "--help → exit 0");
+        assert_eq!(run(&args(&["-h"])), 0, "-h → exit 0");
+        assert_eq!(run(&args(&[])), 2, "no args → usage error exit 2");
+    }
 }

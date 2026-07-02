@@ -158,6 +158,10 @@ pub enum StateError {
     /// An unknown `event_type`.
     #[error("unknown event type '{0}'")]
     UnknownEvent(String),
+    /// U37 (dual-AI OSS review): `hand_init` declared a `deck_repr` string the
+    /// state machine does not recognize (must be `"reenc"`, `"wire"`, or absent).
+    #[error("unknown deck_repr '{0}'")]
+    UnknownDeckRepr(String),
 }
 
 /// The replayable dealing-protocol state.
@@ -326,7 +330,14 @@ impl ProtocolState {
             Some("wire") => {
                 self.last_deck_hash = hex_hash(&canonical_wire_deck_hash());
             }
-            _ => {
+            // U37 (dual-AI OSS review): an unrecognized deck_repr must be
+            // rejected loudly, not silently fall through to the legacy Phase-1
+            // seeding path — a typo'd repr would otherwise replay under the
+            // wrong round-0 deck-hash chain.
+            Some(other) => {
+                return Err(StateError::UnknownDeckRepr(other.to_string()));
+            }
+            None => {
                 self.last_deck_hash = hex_hash(&canonical_initial_deck_hash());
             }
         }
@@ -751,6 +762,54 @@ mod tests {
         .expect("hand_init applies");
         assert_eq!(s.phase, Phase::KeyReg);
         s
+    }
+
+    #[test]
+    fn hand_init_with_unknown_deck_repr_is_rejected() {
+        // U37 (dual-AI OSS review): a typo'd/unknown deck_repr must NOT be
+        // silently accepted onto the legacy Phase-1 seeding path.
+        let mut s = ProtocolState::new();
+        let err = s
+            .apply(
+                event_type::HAND_INIT,
+                &json!({
+                    "players": [
+                        { "seat": 0, "party_id": "party:0" },
+                        { "seat": 1, "party_id": "party:1" }
+                    ],
+                    "button_seat": 0,
+                    "big_blind": 2,
+                    "small_blind": 1,
+                    "deck_repr": "wirex"
+                }),
+            )
+            .expect_err("an unrecognized deck_repr must be rejected");
+        assert!(matches!(err, StateError::UnknownDeckRepr(ref r) if r == "wirex"));
+        // State is left unchanged on error (atomic apply).
+        assert_eq!(s.phase, Phase::PreInit);
+    }
+
+    #[test]
+    fn hand_init_with_known_deck_reprs_still_accepted() {
+        // U37 (dual-AI OSS review): the known reprs keep working.
+        for repr in [Some("wire"), Some("reenc"), None] {
+            let mut s = ProtocolState::new();
+            let mut payload = json!({
+                "players": [
+                    { "seat": 0, "party_id": "party:0" },
+                    { "seat": 1, "party_id": "party:1" }
+                ],
+                "button_seat": 0,
+                "big_blind": 2,
+                "small_blind": 1
+            });
+            if let Some(r) = repr {
+                payload["deck_repr"] = json!(r);
+            }
+            s.apply(event_type::HAND_INIT, &payload)
+                .expect("a known deck_repr is accepted");
+            assert_eq!(s.phase, Phase::KeyReg);
+        }
     }
 
     #[test]

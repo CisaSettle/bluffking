@@ -94,6 +94,13 @@ impl MentalPokerDealingProvider {
     }
 
     /// Deal a hand under a specific [`Scenario`] (fault injection for tests).
+    ///
+    /// # Panics
+    ///
+    /// U65 (dual-AI OSS review): panics if `request.num_players` is outside
+    /// `2..=23` — `2 * n + 5` cards must fit one 52-card deck (the defensive
+    /// guard in `ProtocolRun::new`; Hold'em tables cap at 9 seats, so a live
+    /// caller never hits it).
     pub fn deal_scenario(&self, request: &DealRequest, scenario: Scenario) -> DealtHand {
         let run = ProtocolRun::new(&self.entropy, request);
         let mut events = run.plan_events();
@@ -168,6 +175,12 @@ impl DealingProvider for MentalPokerDealingProvider {
         true
     }
 
+    /// Deal a correct, fully-verifiable hand ([`Scenario::Valid`]).
+    ///
+    /// # Panics
+    ///
+    /// U65 (dual-AI OSS review): panics if `request.num_players` is outside
+    /// `2..=23` — see [`MentalPokerDealingProvider::deal_scenario`].
     fn deal(&self, request: &DealRequest) -> DealtHand {
         self.deal_scenario(request, Scenario::Valid)
     }

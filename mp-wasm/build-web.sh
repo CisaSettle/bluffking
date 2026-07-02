@@ -16,10 +16,22 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-vendor="$here/../client-game/src/vendor/mp-wasm"
+# U49 (dual-AI OSS review): the public OSS repo has no client-game/ — the
+# vendor destination is overridable, and the copy is skipped (not fatal) when
+# the app tree is absent, so a fresh public clone still builds pkg-web/.
+vendor="${MP_WASM_VENDOR_DIR:-$here/../client-game/src/vendor/mp-wasm}"
 
 echo "[build-web] wasm-pack build --target web --out-dir pkg-web --release"
 ( cd "$here" && wasm-pack build --target web --out-dir pkg-web --release )
+
+# U49: only vendor when the app tree exists (or an explicit MP_WASM_VENDOR_DIR
+# was given); otherwise the browser-ready artifacts stay in pkg-web/.
+if [ -z "${MP_WASM_VENDOR_DIR:-}" ] && [ ! -d "$here/../client-game" ]; then
+  echo "[build-web] client-game/ not found (public OSS clone?) — skipping vendor step."
+  echo "[build-web] artifacts ready in $here/pkg-web (browser_demo.html imports ./pkg-web/);"
+  echo "[build-web] set MP_WASM_VENDOR_DIR=<dir> to vendor them elsewhere."
+  exit 0
+fi
 
 mkdir -p "$vendor"
 for f in mp_wasm.js mp_wasm_bg.wasm mp_wasm.d.ts mp_wasm_bg.wasm.d.ts; do

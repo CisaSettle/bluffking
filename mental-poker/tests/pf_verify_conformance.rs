@@ -118,10 +118,17 @@ fn pf_verify_rejects_mutated_seed() {
 }
 
 #[test]
-fn pf_verify_rejects_partial_record_with_only_user_seat() {
-    // The per-user `hands` row persists only that user's hole cards. The verifier
-    // must still anchor on the board + that one seat. Build the full record, then
-    // strip hole_cards down to a single seat — verification must still pass.
+fn pf_verify_accepts_partial_record_with_only_user_seat() {
+    // U41 (dual-AI OSS review): renamed from `pf_verify_rejects_…` — the old name
+    // contradicted the assertion. ACCEPTING is the intended behavior: the per-user
+    // `hands` row persists only that user's hole cards, and the verifier must
+    // still anchor on the board + that one seat (here `dealt_seats` is present and
+    // well-formed). The REJECT case a partial record can hit — a sparse seat with
+    // `dealt_seats` absent — is fail-closed and covered by
+    // `rejects_sparse_row_missing_dealt_seats` in `src/pf.rs` (F3).
+    //
+    // Build the full record, then strip hole_cards down to a single seat —
+    // verification must still pass.
     let mut rec = record_for(
         [0x10; 32],
         BTreeMap::new(),

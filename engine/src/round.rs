@@ -3,7 +3,7 @@
 //! [`BettingRound`] models one street of betting. Multiple consecutive rounds
 //! (preflop → flop → turn → river) combine to form a full hand.
 
-use crate::action::{ActionError, BlindKind, PlayerAction};
+use crate::action::{ActionError, PlayerAction};
 use crate::player::{Chips, PlayerId};
 use serde::{Deserialize, Serialize};
 
@@ -48,6 +48,15 @@ pub struct PlayerState {
     /// and is now only facing a sub-minimum (non-reopening) all-in may call or
     /// fold, but may **not** re-raise.
     pub has_acted: bool,
+    /// `current_bet` level at the moment this player last took an action.
+    ///
+    /// Lets us honour TDA Rule 43: even when `has_acted` is still set (no single
+    /// wager reopened the betting), if *cumulative* short all-ins since this
+    /// player last acted now total at least a full raise, action IS reopened for
+    /// them and they may re-raise. Without this, a 100 → 150 → 220 sequence of
+    /// short all-ins would wrongly deny the opener a legal re-raise when action
+    /// returns facing a 120 increase over the 100 full raise.
+    pub acted_at_bet: Chips,
 }
 
 impl PlayerState {
@@ -59,6 +68,7 @@ impl PlayerState {
             folded: false,
             all_in: false,
             has_acted: false,
+            acted_at_bet: Chips::ZERO,
         }
     }
 }
@@ -294,8 +304,22 @@ impl BettingRound {
             return false;
         }
         // A player who already acted may only re-raise if a full raise cleared
-        // their `has_acted` flag; if it is still set, re-raising is barred.
-        !ps.has_acted
+        // their `has_acted` flag, OR cumulative short all-ins since they last
+        // acted now total at least a full raise (TDA Rule 43).
+        !ps.has_acted || self.action_reopened_for(ps)
+    }
+
+    /// Whether betting is reopened for a player who has already acted because the
+    /// bet has risen by at least a full raise since their last action.
+    ///
+    /// Implements TDA Rule 43: a single sub-minimum all-in does not reopen
+    /// action, but multiple short all-ins that *sum* to a full raise do. The
+    /// increase since the player last acted is `current_bet - acted_at_bet`; if
+    /// that meets or exceeds the last full-raise increment, they regain the right
+    /// to re-raise even though no single wager cleared their `has_acted` flag.
+    fn action_reopened_for(&self, ps: &PlayerState) -> bool {
+        self.last_raise_amount.0 > 0
+            && self.current_bet.0.saturating_sub(ps.acted_at_bet.0) >= self.last_raise_amount.0
     }
 
     /// Apply an action for `player_id` (must be the current actor).
@@ -330,7 +354,7 @@ impl BettingRound {
         // `has_acted` is cleared whenever a full raise legally reopens the
         // betting, so this guard only fires for the illegal re-raise case and
         // never blocks a legitimate 3-bet/4-bet.
-        if ps.has_acted {
+        if ps.has_acted && !self.action_reopened_for(ps) {
             let is_raise_attempt = match action {
                 PlayerAction::Raise { .. } => true,
                 // An all-in that would commit MORE than the current bet is an
@@ -458,22 +482,16 @@ impl BettingRound {
                 Chips(all_in_amount)
             }
 
-            PlayerAction::Blind { kind, amount } => {
-                if matches!(kind, BlindKind::Straddle) {
-                    return Err(ActionError::StraddleNotSupported);
-                }
-                let actual = amount.0.min(stack.0);
-                self.players[idx].contributed.0 += actual;
-                self.players[idx].stack.0 -= actual;
-                self.pot_total.0 += actual;
-                self.mark_all_in_if_broke(idx);
-                if self.players[idx].contributed.0 > self.current_bet.0 {
-                    self.current_bet = Chips(self.players[idx].contributed.0);
-                    is_aggression = true;
-                } else {
-                    is_aggression = false;
-                }
-                Chips(actual)
+            PlayerAction::Blind { .. } => {
+                // Blinds/antes are posted internally during hand setup
+                // (`new_preflop` seeds the preflop round; `GameHand::start_hand`
+                // synthesizes the Blind `ActionRecord`s directly) — they NEVER
+                // flow through the voluntary-action path. Accepting a `Blind`
+                // here would bypass every betting rule (min-raise, call legality,
+                // the no-reopen guard), and the variant is wire-deserializable, so
+                // an integrator feeding client input into `apply_action` would
+                // inherit that bypass. Reject it as an illegal in-turn action.
+                return Err(ActionError::InvalidAction);
             }
         };
 
@@ -501,8 +519,11 @@ impl BettingRound {
             self.actions_remaining = self.actions_remaining.saturating_sub(1);
         }
 
-        // The current actor has now acted this street.
+        // The current actor has now acted this street. Record the bet level they
+        // acted against so a later cumulative full raise (TDA Rule 43) can reopen
+        // their action even without a single reopening wager.
         self.players[idx].has_acted = true;
+        self.players[idx].acted_at_bet = self.current_bet;
 
         self.advance();
         self.check_done();
@@ -789,6 +810,78 @@ mod tests {
 
     fn three_players(s1: u32, s2: u32, s3: u32) -> Vec<(PlayerId, Chips)> {
         vec![(pid(1), c(s1)), (pid(2), c(s2)), (pid(3), c(s3))]
+    }
+
+    // U05 (dual-AI OSS review): a `Blind` is never a voluntary in-turn action —
+    // blinds post internally during setup. Accepting it here would bypass every
+    // betting rule, and the variant is wire-deserializable.
+    #[test]
+    fn blind_action_is_rejected_as_voluntary_action() {
+        use crate::action::BlindKind;
+        let mut round = BettingRound::new(two_players(1000, 1000), 0, c(100), c(20));
+        // Under-min "blind" post that previously slipped through unvalidated.
+        let err = round
+            .apply_action(
+                pid(1),
+                &PlayerAction::Blind {
+                    kind: BlindKind::Small,
+                    amount: c(1),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(err, ActionError::InvalidAction);
+        // State untouched: it is still P1's turn, nothing contributed.
+        assert_eq!(round.current_player(), Some(pid(1)));
+        assert_eq!(round.pot_total(), c(0));
+    }
+
+    // U09 (dual-AI OSS review) / TDA Rule 43: two short all-ins that SUM to at
+    // least a full raise reopen the betting for a player who has already acted.
+    #[test]
+    fn cumulative_short_all_ins_reopen_action() {
+        // P1 opens to 100 (full raise, last_raise_amount = 100).
+        let mut round = BettingRound::new(three_players(5000, 150, 220), 0, c(0), c(20));
+        round
+            .apply_action(pid(1), &PlayerAction::Raise { amount: c(100) })
+            .unwrap();
+        // P2 all-in 150 (+50, short) and P3 all-in 220 (+70, short): neither alone
+        // reopens, but together they raise the bet 120 over the 100 full raise.
+        round.apply_action(pid(2), &PlayerAction::AllIn).unwrap();
+        round.apply_action(pid(3), &PlayerAction::AllIn).unwrap();
+        // Action returns to P1 facing a cumulative full raise → may re-raise.
+        assert_eq!(round.current_player(), Some(pid(1)));
+        assert!(
+            round.current_player_can_raise(),
+            "cumulative short all-ins totalling a full raise must reopen P1's action"
+        );
+        round
+            .apply_action(pid(1), &PlayerAction::Raise { amount: c(400) })
+            .expect("re-raise must be legal when action is reopened cumulatively");
+        assert_eq!(round.current_bet(), c(400));
+    }
+
+    // Negative control: a SINGLE sub-minimum all-in must NOT reopen action.
+    #[test]
+    fn single_short_all_in_does_not_reopen_action() {
+        let mut round = BettingRound::new(three_players(5000, 130, 5000), 0, c(0), c(20));
+        round
+            .apply_action(pid(1), &PlayerAction::Raise { amount: c(100) })
+            .unwrap();
+        round.apply_action(pid(2), &PlayerAction::AllIn).unwrap(); // +30, short
+                                                                   // Action to P3 (fresh) then back to P1: P1 already acted, faces only a 30
+                                                                   // increase over the 100 full raise → cannot re-raise.
+        round.apply_action(pid(3), &PlayerAction::Call).unwrap();
+        assert_eq!(round.current_player(), Some(pid(1)));
+        assert!(
+            !round.current_player_can_raise(),
+            "a single 30-chip short all-in must not reopen P1's action"
+        );
+        assert_eq!(
+            round
+                .apply_action(pid(1), &PlayerAction::Raise { amount: c(300) })
+                .unwrap_err(),
+            ActionError::InvalidAction
+        );
     }
 
     #[test]

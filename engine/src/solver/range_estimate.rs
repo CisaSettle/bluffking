@@ -63,8 +63,10 @@ pub struct RangeClass {
 pub struct RangeEstimate {
     /// Canonical position label for the seat, e.g. `"BTN"`, `"CO"`, `"BB"`.
     pub position: String,
-    /// The preflop action bucket the estimate is keyed on, e.g. `"rfi"`,
-    /// `"facing_open"`, `"vs_3bet"`.
+    /// The preflop action bucket the estimate is keyed on. Serialized values
+    /// come from `ActionBucket::key()`: `"RFI"` (uppercase), `"facing_open"`,
+    /// `"vs_3bet"`, `"vs_4bet"`, `"facing_limp"`. // U61 (dual-AI OSS review):
+    /// the old example `"rfi"` did not match the wire value.
     pub action: String,
     /// Percent of all 1326 starting combos that fall in the estimated range
     /// (a "top N%" figure). `0.0` when the bucket has no chart data.

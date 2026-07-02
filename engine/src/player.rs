@@ -27,7 +27,7 @@ impl std::fmt::Display for PlayerId {
     }
 }
 
-/// Chip count (unsigned 32-bit, matches `INT UNSIGNED` in MySQL).
+/// Chip count, as an unsigned 32-bit integer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Chips(pub u32);
 
@@ -168,10 +168,9 @@ impl Position {
     /// # Example
     /// ```
     /// use engine::Position;
-    /// // Active seats [0,1,2,3,4,5], dealer=0, asking about seat 2.
+    /// // 6-max, dealer=0. Seat 2 is two seats after the button → the big blind.
     /// let pos = Position::for_seat(2, 0, &[0, 1, 2, 3, 4, 5]);
-    /// // 2 steps after dealer in 6 seats → UTG+1 (dist=2 → BB, not UTG+1).
-    /// // Actually dist=2 → BigBlind in 6-max.
+    /// assert_eq!(pos, Position::BigBlind);
     /// ```
     pub fn for_seat(seat: u8, dealer_seat: u8, active_seats: &[u8]) -> Position {
         let n = active_seats.len();
@@ -231,13 +230,17 @@ impl Position {
                 }
             }
             5 => {
-                // 5-handed: BTN, SB, BB, UTG, HJ.
+                // 5-handed: BTN, SB, BB, UTG, CO. The seat immediately right of
+                // the button (dist=4) is the Cutoff, not the Hijack — matching the
+                // n>=6 arm (`num-1 => Cutoff`) and standard convention (U25,
+                // dual-AI OSS review). Mislabelling it Hijack bucketed the CO as
+                // MP in the preflop charts.
                 match dist {
                     0 => Position::Dealer,
                     1 => Position::SmallBlind,
                     2 => Position::BigBlind,
                     3 => Position::Utg,
-                    _ => Position::Hijack,
+                    _ => Position::Cutoff,
                 }
             }
             _ => {
@@ -344,6 +347,33 @@ mod position_tests {
             Position::for_seat(0, dealer, &active),
             Position::BigBlind,
             "seat 0 should be BB"
+        );
+    }
+
+    /// U25 (dual-AI OSS review): 5-handed, the seat right of the button is the
+    /// Cutoff, not the Hijack (which bucketed the CO as MP in the preflop charts).
+    #[test]
+    fn five_handed_labels_cutoff_not_hijack() {
+        let active = [0u8, 1, 2, 3, 4];
+        let dealer = 0u8;
+        let labels: Vec<Position> = active
+            .iter()
+            .map(|&s| Position::for_seat(s, dealer, &active))
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                Position::Dealer,
+                Position::SmallBlind,
+                Position::BigBlind,
+                Position::Utg,
+                Position::Cutoff,
+            ],
+            "5-handed must be BTN, SB, BB, UTG, CO"
+        );
+        assert!(
+            !labels.contains(&Position::Hijack),
+            "no Hijack seat 5-handed"
         );
     }
 

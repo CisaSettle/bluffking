@@ -285,6 +285,23 @@ pub fn verify_hand(rec: &HandRecord) -> Result<PfVerifyReport, PfVerifyError> {
         }
     }
 
+    // U12 (dual-AI OSS review): FAIL-CLOSED when ZERO cards were compared. Both
+    // `hole_cards` and `community` are `#[serde(default)]`, non-2-card seats are
+    // skipped, and an empty board runs zero iterations — so a card-free record
+    // would otherwise sail through every check above and be reported (and
+    // printed by `pf_verify`) as verified/provably fair while attesting NOTHING
+    // about the deal. An honest export always carries at least the owner's two
+    // hole cards or a board card; a record with neither is corrupt or
+    // fabricated → reject rather than certify an empty comparison.
+    if hole_seats_checked == 0 && rec.community.is_empty() {
+        return Err(PfVerifyError(
+            "nothing verified: record contains no comparable cards (no 2-card hole \
+             set, empty board) — refusing to report a card-free record as verified \
+             (U12 fail-closed)"
+                .into(),
+        ));
+    }
+
     Ok(PfVerifyReport {
         deck_seed_hex: hex::encode(deck_seed),
         hole_seats_checked,
@@ -588,6 +605,59 @@ mod tests {
         rec.dealt_seats = vec![2, 2];
         let err = verify_hand(&rec).expect_err("duplicate dealt_seats must reject");
         assert!(err.0.contains("duplicate"), "got: {}", err.0);
+    }
+
+    /// U12 (dual-AI OSS review) RED-first: a record that compares ZERO cards
+    /// (no hole cards, empty board) must NOT verify — a card-free record would
+    /// otherwise print "provably fair" and exit 0 while attesting nothing.
+    #[test]
+    fn rejects_card_free_record() {
+        let mut rec = build_and_record(
+            [0x11; 32],
+            BTreeMap::new(),
+            uuid::Uuid::from_bytes([0xAB; 16]),
+            3,
+        );
+        // Strip every comparable card: no hole cards, empty community.
+        rec.hole_cards = BTreeMap::new();
+        rec.community = Vec::new();
+        let err = verify_hand(&rec).expect_err("card-free record must not verify");
+        assert!(err.0.contains("nothing verified"), "got: {}", err.0);
+    }
+
+    /// U12: skipped (non-2-card) hole entries alone must not count as a
+    /// comparison — with an empty board they still leave zero cards checked.
+    #[test]
+    fn rejects_record_with_only_skipped_hole_entries() {
+        let mut rec = build_and_record(
+            [0x11; 32],
+            BTreeMap::new(),
+            uuid::Uuid::from_bytes([0xAB; 16]),
+            3,
+        );
+        // Folded-but-uncaptured shape: present keys but empty card arrays.
+        for cards in rec.hole_cards.values_mut() {
+            cards.clear();
+        }
+        rec.community = Vec::new();
+        let err = verify_hand(&rec).expect_err("zero-comparison record must not verify");
+        assert!(err.0.contains("nothing verified"), "got: {}", err.0);
+    }
+
+    /// U12 boundary: ONE comparable surface (board only, no hole cards) still
+    /// verifies — the guard only rejects records with NOTHING to compare.
+    #[test]
+    fn board_only_record_still_verifies() {
+        let mut rec = build_and_record(
+            [0x11; 32],
+            BTreeMap::new(),
+            uuid::Uuid::from_bytes([0xAB; 16]),
+            3,
+        );
+        rec.hole_cards = BTreeMap::new();
+        let report = verify_hand(&rec).expect("board-only record must still verify");
+        assert_eq!(report.hole_seats_checked, 0);
+        assert_eq!(report.board_cards_checked, 5);
     }
 
     /// Back-compat: a contiguous-from-0 hand that omits `dealt_seats` still

@@ -2,6 +2,12 @@
 name = "engine"
 version.workspace = true
 edition.workspace = true
+# Explicit metadata (U17/U53, dual-AI OSS review): the workspace roots differ
+# between the private repo and the public mirror, so declare license/repository
+# per crate rather than inheriting, keeping both workspaces consistent.
+license = "AGPL-3.0-only"
+description = "BluffKing poker engine — pure No-Limit Texas Hold'em rules, hand evaluation, and a local solver."
+repository = "https://github.com/CisaSettle/bluffking"
 # Never published to a registry — internal workspace crate (cargo-deny treats
 # it as private so it is exempt from the license allow-list).
 publish = false

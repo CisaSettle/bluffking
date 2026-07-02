@@ -2,15 +2,14 @@
 
 Pure-logic Texas Hold'em rules engine. No IO, no async, no DB. Given a player list, a dealer position, and an RNG, plays a complete hand and returns a `HandResult`.
 
-This crate is the source of truth for poker rules in the project. It is consumed by:
-- `server/` — the per-session task that drives live play
-- `client-game/` — Vue 3 client; hosts **both** the live-play table and the deterministic replay viewer (history / replay / coach / drills all live here). The client re-implements a subset of engine types client-side for animations / preview, mirroring `server/src/protocol.rs` via `client-game/src/protocol.ts`.
+<!-- U46 (dual-AI OSS review): self-contained wording — no private-repo paths/ADR links. -->
+This crate is the source of truth for poker rules in BluffKing. It drives the game server (one session task per table owns a `GameHand`), the deterministic replay viewer, and the post-hand coach — the same ruleset for live play, tests, and replay.
 
 ## Design constraints
 
-- No `rs_poker` types in any public signature (see `docs/architecture/adr/`)
-- No `tokio`, `sqlx`, or `axum` dependencies
-- All public types are `Debug + Clone + PartialEq`
+- No `rs_poker` types in any public signature — `rs_poker` stays an internal evaluation detail, swappable without breaking consumers
+- No `tokio`, `sqlx`, or `axum` dependencies (pure logic — no async, no IO, no DB)
+- Public data types (cards, actions, snapshots, results) derive `Debug + Clone` and usually `PartialEq`; stateful handles (`GameHand`, `PokerRng`) do not
 - `cargo test -p engine` runs without a live database
 
 ## Key modules
@@ -36,4 +35,4 @@ Integration tests live in `engine/tests/`: `full_hand.rs` plays a complete scrip
 
 ## Test-only API surface
 
-The `test-helpers` feature exposes `GameHand::override_hole_cards_for_test`, enabling integration tests in `server/` to inject specific hole cards. **Do not enable in production builds.** The server's `dev-dependencies` enables it for tests only.
+The `test-helpers` feature exposes `GameHand::override_hole_cards_for_test`, enabling downstream integration tests (e.g. the game server's) to inject specific hole cards. **Do not enable in production builds.** Consumers should enable it via `dev-dependencies` only.

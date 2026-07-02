@@ -34,6 +34,12 @@ debug = 0
 
 [profile.release]
 opt-level = 3
+# Overflow checks in release (U10, dual-AI OSS review): chip arithmetic
+# (pot/contribution/award) is unchecked u32; a silent wrap would corrupt chip
+# accounting past detection. The hot solver path is f64 Monte-Carlo, so the
+# integer-bounds-check cost is negligible. Turns an unreachable-but-catastrophic
+# wrap into a loud panic instead.
+overflow-checks = true
 # ThinLTO (not fat `lto = true`). Fat LTO merges every crate's LLVM IR into ONE
 # whole-program module for the final link, and that single optimizer/codegen
 # pass is a large, single-threaded memory SPIKE — on a memory-constrained Docker

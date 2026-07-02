@@ -169,8 +169,10 @@ fn max_concurrent_solves() -> usize {
 /// most one ~1 GB solve runs at a time): with a SINGLE global slot this
 /// anti-monopoly property cannot hold — one IP holding the sole slot makes others
 /// get `solver_busy` until it finishes. That is bounded and acceptable: a solve
-/// is wall-clock-capped (12 s), memory-gated, cached, and each IP is limited to
-/// 15/window, so no IP can sit on the slot indefinitely and no data is exposed.
+/// is iteration-capped (`PUBLIC_MAX_ITERATIONS`) and memory-gated, results are
+/// cached, and each IP is limited to 15/window (U71: the occupancy bound is the
+/// iteration cap + memory gate, not a fixed wall-clock), so no IP can sit on the
+/// slot indefinitely and no data is exposed.
 /// A fair per-IP queue is a future enhancement if single-slot contention ever
 /// becomes real in practice.
 const MAX_INFLIGHT_PER_IP: usize = 1;
@@ -346,6 +348,12 @@ struct CachedSpot {
     /// the global byte accountant by the exact amount this entry contributed —
     /// without re-estimating a value that has since been removed from the map.
     bytes: usize,
+    /// The canonical hero-independent spot representation ([`spot_repr`]) this
+    /// entry was solved for. Compared on every cache hit so a `u64` `spot_key`
+    /// COLLISION (the key is an unkeyed 64-bit hash) can never serve one spot's
+    /// equilibrium for a different spot — a mismatch is treated as a miss (U11,
+    /// dual-AI OSS review).
+    key_repr: String,
 }
 
 /// Estimated in-memory footprint of a `Vec<f32>` action-frequency row: the heap
@@ -366,6 +374,9 @@ fn freq_vec_bytes(freqs: &[f32]) -> usize {
 /// by BYTES, not by a coarse entry count.
 fn cached_spot_bytes(spot: &CachedSpot) -> usize {
     let mut total = std::mem::size_of::<CachedSpot>();
+    // The stored canonical spot repr (U11) — count its heap content too, or the
+    // over-count contract above breaks for tiny entries (Codex consensus F1).
+    total += spot.key_repr.capacity();
     // The per-hand strategy table — the heavy part.
     total += spot.hands.capacity() * std::mem::size_of::<HandStrategy>();
     for h in &spot.hands {
@@ -748,6 +759,14 @@ fn count_range_tokens(s: &str) -> usize {
 /// the SAME spot and must hit the same cached solve instead of re-running the
 /// GB-scale solve. (This is a cache-efficiency canonicalization, NOT range
 /// validation — the upstream grammar still validates the original string.)
+///
+/// U07 (dual-AI OSS review): reordering is ONLY safe when every token is
+/// unweighted. The upstream grammar accepts per-token `:weight` and, for
+/// overlapping tokens, the FIRST occurrence wins — so `"AA:0.2,AA"` (AA@0.2) and
+/// `"AA,AA:0.2"` (AA@1.0) are DIFFERENT ranges that a sort would collapse to one
+/// key, serving one's equilibrium for the other. When any token carries an
+/// explicit weight we therefore preserve order (unweighted tokens are all 1.0,
+/// so reordering them can never change the effective range).
 fn canonical_range(range: &str) -> String {
     let mut toks: Vec<String> = range
         .split(',')
@@ -758,7 +777,9 @@ fn canonical_range(range: &str) -> String {
         })
         .filter(|t| !t.is_empty())
         .collect();
-    toks.sort();
+    if !toks.iter().any(|t| t.contains(':')) {
+        toks.sort();
+    }
     toks.join(",")
 }
 
@@ -768,6 +789,40 @@ fn canonical_range(range: &str) -> String {
 /// strategy to read OUT of the already-solved equilibrium; it does not change the
 /// equilibrium itself. Splitting this out from [`response_key`] documents that
 /// invariant and gives reordered/whitespace range variants a single key.
+/// The canonical hero-independent spot representation as a STRING, over the exact
+/// same discriminating fields [`spot_key`] hashes. Stored in [`CachedSpot`] and
+/// compared on every hit so a `spot_key` hash collision cannot serve the wrong
+/// equilibrium (U11). Uses the U07-fixed [`canonical_range`] so weighted-range
+/// order is preserved here too.
+fn spot_repr(req: &SolveRequest) -> String {
+    let street = match req.street {
+        SolveStreet::Flop => "flop",
+        SolveStreet::Turn => "turn",
+        SolveStreet::River => "river",
+    };
+    let board: String = req
+        .flop
+        .iter()
+        .map(|c| c.to_string().to_ascii_uppercase())
+        .chain(req.turn.map(|t| t.to_string().to_ascii_uppercase()))
+        .chain(req.river.map(|r| r.to_string().to_ascii_uppercase()))
+        .collect::<Vec<_>>()
+        .join("");
+    let player = match req.solving_player {
+        Player::Oop => "oop",
+        Player::Ip => "ip",
+    };
+    format!(
+        "{street}|{board}|{}|{}|{}|{}|{}|{}|{player}",
+        canonical_range(&req.oop_range),
+        canonical_range(&req.ip_range),
+        req.starting_pot,
+        req.effective_stack,
+        req.bet_sizes.to_ascii_lowercase().replace(' ', ""),
+        req.raise_sizes.to_ascii_lowercase().replace(' ', ""),
+    )
+}
+
 fn spot_key(req: &SolveRequest) -> u64 {
     let mut h = DefaultHasher::new();
     match req.street {
@@ -1217,8 +1272,13 @@ pub async fn solve_handler(
     // `canonical_range` inside `spot_key`.
     let key = spot_key(&req);
     if let Some(cached) = solve_cache().get(&key) {
-        let resp = response_from_cached_spot(&cached, req.hero, true);
-        return Json(resp).into_response();
+        // U11: verify the stored canonical spot matches before serving — a u64
+        // hash collision otherwise serves a different spot's equilibrium. On
+        // mismatch, fall through and solve this spot fresh.
+        if cached.key_repr == spot_repr(&req) {
+            let resp = response_from_cached_spot(&cached, req.hero, true);
+            return Json(resp).into_response();
+        }
     }
 
     // --- per-IP in-flight guard (F1) — BEFORE the global permit so one source
@@ -1318,6 +1378,7 @@ pub async fn solve_handler(
         hands: out.hands,
         // Filled in by `cache_insert` from `cached_spot_bytes`; 0 until then.
         bytes: 0,
+        key_repr: spot_repr(&req),
     };
     let resp = response_from_cached_spot(&spot, req.hero, false);
 
@@ -1461,6 +1522,39 @@ mod tests {
             response_key(&a),
             response_key(&b),
             "reordered/whitespace range variants → same response key"
+        );
+    }
+
+    // U07 (dual-AI OSS review): WEIGHTED range tokens are order-sensitive
+    // (upstream: first occurrence wins), so reordering must NOT collapse them to
+    // one cache key. Unweighted tokens stay order-insensitive.
+    #[test]
+    fn canonical_range_preserves_weighted_token_order() {
+        // Unweighted: order-insensitive (still sorted → equal).
+        assert_eq!(canonical_range("AA,KK"), canonical_range("KK,AA"));
+        // Weighted/overlapping: order is semantic → must differ.
+        assert_ne!(
+            canonical_range("AA:0.2,AA"),
+            canonical_range("AA,AA:0.2"),
+            "weighted-range token order changes the effective range — must not collapse"
+        );
+    }
+
+    #[test]
+    fn spot_key_distinguishes_reordered_weighted_ranges() {
+        let mut a = sample_req();
+        let mut b = sample_req();
+        a.oop_range = "AA:0.2,AA".into(); // effective AA@0.2
+        b.oop_range = "AA,AA:0.2".into(); // effective AA@1.0
+        assert_ne!(
+            spot_key(&a),
+            spot_key(&b),
+            "semantically different weighted ranges must not share a cache key"
+        );
+        assert_ne!(
+            spot_repr(&a),
+            spot_repr(&b),
+            "stored spot repr must also differ"
         );
     }
 
@@ -1616,6 +1710,7 @@ mod tests {
             },
             hands: table,
             bytes: 0,
+            key_repr: String::new(),
         }
     }
 

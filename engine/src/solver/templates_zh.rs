@@ -83,12 +83,24 @@ fn pick_template(ctx: &RenderContext<'_>, seed: u64) -> String {
             _ => format!("顶对强踢脚是清晰的价值范围（胜率 {eq}%），{action_zh} 是求解器推荐。"),
         },
         (SolverVerdict::Good, HandStrength::DrawStrong) => match variant {
-            0 => format!("强听牌 + 位置优势：胜率 {eq}%，{action_zh} 既施压又保留主动权。"),
+            // U24 (dual-AI OSS review): only claim 位置优势 when hero actually
+            // closes the action postflop (BTN); other seats get neutral copy.
+            0 if pos == "BTN" => {
+                format!("强听牌 + 位置优势：胜率 {eq}%，{action_zh} 既施压又保留主动权。")
+            }
+            0 => format!("强听牌：胜率 {eq}%，{action_zh} 既施压又保留主动权。"),
             1 => format!("{label} 在这块面有 ≥8 张牌可改进（胜率 {eq}%），{action_zh} 是半诈唬最佳选择。"),
             _ => format!("强听牌（胜率 {eq}%）应该主动出击，{action_zh} 在 {pos} 上 +EV。"),
         },
         (SolverVerdict::Good, _) => match variant {
-            0 => format!("{action_zh} 是当前 {band_zh} 的最佳处理：胜率 {eq}% 高于对方所需赔率 {po}%。"),
+            // U24 (dual-AI OSS review): state the eq-vs-po direction that actually
+            // holds (a Good verdict can also be a correct fold with eq < po).
+            0 => {
+                let dir = eq_vs_po_zh(eq, po);
+                format!(
+                    "{action_zh} 是当前 {band_zh} 的最佳处理：胜率 {eq}% {dir}对方所需赔率 {po}%。"
+                )
+            }
             1 => format!("{label} 在 {pos} 上 {band_zh}：胜率 {eq}%，{action_zh} 长期 +EV。"),
             _ => format!("教练评价：{action_zh} 正确。{band_zh}（胜率 {eq}%）应按此线行进。"),
         },
@@ -117,9 +129,18 @@ fn pick_template(ctx: &RenderContext<'_>, seed: u64) -> String {
 
         // --- Mistake × specific bands ---
         (SolverVerdict::Mistake, HandStrength::PureBluffNoEquity) => match variant {
-            0 => format!("这手牌没胜率（{eq}%）也没听牌——按底池赔率 {po}% 应直接弃牌，{hero_zh} 长期亏 EV。"),
+            // U24 (dual-AI OSS review): the pot-odds fold rationale only holds
+            // when eq < po (facing a bet); the recommendation may also be 过牌,
+            // so name {action_zh} instead of hard-coding 弃牌/丢弃.
+            0 if eq < po => format!(
+                "这手牌没胜率（{eq}%）也没听牌——按底池赔率 {po}% 应直接{action_zh}，{hero_zh} 长期亏 EV。"
+            ),
+            0 => format!("这手牌没胜率（{eq}%）也没听牌——应选择 {action_zh}，{hero_zh} 长期亏 EV。"),
             1 => format!("{label} 在这块面是 {band_zh}：胜率 {eq}%，{action_zh} 才是 +EV，{hero_zh} 是纯亏损线。"),
-            _ => format!("纯诈唬区间应丢弃：胜率 {eq}% 远低于赔率 {po}%。{hero_zh} 错误，正确是 {action_zh}。"),
+            _ if eq < po => format!(
+                "纯诈唬区间：胜率 {eq}% 低于赔率 {po}%。{hero_zh} 错误，正确是 {action_zh}。"
+            ),
+            _ => format!("纯诈唬区间：胜率仅 {eq}%。{hero_zh} 错误，正确是 {action_zh}。"),
         },
         (SolverVerdict::Mistake, HandStrength::Overpair) => match variant {
             0 => format!("超对在这块面胜率 {eq}%，对手赔率 {po}%；{action_zh} 才是 +EV，{hero_zh} 把价值打成了赔付。"),
@@ -128,12 +149,23 @@ fn pick_template(ctx: &RenderContext<'_>, seed: u64) -> String {
         },
         (SolverVerdict::Mistake, HandStrength::PairWeak) => match variant {
             0 => format!("{label} 弱对（胜率 {eq}%）赔率 {po}%：{action_zh} 才是正确，{hero_zh} 长期亏。"),
-            1 => format!("弱对不适合继续投入：胜率 {eq}% < 赔率 {po}%。{hero_zh} 错误，{action_zh} 更稳。"),
+            // U24 (dual-AI OSS review): only emit the "don't continue" pot-odds
+            // claim when eq < po actually holds for this spot.
+            1 if eq < po => format!(
+                "弱对不适合继续投入：胜率 {eq}% < 赔率 {po}%。{hero_zh} 错误，{action_zh} 更稳。"
+            ),
+            1 => format!("弱对（胜率 {eq}%、赔率 {po}%）：{hero_zh} 错误，{action_zh} 更稳。"),
             _ => format!("{band_zh}（胜率 {eq}%）：{hero_zh} 在 {pos} 上是 -EV，{action_zh} 才是求解器策略。"),
         },
         (SolverVerdict::Mistake, HandStrength::DrawStrong) => match variant {
             0 => format!("强听牌（{eq}%）应当 {action_zh}：{hero_zh} 浪费了主动权。"),
-            1 => format!("{band_zh} 价值清晰：胜率 {eq}% 高于赔率 {po}%；{action_zh} 才是 +EV，{hero_zh} 偏弱。"),
+            // U24 (dual-AI OSS review): only claim eq > po when it actually holds.
+            1 if eq > po => format!(
+                "{band_zh} 价值清晰：胜率 {eq}% 高于赔率 {po}%；{action_zh} 才是 +EV，{hero_zh} 偏弱。"
+            ),
+            1 => format!(
+                "{band_zh}（胜率 {eq}%、赔率 {po}%）：{action_zh} 才是 +EV，{hero_zh} 偏弱。"
+            ),
             _ => format!("{label} 在 {pos} 上拿到强听牌：{action_zh} 才能施压，{hero_zh} 漏掉机会。"),
         },
         (SolverVerdict::Mistake, _) => match variant {
@@ -147,6 +179,17 @@ fn pick_template(ctx: &RenderContext<'_>, seed: u64) -> String {
 // ---------------------------------------------------------------------------
 // Localized labels
 // ---------------------------------------------------------------------------
+
+/// U24 (dual-AI OSS review): Chinese comparator for the equity-vs-pot-odds
+/// relation, so templates state the direction that actually holds for the
+/// spot instead of baking one in. (Pure UI wording — data stays substituted.)
+fn eq_vs_po_zh(eq: u8, po: u8) -> &'static str {
+    match eq.cmp(&po) {
+        std::cmp::Ordering::Greater => "高于",
+        std::cmp::Ordering::Less => "低于",
+        std::cmp::Ordering::Equal => "等于",
+    }
+}
 
 /// Map a solver action to its Chinese verb form.
 pub fn action_zh(action: SolverAction) -> &'static str {
@@ -275,6 +318,143 @@ mod tests {
         for hs in HandStrength::all() {
             assert!(!strength_zh(hs).is_empty());
         }
+    }
+
+    /// U24 (dual-AI OSS review): situational clauses must be gated on the
+    /// actual inputs — never assert an eq-vs-po direction, a fold rationale,
+    /// or 位置优势 that does not hold for the spot.
+    #[test]
+    fn u24_situational_clauses_match_inputs() {
+        fn ctx(
+            verdict: SolverVerdict,
+            hs: HandStrength,
+            eq: u8,
+            po: u8,
+            pos: &'static str,
+        ) -> RenderContext<'static> {
+            RenderContext {
+                verdict,
+                hs,
+                equity_pct: eq,
+                pot_odds_pct: po,
+                recommended: SolverAction::Fold,
+                hero_action: Some(SolverAction::Call),
+                hand_label: "72o",
+                position: pos,
+            }
+        }
+
+        // Good catch-all, variant 0: eq-vs-po direction follows the numbers
+        // (a correct fold with eq < po must NOT read "高于").
+        let good_fold = render(
+            &ctx(SolverVerdict::Good, HandStrength::DrawWeak, 10, 30, "SB"),
+            0,
+        );
+        assert!(
+            good_fold.contains("低于"),
+            "eq<po must render 低于: {good_fold}"
+        );
+        assert!(
+            !good_fold.contains("高于"),
+            "eq<po must not claim 高于: {good_fold}"
+        );
+        let good_ahead = render(
+            &ctx(SolverVerdict::Good, HandStrength::DrawWeak, 65, 30, "SB"),
+            0,
+        );
+        assert!(
+            good_ahead.contains("高于"),
+            "eq>po must render 高于: {good_ahead}"
+        );
+
+        // Good × DrawStrong, variant 0: 位置优势 only from the BTN.
+        let ds_btn = render(
+            &ctx(SolverVerdict::Good, HandStrength::DrawStrong, 45, 20, "BTN"),
+            0,
+        );
+        assert!(
+            ds_btn.contains("位置优势"),
+            "BTN may claim 位置优势: {ds_btn}"
+        );
+        let ds_oop = render(
+            &ctx(SolverVerdict::Good, HandStrength::DrawStrong, 45, 20, "UTG"),
+            0,
+        );
+        assert!(
+            !ds_oop.contains("位置优势"),
+            "non-BTN must not claim 位置优势: {ds_oop}"
+        );
+
+        // Mistake × PureBluffNoEquity: pot-odds fold rationale only when eq < po,
+        // and the recommended action is named (never a hard-coded 弃牌/丢弃).
+        let bluff_priced = render(
+            &ctx(
+                SolverVerdict::Mistake,
+                HandStrength::PureBluffNoEquity,
+                5,
+                30,
+                "SB",
+            ),
+            0,
+        );
+        assert!(
+            bluff_priced.contains("应直接弃牌"),
+            "eq<po + Fold reco: {bluff_priced}"
+        );
+        let bluff_free = render(
+            &ctx(
+                SolverVerdict::Mistake,
+                HandStrength::PureBluffNoEquity,
+                5,
+                0,
+                "SB",
+            ),
+            0,
+        );
+        assert!(
+            !bluff_free.contains("按底池赔率"),
+            "eq>=po must drop the pot-odds rationale: {bluff_free}"
+        );
+        let bluff_v2 = render(
+            &ctx(
+                SolverVerdict::Mistake,
+                HandStrength::PureBluffNoEquity,
+                5,
+                0,
+                "SB",
+            ),
+            2,
+        );
+        assert!(
+            !bluff_v2.contains("低于"),
+            "eq>=po must not claim 低于: {bluff_v2}"
+        );
+
+        // Mistake × PairWeak, variant 1: "不适合继续投入" only when eq < po.
+        let weak_ahead = render(
+            &ctx(SolverVerdict::Mistake, HandStrength::PairWeak, 40, 30, "SB"),
+            1,
+        );
+        assert!(
+            !weak_ahead.contains("不适合继续投入"),
+            "eq>=po must drop the fold claim: {weak_ahead}"
+        );
+
+        // Mistake × DrawStrong, variant 1: "高于" only when eq > po.
+        let draw_behind = render(
+            &ctx(
+                SolverVerdict::Mistake,
+                HandStrength::DrawStrong,
+                30,
+                40,
+                "SB",
+            ),
+            1,
+        );
+        assert!(
+            !draw_behind.contains("高于"),
+            "eq<=po must not claim 高于: {draw_behind}"
+        );
     }
 
     #[test]

@@ -43,8 +43,37 @@
 //! independently verifiable.
 
 use crate::signing::{KeyDirectory, Signature, SignatureProvider};
-use ed25519_dalek::{Signature as DalekSignature, Signer, SigningKey, Verifier, VerifyingKey};
+// U30 (dual-AI OSS review): `Verifier` trait no longer imported — verification
+// uses the inherent `VerifyingKey::verify_strict` (see `verify` below).
+use ed25519_dalek::{Signature as DalekSignature, Signer, SigningKey, VerifyingKey};
 use std::collections::BTreeMap;
+
+/// U30 (dual-AI OSS review): strict public-key import.
+///
+/// `VerifyingKey::from_bytes` follows ZIP-215 rules: it accepts **small-order
+/// ("weak") points** and **non-canonical encodings** (dalek issue #626). A
+/// small-order key admits signatures that verify for almost any message, and a
+/// non-canonical encoding gives one logical key two distinct byte forms
+/// (breaking the directory's key-bytes-are-identity assumption). Both are
+/// rejected here at import:
+///
+/// - `is_weak()` rejects small-order points;
+/// - recompressing the decoded point and comparing to the input bytes rejects
+///   any non-canonical encoding (e.g. `y ≥ p`, or the negative-zero sign form),
+///   because `compress()` always produces the canonical form.
+///
+/// Keys *derived* from a secret seed (`with_signer`) never need this: a derived
+/// `A = clamp(H(seed))·B` is always canonical and in the prime-order subgroup.
+fn decode_verifying_key_strict(bytes: &[u8; 32]) -> Option<VerifyingKey> {
+    let vk = VerifyingKey::from_bytes(bytes).ok()?;
+    if vk.is_weak() {
+        return None; // small-order point
+    }
+    if vk.to_edwards().compress().to_bytes() != *bytes {
+        return None; // non-canonical encoding
+    }
+    Some(vk)
+}
 
 /// Real asymmetric Ed25519 signature provider.
 ///
@@ -89,10 +118,13 @@ impl Ed25519SignatureProvider {
     /// instance can verify `signer`'s signatures but cannot sign for it
     /// (the asymmetry boundary).
     ///
-    /// Returns `None` if the bytes are not a valid Ed25519 verifying key (e.g.
-    /// not a canonical compressed Edwards point — threat T8/T9 decode reject).
+    /// Returns `None` if the bytes are not a valid Ed25519 verifying key —
+    /// non-decompressable, **small-order (weak)**, or a **non-canonical
+    /// encoding** (threat T8/T9 decode reject; U30 strict import).
     pub fn with_verifier(mut self, signer: impl Into<String>, vk_bytes: &[u8; 32]) -> Option<Self> {
-        let vk = VerifyingKey::from_bytes(vk_bytes).ok()?;
+        // U30 (dual-AI OSS review): strict import — rejects small-order and
+        // non-canonical encodings, not just non-decompressable bytes.
+        let vk = decode_verifying_key_strict(vk_bytes)?;
         self.verifying.insert(signer.into(), vk);
         Some(self)
     }
@@ -125,7 +157,8 @@ impl Ed25519SignatureProvider {
     ///
     /// Returns `None` if `dir.is_mock` is `true` (a mock/symmetric directory is
     /// not an Ed25519 public-key set) or if any key is not a canonical
-    /// 32-byte Ed25519 verifying key (threat T8/T9 decode reject — no panic).
+    /// 32-byte Ed25519 verifying key — including small-order (weak) points and
+    /// non-canonical encodings (threat T8/T9 decode reject — no panic; U30).
     pub fn verifier_from_directory(dir: &KeyDirectory) -> Option<Self> {
         if dir.is_mock {
             return None;
@@ -134,7 +167,9 @@ impl Ed25519SignatureProvider {
         for (signer, hex_key) in &dir.keys {
             let bytes = hex::decode(hex_key).ok()?;
             let arr: [u8; 32] = bytes.try_into().ok()?;
-            let vk = VerifyingKey::from_bytes(&arr).ok()?;
+            // U30 (dual-AI OSS review): strict import — rejects small-order and
+            // non-canonical encodings, not just non-decompressable bytes.
+            let vk = decode_verifying_key_strict(&arr)?;
             verifying.insert(signer.clone(), vk);
         }
         Some(Self {
@@ -172,7 +207,12 @@ impl SignatureProvider for Ed25519SignatureProvider {
             Err(_) => return false,
         };
         let sig = DalekSignature::from_bytes(&arr);
-        vk.verify(message, &sig).is_ok()
+        // U30 (dual-AI OSS review): `verify_strict`, not `verify` — the strict
+        // check additionally rejects small-order components and the malleable
+        // (ZIP-215 cofactored) acceptances, so a signature accepted here is
+        // unique for a given (key, message). Honest RFC-8032 signatures (which
+        // is everything `sign` above produces) are unaffected.
+        vk.verify_strict(message, &sig).is_ok()
     }
 }
 
@@ -350,6 +390,85 @@ mod tests {
             p.verifying_key_hex("kat").unwrap().len(),
             64,
             "Ed25519 verifying key is 32 bytes / 64 hex chars"
+        );
+    }
+
+    /// U30 (dual-AI OSS review): small-order ("weak") public keys are rejected
+    /// at import — both the direct `with_verifier` path and the directory
+    /// rebuild. A small-order key admits signatures that verify for almost any
+    /// message, so it must never enter the verifying set.
+    #[test]
+    fn u30_small_order_public_key_rejected_at_import() {
+        // The identity point (order 1): compressed Edwards y = 1.
+        let mut identity = [0u8; 32];
+        identity[0] = 0x01;
+        // An order-4 small-order point: compressed Edwards y = 0.
+        let zero_y = [0u8; 32];
+        for bytes in [identity, zero_y] {
+            assert!(
+                Ed25519SignatureProvider::new()
+                    .with_verifier("evil", &bytes)
+                    .is_none(),
+                "small-order verifying key must be rejected at import"
+            );
+        }
+        // Directory path: a small-order key inside an otherwise-valid directory.
+        let mut dir = three_party_provider().directory();
+        dir.keys.insert("party:0".into(), hex::encode(identity));
+        assert!(Ed25519SignatureProvider::verifier_from_directory(&dir).is_none());
+    }
+
+    /// U30: non-canonical point encodings are rejected at import. `y = p`
+    /// (2²⁵⁵ − 19, little-endian `ed ff … 7f`) decodes under dalek's ZIP-215
+    /// rules to the same point as `y = 0` but is a different byte string — one
+    /// logical key must never have two accepted encodings.
+    #[test]
+    fn u30_non_canonical_public_key_rejected_at_import() {
+        let mut y_eq_p = [0xffu8; 32];
+        y_eq_p[0] = 0xed;
+        y_eq_p[31] = 0x7f;
+        assert!(
+            Ed25519SignatureProvider::new()
+                .with_verifier("evil", &y_eq_p)
+                .is_none(),
+            "non-canonical verifying-key encoding must be rejected at import"
+        );
+        let mut dir = three_party_provider().directory();
+        dir.keys.insert("party:0".into(), hex::encode(y_eq_p));
+        assert!(Ed25519SignatureProvider::verifier_from_directory(&dir).is_none());
+    }
+
+    /// U30: the classic Ed25519 malleation — shifting `s` by the group order
+    /// `L` — is REJECTED. With `verify_strict` (plus dalek's s-range check)
+    /// each (key, message) pins a unique accepted signature encoding, so a
+    /// transcript signature cannot be re-encoded without invalidating it.
+    #[test]
+    fn u30_malleated_s_plus_l_signature_rejected() {
+        let p = three_party_provider();
+        let sig_hex = p.sign("party:0", b"hello");
+        assert!(p.verify("party:0", b"hello", &sig_hex));
+
+        let mut sig = hex::decode(&sig_hex).unwrap();
+        // L, little-endian: 2²⁵² + 27742317777372353535851937790883648493.
+        const L: [u8; 32] = [
+            0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9,
+            0xde, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x10,
+        ];
+        // s' = s + L (little-endian add with carry; fits in 32 bytes because
+        // s < L and 2L < 2²⁵⁶).
+        let mut carry = 0u16;
+        for i in 0..32 {
+            let sum = sig[32 + i] as u16 + L[i] as u16 + carry;
+            sig[32 + i] = sum as u8;
+            carry = sum >> 8;
+        }
+        assert_eq!(carry, 0, "s + L must not overflow 32 bytes");
+        let malleated = hex::encode(&sig);
+        assert_ne!(malleated, sig_hex);
+        assert!(
+            !p.verify("party:0", b"hello", &malleated),
+            "an s+L malleated signature must be rejected"
         );
     }
 }

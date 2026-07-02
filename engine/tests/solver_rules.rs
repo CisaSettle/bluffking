@@ -185,9 +185,14 @@ fn rule_r4_call_with_positive_ev() {
     input.to_call = 50; // odds ~4.8% — eq ~20% would satisfy R4.
     input.stack_before = 1000;
     let out = analyze(&input).unwrap();
-    assert!(
-        matches!(out.gto_action, SolverAction::Call | SolverAction::Fold),
-        "R4 territory: expected Call (or Fold if equity too low); got {:?}",
+    // U39 (dual-AI OSS review): Fold must NOT be accepted — with eq ~20% vs
+    // pot odds ~4.8% this is an unambiguous +EV call, and the whole point of
+    // this test is to catch an R4→fold regression. The old `Call | Fold`
+    // assertion could never fail on exactly that regression.
+    assert_eq!(
+        out.gto_action,
+        SolverAction::Call,
+        "R4 must call with equity far above pot odds; got {:?}",
         out.gto_action
     );
 }

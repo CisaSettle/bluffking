@@ -2,6 +2,11 @@
 name = "mp-wasm"
 version = "0.1.0"
 edition = "2021"
+# Explicit metadata (U17/U53, dual-AI OSS review): detached crate, cannot inherit
+# from the workspace root.
+license = "AGPL-3.0-only"
+description = "PROTOTYPE wasm-bindgen wrapper over mental_poker::crypto_real for in-browser DKG / shuffle / threshold decryption."
+repository = "https://github.com/CisaSettle/bluffking"
 publish = false
 
 # Phase-4 server-blind WEB crypto client (ADR-063) — PROTOTYPE, pending external

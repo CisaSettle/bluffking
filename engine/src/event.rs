@@ -4,6 +4,12 @@
 //! point during a hand. The server consumes these via [`crate::game::GameHand::drain_events`]
 //! and forwards them to connected clients.
 //!
+//! **Redaction is the consumer's responsibility.** Two fields are secret and
+//! MUST be stripped/filtered before broadcasting: [`EngineEvent::HoleCardsDealt`]
+//! `cards` (redact per recipient seat) and [`EngineEvent::HandStarted`]
+//! `deck_seed` (the full shuffle key — never broadcast it to any client). The
+//! stream is server-internal; "forward to clients" above assumes that redaction.
+//!
 //! ## Design notes
 //! - Events carry `seat: u8` (not `PlayerId`) — the translation from the engine's
 //!   internal `PlayerId` to the wire-visible seat index happens inside `drain_events`,
@@ -52,6 +58,17 @@ pub enum EngineEvent {
         small_blind: u64,
         /// Deck seed (for per-bot RNG derivation — ADR-024 §6, ADR-062 §2).
         /// 256-bit; the server projects it to a `u64` for the bot RNG.
+        ///
+        /// **SECURITY — MUST NOT be forwarded to clients.** In the default
+        /// (plaintext) deal this is the full ChaCha20 shuffle key: it
+        /// reconstructs the entire 52-card order (every hole card and the whole
+        /// runout) via [`crate::deck::Deck::new`] before any betting. Unlike the
+        /// per-seat filtering that redacts [`Self::HoleCardsDealt`], leaking this
+        /// one field exposes *all* seats at once. The event stream is
+        /// server-internal; consume `deck_seed` only on trusted paths (bot RNG,
+        /// hand-history persistence) and strip it before broadcasting. See also
+        /// [`crate::game::GameHand::deck_seed`] for a getter that does not travel
+        /// on the broadcastable stream.
         deck_seed: DeckSeed,
     },
 

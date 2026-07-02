@@ -3,6 +3,10 @@ name = "gto-solver"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+# Explicit metadata (U17/U53, dual-AI OSS review) — see engine/Cargo.toml.
+license = "AGPL-3.0-only"
+description = "Postflop CFR GTO solver wrapper (isolates the unsafe postflop-solver dependency from the forbid-unsafe engine)."
+repository = "https://github.com/CisaSettle/bluffking"
 publish = false
 
 # ── Why this is its OWN crate (not in `engine`, not in `server` directly) ──────

@@ -152,12 +152,15 @@ impl<'a> TranscriptBuilder<'a> {
         }
     }
 
-    /// Append, chain, and sign one event. `signer` is the originating id.
+    /// Append, chain, and sign one event. `originator` is the acting party's id.
     ///
-    /// ADR-041 §4: `signer` is always `coordinator` on the envelope layer.
-    /// The builder uses `coordinator` in the `signer` field regardless of the
-    /// `signer` argument for the event envelope, then delegates signing to the
-    /// signer field argument (which should be `coordinator`).
+    /// U43 (dual-AI OSS review): `originator` is accepted purely for call-site
+    /// self-documentation and is intentionally NOT used — ADR-041 §4 fixes the
+    /// envelope layer to always be signed by the coordinator, and the acting
+    /// party's identity enters the tamper-evident chain via `contributor_claim`
+    /// (see [`Self::append_with_contributor`]), never via the envelope signer.
+    /// (Dropping the parameter is deferred: it would break the server builder
+    /// and the transcript test suites in the same change.)
     ///
     /// `contributor_claim` is the pre-computed `(contributor_id, signature_hex)` pair
     /// for client-action events. When `Some`, the payload's `contributor` /
@@ -171,21 +174,25 @@ impl<'a> TranscriptBuilder<'a> {
     /// which the **verifier** will detect on replay. This lets tests assemble
     /// deliberately-broken transcripts that are still cryptographically
     /// well-formed (correct chain + signatures).
-    pub fn append(&mut self, event_type: &str, payload: Value, signer: &str) {
-        self.append_with_contributor(event_type, payload, signer, None);
+    pub fn append(&mut self, event_type: &str, payload: Value, originator: &str) {
+        self.append_with_contributor(event_type, payload, originator, None);
     }
 
-    /// Like [`append`], but allows supplying a pre-computed contributor
-    /// `(contributor_id, contributor_signature_hex)` pair (ADR-041 §4).
+    /// Like [`append`](Self::append), but allows supplying a pre-computed
+    /// contributor `(contributor_id, contributor_signature_hex)` pair
+    /// (ADR-041 §4).
     ///
     /// The contributor fields are injected into the payload before the
     /// `payload_hash` is computed, so the payload_hash covers the contributor
     /// signature — making it part of the tamper-evident chain.
+    ///
+    /// U43 (dual-AI OSS review): `_originator` is intentionally unused — see
+    /// [`Self::append`].
     pub fn append_with_contributor(
         &mut self,
         event_type: &str,
         mut payload: Value,
-        signer: &str,
+        _originator: &str,
         contributor_claim: Option<(&str, &str)>,
     ) {
         // Inject contributor fields into the payload if provided.
@@ -226,9 +233,6 @@ impl<'a> TranscriptBuilder<'a> {
         };
         let event_hash = event.event_hash();
         event.signature = self.signer.sign(envelope_signer, &event_hash);
-
-        // Suppress unused-variable warning when signer is not coordinator.
-        let _ = signer;
 
         self.prev_hash = event_hash;
         self.seq += 1;

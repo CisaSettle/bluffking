@@ -155,11 +155,15 @@ pub struct ReencProof {
     pub t1: String,
     /// `T2 = w·Q` (commitment for the `R`-knowledge sigma over base `Q`).
     pub t2: String,
-    /// `Tf = (Σ_j v_j·D_in1[j]) + (Σ_j v_j·D_in2[j])·0 …` — see code: the
-    /// commitment binding the `f`-blinders to the input-deck linear combination.
-    /// Encoded as the pair `(Tf1, Tf2)` over the two ciphertext coordinates.
+    // U64 (dual-AI OSS review): doc corrected — the old formula was garbled
+    // (`Tf = (Σ v_j·D_in1[j]) + (Σ v_j·D_in2[j])·0 …`); the prover computes a
+    // plain per-coordinate sum over the `f`-blinders `v_j` (see `Shuffle::prove`).
+    /// `Tf1 = Σ_j v_j·D_in[j].c1` — first coordinate of the sigma commitment
+    /// binding the `f`-blinders `v_j` to the input-deck linear combination
+    /// (its response is `z_f`; checked by Eq-A1 in `verify_reenc`).
     pub tf1: String,
-    /// Second coordinate of the `f`-linear-combination commitment.
+    /// `Tf2 = Σ_j v_j·D_in[j].c2` — second coordinate of the same commitment
+    /// (checked by Eq-A2 in `verify_reenc`).
     pub tf2: String,
     /// `Tb_j = v_j·G + u_j·H` — **per-element** commitments binding each `f_j`
     /// (via the SAME `v_j` used in `Tf`) to its individual `Cf_j` opening, so the
@@ -269,7 +273,14 @@ fn challenge_weights(t: &mut Transcript, n: usize) -> Vec<Scalar> {
 /// A re-encryption shuffle a party performed: the input deck, the output deck,
 /// the permutation `π` (`output[k] = reencrypt(input[π[k]], ρ[k])`), the
 /// re-encryption randomness, and the joint key. Held only by the prover.
-#[derive(Debug, Clone)]
+///
+/// U31 (dual-AI OSS review): `π` and `ρ` are the shuffle's SECRET witness
+/// (either one reveals the card mapping), so the `Debug` impl is manual and
+/// **redacts** both — only the public statement prints. No `Drop` scrub is
+/// possible here (callers move fields out, e.g. the Phase-4 bench takes
+/// `output`, and a `Drop` impl forbids field moves); zeroize-on-drop for the
+/// witness is a follow-up hardening item.
+#[derive(Clone)]
 pub struct Shuffle {
     /// Input ciphertext deck.
     pub input: Vec<Ct>,
@@ -281,6 +292,21 @@ pub struct Shuffle {
     pub rho: Vec<Scalar>,
     /// Joint public key `Q`.
     pub joint_key: RistrettoPoint,
+}
+
+// U31 (dual-AI OSS review): manual Debug — the permutation `pi` and the
+// re-encryption randomness `rho` are REDACTED so `{:?}` (logs, panics, `dbg!`)
+// can never leak the witness; the public decks + joint key still print.
+impl std::fmt::Debug for Shuffle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Shuffle")
+            .field("input", &self.input)
+            .field("output", &self.output)
+            .field("pi", &"<redacted>")
+            .field("rho", &"<redacted>")
+            .field("joint_key", &self.joint_key)
+            .finish()
+    }
 }
 
 impl Shuffle {
@@ -962,3 +988,38 @@ impl ShuffleProofProvider for RealShuffleProofProvider {
 
 #[cfg(test)]
 mod tests;
+
+// U31 (dual-AI OSS review): the Debug-redaction test lives inline because the
+// main test module (`shuffle/tests.rs`) is a separate file with its own scope.
+#[cfg(test)]
+mod u31_debug_tests {
+    use super::*;
+    use rand::rngs::OsRng;
+
+    /// U31: `Shuffle`'s Debug must REDACT the secret witness (`pi`, `rho`) —
+    /// either one reveals the card mapping — while the public statement
+    /// (decks, joint key) still prints.
+    #[test]
+    fn u31_shuffle_debug_redacts_witness() {
+        let mut rng = OsRng;
+        let x = Scalar::random(&mut rng);
+        let q = x * G;
+        let input: Vec<Ct> = (0..4)
+            .map(|i| Ct::encrypt_card(i as u8, &q, &Scalar::random(&mut rng)))
+            .collect();
+        let shuffle = Shuffle::perform(input, &q, &mut rng);
+        let dbg = format!("{shuffle:?}");
+        // The witness is redacted: markers present…
+        assert!(dbg.contains("pi: \"<redacted>\""), "pi not redacted: {dbg}");
+        assert!(
+            dbg.contains("rho: \"<redacted>\""),
+            "rho not redacted: {dbg}"
+        );
+        // …and the raw Debug forms are absent (guards a regression back to
+        // `#[derive(Debug)]`).
+        assert!(!dbg.contains(&format!("{:?}", shuffle.pi)));
+        for r in &shuffle.rho {
+            assert!(!dbg.contains(&format!("{r:?}")));
+        }
+    }
+}

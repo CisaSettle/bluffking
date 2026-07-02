@@ -5,6 +5,22 @@
 //! no clock. Anyone — a player, an auditor, a regulator — can run it against an
 //! exported transcript and a key directory to confirm the hand was dealt
 //! honestly.
+//!
+//! # Trust boundary of the embedded key directory (U03, dual-AI OSS review)
+//!
+//! The signature verifiers are built from `transcript.key_directory`, which is
+//! **authored by the untrusted coordinator** and travels inside the transcript
+//! itself. For an asymmetric (non-mock) directory the verifier cross-checks
+//! every `key_registered` event's party-attested `signing_pubkey` against the
+//! directory entry for that party ([`VerifyErrorKind::KeyDirectoryMismatch`]),
+//! so the directory cannot silently diverge from the keys the parties signed
+//! into the event log. Even so, a `verify()` `Ok` (or `mp-verify` exit 0)
+//! attests **internal consistency under the transcript's OWN embedded keys**: a
+//! transcript fully fabricated with attacker-generated keys is self-consistent
+//! by construction. A participant gains a genuine fairness guarantee only by
+//! additionally pinning their OWN known key — checking that the
+//! `key_registered` event for their seat attests the `signing_pubkey` (and DKG
+//! `shuffle_pubkey`) their client actually generated.
 
 use crate::crypto::{
     DecryptionProvider, MockDecryptionProvider, MockShuffleProofProvider, Salt,
@@ -14,7 +30,7 @@ use crate::events::*;
 use crate::hash::{canonical_json, ds_hash, hex_hash, parse_hash, Hash, ZERO_HASH};
 use crate::signing::{MockSignatureProvider, SignatureProvider};
 use crate::state::{Phase, ProtocolState, StateError};
-use crate::transcript::{Transcript, TranscriptEvent};
+use crate::transcript::{Transcript, TranscriptEvent, PROTOCOL_VERSION};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -211,6 +227,29 @@ pub enum VerifyErrorKind {
     /// The transcript declares a proof scheme the verifier cannot check.
     #[error("unsupported scheme '{0}'")]
     UnsupportedScheme(String),
+    /// U13 (dual-AI OSS review): the transcript declares a protocol version this
+    /// verifier does not implement. Fail closed, mirroring the
+    /// [`UnsupportedScheme`](Self::UnsupportedScheme) dispatch — a transcript
+    /// claiming e.g. version 999 must not silently verify under v1 rules.
+    #[error("unsupported transcript protocol version {got} (verifier implements {supported})")]
+    UnsupportedProtocolVersion {
+        /// Version declared by the transcript.
+        got: u16,
+        /// The protocol version this verifier implements.
+        supported: u16,
+    },
+    /// U03 (dual-AI OSS review): a `key_registered` event's party-attested
+    /// `signing_pubkey` does not match the `key_directory` entry the verifier
+    /// built its signature checks from. The directory is authored by the
+    /// untrusted coordinator; without this bind it could carry
+    /// coordinator-generated keys that diverge from the keys the parties
+    /// actually attested (and signed) in the event log. Checked for asymmetric
+    /// (non-mock) directories — the dev-only mock path attests a placeholder
+    /// hash, not the symmetric HMAC secret, and is never reported Sound.
+    #[error(
+        "key directory mismatch for party '{0}': attested signing_pubkey != key_directory entry"
+    )]
+    KeyDirectoryMismatch(String),
     /// The key directory could not be used to build a signature verifier.
     #[error("unusable key directory: {0}")]
     BadKeyDirectory(String),
@@ -248,6 +287,22 @@ fn err(seq: u64, kind: VerifyErrorKind) -> VerifyError {
 
 /// Verify an exported transcript end to end.
 pub fn verify(transcript: &Transcript) -> Result<VerifyReport, VerifyError> {
+    // U13 (dual-AI OSS review): fail closed on an unsupported protocol version,
+    // mirroring the UnsupportedScheme dispatch below. Every rule this verifier
+    // replays is the v1 ruleset; a transcript declaring any other version must
+    // be rejected up front, not silently checked under v1 semantics. (The
+    // per-event check below only enforces event↔transcript AGREEMENT — without
+    // this gate a whole transcript could self-declare version 999.)
+    if transcript.protocol_version != PROTOCOL_VERSION {
+        return Err(err(
+            0,
+            VerifyErrorKind::UnsupportedProtocolVersion {
+                got: transcript.protocol_version,
+                supported: PROTOCOL_VERSION,
+            },
+        ));
+    }
+
     if transcript.events.is_empty() {
         return Err(err(0, VerifyErrorKind::Empty));
     }
@@ -463,6 +518,41 @@ pub fn verify(transcript: &Transcript) -> Result<VerifyReport, VerifyError> {
         // independently of the transcript placement.
         if CONTRIBUTOR_REQUIRED_EVENTS.contains(&event.event_type.as_str()) {
             verify_contributor_signature(seq, event, sig.as_ref())?;
+        }
+
+        // (3d) U03 (dual-AI OSS review): bind the coordinator-authored
+        // key_directory to the keys the parties themselves attested. Every
+        // signature check above trusts `transcript.key_directory` — which the
+        // untrusted coordinator wrote — so without this cross-check the
+        // directory entry for a party could silently differ from the
+        // `signing_pubkey` that party attested (and contributor-signed) in its
+        // `key_registered` event. Enforced for asymmetric (non-mock)
+        // directories: only they can ever be classified Sound, and the dev-only
+        // mock path deliberately attests a placeholder hash (`mp:pubkey:v1`),
+        // not the symmetric HMAC secret the mock directory carries. NOTE: even
+        // with this bind, `verify()` Ok attests internal consistency under the
+        // transcript's OWN embedded keys — see the module docs for the
+        // participant-side key-pinning caveat.
+        if !transcript.key_directory.is_mock && event.event_type == event_type::KEY_REGISTERED {
+            let party = event
+                .payload
+                .get("party_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| err(seq, malformed("key_registered missing party_id")))?;
+            let attested = event
+                .payload
+                .get("signing_pubkey")
+                .and_then(Value::as_str)
+                .ok_or_else(|| err(seq, malformed("key_registered missing signing_pubkey")))?;
+            match transcript.key_directory.keys.get(party) {
+                Some(dir_key) if dir_key == attested => {}
+                _ => {
+                    return Err(err(
+                        seq,
+                        VerifyErrorKind::KeyDirectoryMismatch(party.to_string()),
+                    ));
+                }
+            }
         }
 
         // (6) state hash before.
@@ -1218,5 +1308,157 @@ mod soundness_tests {
             Err(VerifyFairnessError::Replay(_)) => {}
             other => panic!("expected a Replay error for a corrupt transcript, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod key_directory_and_version_tests {
+    //! U03 + U13 (dual-AI OSS review) regressions: the coordinator-authored
+    //! key_directory must match the party-attested `signing_pubkey`s, and an
+    //! unsupported `protocol_version` must fail closed.
+    use super::*;
+    use crate::crypto_real::Ed25519SignatureProvider;
+    use crate::mental::MentalPokerDealingProvider;
+    use crate::provider::{DealRequest, DealingProvider};
+    use crate::transcript::{to_payload, TranscriptBuilder};
+
+    /// Build a minimal asymmetric (Ed25519, `is_mock == false`) transcript:
+    /// `hand_init` + one `key_registered` per party, honestly signed throughout.
+    /// With `tamper_party1_key` the coordinator keeps its OWN directory (the keys
+    /// actually used to sign) but records a FABRICATED `signing_pubkey` in
+    /// party:1's attestation — the U03 divergence the cross-check must catch.
+    fn build_asym_transcript(tamper_party1_key: bool) -> Transcript {
+        let hand_id = "u03-hand-0001";
+        let table_id = "u03-table";
+        let mut ed = Ed25519SignatureProvider::new();
+        ed = ed.with_signer(COORDINATOR, &ds_hash("u03:coord-seed:v1", &[b"seed"]));
+        for seat in 0..2u8 {
+            ed = ed.with_signer(
+                party_id(seat),
+                &ds_hash("u03:party-seed:v1", &[[seat].as_slice()]),
+            );
+        }
+        let directory = ed.directory();
+        assert!(!directory.is_mock, "Ed25519 directory must be asymmetric");
+
+        let shuffle = MockShuffleProofProvider;
+        let decryption = MockDecryptionProvider;
+        let mut builder = TranscriptBuilder::new(
+            hand_id,
+            table_id,
+            "u03-test",
+            &ed,
+            &shuffle,
+            &decryption,
+            directory,
+        );
+
+        let players: Vec<PlayerEntry> = (0..2u8)
+            .map(|s| PlayerEntry {
+                seat: s,
+                party_id: party_id(s),
+            })
+            .collect();
+        builder.append(
+            event_type::HAND_INIT,
+            to_payload(&HandInitPayload {
+                players,
+                button_seat: 0,
+                big_blind: 20,
+                small_blind: 10,
+                deck_repr: Some("wire".to_string()),
+            }),
+            COORDINATOR,
+        );
+
+        for seat in 0..2u8 {
+            let pid = party_id(seat);
+            let mut signing_pubkey = ed.verifying_key_hex(&pid).expect("ed vk for party");
+            if tamper_party1_key && seat == 1 {
+                // Attest a key that is NOT the directory entry used to sign.
+                signing_pubkey = hex::encode([0xEEu8; 32]);
+            }
+            let shuffle_pubkey = hex_hash(&ds_hash("u03:shuffle-pk:v1", &[[seat].as_slice()]));
+            let payload = to_payload(&KeyRegisteredPayload {
+                party_id: pid.clone(),
+                seat,
+                signing_pubkey,
+                shuffle_pubkey,
+                contributor: None,
+                contributor_signature: None,
+                // Mock shuffle + mock decrypt → the F2 PoK gate is off.
+                key_pok: None,
+            });
+            // Contributor-sign the canonical claim with the party's REAL key
+            // (which IS in the directory) — so (3c) passes and only the U03
+            // cross-check can catch the fabricated attestation.
+            let claim =
+                contributor_claim_object(event_type::KEY_REGISTERED, hand_id, &pid, &payload)
+                    .expect("key_registered claim");
+            let claim_hash = ds_hash("mp:claim:v1", &[&canonical_json(&claim)]);
+            let csig = ed.sign(&pid, &claim_hash);
+            builder.append_with_contributor(
+                event_type::KEY_REGISTERED,
+                payload,
+                COORDINATOR,
+                Some((pid.as_str(), csig.as_str())),
+            );
+        }
+        builder.finish()
+    }
+
+    /// U03: a non-mock transcript whose key_directory entry diverges from the
+    /// party-attested `signing_pubkey` must be rejected — the directory is
+    /// coordinator-authored and must not silently override the attested keys.
+    #[test]
+    fn rejects_key_directory_signing_pubkey_mismatch() {
+        let transcript = build_asym_transcript(true);
+        let err = verify(&transcript).expect_err("mismatched attested key must reject");
+        assert!(
+            matches!(&err.kind, VerifyErrorKind::KeyDirectoryMismatch(p) if p == "party:1"),
+            "expected KeyDirectoryMismatch for party:1, got: {err}"
+        );
+    }
+
+    /// U03 positive control: honest matching attestations get PAST the
+    /// cross-check (the truncated transcript then fails only on termination).
+    #[test]
+    fn matching_attested_keys_pass_the_cross_check() {
+        let transcript = build_asym_transcript(false);
+        let err = verify(&transcript).expect_err("truncated transcript is not terminal");
+        assert!(
+            matches!(err.kind, VerifyErrorKind::NotTerminal(_)),
+            "honest attested keys must not trip the U03 cross-check, got: {err}"
+        );
+    }
+
+    /// U13: a transcript declaring a protocol version this verifier does not
+    /// implement must fail closed up front — never verify under v1 rules.
+    #[test]
+    fn rejects_unsupported_protocol_version() {
+        let request = DealRequest {
+            hand_id: "u13-hand-0001".to_string(),
+            table_id: "u13-table".to_string(),
+            num_players: 3,
+            button_seat: 0,
+            big_blind: 20,
+            small_blind: 10,
+        };
+        let dealt = MentalPokerDealingProvider::deterministic().deal(&request);
+        let mut transcript = dealt
+            .transcript
+            .expect("mental poker provider always produces a transcript");
+        transcript.protocol_version = 999;
+        let err = verify(&transcript).expect_err("unsupported protocol version must reject");
+        assert!(
+            matches!(
+                err.kind,
+                VerifyErrorKind::UnsupportedProtocolVersion {
+                    got: 999,
+                    supported: PROTOCOL_VERSION,
+                }
+            ),
+            "expected UnsupportedProtocolVersion, got: {err}"
+        );
     }
 }

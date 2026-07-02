@@ -225,6 +225,7 @@ pub fn analyze_spot(req: &SpotRequest) -> Result<SpotAnalysis, SolverError> {
             spr: spr(req.stack_bb, req.pot_bb),
             hand_strength: hand_class,
             to_call: bb_to_units(req.to_call_bb),
+            stack_before: bb_to_units(req.stack_bb as f32),
             can_check: req.to_call_bb <= 0.0,
             // Intentional self-serve proxy: we don't track preflop last-aggressor
             // here, so `hero_facing ∈ {Check, FirstToAct}` stands in for it. Only
@@ -760,14 +761,17 @@ fn validate(req: &SpotRequest) -> Result<(), SolverError> {
             }
         }
     }
-    // Board count must match the street.
-    let expected = match req.street {
-        Street::Preflop => 0,
-        Street::Flop => 3,
-        Street::Turn => 4,
-        Street::River => 5,
+    // Board SHAPE must match the street exactly — a count-only check accepts
+    // structurally impossible boards (e.g. a turn card with no flop, or a river
+    // with no turn) whenever the total happens to match (U21, dual-AI OSS review).
+    let b = &req.board;
+    let shape_ok = match req.street {
+        Street::Preflop => b.flop.is_none() && b.turn.is_none() && b.river.is_none(),
+        Street::Flop => b.flop.is_some() && b.turn.is_none() && b.river.is_none(),
+        Street::Turn => b.flop.is_some() && b.turn.is_some() && b.river.is_none(),
+        Street::River => b.flop.is_some() && b.turn.is_some() && b.river.is_some(),
     };
-    if req.board.count() != expected {
+    if !shape_ok {
         return Err(SolverError::InvalidCards);
     }
     // Negative pot/to-call or NaN is invalid.

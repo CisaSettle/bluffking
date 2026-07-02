@@ -117,7 +117,10 @@ pub const CFR_ITERS: u32 = 2_000;
 /// discounted-regret schemes that converge fast + stably on a 2-action tree, and
 /// the exploitability test measures the actual convergence of THIS form — so the
 /// honest description is "a discounted-regret variant with DCFR coefficients,"
-/// NOT "the canonical DCFR update."
+/// NOT "the canonical DCFR update." U62 (dual-AI OSS review): the STRATEGY
+/// averaging is likewise a variant — it is increment-scaled per iteration
+/// (asymptotically near-uniform), not the exact accumulated `(t/(t+1))^γ`
+/// weighting; the same "variant, not canonical" caveat applies to it.
 const DCFR_ALPHA: f64 = 1.5;
 const DCFR_BETA: f64 = 0.0;
 const DCFR_GAMMA: f64 = 2.0;
@@ -305,6 +308,12 @@ impl EquityMatrix {
     /// is zero-sum in equity mass, the tiny chop term folded into the rounding).
     /// The diagonal (same class, distinct reps) is estimated directly. This
     /// halves the ~28.5k cells to ~14.3k. Determinism unaffected (fixed seeds).
+    ///
+    /// # Panics
+    /// In debug builds, panics unless `keys.len() == N_CLASSES` (169). `keys` must
+    /// be the canonical 169-class list (`all_hand_keys()`); other slices produce a
+    /// mis-shaped matrix or an out-of-range access downstream (U26, dual-AI OSS
+    /// review — pass `all_hand_keys()`).
     pub fn build(keys: &[String]) -> EquityMatrix {
         let n = keys.len();
         debug_assert_eq!(n, N_CLASSES);
@@ -327,6 +336,11 @@ impl EquityMatrix {
                 board: BoardCards::empty(),
                 opponents: OpponentSpec::Random(1),
                 trials: EQUITY_TRIALS,
+                // U63 (dual-AI OSS review): `usize::MAX / 2` as the villain-slot
+                // sentinel is platform-width-dependent (differs on 32- vs 64-bit),
+                // so byte-reproducibility of the generated charts is only
+                // guaranteed on the build/CI/prod targets, which are all 64-bit.
+                // A 32-bit build would produce a different vs_random seed.
                 seed: cell_seed(h, usize::MAX / 2),
                 // ADR-082: chart generation is NOT the coach — full trial count.
                 early_stop: None,
@@ -896,8 +910,21 @@ fn solve_bucket_full_iters(
             pm.hero_cont,
         )
     };
-    let hero_ev_vill_fold = pm.dead + pm.vill_in - pm.hero_in;
+    // Villain folds → hero wins the whole pot (dead + both stakes) and gets their
+    // own `hero_in` back, so hero's NET is `dead + vill_in`. U06 (dual-AI OSS
+    // review): the prior `- pm.hero_in` double-subtracted hero's investment,
+    // understating fold equity and skewing the vs_3bet/vs_4bet continue ranges.
+    // Matches the module spec ("hero wins dead + villain's invested stake").
+    let hero_ev_vill_fold = pm.dead + pm.vill_in;
     let hero_ev_fold = -pm.hero_in;
+    // Chip conservation at the fold terminal: hero's gain + villain's loss = dead.
+    debug_assert!(
+        (hero_ev_vill_fold + (-pm.vill_in) - pm.dead).abs() < 1e-9,
+        "fold terminal violates chip conservation: {} + {} != {}",
+        hero_ev_vill_fold,
+        -pm.vill_in,
+        pm.dead
+    );
 
     let vill_ev_call = |h: usize, v: usize| -> f64 {
         villain_call_ev(
@@ -1140,7 +1167,8 @@ fn bucket_exploitability(sol: &BucketSolution, matrix: &EquityMatrix) -> Exploit
 
     let final_pot = pm.dead + pm.hero_cont + pm.vill_cont;
     let hero_ev_fold = -pm.hero_in;
-    let hero_ev_vill_fold = pm.dead + pm.vill_in - pm.hero_in;
+    // U06: villain fold pays hero the whole pot; net = dead + vill_in (see solver).
+    let hero_ev_vill_fold = pm.dead + pm.vill_in;
     let vill_ev_fold = -pm.vill_in;
 
     // SAME shared terminal definitions the solver used (F7) — incl. the F2 all-in

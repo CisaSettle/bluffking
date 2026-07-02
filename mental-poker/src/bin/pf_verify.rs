@@ -28,7 +28,11 @@ use mental_poker::pf::{verify_hand, HandRecord};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let code = match args.get(1).map(String::as_str) {
+    std::process::exit(run(&args));
+}
+
+fn run(args: &[String]) -> i32 {
+    match args.get(1).map(String::as_str) {
         Some("--hand") => match args.get(2) {
             Some(path) => verify_path(path),
             None => {
@@ -37,14 +41,20 @@ fn main() {
             }
         },
         Some("-") => verify_stdin(),
-        Some("-h") | Some("--help") | None => {
+        // U66 (dual-AI OSS review): explicitly-requested help is a SUCCESS
+        // (exit 0); only a genuine usage error (no argument, or `--hand`
+        // missing its path above) exits 2.
+        Some("-h") | Some("--help") => {
+            print_usage();
+            0
+        }
+        None => {
             print_usage();
             2
         }
         // Bare path argument for convenience.
         Some(path) => verify_path(path),
-    };
-    std::process::exit(code);
+    }
 }
 
 fn print_usage() {
@@ -107,5 +117,27 @@ fn verify_json(json: &str) -> i32 {
             println!("  {e}");
             1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run;
+
+    fn args(rest: &[&str]) -> Vec<String> {
+        std::iter::once("pf_verify")
+            .chain(rest.iter().copied())
+            .map(String::from)
+            .collect()
+    }
+
+    /// U66 (dual-AI OSS review): explicit `--help` / `-h` is a success (0);
+    /// no argument, or `--hand` without a path, stays a usage error (2).
+    #[test]
+    fn explicit_help_exits_zero_but_usage_errors_exit_two() {
+        assert_eq!(run(&args(&["--help"])), 0, "--help → exit 0");
+        assert_eq!(run(&args(&["-h"])), 0, "-h → exit 0");
+        assert_eq!(run(&args(&[])), 2, "no args → usage error exit 2");
+        assert_eq!(run(&args(&["--hand"])), 2, "--hand w/o path → exit 2");
     }
 }

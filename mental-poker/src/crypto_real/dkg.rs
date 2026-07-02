@@ -223,7 +223,12 @@ fn pedersen_commit(q_i: &RistrettoPoint, blind: &Scalar) -> RistrettoPoint {
 /// A party's secret DKG state: its secret share `x_i`, the blind, and its public
 /// share `Q_i`. The secret `x_i` NEVER leaves the party (and is never sent to
 /// the coordinator).
-#[derive(Debug, Clone)]
+///
+/// U31 (dual-AI OSS review): the `Debug` impl is manual and **redacts** `x_i`
+/// and `blind` (a stray `{:?}` in a log line / panic message must never leak
+/// key material), and `Drop` best-effort scrubs both scalars (see the impls
+/// below for the honest caveat on the scrub).
+#[derive(Clone)]
 pub struct DkgParty {
     /// Stable party identifier (e.g. `"party:0"`).
     pub party_id: String,
@@ -233,6 +238,35 @@ pub struct DkgParty {
     pub blind: Scalar,
     /// Public key share `Q_i = x_i·G`.
     pub q_i: RistrettoPoint,
+}
+
+// U31 (dual-AI OSS review): manual Debug — the secret share `x_i` and the
+// commitment blind are REDACTED so `{:?}` (logs, panics, `dbg!`, the derived
+// Debug of any containing struct such as `DkgRun`) can never print them; only
+// the public fields are shown.
+impl std::fmt::Debug for DkgParty {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DkgParty")
+            .field("party_id", &self.party_id)
+            .field("x_i", &"<redacted>")
+            .field("blind", &"<redacted>")
+            .field("q_i", &point_to_hex(&self.q_i))
+            .finish()
+    }
+}
+
+// U31 (dual-AI OSS review): best-effort scrub of the secret share + blind when
+// the party state is dropped, so the plaintext scalars do not linger in freed
+// memory. HONEST CAVEAT: `zeroize` is deliberately NOT a dependency of this
+// crate, so this is a plain overwrite — it removes the obvious freed-memory
+// copy but is not hardened against compiler dead-store elimination or copies
+// made by moves; a guaranteed wipe (the `zeroize` crate's fenced write) is a
+// follow-up hardening item, not an increment-1 claim.
+impl Drop for DkgParty {
+    fn drop(&mut self) {
+        self.x_i = Scalar::ZERO;
+        self.blind = Scalar::ZERO;
+    }
 }
 
 impl DkgParty {
@@ -723,6 +757,40 @@ mod tests {
             verify_dkg(&run.commitments, &shares).unwrap_err(),
             DkgError::PartySetMismatch
         );
+    }
+
+    /// U31 (dual-AI OSS review): `DkgParty`'s Debug must REDACT the secret
+    /// share `x_i` and the commitment blind — a stray `{:?}` (log line, panic
+    /// message, `dbg!`) must never leak key material. The public fields still
+    /// print.
+    #[test]
+    fn u31_debug_redacts_secret_share_and_blind() {
+        let mut rng = OsRng;
+        let party = DkgParty::generate("party:0", &mut rng);
+        let dbg = format!("{party:?}");
+        // Public fields still print (party id + public share).
+        assert!(dbg.contains("party:0"));
+        assert!(dbg.contains(&point_to_hex(&party.q_i)));
+        // Secrets are redacted: the marker is present…
+        assert!(
+            dbg.contains("x_i: \"<redacted>\""),
+            "x_i not redacted: {dbg}"
+        );
+        assert!(
+            dbg.contains("blind: \"<redacted>\""),
+            "blind not redacted: {dbg}"
+        );
+        // …and the raw scalar Debug forms are absent (guards a regression back
+        // to `#[derive(Debug)]`).
+        assert!(!dbg.contains(&format!("{:?}", party.x_i)));
+        assert!(!dbg.contains(&format!("{:?}", party.blind)));
+        // A containing struct's derived Debug (DkgRun) inherits the redaction.
+        let run = DkgRun::simulate(2, &mut rng);
+        let run_dbg = format!("{run:?}");
+        assert!(run_dbg.contains("<redacted>"));
+        for p in &run.parties {
+            assert!(!run_dbg.contains(&format!("{:?}", p.x_i)));
+        }
     }
 
     /// Malformed DKG fields are clean rejects (no panic).

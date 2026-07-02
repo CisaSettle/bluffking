@@ -1,4 +1,11 @@
 <!doctype html>
+<!-- U48 (dual-AI OSS review): BUILD FIRST — this page imports ./pkg-web/mp_wasm.js,
+     produced by ./build-web.sh (wasm-pack, target web). It also fetches the KAT
+     vectors from ../mental-poker/, so serve the REPO ROOT over HTTP:
+       ./mp-wasm/build-web.sh
+       python3 -m http.server 8080            # run from the repo root
+       open http://localhost:8080/mp-wasm/browser_demo.html
+     Full instructions: mp-wasm/README.md -->
 <html lang="en">
 <head>
 <meta charset="utf-8">

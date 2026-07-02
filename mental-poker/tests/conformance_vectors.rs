@@ -470,61 +470,65 @@ fn conformance_vectors_stable() {
     let vectors = build_vectors();
     let vectors_json = serde_json::to_string_pretty(&vectors).expect("vectors serialize");
 
-    let existing = std::fs::read_to_string(VECTOR_PATH);
-
-    match existing {
-        Err(_) => {
-            // First run: write the file.
-            std::fs::write(VECTOR_PATH, &vectors_json).expect("write conformance vectors");
-            println!(
-                "[conformance_vectors] wrote {} bytes to {VECTOR_PATH}",
-                vectors_json.len()
-            );
-        }
-        Ok(content) => {
-            // Subsequent runs: parse and re-assert every vector.
-            let stored: Value = serde_json::from_str(&content).expect("parse stored vectors");
-
-            // Must be a JSON array.
-            let stored_arr = stored
-                .as_array()
-                .expect("mp_conformance.json must be a JSON array (ADR-041 §7)");
-            let live_arr = &vectors;
-
-            assert_eq!(
-                stored_arr.len(),
-                live_arr.len(),
-                "conformance vector count changed: stored={} live={}",
-                stored_arr.len(),
-                live_arr.len()
-            );
-
-            for (i, (stored_v, live_v)) in stored_arr.iter().zip(live_arr.iter()).enumerate() {
-                let kind = live_v["kind"].as_str().unwrap_or("<unknown>");
-                assert_eq!(
-                    stored_v["kind"], live_v["kind"],
-                    "vector[{i}] kind mismatch"
-                );
-                assert_eq!(
-                    stored_v["expected"], live_v["expected"],
-                    "vector[{i}] ({kind}) expected value changed: \
-                     stored={} live={}",
-                    stored_v["expected"], live_v["expected"]
-                );
-            }
-
-            // Count by kind for the summary line.
-            let mut counts: std::collections::HashMap<&str, usize> = Default::default();
-            for v in live_arr {
-                *counts.entry(v["kind"].as_str().unwrap_or("?")).or_insert(0) += 1;
-            }
-            println!(
-                "[conformance_vectors] all {} vectors verified ({:?})",
-                live_arr.len(),
-                counts,
-            );
-        }
+    // U38 (dual-AI OSS review): regeneration is an explicit opt-in — a missing
+    // golden file is a FAILURE, never a silent write-and-pass (which would let
+    // a deleted/renamed golden skip every comparison).
+    if std::env::var("UPDATE_KAT_VECTORS").as_deref() == Ok("1") {
+        std::fs::write(VECTOR_PATH, &vectors_json).expect("write conformance vectors");
+        println!(
+            "[conformance_vectors] regenerated {VECTOR_PATH} ({} bytes)",
+            vectors_json.len()
+        );
     }
+
+    let content = std::fs::read_to_string(VECTOR_PATH).unwrap_or_else(|e| {
+        panic!(
+            "committed golden file {VECTOR_PATH} missing/unreadable: {e} \
+             (regenerate with UPDATE_KAT_VECTORS=1 and commit + review the diff)"
+        )
+    });
+
+    // Parse and re-assert every vector against the committed golden content.
+    let stored: Value = serde_json::from_str(&content).expect("parse stored vectors");
+
+    // Must be a JSON array.
+    let stored_arr = stored
+        .as_array()
+        .expect("mp_conformance.json must be a JSON array (ADR-041 §7)");
+    let live_arr = &vectors;
+
+    assert_eq!(
+        stored_arr.len(),
+        live_arr.len(),
+        "conformance vector count changed: stored={} live={}",
+        stored_arr.len(),
+        live_arr.len()
+    );
+
+    for (i, (stored_v, live_v)) in stored_arr.iter().zip(live_arr.iter()).enumerate() {
+        let kind = live_v["kind"].as_str().unwrap_or("<unknown>");
+        assert_eq!(
+            stored_v["kind"], live_v["kind"],
+            "vector[{i}] kind mismatch"
+        );
+        assert_eq!(
+            stored_v["expected"], live_v["expected"],
+            "vector[{i}] ({kind}) expected value changed: \
+             stored={} live={}",
+            stored_v["expected"], live_v["expected"]
+        );
+    }
+
+    // Count by kind for the summary line.
+    let mut counts: std::collections::HashMap<&str, usize> = Default::default();
+    for v in live_arr {
+        *counts.entry(v["kind"].as_str().unwrap_or("?")).or_insert(0) += 1;
+    }
+    println!(
+        "[conformance_vectors] all {} vectors verified ({:?})",
+        live_arr.len(),
+        counts,
+    );
 }
 
 /// Positive test: build vectors and assert the `expected` fields are non-empty.

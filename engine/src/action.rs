@@ -69,6 +69,12 @@ impl PlayerAction {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActionRecord {
     /// 0-based index of this action within the hand.
+    ///
+    /// Contract: `seq` fits in `u16` (the wire protocol range-locks it and the DB
+    /// stores it as a smallint). The counter that produces it saturates rather
+    /// than wraps (U33, dual-AI OSS review) so it can never alias a late action
+    /// onto an early sequence number (e.g. the SB blind at `seq == 0`). Reaching
+    /// 65 535 actions in one hand is not physically possible in real play.
     pub seq: u16,
     /// Street on which the action occurred.
     pub street: Street,
@@ -89,7 +95,11 @@ pub struct ActionRecord {
 }
 
 /// Errors that can occur when applying an action to a betting round or hand.
+///
+/// `#[non_exhaustive]` (U70, dual-AI OSS review): new failure modes may be added
+/// in a minor release, so downstream matches must include a wildcard arm.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum ActionError {
     /// The acting player is not the one whose turn it is.
     #[error("not your turn")]

@@ -2,6 +2,10 @@
 name = "mental-poker"
 version.workspace = true
 edition.workspace = true
+# Explicit metadata (U17/U53, dual-AI OSS review) — see engine/Cargo.toml.
+license = "AGPL-3.0-only"
+description = "Mental Poker card-dealing protocol: dealing abstraction, signed transcript, and offline verifier."
+repository = "https://github.com/CisaSettle/bluffking"
 # Never published to a registry — internal workspace crate (cargo-deny private).
 publish = false
 
