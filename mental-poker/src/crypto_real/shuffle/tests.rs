@@ -297,10 +297,10 @@ fn tampered_reenc_proof_field_rejected() {
     let (shuffle, _q) = fresh_shuffle(3, &mut rng);
     let (proof, ih, oh) = prove(&shuffle, "party:0", 0);
 
-    // Flip the R-response z_r.
+    // Flip the R-response z_r (in the first card-integrity round).
     let mut arg = deserialize_argument(&proof.attestation).unwrap();
-    let zr = scalar_from_hex(&arg.reenc.z_r).unwrap();
-    arg.reenc.z_r = scalar_to_hex(&(zr + Scalar::ONE));
+    let zr = scalar_from_hex(&arg.reenc_rounds[0].reenc.z_r).unwrap();
+    arg.reenc_rounds[0].reenc.z_r = scalar_to_hex(&(zr + Scalar::ONE));
     let mut tampered = proof.clone();
     tampered.attestation = serialize_argument(&arg);
     assert!(
@@ -308,10 +308,10 @@ fn tampered_reenc_proof_field_rejected() {
         "a tampered Part-A response MUST be rejected"
     );
 
-    // Flip a z_f entry.
+    // Flip a z_f entry (first round).
     let mut arg2 = deserialize_argument(&proof.attestation).unwrap();
-    let zf = scalar_from_hex(&arg2.reenc.z_f[5]).unwrap();
-    arg2.reenc.z_f[5] = scalar_to_hex(&(zf + Scalar::ONE));
+    let zf = scalar_from_hex(&arg2.reenc_rounds[0].reenc.z_f[5]).unwrap();
+    arg2.reenc_rounds[0].reenc.z_f[5] = scalar_to_hex(&(zf + Scalar::ONE));
     let mut tampered2 = proof.clone();
     tampered2.attestation = serialize_argument(&arg2);
     assert!(!verifier().verify_shuffle("party:0", 0, &ih, &oh, None, &tampered2));
@@ -399,7 +399,7 @@ fn malformed_attestation_clean_reject() {
 
     // A non-decompressable point inside the argument.
     let mut arg = deserialize_argument(&proof.attestation).unwrap();
-    arg.f_commitments[0] = "ff".repeat(32);
+    arg.reenc_rounds[0].f_commitments[0] = "ff".repeat(32);
     let mut bad3 = proof.clone();
     bad3.attestation = serialize_argument(&arg);
     assert!(!verifier().verify_shuffle("party:0", 0, &ih, &oh, None, &bad3));
@@ -438,6 +438,161 @@ fn valid_across_party_counts() {
             "a mutated output ciphertext must reject for {np} parties"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// BUG-125: card-integrity soundness is cryptographically negligible.
+//
+// A single challenge-weight vector catches a card swap/duplicate/drop except with
+// the union-bound error ≤ N!/ℓ ≈ 2⁻²⁶·⁵ at N=52 — NOT negligible. The fix runs the
+// card-integrity argument under `CHAL_REPS` independent challenge vectors bound to
+// ONE shared permutation, giving a card-integrity term ≤ N!/ℓ^CHAL_REPS (≈ 2⁻²⁷⁸).
+// The OVERALL proof soundness is dominated by the larger Part-B permutation /
+// β-compression Schwartz–Zippel term O(N·CHAL_REPS/ℓ) ≈ 2⁻²⁴⁵ — still ≪ 2⁻¹²⁸.
+// These tests lock the security parameter AND the verifier's structural requirement
+// that a proof carry exactly `CHAL_REPS` rounds (so a weakened single-round proof
+// cannot be accepted).
+// ---------------------------------------------------------------------------
+
+/// The chosen `CHAL_REPS` must drive the card-integrity soundness term
+/// `N!/ℓ^CHAL_REPS` below the 2⁻¹²⁸ cryptographic-negligibility bar at a full
+/// N = 52 deck. `log2(52!) ≈ 225.58`, `log2(ℓ) ≈ 252`. (The overall proof bound is
+/// dominated by the larger Part-B Schwartz–Zippel term ≈ 2⁻²⁴⁵, which also clears
+/// 128 bits; this gate targets the card-integrity parameter someone might silently
+/// weaken.) This is the static gate that stops anyone silently dropping `CHAL_REPS`
+/// back toward the weak v1 (=1).
+#[test]
+fn soundness_reps_meets_128_bit_bar() {
+    // log2(52!) via Stirling-free direct sum of log2 of 1..=52.
+    let log2_n_fact: f64 = (1..=52u32).map(|k| (k as f64).log2()).sum();
+    let log2_ell: f64 = 252.0; // ristretto255 group order ℓ ≈ 2^252
+    let soundness_bits = (CHAL_REPS as f64) * log2_ell - log2_n_fact;
+    // (`CHAL_REPS >= 2` is enforced at compile time via a `const _` assertion in
+    // shuffle.rs; here we gate the actual soundness margin.)
+    assert!(
+        soundness_bits >= 128.0,
+        "card-integrity term N!/ℓ^CHAL_REPS must be <= 2^-128; got 2^-{soundness_bits:.1} for CHAL_REPS={CHAL_REPS}"
+    );
+}
+
+/// A genuine proof carries exactly `CHAL_REPS` independent card-integrity rounds,
+/// and those rounds use DIFFERENT challenge weights (independent Fiat–Shamir
+/// squeezes) — the `f` commitments differ round-to-round.
+#[test]
+fn argument_carries_independent_challenge_rounds() {
+    let mut rng = OsRng;
+    let (shuffle, _q) = fresh_shuffle(3, &mut rng);
+    let (proof, _ih, _oh) = prove(&shuffle, "party:0", 0);
+    let arg = deserialize_argument(&proof.attestation).unwrap();
+    assert_eq!(
+        arg.reenc_rounds.len(),
+        CHAL_REPS,
+        "a proof MUST carry exactly CHAL_REPS card-integrity rounds"
+    );
+    // Independent challenges ⇒ independent f = e∘π⁻¹ ⇒ different commitments.
+    assert_ne!(
+        arg.reenc_rounds[0].f_commitments, arg.reenc_rounds[1].f_commitments,
+        "rounds must use independent challenge-weight vectors (distinct f commitments)"
+    );
+}
+
+/// SOUNDNESS REGRESSION (the core BUG-125 fix): a proof stripped down to a SINGLE
+/// card-integrity round (the retired weak-v1 shape, soundness ~2⁻²⁶) MUST be
+/// rejected — the verifier requires exactly `CHAL_REPS` rounds. Likewise a padded
+/// proof with an extra round. Without the length gate the whole hardening is moot.
+#[test]
+fn wrong_number_of_rounds_rejected() {
+    let mut rng = OsRng;
+    let (shuffle, _q) = fresh_shuffle(3, &mut rng);
+    let (proof, ih, oh) = prove(&shuffle, "party:0", 0);
+
+    // Baseline: the genuine CHAL_REPS-round proof verifies.
+    assert!(verifier().verify_shuffle("party:0", 0, &ih, &oh, None, &proof));
+
+    // Truncate to a single round (the weak v1 shape) → reject.
+    let mut arg = deserialize_argument(&proof.attestation).unwrap();
+    arg.reenc_rounds.truncate(1);
+    let mut weak = proof.clone();
+    weak.attestation = serialize_argument(&arg);
+    assert!(
+        !verifier().verify_shuffle("party:0", 0, &ih, &oh, None, &weak),
+        "a single-round (weak-v1) proof MUST be rejected (soundness would be ~2^-26)"
+    );
+
+    // Duplicate a round to over-length → reject (exact count required).
+    let mut arg2 = deserialize_argument(&proof.attestation).unwrap();
+    let extra = arg2.reenc_rounds[0].clone();
+    arg2.reenc_rounds.push(extra);
+    let mut padded = proof.clone();
+    padded.attestation = serialize_argument(&arg2);
+    assert!(
+        !verifier().verify_shuffle("party:0", 0, &ih, &oh, None, &padded),
+        "a proof with != CHAL_REPS rounds MUST be rejected"
+    );
+}
+
+/// Every card-integrity round independently gates: tampering the Part-A response
+/// of ANY single round (here the LAST) rejects the whole proof. This is what makes
+/// a card swap have to survive ALL `CHAL_REPS` rounds.
+#[test]
+fn tampering_any_single_round_rejected() {
+    let mut rng = OsRng;
+    let (shuffle, _q) = fresh_shuffle(3, &mut rng);
+    let (proof, ih, oh) = prove(&shuffle, "party:0", 0);
+
+    let last = CHAL_REPS - 1;
+    let mut arg = deserialize_argument(&proof.attestation).unwrap();
+    let zr = scalar_from_hex(&arg.reenc_rounds[last].reenc.z_r).unwrap();
+    arg.reenc_rounds[last].reenc.z_r = scalar_to_hex(&(zr + Scalar::ONE));
+    let mut tampered = proof.clone();
+    tampered.attestation = serialize_argument(&arg);
+    assert!(
+        !verifier().verify_shuffle("party:0", 0, &ih, &oh, None, &tampered),
+        "tampering ANY single round's Part-A response MUST reject the whole proof"
+    );
+}
+
+/// A card swap paired with a maliciously RE-PROVED single round must still fail:
+/// even if an attacker could luck out on one challenge vector (prob ~2⁻²⁶), the
+/// shared permutation forces the SAME π across all rounds, so the swap must also
+/// satisfy the other independent vector(s) — which a genuine tamper cannot. Here
+/// we mutate an output ciphertext and rebind the hash (as TR-1) and confirm
+/// rejection holds with the multi-round argument.
+#[test]
+fn card_swap_rejected_under_multi_round() {
+    let mut rng = OsRng;
+    let (shuffle, q) = fresh_shuffle(4, &mut rng);
+    let (proof, ih, _oh) = prove(&shuffle, "party:2", 3);
+
+    let mut arg = deserialize_argument(&proof.attestation).unwrap();
+    arg.output_deck[11] = Ct::encrypt_card(0, &q, &Scalar::random(&mut rng)).to_wire();
+    let new_oh = deck_hash(&decode_deck(&arg.output_deck).unwrap());
+    let mut tampered = proof.clone();
+    tampered.attestation = serialize_argument(&arg);
+    tampered.output_deck_hash = hex_hash(&new_oh);
+    assert!(
+        !verifier().verify_shuffle("party:2", 3, &ih, &new_oh, None, &tampered),
+        "a swapped output card MUST be rejected under the multi-round argument"
+    );
+}
+
+/// The full-deck attestation (all `CHAL_REPS` rounds) must fit inside the server's
+/// WebSocket `max_message_size` (256 KiB, `server/src/ws.rs`), with headroom for
+/// the `mp_submit_shuffle` JSON envelope it is carried inside. This guards against
+/// a future `CHAL_REPS` bump silently making real shuffle proofs unsendable.
+#[test]
+fn attestation_fits_ws_message_limit() {
+    const WS_CAP: usize = 256 * 1024;
+    const ENVELOPE_HEADROOM: usize = 8 * 1024; // round/party/deck-hash wrapper
+    let mut rng = OsRng;
+    let (shuffle, _q) = fresh_shuffle(6, &mut rng);
+    let (proof, _ih, _oh) = prove(&shuffle, "party:0", 0);
+    let len = proof.attestation.len();
+    assert!(
+        len + ENVELOPE_HEADROOM <= WS_CAP,
+        "attestation ({len} chars) + envelope must fit the {WS_CAP}-char WS cap \
+         (CHAL_REPS={CHAL_REPS}); reduce CHAL_REPS or shrink the argument"
+    );
 }
 
 /// The prover requires a witness; the verifier-only provider has none.

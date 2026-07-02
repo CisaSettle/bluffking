@@ -23,10 +23,15 @@
 //! i.e. `D_out` is exactly `D_in` permuted and re-encrypted — no card is
 //! swapped, replaced, dropped, or duplicated (threat T5). A malicious shuffler
 //! that mutates any output ciphertext, or applies a non-permutation map, is
-//! rejected by `verify_shuffle` **except with the interim argument's soundness
-//! error** — ~2⁻²⁶ at N=52, NOT cryptographically negligible (see "Honest
-//! caveats"). It catches the exact attack the `MockShuffleProofProvider` cannot,
-//! but that residual margin is an external-audit item, not a closed guarantee.
+//! rejected by `verify_shuffle` except with a **cryptographically negligible**
+//! soundness error. The card-integrity argument (Part A) is run under
+//! [`CHAL_REPS`] **independent** Fiat–Shamir challenge-weight vectors that all
+//! share ONE committed permutation (Part B, over the β-combined weights). Its
+//! card-integrity term is `N!/ℓ^CHAL_REPS` ≈ 2⁻²⁷⁸ at N=52, `CHAL_REPS = 2`
+//! (BUG-125); the OVERALL proof soundness error is dominated by the Part-B
+//! permutation / β-compression Schwartz–Zippel term `O(N·CHAL_REPS/ℓ)` ≈ 2⁻²⁴⁵ —
+//! both terms far below 2⁻¹²⁸. It catches the exact attack the
+//! `MockShuffleProofProvider` cannot.
 //!
 //! ## Soundness mechanism (why a card swap is caught)
 //!
@@ -70,25 +75,30 @@
 //!
 //! ## Honest caveats (read before trusting this)
 //!
-//! - **Interim, not Bayer–Groth — and its soundness margin is not negligible.**
-//!   This is the sound sigma-based interim the spec §3.6 explicitly permits, not
-//!   the succinct Bayer–Groth argument. Two consequences, both external-audit
-//!   items: (1) proof size is `O(N)` (it carries the `f` commitments) rather than
-//!   `O(√N)` — a perf trade-off the Milestone-B bench measures; and (2) card
-//!   integrity (Part A) rests on ONE random linear combination, and because cards
-//!   are encoded as small consecutive multiples of `G` (`ec::card_point` =
-//!   `(id+1)·G`), the message-integrity check collapses to a single
-//!   small-coefficient scalar relation whose statistical soundness error is
-//!   ≈ `N!/ℓ` ≈ **2⁻²⁶ at N=52** — far above cryptographic negligibility
-//!   (Bayer–Groth would be ~2⁻²⁵²). No efficient algorithm to exploit this margin
-//!   is known, so it is a soundness-*margin* weakness, not a turnkey false-accept;
-//!   closing it (independent multi-challenge Part A, hash-to-curve message points,
-//!   or full Bayer–Groth) is an external-audit item.
+//! - **Interim scheme, but the card-integrity soundness margin IS now negligible
+//!   (BUG-125 fix).** This is the sound sigma-based interim the spec §3.6 permits,
+//!   not the succinct Bayer–Groth argument, so proof size is `O(CHAL_REPS·N)` (it
+//!   carries the `f` commitments) rather than `O(√N)` — a perf trade-off the
+//!   Milestone-B bench measures. Historically it had one further gap: card
+//!   integrity (Part A) rested on ONE random linear combination, and because
+//!   cards are encoded as small consecutive multiples of `G` (`ec::card_point` =
+//!   `(id+1)·G`), the message-integrity check was a single scalar relation whose
+//!   statistical soundness error was ≈ `N!/ℓ` ≈ 2⁻²⁶ at N=52 — above
+//!   cryptographic negligibility. That is CLOSED here via the "independent
+//!   multi-challenge Part A" route: Part A runs under [`CHAL_REPS`] independent
+//!   challenge-weight vectors that share ONE committed permutation (Part B folds
+//!   them with a Fiat–Shamir `β` so the same `π` must fit every vector), driving
+//!   the card-integrity term to `N!/ℓ^CHAL_REPS` ≈ 2⁻²⁷⁸. Sharing the permutation
+//!   is why two vectors reach `ℓ²` (not the `ℓ¹` that two *independent* full
+//!   arguments would give). The OVERALL proof soundness is the union of that term
+//!   and the Part-B permutation / β-compression Schwartz–Zippel terms
+//!   `O(N·CHAL_REPS/ℓ)` ≈ 2⁻²⁴⁵, which dominate — still ≪ 2⁻¹²⁸. A succinct
+//!   Bayer–Groth argument remains a later increment.
 //! - **Zero-knowledge of the permutation** is argued informally here (the `f`
 //!   commitments and `R`/`x`-polynomial blinders hide `π`); a rigorous ZK proof
 //!   and a constant-time review are **follow-up hardening items**, not increment-1
 //!   claims. The *soundness* property (a swap is rejected) is what the TR-1/2/3
-//!   tests gate, up to the ~2⁻²⁶ interim bound noted above.
+//!   tests gate, at the ~2⁻²⁴⁵ overall soundness bound noted above (BUG-125).
 //! - **Cross-vendor AI-audited (ADR-076/077/078); open-source + verifiable.** GA'd
 //!   for the engine-blind table class by ADR-070 (which lifted the ADR-063 cage); in
 //!   production reachable ONLY for engine-blind sessions via
@@ -115,7 +125,42 @@ use super::ec::pedersen_h;
 /// Scheme identifier for the (sound, sigma-based interim) re-encryption shuffle
 /// (spec §3.6). The full Bayer–Groth `"bg-shuffle-ristretto-v1"` is a later
 /// increment; this discriminator keeps the verifier dispatch unambiguous.
-pub const SCHEME: &str = "reenc-shuffle-ristretto-v1";
+///
+/// **`v2` (BUG-125):** the card-integrity argument now runs under [`CHAL_REPS`]
+/// independent challenge-weight vectors sharing one committed permutation, closing
+/// the `v1` ~2⁻²⁶ soundness margin. The wire format changed (`reenc_rounds`), so a
+/// `v1` proof is structurally non-verifiable under `v2` (fail-closed) — the weaker
+/// `v1` scheme is retired.
+pub const SCHEME: &str = "reenc-shuffle-ristretto-v2";
+
+/// Number of **independent** Fiat–Shamir challenge-weight vectors the card-integrity
+/// (Part A) argument is repeated under, all bound to a SINGLE committed permutation
+/// by the shared β-combined permutation argument (Part B).
+///
+/// A single weight vector catches a card swap / duplicate / drop except with the
+/// union-bound soundness error `≤ N!/ℓ` (union over the `N!` permutations the
+/// committed `f` could take) — ≈ 2⁻²⁶·⁵ at `N = 52`, `ℓ ≈ 2²⁵²`. Because ALL
+/// `CHAL_REPS` vectors must be satisfied by the SAME permutation, the
+/// card-integrity term is `≤ N!/ℓ^CHAL_REPS`, i.e. one extra factor of `ℓ` per
+/// vector:
+///   * `CHAL_REPS = 2` ⇒ `≤ 2⁻²⁷⁸` — far below the 2⁻¹²⁸ cryptographic-negligibility
+///     bar, and much stronger (and smaller) than `CHAL_REPS` *independent* full
+///     arguments, which would only reach `(N!/ℓ)^CHAL_REPS = 2⁻⁵³` for two vectors.
+///
+/// This card-integrity term is NOT the whole soundness story: the OVERALL proof
+/// error also union-bounds in the Part-B permutation argument (the Schwartz–Zippel
+/// product check at random `x` and the β tuple-compression), whose terms
+/// `O(N·CHAL_REPS/ℓ)` ≈ 2⁻²⁴⁵ DOMINATE. So the honest overall bound is ≈ 2⁻²⁴⁵ —
+/// still far below 2⁻¹²⁸. The `soundness_reps_meets_128_bit_bar` test gates only the
+/// card-integrity term (the parameter someone might silently weaken).
+///
+/// Keep `≥ 2`. Proof size / verify cost scale linearly in `CHAL_REPS`; the whole
+/// attestation must fit the WS `max_message_size` (256 KiB) — 2 comfortably does.
+pub const CHAL_REPS: usize = 2;
+
+// Compile-time floor: a single challenge-weight vector is the retired weak `v1`
+// shape (~2⁻²⁶ card-swap soundness). Setting `CHAL_REPS < 2` fails to compile.
+const _: () = assert!(CHAL_REPS >= 2);
 
 // ===========================================================================
 // Wire form of the argument (carried in `ShuffleProof.attestation` as JSON-hex)
@@ -136,15 +181,29 @@ pub struct ShuffleArgument {
     pub output_deck: Vec<CtWire>,
     /// The joint public key `Q` (so the verifier can recompute `e_k·Q` etc.).
     pub joint_key: String,
-    /// Per-element Pedersen commitments to the permuted weights `f_j`:
-    /// `Cf_j = f_j·G + b_j·H`.
+    /// One card-integrity (Part A) instance per **independent** challenge-weight
+    /// vector `e^(i)` — exactly [`CHAL_REPS`] of them. Each carries its own `f`
+    /// commitments. The verifier REQUIRES the length to equal `CHAL_REPS` (a proof
+    /// carrying fewer rounds — e.g. the retired single-round `v1` shape — is
+    /// rejected; that is what makes the card-integrity term `N!/ℓ^CHAL_REPS`).
+    pub reenc_rounds: Vec<ReencRound>,
+    /// Part B — the SINGLE shared permutation argument over the β-combined weights:
+    /// proves the `f` vectors of every round are the SAME permutation of their
+    /// respective `e^(i)`, so one `π` fits all `CHAL_REPS` challenge vectors.
+    pub perm: PermProof,
+}
+
+/// One independent card-integrity round: the `f` commitments for this round's
+/// challenge-weight vector `e^(i)`, plus the Part-A re-encryption-equality proof.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReencRound {
+    /// Per-element Pedersen commitments to this round's permuted weights
+    /// `f^(i)_j = e^(i)_{π⁻¹(j)}`: `Cf_j = f^(i)_j·G + b_j·H`.
     pub f_commitments: Vec<String>,
     /// Part A — Chaum–Pedersen proof that the homomorphic difference is a clean
-    /// re-encryption of the identity: `Δ = (R·G, R·Q)` with knowledge of `R`,
-    /// AND the committed `f` reproduces `Σ f_j·D_in[j]`.
+    /// re-encryption of the identity: `Δ = (R·G, R·Q)` with knowledge of `R`, AND
+    /// the committed `f^(i)` reproduces `Σ f^(i)_j·D_in[j]`, for THIS round's `e^(i)`.
     pub reenc: ReencProof,
-    /// Part B — permutation argument: `{f_j}` is a permutation of `{e_k}`.
-    pub perm: PermProof,
 }
 
 /// Part A: proves the homomorphic difference is a re-encryption of zero and the
@@ -337,6 +396,13 @@ impl Shuffle {
     }
 
     /// Build the non-interactive proof.
+    ///
+    /// The card-integrity argument (Part A) is repeated under [`CHAL_REPS`]
+    /// independent challenge-weight vectors `e^(0..CHAL_REPS)`; a single shared
+    /// permutation argument (Part B) over their `β`-combined weights binds every
+    /// round to the SAME permutation `π`, so the **card-integrity term** is
+    /// `N!/ℓ^CHAL_REPS` (the overall soundness error is dominated by the Part-B
+    /// `O(N·CHAL_REPS/ℓ)` Schwartz–Zippel term — see [`CHAL_REPS`], BUG-125).
     pub fn prove<R: RngCore + CryptoRng>(
         &self,
         party: &str,
@@ -348,74 +414,57 @@ impl Shuffle {
         let q = self.joint_key;
 
         let mut t = statement_transcript(party, round, &q, &self.input, &self.output);
-        let e = challenge_weights(&mut t, n);
 
-        // f_j = e_{π⁻¹(j)} : the challenge weight that lands on input index j.
-        // π[k] = input index for output k ⇒ for input index j = π[k], f_j = e_k.
-        let mut f = vec![Scalar::ZERO; n];
-        for (k, &j) in self.pi.iter().enumerate() {
-            f[j] = e[k];
+        // Per independent challenge-weight vector: commit f^(i) and prove Part A.
+        // The permuted weights f^(i)_j = e^(i)_{π⁻¹(j)}, blinds b^(i), and their
+        // commitments are retained so the shared permutation argument below can
+        // β-combine them (all under the SAME π).
+        let mut reenc_rounds = Vec::with_capacity(CHAL_REPS);
+        let mut f_all: Vec<Vec<Scalar>> = Vec::with_capacity(CHAL_REPS);
+        let mut b_all: Vec<Vec<Scalar>> = Vec::with_capacity(CHAL_REPS);
+        for rep in 0..CHAL_REPS {
+            t.append_u64(b"rep", rep as u64);
+            let e = challenge_weights(&mut t, n);
+
+            // f_j = e_{π⁻¹(j)} : the challenge weight that lands on input index j.
+            // π[k] = input index for output k ⇒ for input index j = π[k], f_j = e_k.
+            let mut f = vec![Scalar::ZERO; n];
+            for (k, &j) in self.pi.iter().enumerate() {
+                f[j] = e[k];
+            }
+
+            // Pedersen-commit to f: Cf_j = f_j·G + b_j·H.
+            let b: Vec<Scalar> = (0..n).map(|_| Scalar::random(rng)).collect();
+            let cf: Vec<RistrettoPoint> = (0..n).map(|j| f[j] * G + b[j] * h).collect();
+
+            // R = Σ_k e_k · ρ_k  (the aggregate re-encryption randomness).
+            let r_agg: Scalar = (0..n).map(|k| e[k] * self.rho[k]).sum();
+
+            // Absorb the f commitments before deriving the Part-A challenge.
+            for cf_j in &cf {
+                t.append_message(b"Cf", cf_j.compress().as_bytes());
+            }
+
+            let reenc = prove_reenc(&mut t, &self.input, &f, &b, r_agg, &q, &h, rng);
+            reenc_rounds.push(ReencRound {
+                f_commitments: cf.iter().map(point_to_hex).collect(),
+                reenc,
+            });
+            f_all.push(f);
+            b_all.push(b);
         }
 
-        // Pedersen-commit to f: Cf_j = f_j·G + b_j·H.
-        let b: Vec<Scalar> = (0..n).map(|_| Scalar::random(rng)).collect();
-        let cf: Vec<RistrettoPoint> = (0..n).map(|j| f[j] * G + b[j] * h).collect();
-
-        // R = Σ_k e_k · ρ_k  (the aggregate re-encryption randomness).
-        let r_agg: Scalar = (0..n).map(|k| e[k] * self.rho[k]).sum();
-
-        // Absorb the f commitments before deriving the Part-A challenge.
-        for cf_j in &cf {
-            t.append_message(b"Cf", cf_j.compress().as_bytes());
-        }
-
-        // ---- Part A: prove Δ = Σ e_k·D_out[k] − Σ f_j·D_in[j] = (R·G, R·Q). ----
-        // Sigma over R (two bases G, Q), AND over the f_j / b_j used to form
-        // Σ f_j·D_in[j] and Σ b_j·H. One joint challenge c_a.
-        let w = Scalar::random(rng); // blinder for R
-        let v: Vec<Scalar> = (0..n).map(|_| Scalar::random(rng)).collect(); // blinders for f_j
-        let u: Vec<Scalar> = (0..n).map(|_| Scalar::random(rng)).collect(); // blinders for b_j
-
-        let t1 = w * G;
-        let t2 = w * q;
-        // Tf = Σ_j v_j·D_in[j]  (a ciphertext: bind blinders to the input deck).
-        let tf1: RistrettoPoint = (0..n).map(|j| v[j] * self.input[j].c1).sum();
-        let tf2: RistrettoPoint = (0..n).map(|j| v[j] * self.input[j].c2).sum();
-        // Tb_j = v_j·G + u_j·H — PER-ELEMENT, binding the same v_j to each f
-        // commitment's opening (so Part A's f_j and the committed Cf_j are
-        // index-matched, not just equal in aggregate).
-        let tb_pts: Vec<RistrettoPoint> = (0..n).map(|j| v[j] * G + u[j] * h).collect();
-
-        t.append_message(b"A_T1", t1.compress().as_bytes());
-        t.append_message(b"A_T2", t2.compress().as_bytes());
-        t.append_message(b"A_Tf1", tf1.compress().as_bytes());
-        t.append_message(b"A_Tf2", tf2.compress().as_bytes());
-        for tb_j in &tb_pts {
-            t.append_message(b"A_Tb", tb_j.compress().as_bytes());
-        }
-        let c_a = challenge_scalar(&mut t, b"c_a");
-
-        let z_r = w + c_a * r_agg;
-        let z_f: Vec<Scalar> = (0..n).map(|j| v[j] + c_a * f[j]).collect();
-        let z_b: Vec<Scalar> = (0..n).map(|j| u[j] + c_a * b[j]).collect();
-
-        let reenc = ReencProof {
-            t1: point_to_hex(&t1),
-            t2: point_to_hex(&t2),
-            tf1: point_to_hex(&tf1),
-            tf2: point_to_hex(&tf2),
-            tb: tb_pts.iter().map(point_to_hex).collect(),
-            z_r: scalar_to_hex(&z_r),
-            z_f: z_f.iter().map(scalar_to_hex).collect(),
-            z_b: z_b.iter().map(scalar_to_hex).collect(),
-        };
-
-        // ---- Part B: permutation argument ∏(x − f_j) == ∏(x − e_k). ----
-        let x = {
-            // squeeze the polynomial challenge AFTER Part A is bound.
-            challenge_scalar(&mut t, b"x")
-        };
-        let perm = prove_permutation(&mut t, &f, &b, &x, &h, rng);
+        // ---- Part B (shared): one permutation argument over the β-combined
+        // weights g_j = Σ_i β^i·f^(i)_j. Because every f^(i) uses the SAME π,
+        // {g_j} is a permutation of {Σ_i β^i·e^(i)_k}; proving that binds all
+        // CHAL_REPS rounds to one permutation, so a card swap must survive ALL of
+        // them (⇒ card-integrity term N!/ℓ^CHAL_REPS; overall soundness dominated
+        // by the Part-B SZ term O(N·CHAL_REPS/ℓ)). ----
+        let beta = challenge_scalar(&mut t, b"beta");
+        let (g, g_blind) = combine_weights(&f_all, &b_all, &beta);
+        // squeeze the polynomial challenge AFTER the combined weights are bound.
+        let x = challenge_scalar(&mut t, b"x");
+        let perm = prove_permutation(&mut t, &g, &g_blind, &x, &h, rng);
 
         ShuffleProof {
             scheme: SCHEME.to_string(),
@@ -425,12 +474,93 @@ impl Shuffle {
                 input_deck: self.input.iter().map(|c| c.to_wire()).collect(),
                 output_deck: self.output.iter().map(|c| c.to_wire()).collect(),
                 joint_key: point_to_hex(&q),
-                f_commitments: cf.iter().map(point_to_hex).collect(),
-                reenc,
+                reenc_rounds,
                 perm,
             }),
         }
     }
+}
+
+/// Prove Part A for ONE challenge-weight vector: the homomorphic difference
+/// `Σ e_k·D_out[k] − Σ f_j·D_in[j]` is a clean re-encryption of the identity
+/// `(R·G, R·Q)`, and the committed `f`/`b` were used honestly. The `f` commitments
+/// must already be absorbed into `t` by the caller.
+#[allow(clippy::too_many_arguments)]
+fn prove_reenc<R: RngCore + CryptoRng>(
+    t: &mut Transcript,
+    input: &[Ct],
+    f: &[Scalar],
+    b: &[Scalar],
+    r_agg: Scalar,
+    q: &RistrettoPoint,
+    h: &RistrettoPoint,
+    rng: &mut R,
+) -> ReencProof {
+    let n = input.len();
+    // Sigma over R (two bases G, Q), AND over the f_j / b_j used to form
+    // Σ f_j·D_in[j] and Σ b_j·H. One joint challenge c_a.
+    let w = Scalar::random(rng); // blinder for R
+    let v: Vec<Scalar> = (0..n).map(|_| Scalar::random(rng)).collect(); // blinders for f_j
+    let u: Vec<Scalar> = (0..n).map(|_| Scalar::random(rng)).collect(); // blinders for b_j
+
+    let t1 = w * G;
+    let t2 = w * q;
+    // Tf = Σ_j v_j·D_in[j]  (a ciphertext: bind blinders to the input deck).
+    let tf1: RistrettoPoint = (0..n).map(|j| v[j] * input[j].c1).sum();
+    let tf2: RistrettoPoint = (0..n).map(|j| v[j] * input[j].c2).sum();
+    // Tb_j = v_j·G + u_j·H — PER-ELEMENT, binding the same v_j to each f
+    // commitment's opening (so Part A's f_j and the committed Cf_j are
+    // index-matched, not just equal in aggregate).
+    let tb_pts: Vec<RistrettoPoint> = (0..n).map(|j| v[j] * G + u[j] * h).collect();
+
+    t.append_message(b"A_T1", t1.compress().as_bytes());
+    t.append_message(b"A_T2", t2.compress().as_bytes());
+    t.append_message(b"A_Tf1", tf1.compress().as_bytes());
+    t.append_message(b"A_Tf2", tf2.compress().as_bytes());
+    for tb_j in &tb_pts {
+        t.append_message(b"A_Tb", tb_j.compress().as_bytes());
+    }
+    let c_a = challenge_scalar(t, b"c_a");
+
+    let z_r = w + c_a * r_agg;
+    let z_f: Vec<Scalar> = (0..n).map(|j| v[j] + c_a * f[j]).collect();
+    let z_b: Vec<Scalar> = (0..n).map(|j| u[j] + c_a * b[j]).collect();
+
+    ReencProof {
+        t1: point_to_hex(&t1),
+        t2: point_to_hex(&t2),
+        tf1: point_to_hex(&tf1),
+        tf2: point_to_hex(&tf2),
+        tb: tb_pts.iter().map(point_to_hex).collect(),
+        z_r: scalar_to_hex(&z_r),
+        z_f: z_f.iter().map(scalar_to_hex).collect(),
+        z_b: z_b.iter().map(scalar_to_hex).collect(),
+    }
+}
+
+/// β-combine the per-round weight vectors + blinds into a single vector
+/// `g_j = Σ_i β^i·vals[i][j]` (and `g_blind_j = Σ_i β^i·blinds[i][j]`). Folding the
+/// `CHAL_REPS` independent `f` vectors this way lets ONE permutation argument bind
+/// them all to the same `π` (`{g_j}` is a permutation of the identically-combined
+/// public weights iff every round shares the permutation, up to a Schwartz–Zippel
+/// error in `β`). `vals` must be non-empty and rectangular.
+fn combine_weights(
+    vals: &[Vec<Scalar>],
+    blinds: &[Vec<Scalar>],
+    beta: &Scalar,
+) -> (Vec<Scalar>, Vec<Scalar>) {
+    let n = vals[0].len();
+    let mut g = vec![Scalar::ZERO; n];
+    let mut gb = vec![Scalar::ZERO; n];
+    for j in 0..n {
+        let mut pw = Scalar::ONE;
+        for i in 0..vals.len() {
+            g[j] += pw * vals[i][j];
+            gb[j] += pw * blinds[i][j];
+            pw *= beta;
+        }
+    }
+    (g, gb)
 }
 
 /// Prove `∏_j (x − f_j) == ∏_k (x − e_k)` in committed form (the Neff /
@@ -596,33 +726,66 @@ fn verify_argument(
 
     // Re-derive the public challenges from the SAME transcript binding (T6).
     let mut t = statement_transcript(party, round, &q, &d_in, &d_out);
-    let e = challenge_weights(&mut t, n);
 
-    // Decode f commitments.
-    if arg.f_commitments.len() != n {
-        return false;
-    }
-    let cf: Vec<RistrettoPoint> = match arg
-        .f_commitments
-        .iter()
-        .map(|s| point_from_hex(s))
-        .collect::<Option<Vec<_>>>()
-    {
-        Some(v) => v,
-        None => return false,
-    };
-    for cf_j in &cf {
-        t.append_message(b"Cf", cf_j.compress().as_bytes());
-    }
-
-    // ---- Part A verification ----
-    if !verify_reenc(&mut t, &arg.reenc, &d_in, &d_out, &cf, &e, &q, &h, n) {
+    // SOUNDNESS-CRITICAL (BUG-125): a valid proof MUST carry exactly CHAL_REPS
+    // independent card-integrity rounds. Accepting fewer (e.g. a single-round
+    // `v1`-shaped proof) would drop the bound back to N!/ℓ ≈ 2⁻²⁶. The scheme id
+    // (`v2`) + this length gate + the strict deserialize all reject the weak shape.
+    if arg.reenc_rounds.len() != CHAL_REPS {
         return false;
     }
 
-    // ---- Part B verification ----
+    // ---- Part A: one instance per independent challenge-weight vector. ----
+    let mut e_all: Vec<Vec<Scalar>> = Vec::with_capacity(CHAL_REPS);
+    let mut cf_all: Vec<Vec<RistrettoPoint>> = Vec::with_capacity(CHAL_REPS);
+    for (rep, rr) in arg.reenc_rounds.iter().enumerate() {
+        t.append_u64(b"rep", rep as u64);
+        let e = challenge_weights(&mut t, n);
+
+        if rr.f_commitments.len() != n {
+            return false;
+        }
+        let cf: Vec<RistrettoPoint> = match rr
+            .f_commitments
+            .iter()
+            .map(|s| point_from_hex(s))
+            .collect::<Option<Vec<_>>>()
+        {
+            Some(v) => v,
+            None => return false,
+        };
+        for cf_j in &cf {
+            t.append_message(b"Cf", cf_j.compress().as_bytes());
+        }
+
+        if !verify_reenc(&mut t, &rr.reenc, &d_in, &d_out, &cf, &e, &q, &h, n) {
+            return false;
+        }
+        e_all.push(e);
+        cf_all.push(cf);
+    }
+
+    // ---- Part B (shared): β-combine every round's public weights e^(i) and
+    // committed f^(i), then run ONE permutation argument. Because a single π must
+    // satisfy the combined relation, the card-integrity union bound is over ONE
+    // permutation (N!), giving the card-integrity term N!/ℓ^CHAL_REPS (see
+    // CHAL_REPS / BUG-125; the overall soundness error is dominated by the Part-B
+    // SZ term O(N·CHAL_REPS/ℓ)), not the N! per round that CHAL_REPS *independent*
+    // arguments would each admit. ----
+    let beta = challenge_scalar(&mut t, b"beta");
+    let mut cg = vec![RistrettoPoint::identity(); n]; // Σ_i β^i·Cf^(i)_j
+    let mut hh = vec![Scalar::ZERO; n]; // Σ_i β^i·e^(i)_k (public combined weights)
+    for j in 0..n {
+        let mut pw = Scalar::ONE;
+        for i in 0..CHAL_REPS {
+            cg[j] += pw * cf_all[i][j];
+            hh[j] += pw * e_all[i][j];
+            pw *= beta;
+        }
+    }
+    // squeeze the polynomial challenge AFTER the combined weights are bound.
     let x = challenge_scalar(&mut t, b"x");
-    verify_permutation(&mut t, &arg.perm, &cf, &e, &x, &h, n)
+    verify_permutation(&mut t, &arg.perm, &cg, &hh, &x, &h, n)
 }
 
 /// Verify Part A: the homomorphic difference is `(R·G, R·Q)` and the `f`
