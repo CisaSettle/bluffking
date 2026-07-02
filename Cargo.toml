@@ -10,11 +10,10 @@ version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-only"
 authors = ["BluffKing OSS Contributors"]
-# U53: declared MSRV — a conservative recent stable the crates compile under.
-# (Crate-side `rust-version.workspace = true` / `repository.workspace = true`
-# inheritance is handled upstream in the mirrored crate manifests; declaring the
-# keys here is harmless when not yet inherited.)
-rust-version = "1.82"
+# No `rust-version` (MSRV) is declared: CI builds only on stable (latest), so a
+# fixed MSRV would be an untested — and likely false — claim. Better to make no
+# promise than an unverified one. (Reinstate with a pinned-toolchain CI lane if
+# older-toolchain support is ever a goal — dual-AI review U53.)
 repository = "https://github.com/CisaSettle/bluffking"
 
 [workspace.dependencies]
