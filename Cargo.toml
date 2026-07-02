@@ -10,6 +10,12 @@ version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-only"
 authors = ["BluffKing OSS Contributors"]
+# U53: declared MSRV — a conservative recent stable the crates compile under.
+# (Crate-side `rust-version.workspace = true` / `repository.workspace = true`
+# inheritance is handled upstream in the mirrored crate manifests; declaring the
+# keys here is harmless when not yet inherited.)
+rust-version = "1.82"
+repository = "https://github.com/CisaSettle/bluffking"
 
 [workspace.dependencies]
 # Only the deps these two crates actually reference via `{ workspace = true }`.

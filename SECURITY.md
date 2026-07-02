@@ -15,9 +15,10 @@ availability, rate-limit tuning) go to the service operator, not here.
 ## Reporting a vulnerability
 
 Please report suspected vulnerabilities **privately** — do not open a public
-issue for security problems. Use GitHub's **"Report a vulnerability"** (Security
-→ Advisories) on this repository, or email the maintainer at the address listed
-on the repository profile. We aim to acknowledge within a few business days.
+issue for security problems. Use GitHub's **"Report a vulnerability"** button
+under this repository's **Security → Advisories** tab (private vulnerability
+reporting is enabled), which opens a private advisory visible only to you and the
+maintainers. We aim to acknowledge within a few business days.
 
 When reporting, please include: affected crate + version/commit, a minimal
 reproduction, and the impact you believe it has.

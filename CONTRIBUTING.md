@@ -15,7 +15,10 @@ cargo fmt --all -- --check
 cargo deny check                          # advisories + licenses + sources
 ```
 
-All four must pass. CI runs the same gates (`.github/workflows/ci.yml`).
+All five must pass (U55). CI runs the same gates (`.github/workflows/ci.yml`) and,
+in addition, runs the **mp-wasm gate** (clippy / test / wasm32 build on the
+detached crate) and the **prepublish provenance/secret scan**
+(`scripts/prepublish-check.sh`).
 
 ## Style
 
@@ -33,6 +36,13 @@ ability to do both, contributions are accepted under a **Developer Certificate o
 Origin** sign-off (`git commit -s`), and the maintainer may ask for a short
 contributor agreement before merging non-trivial code that could flow into the
 closed service.
+
+**DCO is required and enforced (U29).** Every commit in a pull request MUST carry
+a `Signed-off-by:` trailer (`git commit -s`, or `-s` on `git commit --amend` /
+`git rebase --signoff` for existing commits). A CI check inspects each PR commit
+for the trailer, and PRs with any commit missing it will be asked to amend before
+merge. Sign-off is legally load-bearing for the dual-license model above, so it is
+not optional.
 
 If you are not comfortable with those terms, you are still free under AGPL to
 fork, modify, and self-host — you just need to offer your own corresponding

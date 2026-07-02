@@ -80,13 +80,15 @@ pinned AGPL `postflop-solver` (via the published `gto-solver/Cargo.toml` +
 `Cargo.lock`), (2) the `gto-solver/` wrapper crate, (3) the exact deployed
 endpoint `server/src/handlers/gto_solve.rs` (published at
 `server-integration/gto_solve.rs`), and (4) the `engine/` crate the wrapper
-links. It is pinned to an **immutable tag** so the offer matches the exact
-deployed version:
-**https://github.com/CisaSettle/bluffking/tree/solver-src-2026-07-01**.
-`POSTFLOP_SOLVER_SOURCE_URL` points there and `ENABLE_POSTFLOP_SOLVER=true` in
-production, so `/api/tools/poker/solve` mounts and every response + the
-`GET /solve/source` endpoint offer that link (the web UI renders a visible
-"Source code (AGPL-3.0)" link on the solver page). This satisfies the AGPL §13
-network-user offer for the solver endpoint per ADR-072 §3a. The broader ADR-072
+links. It is pinned to an **immutable `solver-src-*` tag** so the offer matches
+the exact deployed version. Because that tag advances with each solver deploy,
+this file deliberately does **not** hard-code a specific one (U28): the exact
+current tag is whatever `POSTFLOP_SOLVER_SOURCE_URL` resolves to, which is
+returned by **`GET /api/tools/poker/solve/source`** (and echoed in every
+`/api/tools/poker/solve` response, so the web UI renders a visible
+"Source code (AGPL-3.0)" link on the solver page). `ENABLE_POSTFLOP_SOLVER=true`
+in production, so the route mounts and serves that offer. This satisfies the
+AGPL §13 network-user offer for the solver endpoint per ADR-072 §3a. The broader
+ADR-072
 §3 engine-wide footer/About "Source code" link (build-SHA-pinned, covering the
 whole deployed engine) remains a follow-up and is tracked in ADR-072.
