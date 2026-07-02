@@ -43,7 +43,7 @@ beats fairness you are told to trust.
 ### Build &amp; test
 
 ```bash
-cargo build                              # engine + mental-poker + gto-solver (no DB, no network)
+cargo build                              # engine + mental-poker + gto-solver (no DB, no services — network only for the one pinned git dependency on first fetch) [U54]
 cargo test -p engine                     # unit + integration
 cargo test -p mental-poker               # incl. the offline transcript verifier
 cargo clippy --workspace -- -D warnings
@@ -113,7 +113,7 @@ section) and [`SECURITY.md`](SECURITY.md).
 ### 构建与测试
 
 ```bash
-cargo build                              # engine + mental-poker + gto-solver(无需数据库/网络)
+cargo build                              # engine + mental-poker + gto-solver(无需数据库/服务;仅首次拉取那一个固定的 git 依赖时联网)[U54]
 cargo test -p engine                     # 单元 + 集成
 cargo test -p mental-poker               # 含离线 transcript 验证器
 cargo clippy --workspace -- -D warnings

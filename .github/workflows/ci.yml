@@ -4,6 +4,10 @@ on:
   push:
   pull_request:
 
+# U56: GITHUB_TOKEN defaults to write scope; this CI only reads the repo.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -25,19 +29,39 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        # U16: --locked fails on a drifted Cargo.lock (part of the §13 Corresponding
+        # Source); --all-features also compiles engine's test-helpers feature.
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: test
         # engine + mental-poker are DB-free — no Postgres service needed.
-        run: cargo test --workspace
+        # U16: --locked + --all-features (same rationale as clippy).
+        run: cargo test --workspace --all-features --locked
 
-      - name: mp-wasm (wasm32 build check)
-        # mp-wasm is a detached crate (own workspace, targets wasm32), so the
-        # root `--workspace` commands above don't cover it.
-        run: cd mp-wasm && cargo check --target wasm32-unknown-unknown
+      - name: mp-wasm (detached crate — clippy / test / wasm build + fmt advisory)
+        # U15: mp-wasm is a detached crate (own workspace, targets wasm32), so the
+        # root `--workspace` clippy/test/fmt never covered it — its native unit
+        # tests (incl. security regressions) and clippy did not run in CI. Run them
+        # here on the host target, then the wasm32 build check (--locked, U16,
+        # guards mp-wasm's own Cargo.lock).
+        # NOTE: `cargo fmt --check` is advisory-only (`|| ::warning::`): mp-wasm's
+        # source is mirrored from the upstream private repo and its formatting is
+        # reconciled there, so drift is surfaced but must not fail this gate.
+        working-directory: mp-wasm
+        run: |
+          cargo clippy --all-targets -- -D warnings
+          cargo test
+          cargo check --locked --target wasm32-unknown-unknown
+          cargo fmt --check || echo "::warning::mp-wasm rustfmt drift (reconciled upstream; advisory only)"
 
       - name: cargo-deny (advisories + licenses + sources)
         uses: EmbarkStudios/cargo-deny-action@v2
+
+      - name: cargo-deny (mp-wasm detached lockfile)
+        # U15: mp-wasm has its own Cargo.lock the root cargo-deny never scans.
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: mp-wasm/Cargo.toml
 
       - name: pre-publish gate (secret / data-provenance scan)
         # BLOCKING: this repo is public (see PUBLISH-BLOCKERS.md), and OSS-native
@@ -45,3 +69,35 @@ jobs:
         # so this secret/provenance scan is the automated backstop for every push
         # and external PR. It must exit 0.
         run: bash scripts/prepublish-check.sh
+
+  dco:
+    # U29: DCO sign-off (`git commit -s`) is legally load-bearing for the
+    # dual-license model (see CONTRIBUTING.md). This is a NON-BLOCKING advisory
+    # check (continue-on-error) — it flags PR commits missing a `Signed-off-by`
+    # trailer but never fails the build; maintainers ask the contributor to amend.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check Signed-off-by (DCO) on PR commits
+        # SHAs come from the event payload — assigned via env (not inlined into
+        # the script) per GitHub's workflow-injection guidance.
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          missing=0
+          for sha in $(git rev-list "$BASE_SHA..$HEAD_SHA"); do
+            if ! git show -s --format=%B "$sha" | grep -qiE '^Signed-off-by: .+'; then
+              echo "::warning::commit $sha is missing a Signed-off-by (DCO) trailer"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "Some commits lack DCO sign-off — amend with 'git commit -s' (see CONTRIBUTING.md)."
+            exit 1
+          fi
+          echo "All PR commits carry Signed-off-by."
