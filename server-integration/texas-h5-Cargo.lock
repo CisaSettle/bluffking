@@ -2650,6 +2650,7 @@ dependencies = [
  "hex",
  "hmac",
  "http-body-util",
+ "idna",
  "jsonwebtoken",
  "mental-poker",
  "proptest",

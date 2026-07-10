@@ -763,13 +763,36 @@ impl BettingRound {
         // instead of running the board out. n_can_act was 1 but none of the
         // branches below fired, leaving the round open.
         if self.n_can_act == 1 {
-            let lone_can_call = self
+            // Find the lone player who can still act.
+            let lone = self
                 .players
                 .iter()
-                .any(|p| !p.folded && !p.all_in && p.contributed.0 < self.current_bet.0);
-            if !lone_can_call {
-                self.done = true;
-                return;
+                .find(|p| !p.folded && !p.all_in)
+                .map(|p| (p.player_id, p.contributed.0));
+            if let Some((lone_id, lone_contrib)) = lone {
+                // The lone live player faces a real fold-or-call decision ONLY if
+                // some OTHER non-folded player has actually committed MORE chips
+                // than they have. Compare against the largest ACTUAL opponent
+                // contribution — NOT `self.current_bet`, which `new_preflop`
+                // floors to a full big blind even when the big blind is all-in
+                // for LESS than a full blind. Comparing against that floor invents
+                // a phantom "owed call": a player who has already fully covered
+                // every live opponent (e.g. HU, SB posted 10, BB all-in for 8) was
+                // forced to fold-or-call a bet nobody actually made, forfeiting
+                // already-matched chips. Closing here lets the uncalled overage be
+                // refunded and the board run out to showdown, which is correct NL
+                // behaviour (dual-AI audit 2026-07-10, finding C11).
+                let max_opp_contrib = self
+                    .players
+                    .iter()
+                    .filter(|p| p.player_id != lone_id && !p.folded)
+                    .map(|p| p.contributed.0)
+                    .max()
+                    .unwrap_or(0);
+                if lone_contrib >= max_opp_contrib {
+                    self.done = true;
+                    return;
+                }
             }
         }
 
