@@ -5,6 +5,7 @@
 //! [`crate::eval::rank_players`].
 
 use crate::action::{ActionError, ActionRecord, BlindKind, PlayerAction};
+use crate::card::Card;
 use crate::deck::Deck;
 use crate::eval::{rank_players, HandRank};
 use crate::event::EngineEvent;
@@ -1521,6 +1522,33 @@ impl GameHand {
         self.deck_seed
     }
 
+    /// Return the real community cards that were still undealt when this hand
+    /// finished.
+    ///
+    /// Plaintext hands deal directly from `deck`, with no burn cards, so the
+    /// next `5 - board.count()` cards are the only valid rabbit-hunt runout.
+    /// This accessor is deliberately read-only and does not advance the deck.
+    /// Blind hands return an empty vector because their coordinator owns the
+    /// unopened deck and the server must never invent a continuation.
+    pub fn undealt_board(&self) -> Vec<Card> {
+        if self.mode != HandMode::Plaintext || !self.is_done() {
+            return Vec::new();
+        }
+        let needed = 5usize.saturating_sub(self.board.count());
+        if needed == 0 {
+            return Vec::new();
+        }
+        let remaining = self.deck.remaining();
+        let start = self.deck.cards().len().saturating_sub(remaining);
+        self.deck
+            .cards()
+            .iter()
+            .skip(start)
+            .take(needed.min(remaining))
+            .copied()
+            .collect()
+    }
+
     /// Read-only reference to the active betting round, if any.
     ///
     /// Used by the session layer to query `players_yet_to_act()` without
@@ -2855,6 +2883,71 @@ mod tests {
         // SB=10 + BB=20 = 30 total. Winner gets 30.
         let total: u32 = result.chips_awarded.values().sum();
         assert_eq!(total, 30);
+    }
+
+    #[test]
+    fn undealt_board_returns_the_real_preflop_runout_without_advancing_deck() {
+        let mut hand = GameHand::new_with_rng(
+            vec![(pid(1), c(1000), 0), (pid(2), c(1000), 1)],
+            0,
+            c(20),
+            c(10),
+            PokerRng::from_seed(2),
+        );
+        hand.start().unwrap();
+        let actor = hand.snapshot().current_actor.unwrap();
+        hand.apply_action(actor, PlayerAction::Fold).unwrap();
+        assert!(hand.is_done());
+
+        let before = hand.deck.remaining();
+        let runout = hand.undealt_board();
+
+        assert_eq!(runout.len(), 5, "preflop fold leaves five real board cards");
+        assert_eq!(
+            hand.deck.remaining(),
+            before,
+            "rabbit hunt must not consume cards"
+        );
+        assert_eq!(
+            runout[0],
+            hand.deck.cards()[hand.deck.cards().len() - before]
+        );
+    }
+
+    #[test]
+    fn undealt_board_is_empty_after_a_complete_river() {
+        let mut hand = GameHand::new_with_rng(
+            vec![(pid(1), c(1000), 0), (pid(2), c(1000), 1)],
+            0,
+            c(20),
+            c(10),
+            PokerRng::from_seed(42),
+        );
+        hand.start().unwrap();
+
+        // Both players check/call through every street. The engine deals the
+        // flop, turn, and river before reaching Done.
+        loop {
+            let actor = hand.snapshot().current_actor;
+            let Some(actor) = actor else { break };
+            let snap = hand.snapshot();
+            let action = if snap.current_bet
+                > snap
+                    .players
+                    .iter()
+                    .find(|p| p.player_id == actor)
+                    .map(|p| p.committed_this_street)
+                    .unwrap_or(Chips::ZERO)
+            {
+                PlayerAction::Call
+            } else {
+                PlayerAction::Check
+            };
+            hand.apply_action(actor, action).unwrap();
+        }
+        assert!(hand.is_done());
+        assert_eq!(hand.snapshot().board.count(), 5);
+        assert!(hand.undealt_board().is_empty());
     }
 
     /// C6 review: a `Call` issued in a checkable spot (`to_call == 0`) must be
