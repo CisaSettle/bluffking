@@ -356,7 +356,16 @@ impl BettingRound {
         // never blocks a legitimate 3-bet/4-bet.
         if ps.has_acted && !self.action_reopened_for(ps) {
             let is_raise_attempt = match action {
-                PlayerAction::Raise { .. } => true,
+                PlayerAction::Raise { amount: raise_to } => {
+                    // Some clients/replay producers encode a short all-in call
+                    // as `Raise(to=table_bet)` rather than `AllIn`.  It is not
+                    // an aggressive raise when the player is committing their
+                    // entire remaining stack and still ends at or below the
+                    // current bet; TDA Rule 6 allows that call even though the
+                    // action was not reopened.
+                    let to_commit = raise_to.0.saturating_sub(ps.contributed.0);
+                    !(to_commit == ps.stack.0 && raise_to.0 <= self.current_bet.0)
+                }
                 // An all-in that would commit MORE than the current bet is an
                 // aggressive re-raise; an all-in that only calls (or under-calls)
                 // is allowed.
@@ -1330,6 +1339,31 @@ mod tests {
         // But p1 may legally call the extra 30.
         round.apply_action(pid(1), &PlayerAction::Call).unwrap();
         assert_eq!(round.player_contributed(pid(1)).0, 130);
+    }
+
+    /// A short all-in call may arrive through the `Raise(to=...)` wire shape.
+    /// It must be accepted for an already-acted player when it does not exceed
+    /// the table bet, while a genuine re-raise remains blocked above.
+    #[test]
+    fn acted_player_may_submit_raise_form_for_short_all_in_call() {
+        let mut round = BettingRound::new(three_players(130, 1000, 130), 0, c(0), c(100));
+        round
+            .apply_action(pid(1), &PlayerAction::Raise { amount: c(100) })
+            .unwrap();
+        round.apply_action(pid(2), &PlayerAction::Call).unwrap();
+        round.apply_action(pid(3), &PlayerAction::AllIn).unwrap();
+
+        assert_eq!(round.current_bet().0, 130);
+        assert_eq!(round.current_player(), Some(pid(1)));
+        round
+            .apply_action(pid(1), &PlayerAction::Raise { amount: c(130) })
+            .unwrap();
+        assert!(round.player_all_in(pid(1)));
+
+        // The remaining deep player still owes the short all-in difference.
+        assert_eq!(round.current_player(), Some(pid(2)));
+        round.apply_action(pid(2), &PlayerAction::Call).unwrap();
+        assert!(round.is_done());
     }
 
     /// Regression (audit 2026-06-03): `current_player_can_raise()` must report

@@ -1242,7 +1242,10 @@ impl GameHand {
         let button_order = self.button_relative_order();
         let pot_results =
             distribute_pots_among_survivors(&self.cumulative_side_pots, &survivors, &button_order);
-        let result = self.finalize_pots(pot_results, Vec::new());
+        // The board was not recovered, so this is a chip settlement without a
+        // showdown. Keep the result card-free: `show_order` is the protocol's
+        // explicit signal that no cards/rank should be exposed.
+        let result = self.finalize_pots_with_show_order(pot_results, Vec::new(), Vec::new());
         self.events.push(EngineEvent::HandFinished {
             result: result.clone(),
         });
@@ -1383,6 +1386,15 @@ impl GameHand {
         pot_results: Vec<PotResult>,
         showdown: Vec<ShowdownEntry>,
     ) -> HandResult {
+        self.finalize_pots_with_show_order(pot_results, showdown, self.compute_show_order())
+    }
+
+    fn finalize_pots_with_show_order(
+        &self,
+        pot_results: Vec<PotResult>,
+        showdown: Vec<ShowdownEntry>,
+        show_order: Vec<PlayerId>,
+    ) -> HandResult {
         // chips_awarded: sum from all pots.
         let mut chips_awarded: HashMap<u64, u32> = self
             .seats
@@ -1427,8 +1439,6 @@ impl GameHand {
                 (s.player_id.inner(), s.stack.0 + awarded)
             })
             .collect();
-
-        let show_order = self.compute_show_order();
 
         HandResult {
             deck_seed: self.deck_seed,
@@ -4048,6 +4058,14 @@ mod blind_tests {
             *result.final_stacks.get(&pid(1).inner()).unwrap_or(&0),
             2000,
             "the honest survivor ends with the whole table"
+        );
+        assert!(
+            result.showdown.is_empty(),
+            "board-forfeit settlement must not fabricate a showdown"
+        );
+        assert!(
+            result.show_order.is_empty(),
+            "board-forfeit settlement must not expose a showdown order"
         );
     }
 
