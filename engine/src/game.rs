@@ -243,11 +243,109 @@ enum HandMode {
     Blind,
 }
 
+/// Pure, authoritative betting transition preview.
+///
+/// Engine-blind clients sign these public chip/round facts before the server
+/// mutates the hand. They remove every ambiguous inference from an action label:
+/// a `Call` or `Raise` can exhaust a stack, and a short all-in may raise the bet
+/// without reopening action. The preview is produced by applying the action to a
+/// cloned [`BettingRound`]; the live hand, history, pot, sequence and events are
+/// untouched.
+///
+/// The `*_before` fields describe the acting player's current street. The
+/// `*_after`, `next_actor`, and `street_after` fields describe the stabilized
+/// [`GameHand`] after the action has also performed any automatic street
+/// transition. Consequently, a street-closing preflop call reports the flop's
+/// zeroed commitments/current bet and its first actor. `round_closed_after` is
+/// the one deliberate exception: it records whether this action closed the
+/// *prior* betting round. This lets a verifier distinguish a street transition
+/// from an ordinary same-street action while still chaining directly into the
+/// next prompt's stabilized pre-state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionTransitionPreview {
+    pub stack_before: Chips,
+    pub committed_before: Chips,
+    pub current_bet_before: Chips,
+    pub min_raise_to_before: Option<Chips>,
+    pub stack_after: Chips,
+    pub committed_after: Chips,
+    pub current_bet_after: Chips,
+    pub min_raise_to_after: Option<Chips>,
+    pub all_in_after: bool,
+    pub round_closed_after: bool,
+    pub next_actor: Option<PlayerId>,
+    pub next_actor_can_raise_after: bool,
+    pub street_after: Street,
+    /// No further betting action can occur; any remaining community cards are
+    /// a forced runout before showdown. In blind mode the physical engine may
+    /// still be paused at a pending board street, so this is stronger than
+    /// `hand_done_after` and is the protocol-facing terminal signal.
+    pub betting_terminal_after: bool,
+    pub hand_done_after: bool,
+}
+
+/// Engine-derived betting semantics for one recorded action on the current
+/// street.
+///
+/// `PlayerAction::AllIn` describes how chips were committed, not whether the
+/// wager was a raise.  An all-in may be an under-call, an exact call, a short
+/// raise that increases the wager without reopening action, or a full raise.
+/// Strategy/coach code must use these flags instead of classifying every
+/// `AllIn` token as a 3-bet/4-bet.  The facts are reconstructed from the same
+/// action records and minimum-raise rules that the engine applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreetActionFact {
+    pub player_id: PlayerId,
+    pub action: PlayerAction,
+    /// The action raised the street's wager above the previous `current_bet`.
+    /// A short all-in raise is `true`; an all-in call/under-call is `false`.
+    pub increased_bet: bool,
+    /// The wager increase was at least the last full bet/raise increment.
+    /// Only these actions advance preflop open/3-bet/4-bet chart depth.
+    pub full_raise: bool,
+}
+
+impl StreetActionFact {
+    /// Whether this action contributed a caller rather than a new wager.
+    ///
+    /// Some protocol-shaped `Raise` / `AllIn` actions are really exact or
+    /// under-calls.  Conversely, a short all-in that increases the wager is
+    /// still a raise for caller-count purposes even though it does not reopen
+    /// action.  Keep this projection separate from [`Self::strategy_action`],
+    /// whose job is only to preserve full-raise chart depth.
+    pub fn is_call_like(&self) -> bool {
+        matches!(self.action, PlayerAction::Call)
+            || (matches!(
+                self.action,
+                PlayerAction::Raise { .. } | PlayerAction::AllIn
+            ) && !self.increased_bet)
+    }
+
+    /// Action shape used by full-raise-depth strategy consumers.
+    ///
+    /// A short raise retains its real wager increase via
+    /// [`Self::increased_bet`]; an all-in call has that flag clear. Both are
+    /// represented as `Call` here so code that counts `Raise | AllIn` cannot
+    /// mistake either for a full re-raise.
+    pub fn strategy_action(&self) -> PlayerAction {
+        if matches!(
+            self.action,
+            PlayerAction::Raise { .. } | PlayerAction::AllIn
+        ) && !self.full_raise
+        {
+            PlayerAction::Call
+        } else {
+            self.action.clone()
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // GameHand
 // ---------------------------------------------------------------------------
 
 /// Orchestrates a complete Texas Hold'em hand.
+#[derive(Clone)]
 pub struct GameHand {
     seats: Vec<HandSeat>,
     dealer_idx: usize,
@@ -522,6 +620,17 @@ impl GameHand {
         if self.phase != Phase::NotStarted {
             return Err(ActionError::HandFinished);
         }
+        // Every public chip/pot amount is u32. Reject an unrepresentable table
+        // before blinds or pot math can overflow in debug or wrap in release.
+        if self
+            .seats
+            .iter()
+            .map(|seat| u64::from(seat.starting_stack.0))
+            .sum::<u64>()
+            > u64::from(u32::MAX)
+        {
+            return Err(ActionError::InvalidAction);
+        }
         let n = self.seats.len();
         if n < 2 {
             return Err(ActionError::NotInHand);
@@ -753,6 +862,94 @@ impl GameHand {
         }
 
         Ok(self.snapshot())
+    }
+
+    /// Apply an action from the current player.
+    ///
+    /// This is the pure preflight companion to [`Self::apply_action`]. It runs
+    /// the complete betting-round legality check on a clone and therefore does
+    /// not move chips, allocate an action sequence, append history, or emit an
+    /// event. A single-owner coordinator can use it to finish every fallible
+    /// protocol/chain check before the real mutation.
+    pub fn validate_action(
+        &self,
+        player_id: PlayerId,
+        action: &PlayerAction,
+    ) -> Result<(), ActionError> {
+        self.preview_action_transition(player_id, action)
+            .map(|_| ())
+    }
+
+    /// Preview the exact public pre/post betting state without mutating the hand.
+    pub fn preview_action_transition(
+        &self,
+        player_id: PlayerId,
+        action: &PlayerAction,
+    ) -> Result<ActionTransitionPreview, ActionError> {
+        match &self.phase {
+            Phase::NotStarted => return Err(ActionError::HandNotStarted),
+            Phase::Done => return Err(ActionError::HandFinished),
+            Phase::Betting(_) => {}
+        }
+        if !self.seats.iter().any(|seat| seat.player_id == player_id) {
+            return Err(ActionError::NotInHand);
+        }
+        let mut round_after_action = self
+            .betting_round
+            .clone()
+            .ok_or(ActionError::HandFinished)?;
+        let before = round_after_action
+            .player_states()
+            .iter()
+            .find(|player| player.player_id == player_id)
+            .ok_or(ActionError::NotInHand)?;
+        let stack_before = before.stack;
+        let committed_before = before.contributed;
+        let current_bet_before = round_after_action.current_bet();
+        let min_raise_to_before = round_after_action
+            .current_player_can_raise()
+            .then(|| round_after_action.min_raise_to());
+
+        round_after_action.apply_action(player_id, action)?;
+        // This flag intentionally describes the round in which the action was
+        // taken. All other post fields below come from the fully stabilized
+        // hand (which may already contain the next street's betting round).
+        let round_closed_after = round_after_action.is_done();
+
+        let mut hand_after = self.clone();
+        hand_after.apply_action(player_id, action.clone())?;
+        let after_snapshot = hand_after.snapshot();
+        let after = after_snapshot
+            .players
+            .iter()
+            .find(|player| player.player_id == player_id)
+            .expect("previewed player remains in hand snapshot");
+        let next_actor = after_snapshot.current_actor;
+        let next_actor_can_raise_after = next_actor.is_some()
+            && hand_after
+                .betting_round_ref()
+                .is_some_and(BettingRound::current_player_can_raise);
+        let betting_terminal_after = hand_after.is_done()
+            || hand_after
+                .betting_round_ref()
+                .is_none_or(BettingRound::is_done);
+        Ok(ActionTransitionPreview {
+            stack_before,
+            committed_before,
+            current_bet_before,
+            min_raise_to_before,
+            stack_after: after.stack,
+            committed_after: after.committed_this_street,
+            current_bet_after: after_snapshot.current_bet,
+            min_raise_to_after: after_snapshot.min_raise_to,
+            all_in_after: after.all_in,
+            round_closed_after,
+            next_actor,
+            next_actor_can_raise_after,
+            street_after: after_snapshot.street,
+            betting_terminal_after,
+            hand_done_after: hand_after.is_done(),
+        })
     }
 
     /// Apply an action from the current player.
@@ -1207,6 +1404,10 @@ impl GameHand {
             self.completed_pot.0 += round_total;
             self.accumulate_pots(new_pots);
         }
+        // Capture entitlement before force-folding withholders. Their matched
+        // stake is forfeited to honest survivors, not reclassified as a normal
+        // folded-player refund.
+        let settlement_pots = self.settlement_side_pots();
 
         // Force-fold each attributable withholder (only a currently non-folded
         // seat — a folded/unknown/duplicate id is ignored, never an error: the
@@ -1241,7 +1442,7 @@ impl GameHand {
 
         let button_order = self.button_relative_order();
         let pot_results =
-            distribute_pots_among_survivors(&self.cumulative_side_pots, &survivors, &button_order);
+            distribute_pots_among_survivors(&settlement_pots, &survivors, &button_order);
         // The board was not recovered, so this is a chip settlement without a
         // showdown. Keep the result card-free: `show_order` is the protocol's
         // explicit signal that no cards/rank should be exposed.
@@ -1349,8 +1550,9 @@ impl GameHand {
         // (action) order (audit 2026-06-03).
         let button_order = self.button_relative_order();
 
+        let settlement_pots = self.settlement_side_pots();
         let pot_results = distribute_pots(
-            &self.cumulative_side_pots,
+            &settlement_pots,
             &eligible,
             &self.board,
             &button_order,
@@ -1373,8 +1575,8 @@ impl GameHand {
     /// zero-leak. `rank_hand` is not called.
     fn assemble_blind_uncontested_result(&self, lone: Option<PlayerId>) -> HandResult {
         let button_order = self.button_relative_order();
-        let pot_results =
-            distribute_pots_uncontested(&self.cumulative_side_pots, lone, &button_order);
+        let settlement_pots = self.settlement_side_pots();
+        let pot_results = distribute_pots_uncontested(&settlement_pots, lone, &button_order);
         self.finalize_pots(pot_results, Vec::new())
     }
 
@@ -1421,13 +1623,51 @@ impl GameHand {
         // kills a single room is strictly preferable to silently corrupting the
         // persisted stacks of a distribution regression. (A graceful Result return
         // would change this fn's signature across many call sites — out of scope.)
-        assert_eq!(
-            chips_awarded.values().sum::<u32>(),
-            self.cumulative_side_pots
+        for pot in &pot_results {
+            assert_eq!(
+                pot.winners
+                    .iter()
+                    .map(|winner| u64::from(winner.amount_won.0))
+                    .sum::<u64>(),
+                u64::from(pot.amount.0),
+                "every pot must award or refund its full amount"
+            );
+        }
+        let total_awarded = chips_awarded
+            .values()
+            .map(|amount| u64::from(*amount))
+            .sum::<u64>();
+        let result_pot_total = pot_results
+            .iter()
+            .map(|pot| u64::from(pot.amount.0))
+            .sum::<u64>();
+        let legacy_pot_total = self
+            .cumulative_side_pots
+            .iter()
+            .map(|pot| u64::from(pot.amount.0))
+            .sum::<u64>();
+        let total_contributed =
+            self.seats
                 .iter()
-                .map(|p| p.amount.0)
-                .sum::<u32>(),
-            "chip conservation: chips_awarded != total in pots (a pot was dropped)"
+                .map(|seat| {
+                    u64::from(
+                        seat.starting_stack.0.checked_sub(seat.stack.0).expect(
+                            "in-hand stack cannot exceed its starting stack before settlement",
+                        ),
+                    )
+                })
+                .sum::<u64>();
+        assert_eq!(
+            legacy_pot_total, total_contributed,
+            "street bookkeeping must contain every committed chip"
+        );
+        assert_eq!(
+            result_pot_total, total_contributed,
+            "canonical pots must equal the whole hand's committed chips"
+        );
+        assert_eq!(
+            total_awarded, result_pot_total,
+            "chip conservation: awards must equal canonical pots"
         );
 
         // final_stacks = current stack + chips awarded.
@@ -1436,9 +1676,26 @@ impl GameHand {
             .iter()
             .map(|s| {
                 let awarded = *chips_awarded.get(&s.player_id.inner()).unwrap_or(&0);
-                (s.player_id.inner(), s.stack.0 + awarded)
+                (
+                    s.player_id.inner(),
+                    s.stack
+                        .0
+                        .checked_add(awarded)
+                        .expect("settled stack must fit the public u32 chip range"),
+                )
             })
             .collect();
+        assert_eq!(
+            final_stacks
+                .values()
+                .map(|stack| u64::from(*stack))
+                .sum::<u64>(),
+            self.seats
+                .iter()
+                .map(|seat| u64::from(seat.starting_stack.0))
+                .sum::<u64>(),
+            "final stacks must equal starting stacks"
+        );
 
         HandResult {
             deck_seed: self.deck_seed,
@@ -1573,9 +1830,10 @@ impl GameHand {
     /// voluntary betting actions and must not be treated as aggression when
     /// building bot `DecisionContext.street_actions`.
     ///
-    /// Used by the session layer to populate `DecisionContext.street_actions` and
-    /// derive `last_aggressor_seat` / `preflop_aggressor_seat` from live state
-    /// rather than from hardcoded defaults (codex audit finding 1 / BLOCKER).
+    /// This is a raw compatibility view. `AllIn` and call-shaped `Raise` tokens
+    /// are semantically ambiguous, so strategy, coach, and aggressor consumers
+    /// must use [`Self::current_street_action_facts`] (or its strategy
+    /// projection) instead of inferring aggression from this method.
     pub fn current_street_actions(&self) -> Vec<(PlayerId, PlayerAction)> {
         let current = self.current_street();
         self.actions
@@ -1585,6 +1843,91 @@ impl GameHand {
             })
             .map(|rec| (rec.player_id, rec.action.clone()))
             .collect()
+    }
+
+    /// Current-street actions with authoritative wager semantics.
+    ///
+    /// An `AllIn` token alone is ambiguous.  This projection distinguishes an
+    /// all-in call/under-call, a short all-in raise, and a full raise by
+    /// replaying only public commitment totals.  Preflop starts from the
+    /// nominal big-blind bring-in even when the posted BB was short; later
+    /// streets start from zero.  `last_full_raise` changes only after a full
+    /// wager, exactly like [`BettingRound`].
+    pub fn current_street_action_facts(&self) -> Vec<StreetActionFact> {
+        let current_street = self.current_street();
+        let mut current_bet = if current_street == Street::Preflop {
+            self.big_blind.0
+        } else {
+            0
+        };
+        let mut last_full_raise = self.big_blind.0;
+        let mut committed_by_player: HashMap<u64, u32> = HashMap::new();
+        let mut facts = Vec::new();
+
+        for record in self
+            .actions
+            .iter()
+            .filter(|record| record.street == current_street)
+        {
+            let committed = committed_by_player
+                .entry(record.player_id.inner())
+                .or_default();
+            *committed = committed
+                .checked_add(record.amount.0)
+                .expect("one player's street commitment cannot exceed u32");
+
+            if matches!(record.action, PlayerAction::Blind { .. }) {
+                continue;
+            }
+
+            let aggressive_shape = matches!(
+                record.action,
+                PlayerAction::Raise { .. } | PlayerAction::AllIn
+            );
+            let increased_bet = aggressive_shape && *committed > current_bet;
+            let raise_delta = (*committed).saturating_sub(current_bet);
+            let full_raise = increased_bet && raise_delta >= last_full_raise;
+
+            if increased_bet {
+                current_bet = *committed;
+            }
+            if full_raise {
+                last_full_raise = raise_delta;
+            }
+
+            facts.push(StreetActionFact {
+                player_id: record.player_id,
+                action: record.action.clone(),
+                increased_bet,
+                full_raise,
+            });
+        }
+
+        facts
+    }
+
+    /// Strategy-facing current-street history.
+    ///
+    /// Full raises retain their `Raise` / `AllIn` shape.  A short raise or an
+    /// all-in call becomes `Call`, while its real aggressor identity remains
+    /// available from [`Self::current_street_action_facts`].
+    pub fn current_street_strategy_actions(&self) -> Vec<(PlayerId, PlayerAction)> {
+        self.current_street_action_facts()
+            .into_iter()
+            .map(|fact| (fact.player_id, fact.strategy_action()))
+            .collect()
+    }
+
+    /// The sequence number that the next successfully-applied action will
+    /// receive. Blinds consume sequence numbers 0 and 1, so the first
+    /// voluntary action of a normal hand is 2.
+    ///
+    /// This is intentionally read-only: the engine remains the sole allocator
+    /// of action sequence numbers. The engine-blind coordinator uses the value
+    /// to validate a client's pre-signed action claim *before* mutating betting
+    /// state, then `apply_action` records the same value atomically.
+    pub fn next_action_seq(&self) -> u16 {
+        self.action_seq
     }
 
     // ---------------------------------------------------------------------------
@@ -2014,7 +2357,8 @@ impl GameHand {
                 // BB) — the non-button player acts first post-flop in HU.
                 // Starting the walk at `dealer + 1` unifies both cases.
                 let n = self.seats.len();
-                let first_seat_idx = self.first_active_after((self.dealer_idx + 1) % n);
+                let dealer_idx = self.dealer_idx % n;
+                let first_seat_idx = self.first_active_after((dealer_idx + 1) % n);
                 let first_actor_pid = self.seats[first_seat_idx].player_id;
 
                 // Build the round with current stacks (post-previous-round).
@@ -2149,15 +2493,16 @@ impl GameHand {
         //   * river aggressor exists → their seat
         //   * else → first non-folded seat clockwise from button (dealer + 1)
         let n = self.seats.len();
+        let first_left_of_button = (self.dealer_idx % n + 1) % n;
         let start_idx = if let Some(pid) = last_river_aggressor {
             self.seats
                 .iter()
                 .position(|s| s.player_id == pid)
-                .unwrap_or((self.dealer_idx + 1) % n)
+                .unwrap_or(first_left_of_button)
         } else {
             // Clockwise from the button — start the search at dealer+1 and walk
             // through non-folded seats.
-            let mut idx = (self.dealer_idx + 1) % n;
+            let mut idx = first_left_of_button;
             for _ in 0..n {
                 if !self.seats[idx].folded {
                     break;
@@ -2194,8 +2539,9 @@ impl GameHand {
         if n == 0 {
             return order;
         }
+        let first_left_of_button = (self.dealer_idx % n + 1) % n;
         for offset in 0..n {
-            let idx = (self.dealer_idx + 1 + offset) % n;
+            let idx = (first_left_of_button + offset) % n;
             order.insert(self.seats[idx].player_id.inner(), offset);
         }
         order
@@ -2213,19 +2559,108 @@ impl GameHand {
         start % n
     }
 
-    /// The full side-pot decomposition visible right now: earlier streets'
-    /// absorbed layers (`cumulative_side_pots`) followed by the active betting
-    /// round's layers. U23 (dual-AI OSS review): reporting only the active
-    /// round's layers mid-hand dropped every prior-street layer from the snapshot
-    /// and `PotUpdated`, so a client could not see the real pot structure until
-    /// the hand ended. The two layer sets are disjoint (different streets'
-    /// contributions), so concatenation is the merged view.
+    /// The hand-global pot decomposition visible right now.
     fn merged_side_pots(&self) -> Vec<SidePot> {
-        let mut pots = self.cumulative_side_pots.clone();
-        if let Some(round) = &self.betting_round {
-            pots.extend(round.side_pots());
+        self.hand_side_pots()
+    }
+
+    /// Rebuild canonical pots from each player's total contribution for the
+    /// whole hand. Street-local pot fragments are bookkeeping only: real side
+    /// pot boundaries arise when total contributions (normally all-in caps)
+    /// change the set of players entitled to a layer.
+    fn hand_side_pots(&self) -> Vec<SidePot> {
+        let all: Vec<(PlayerId, u32)> = self
+            .seats
+            .iter()
+            .map(|seat| {
+                (
+                    seat.player_id,
+                    seat.starting_stack
+                        .0
+                        .checked_sub(seat.stack.0)
+                        .expect("in-hand stack cannot exceed its starting stack"),
+                )
+            })
+            .collect();
+        let eligible: Vec<(PlayerId, u32)> = self
+            .seats
+            .iter()
+            .filter(|seat| !seat.folded)
+            .map(|seat| {
+                (
+                    seat.player_id,
+                    seat.starting_stack
+                        .0
+                        .checked_sub(seat.stack.0)
+                        .expect("in-hand stack cannot exceed its starting stack"),
+                )
+            })
+            .collect();
+        if eligible.is_empty() {
+            return Vec::new();
         }
-        pots
+
+        let mut levels: Vec<u32> = all.iter().map(|(_, amount)| *amount).collect();
+        levels.sort_unstable();
+        levels.dedup();
+        let mut previous = 0u32;
+        let mut pots: Vec<SidePot> = Vec::new();
+
+        for level in levels.into_iter().filter(|level| *level > 0) {
+            let slice = level - previous;
+            let amount = all
+                .iter()
+                .map(|(_, contribution)| contribution.saturating_sub(previous).min(slice))
+                .sum::<u32>();
+            let pot_eligible: Vec<PlayerId> = eligible
+                .iter()
+                .filter(|(_, contribution)| *contribution >= level)
+                .map(|(pid, _)| *pid)
+                .collect();
+            let contributors: Vec<PlayerId> = all
+                .iter()
+                .filter(|(_, contribution)| *contribution > previous)
+                .map(|(pid, _)| *pid)
+                .collect();
+
+            let (eligible_ids, refund_to) = if pot_eligible.is_empty() {
+                (Vec::new(), contributors)
+            } else {
+                let refund = if pot_eligible.len() == 1 && contributors == pot_eligible {
+                    pot_eligible.clone()
+                } else {
+                    Vec::new()
+                };
+                (pot_eligible, refund)
+            };
+            if amount > 0 {
+                pots.push(SidePot {
+                    cap: Chips(level),
+                    amount: Chips(amount),
+                    eligible: eligible_ids,
+                    refund_to,
+                });
+            }
+            previous = level;
+        }
+
+        let mut canonical: Vec<SidePot> = Vec::new();
+        for pot in pots {
+            if let Some(existing) = canonical.last_mut().filter(|existing| {
+                existing.eligible == pot.eligible && existing.refund_to == pot.refund_to
+            }) {
+                existing.amount.0 += pot.amount.0;
+                existing.cap.0 = existing.cap.0.max(pot.cap.0);
+            } else {
+                canonical.push(pot);
+            }
+        }
+        canonical
+    }
+
+    /// Canonical, hand-global pots used for every terminal settlement path.
+    fn settlement_side_pots(&self) -> Vec<SidePot> {
+        self.hand_side_pots()
     }
 
     /// Accumulate new side pots into the running cumulative list.
@@ -2233,8 +2668,6 @@ impl GameHand {
         if new_pots.is_empty() {
             return;
         }
-        // For simplicity, append the new pots. Each pot has the eligible set for
-        // THAT street. The `distribute_pots` function handles each pot independently.
         self.cumulative_side_pots.extend(new_pots);
     }
 }
@@ -2256,13 +2689,14 @@ pub fn blind_positions(dealer_idx: usize, n: usize) -> (usize, usize) {
     if n < 2 {
         return (0, 0);
     }
+    let dealer_idx = dealer_idx % n;
     if n == 2 {
         // Heads-up: dealer is SB, other player is BB. Apply `% n` to the dealer
         // here too — `start()` indexes `self.seats[sb_idx]` BEFORE the `% n`
         // guard on the HandStarted event, so an out-of-range `dealer_idx`
         // (>= 2) would panic on index-out-of-bounds. The 3+ branch already
         // normalizes; this makes the stated defense-in-depth hold for n == 2.
-        let sb = dealer_idx % 2;
+        let sb = dealer_idx;
         let bb = (dealer_idx + 1) % 2;
         (sb, bb)
     } else {
@@ -2739,6 +3173,22 @@ mod tests {
         Card::new(r, s)
     }
 
+    #[test]
+    fn start_rejects_table_chip_total_above_public_u32_pot_range() {
+        let mut hand = GameHand::new_with_rng(
+            vec![(pid(1), c(u32::MAX), 0), (pid(2), c(1), 1)],
+            0,
+            c(2),
+            c(1),
+            PokerRng::from_seed(1),
+        );
+        assert!(matches!(hand.start(), Err(ActionError::InvalidAction)));
+        assert!(
+            hand.actions.is_empty(),
+            "oversized table must fail before blinds"
+        );
+    }
+
     // ---- P0 regression: blind seq uniqueness (M6-6 bug) ----
 
     /// SB blind must get seq=0, BB blind must get seq=1.
@@ -2773,6 +3223,174 @@ mod tests {
             result_actions[0].seq, result_actions[1].seq,
             "SB and BB blind seq must be distinct (was the P0 bug)"
         );
+    }
+
+    #[test]
+    fn validate_action_is_pure_for_valid_and_invalid_inputs() {
+        let mut hand = GameHand::new_with_rng(
+            vec![(pid(1), c(1000), 0), (pid(2), c(1000), 1)],
+            0,
+            c(20),
+            c(10),
+            PokerRng::from_seed(43),
+        );
+        let before = hand.start().expect("start ok");
+        let actor = before.current_actor.expect("preflop actor");
+        let wrong_actor = if actor == pid(1) { pid(2) } else { pid(1) };
+        let seq = hand.next_action_seq();
+        let actions = hand.actions.len();
+        let events = hand.events.len();
+        let snapshot_before = hand.snapshot();
+
+        hand.validate_action(actor, &PlayerAction::Call)
+            .expect("current actor call validates");
+        assert!(matches!(
+            hand.validate_action(wrong_actor, &PlayerAction::Call),
+            Err(ActionError::NotYourTurn)
+        ));
+
+        let snapshot_after = hand.snapshot();
+        assert_eq!(hand.next_action_seq(), seq);
+        assert_eq!(hand.actions.len(), actions);
+        assert_eq!(hand.events.len(), events);
+        assert_eq!(snapshot_after.current_actor, snapshot_before.current_actor);
+        assert_eq!(snapshot_after.pot, snapshot_before.pot);
+        assert_eq!(snapshot_after.current_bet, snapshot_before.current_bet);
+        assert_eq!(
+            snapshot_after
+                .players
+                .iter()
+                .map(|player| (player.player_id, player.stack, player.committed_this_street))
+                .collect::<Vec<_>>(),
+            snapshot_before
+                .players
+                .iter()
+                .map(|player| (player.player_id, player.stack, player.committed_this_street))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn hu_all_in_opponent_exposes_call_only_and_stabilized_runout_preview() {
+        let mut hand = GameHand::new_blind(
+            vec![(pid(1), c(100), 0), (pid(2), c(1000), 1)],
+            0,
+            c(20),
+            c(10),
+            DeckSeed::default(),
+        );
+        hand.start().expect("start blind hand");
+        assert_eq!(hand.snapshot().current_actor, Some(pid(1)));
+        hand.apply_action(pid(1), PlayerAction::AllIn)
+            .expect("button/SB shove");
+
+        let snap = hand.snapshot();
+        assert_eq!(snap.current_actor, Some(pid(2)));
+        assert_eq!(snap.current_bet, c(100));
+        assert_eq!(
+            snap.min_raise_to, None,
+            "the sole live stack may fold/call but cannot build a dry side pot"
+        );
+        assert_eq!(
+            hand.preview_action_transition(pid(2), &PlayerAction::Raise { amount: c(200) })
+                .unwrap_err(),
+            ActionError::InvalidAction
+        );
+        assert_eq!(
+            hand.preview_action_transition(pid(2), &PlayerAction::AllIn)
+                .unwrap_err(),
+            ActionError::InvalidAction,
+            "an over-call all-in is still an aggressive dry-side-pot wager"
+        );
+
+        let call = hand
+            .preview_action_transition(pid(2), &PlayerAction::Call)
+            .expect("call remains legal");
+        assert_eq!(call.min_raise_to_before, None);
+        assert!(call.round_closed_after, "the call closes preflop");
+        assert_eq!(call.street_after, Street::Flop);
+        assert_eq!(call.committed_after, c(0));
+        assert_eq!(call.current_bet_after, c(0));
+        assert_eq!(call.min_raise_to_after, None);
+        assert_eq!(call.next_actor, None, "all-in runout has no flop actor");
+        assert!(!call.next_actor_can_raise_after);
+        assert!(call.betting_terminal_after);
+    }
+
+    #[test]
+    fn transition_preview_stabilizes_street_closing_action_into_flop_state() {
+        let mut hand = GameHand::new_blind(
+            vec![(pid(1), c(1000), 0), (pid(2), c(1000), 1)],
+            0,
+            c(20),
+            c(10),
+            DeckSeed::default(),
+        );
+        hand.start().expect("start blind hand");
+        hand.apply_action(pid(1), PlayerAction::Call)
+            .expect("SB completes");
+
+        let transition = hand
+            .preview_action_transition(pid(2), &PlayerAction::Check)
+            .expect("BB option checks");
+        assert!(transition.round_closed_after, "check closes preflop");
+        assert_eq!(transition.street_after, Street::Flop);
+        assert_eq!(transition.stack_after, c(980));
+        assert_eq!(transition.committed_after, c(0));
+        assert_eq!(transition.current_bet_after, c(0));
+        assert_eq!(transition.min_raise_to_after, Some(c(20)));
+        assert_eq!(
+            transition.next_actor,
+            Some(pid(2)),
+            "the non-button/BB acts first postflop heads-up"
+        );
+        assert!(transition.next_actor_can_raise_after);
+        assert!(!transition.betting_terminal_after);
+    }
+
+    #[test]
+    fn short_big_blind_transition_uses_actual_live_contribution() {
+        // 3-way 10/20: button folds, SB's posted 10 already covers the BB's
+        // short all-in 8. No SB action exists; betting is terminal and only the
+        // board runout remains.
+        let mut covered = GameHand::new_blind(
+            vec![(pid(1), c(100), 0), (pid(2), c(100), 1), (pid(3), c(8), 2)],
+            0,
+            c(20),
+            c(10),
+            DeckSeed::default(),
+        );
+        covered.start().unwrap();
+        assert_eq!(covered.snapshot().current_actor, Some(pid(1)));
+        let closes = covered
+            .preview_action_transition(pid(1), &PlayerAction::Fold)
+            .unwrap();
+        assert!(closes.round_closed_after);
+        assert!(closes.betting_terminal_after);
+        assert_eq!(closes.next_actor, None);
+        assert_eq!(closes.min_raise_to_after, None);
+
+        // Negative companion: with a 5-chip SB, the short BB's actual 8 leaves
+        // a three-chip decision. The fold transition stays preflop, exposes the
+        // SB as actor, and advertises no dry-side-pot raise.
+        let mut owing = GameHand::new_blind(
+            vec![(pid(1), c(100), 0), (pid(2), c(100), 1), (pid(3), c(8), 2)],
+            0,
+            c(20),
+            c(5),
+            DeckSeed::default(),
+        );
+        owing.start().unwrap();
+        let remains = owing
+            .preview_action_transition(pid(1), &PlayerAction::Fold)
+            .unwrap();
+        assert!(!remains.round_closed_after);
+        assert!(!remains.betting_terminal_after);
+        assert_eq!(remains.street_after, Street::Preflop);
+        assert_eq!(remains.current_bet_after, c(8));
+        assert_eq!(remains.next_actor, Some(pid(2)));
+        assert_eq!(remains.min_raise_to_after, None);
+        assert!(!remains.next_actor_can_raise_after);
     }
 
     /// First voluntary action must get seq=2 (not seq=1 as before the fix).
@@ -2874,6 +3492,156 @@ mod tests {
             1,
             "out-of-range odd HU dealer index must wrap to seat 1"
         );
+    }
+
+    #[test]
+    fn usize_max_dealer_idx_wraps_through_a_complete_hand() {
+        assert_eq!(blind_positions(usize::MAX, 2), (usize::MAX % 2, 0));
+        let dealer = usize::MAX % 3;
+        assert_eq!(
+            blind_positions(usize::MAX, 3),
+            ((dealer + 1) % 3, (dealer + 2) % 3)
+        );
+
+        let mut hand = GameHand::new_with_rng(
+            vec![
+                (pid(1), c(1_000), 0),
+                (pid(2), c(1_000), 1),
+                (pid(3), c(1_000), 2),
+            ],
+            usize::MAX,
+            c(20),
+            c(10),
+            PokerRng::from_seed(13),
+        );
+        hand.start().expect("usize::MAX dealer starts safely");
+
+        while !hand.is_done() {
+            let snapshot = hand.snapshot();
+            let actor = snapshot.current_actor.expect("live hand has an actor");
+            let player = snapshot
+                .players
+                .iter()
+                .find(|player| player.player_id == actor)
+                .expect("actor exists");
+            let action = if snapshot.current_bet.0 > player.committed_this_street.0 {
+                PlayerAction::Call
+            } else {
+                PlayerAction::Check
+            };
+            hand.apply_action(actor, action)
+                .expect("call/check runout remains legal");
+        }
+
+        let result = hand.finish();
+        assert_eq!(result.show_order.len(), 3);
+    }
+
+    #[test]
+    fn street_action_facts_distinguish_all_in_call_short_raise_and_full_raise() {
+        struct Case {
+            all_in_total: u32,
+            increased_bet: bool,
+            full_raise: bool,
+            call_like: bool,
+            expected_last_aggressor: PlayerId,
+        }
+
+        let opener = pid(4);
+        let all_in_player = pid(1);
+        let cases = [
+            Case {
+                all_in_total: 50,
+                increased_bet: false,
+                full_raise: false,
+                call_like: true,
+                expected_last_aggressor: opener,
+            },
+            Case {
+                all_in_total: 100,
+                increased_bet: false,
+                full_raise: false,
+                call_like: true,
+                expected_last_aggressor: opener,
+            },
+            Case {
+                all_in_total: 150,
+                increased_bet: true,
+                full_raise: false,
+                call_like: false,
+                expected_last_aggressor: all_in_player,
+            },
+            Case {
+                all_in_total: 180,
+                increased_bet: true,
+                full_raise: true,
+                call_like: false,
+                expected_last_aggressor: all_in_player,
+            },
+        ];
+
+        for case in cases {
+            // Four handed, dealer pid1: pid2 posts SB, pid3 posts BB, pid4
+            // opens first to 100, then pid1 commits the case's exact stack.
+            let mut hand = GameHand::new_with_rng(
+                vec![
+                    (all_in_player, c(case.all_in_total), 0),
+                    (pid(2), c(1_000), 1),
+                    (pid(3), c(1_000), 2),
+                    (opener, c(1_000), 3),
+                ],
+                0,
+                c(20),
+                c(10),
+                PokerRng::from_seed(u64::from(case.all_in_total)),
+            );
+            hand.start().expect("start hand");
+            assert_eq!(hand.snapshot().current_actor, Some(opener));
+            hand.apply_action(opener, PlayerAction::Raise { amount: c(100) })
+                .expect("opening raise");
+            assert_eq!(hand.snapshot().current_actor, Some(all_in_player));
+            hand.apply_action(all_in_player, PlayerAction::AllIn)
+                .expect("all-in case is legal");
+
+            let facts = hand.current_street_action_facts();
+            assert_eq!(facts.len(), 2);
+            assert!(facts[0].increased_bet);
+            assert!(facts[0].full_raise);
+            assert_eq!(facts[1].increased_bet, case.increased_bet);
+            assert_eq!(facts[1].full_raise, case.full_raise);
+            assert_eq!(facts[1].is_call_like(), case.call_like);
+
+            let projected = facts[1].strategy_action();
+            if case.full_raise {
+                assert_eq!(projected, PlayerAction::AllIn);
+            } else {
+                assert_eq!(projected, PlayerAction::Call);
+            }
+            assert_eq!(
+                facts
+                    .iter()
+                    .rev()
+                    .find(|fact| fact.increased_bet)
+                    .map(|fact| fact.player_id),
+                Some(case.expected_last_aggressor)
+            );
+        }
+    }
+
+    #[test]
+    fn call_like_fact_counts_calls_but_not_short_raises() {
+        let fact = |action, increased_bet| StreetActionFact {
+            player_id: pid(1),
+            action,
+            increased_bet,
+            full_raise: false,
+        };
+
+        assert!(fact(PlayerAction::Call, false).is_call_like());
+        assert!(fact(PlayerAction::AllIn, false).is_call_like());
+        assert!(fact(PlayerAction::Raise { amount: c(100) }, false).is_call_like());
+        assert!(!fact(PlayerAction::AllIn, true).is_call_like());
+        assert!(!fact(PlayerAction::Raise { amount: c(150) }, true).is_call_like());
     }
 
     #[test]
@@ -3858,10 +4626,17 @@ mod blind_tests {
         );
         hand.start().unwrap();
 
-        // Everyone shoves all-in pre-flop; betting closes and the board runs out
-        // street by street via injection.
+        // The short and mid stacks shove; the deep stack is then the sole live
+        // stack and calls the 200 wager, retaining its unmatched 100 instead of
+        // manufacturing a dry side pot. Betting closes and the board runs out.
         let board = standard_board();
-        run_blind_betting(&mut hand, &board, |_snap, _actor| PlayerAction::AllIn);
+        run_blind_betting(&mut hand, &board, |_snap, actor| {
+            if actor == pid(3) {
+                PlayerAction::Call
+            } else {
+                PlayerAction::AllIn
+            }
+        });
         assert!(hand.is_done());
         let snap = hand.snapshot();
         assert_eq!(snap.board.count(), 5, "all-in runout reveals full board");
@@ -3896,15 +4671,19 @@ mod blind_tests {
 
         // pid1 (trips jacks) wins the main pot (all three contribute 100 → 300).
         // pid3 (trips nines) beats pid2 for the 200-chip second layer (pid2,pid3
-        // contribute 100 each above the 100 cap). pid3's unmatched top 100 over
-        // pid2's stack is refunded to pid3.
+        // contribute 100 each above the 100 cap). pid3's unmatched top 100 never
+        // enters the pot.
         let p1_award = *result.chips_awarded.get(&pid(1).inner()).unwrap();
         let p3_award = *result.chips_awarded.get(&pid(3).inner()).unwrap();
         let p2_award = *result.chips_awarded.get(&pid(2).inner()).unwrap();
         assert_eq!(p1_award, 300, "short stack scoops the 300 main pot");
         assert_eq!(p2_award, 0, "mid stack (ace high) wins nothing");
-        // pid3 wins the 200 side pot + its own 100 unmatched overage refund.
-        assert_eq!(p3_award, 300, "deep stack wins side pot + overage refund");
+        assert_eq!(p3_award, 200, "deep stack wins only the contested side pot");
+        assert_eq!(
+            result.final_stacks.get(&pid(3).inner()),
+            Some(&300),
+            "deep stack retains 100 and wins the 200 side pot"
+        );
     }
 
     // ---- 4b. forfeit economics: a side pot eligible ONLY to forfeiters must

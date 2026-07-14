@@ -1,15 +1,11 @@
-//! ADR-065 M2 — honest, public-information-only opponent range estimate.
+//! Honest, public-information-only opponent range estimate.
 //!
-//! This is the "复盘解锁 / range insight" computation: given ONLY a target
+//! Given only a target
 //! seat's *position* and its *preflop action bucket* (both derivable from public
 //! table information — who posted the blinds, the betting order, the board), it
 //! returns the set of starting hands a GTO baseline would play that way.
 //!
-//! # The fairness barrier (ADR-065 banner + T7/T8 — STRUCTURAL, must-fix)
-//!
-//! The product decision (ADR-065 banner, 2026-06-15) is that M2 reveals a
-//! *range estimate*, NOT literal opponent hole cards. The §4 body of the ADR
-//! (literal hole-card reveal) is SUPERSEDED and BLOCKED.
+//! # The fairness barrier
 //!
 //! This module is **structurally incapable** of emitting a literal hole card:
 //! its only inputs are a [`PositionBucket`] and an [`ActionBucket`] (two small
@@ -56,7 +52,7 @@ pub struct RangeClass {
 /// An honest, public-information-only estimate of the hands a seat would play
 /// the observed way from the observed position.
 ///
-/// SECURITY (ADR-065 T7/T8): contains NO literal hole cards — only aggregate
+/// SECURITY: contains NO literal hole cards — only aggregate
 /// 169-grid hand classes and an explicit basis label. It is safe to return to
 /// any participant of a finished hand.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -96,7 +92,7 @@ impl RangeEstimate {
 /// action bucket.
 ///
 /// This is the single entry point for the M2 "range insight" feature. Its
-/// signature is the structural fairness barrier (ADR-065 T7/T8): the inputs are
+/// signature is the structural fairness barrier: the inputs are
 /// two enums, so it is impossible for this code to read or emit a real hole
 /// card.
 ///

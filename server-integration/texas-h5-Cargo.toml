@@ -1,5 +1,5 @@
 [workspace]
-members = ["engine", "mental-poker", "server", "gto-solver"]
+members = ["engine", "mental-poker", "server", "gto-solver", "tools/bnb-hd-recovery"]
 resolver = "2"
 
 [workspace.package]

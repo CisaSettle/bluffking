@@ -227,6 +227,36 @@ pub enum OpenError {
     NotACard,
 }
 
+/// Verify one authenticated party's partial decryption against the committed
+/// ciphertext and that party's published DKG public key. This is the safe
+/// coordinator-side primitive for relays: it validates routing and DLEQ
+/// soundness without combining shares or materializing the plaintext card.
+pub fn verify_decryption_share(
+    deck_index: u32,
+    ct: &Ct,
+    party_pubkeys: &[(String, RistrettoPoint)],
+    share: &DecryptionShare,
+) -> Result<(), OpenError> {
+    let q_i = party_pubkeys
+        .iter()
+        .find(|(id, _)| id == &share.party_id)
+        .map(|(_, q)| *q)
+        .ok_or(OpenError::QuorumMismatch)?;
+
+    // Keep the same defense-in-depth identity-key rejection as the full
+    // threshold verifier. A caller-supplied directory is not trusted merely
+    // because it has the right party id.
+    if is_identity_pubkey(&q_i) {
+        return Err(OpenError::BadProof(share.party_id.clone()));
+    }
+    let d_i =
+        point_from_hex(&share.d_i).ok_or_else(|| OpenError::Malformed(share.party_id.clone()))?;
+    if !dleq_verify(&share.party_id, deck_index, &q_i, ct, &d_i, &share.dleq) {
+        return Err(OpenError::BadProof(share.party_id.clone()));
+    }
+    Ok(())
+}
+
 /// Verify every share's DLEQ against the published DKG public shares `Q_i`
 /// (`party_id → Q_i`) and recover the card id by combining `M = C2 − Σ D_i`.
 ///
@@ -253,24 +283,9 @@ pub fn verify_and_open(
             return Err(OpenError::QuorumMismatch); // duplicate party
         }
         seen.push(&share.party_id);
-        let q_i = party_pubkeys
-            .iter()
-            .find(|(id, _)| id == &share.party_id)
-            .map(|(_, q)| *q)
-            .ok_or(OpenError::QuorumMismatch)?; // party not in DKG set
-
-        // F-CRYPTO-15 (code-review #6): reject an identity (x_i=0) pubkey here
-        // too, not only at DKG verification — this verifier trusts a caller-
-        // supplied `party_pubkeys` slice, so it must enforce the guard itself.
-        // See `ec::is_identity_pubkey` for the full rationale.
-        if is_identity_pubkey(&q_i) {
-            return Err(OpenError::BadProof(share.party_id.clone()));
-        }
-        let d_i = point_from_hex(&share.d_i)
-            .ok_or_else(|| OpenError::Malformed(share.party_id.clone()))?;
-        if !dleq_verify(&share.party_id, deck_index, &q_i, ct, &d_i, &share.dleq) {
-            return Err(OpenError::BadProof(share.party_id.clone()));
-        }
+        verify_decryption_share(deck_index, ct, party_pubkeys, share)?;
+        let d_i =
+            point_from_hex(&share.d_i).expect("verify_decryption_share accepted canonical d_i");
         sum_d += d_i;
     }
     let m = ct.c2 - sum_d;
@@ -461,6 +476,65 @@ mod tests {
             .iter()
             .map(|p| (p.party_id.clone(), p.q_i))
             .collect()
+    }
+
+    /// Relay verification is intentionally single-share (it must not combine or
+    /// reveal a card), but it still binds the authenticated party, deck index,
+    /// exact committed ciphertext, partial decryption, and DKG key. Any change
+    /// to one of those fields must fail before the coordinator counts the share.
+    #[test]
+    fn verify_decryption_share_binds_sender_index_ciphertext_and_proof() {
+        let mut rng = OsRng;
+        let run = DkgRun::simulate(3, &mut rng);
+        let pks = pubkeys(&run);
+        let deck_index = 17;
+        let ct = Ct::encrypt_card(31, &run.joint_key, &Scalar::random(&mut rng));
+        let share = partial_decrypt(&run.parties[1], deck_index, &ct, &mut rng);
+
+        assert_eq!(
+            verify_decryption_share(deck_index, &ct, &pks, &share),
+            Ok(()),
+            "a genuine opaque share must verify without opening the card"
+        );
+        assert!(matches!(
+            verify_decryption_share(deck_index + 1, &ct, &pks, &share),
+            Err(OpenError::BadProof(party)) if party == "party:1"
+        ));
+
+        let mut wrong_sender = share.clone();
+        wrong_sender.party_id = "party:0".into();
+        assert!(matches!(
+            verify_decryption_share(deck_index, &ct, &pks, &wrong_sender),
+            Err(OpenError::BadProof(party)) if party == "party:0"
+        ));
+
+        let mut unknown_sender = share.clone();
+        unknown_sender.party_id = "party:99".into();
+        assert_eq!(
+            verify_decryption_share(deck_index, &ct, &pks, &unknown_sender),
+            Err(OpenError::QuorumMismatch)
+        );
+
+        let mut changed_ct = ct;
+        changed_ct.c2 += G;
+        assert!(matches!(
+            verify_decryption_share(deck_index, &changed_ct, &pks, &share),
+            Err(OpenError::BadProof(party)) if party == "party:1"
+        ));
+
+        let mut changed_share = share.clone();
+        changed_share.d_i = point_to_hex(&(point_from_hex(&share.d_i).unwrap() + G));
+        assert!(matches!(
+            verify_decryption_share(deck_index, &ct, &pks, &changed_share),
+            Err(OpenError::BadProof(party)) if party == "party:1"
+        ));
+
+        let mut malformed = share;
+        malformed.d_i = "not-a-point".into();
+        assert!(matches!(
+            verify_decryption_share(deck_index, &ct, &pks, &malformed),
+            Err(OpenError::Malformed(party)) if party == "party:1"
+        ));
     }
 
     /// Code-review #6 (F-CRYPTO-15 at the consuming verifier): a malicious party

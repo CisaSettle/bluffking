@@ -65,7 +65,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use axum::{
-    extract::{rejection::JsonRejection, ConnectInfo},
+    extract::{rejection::JsonRejection, ConnectInfo, State},
     http::StatusCode,
     response::IntoResponse,
     Json,
@@ -80,6 +80,10 @@ use gto_solver::{
     hero_strategy, solve_spot, HandStrategy, Player, SolveError, SolveLimits, SolveOutput,
     SolveRequest, SolveStreet,
 };
+
+use crate::app_state::AppState;
+use crate::auth::middleware::OptionalAuthUser;
+use crate::entitlement::{self, Tier};
 
 /// Hard wall-clock timeout for one solve. The design measured a 1-bet-size flop
 /// at single-digit seconds; 12 s leaves headroom for a busy box while bounding a
@@ -183,7 +187,28 @@ const MAX_INFLIGHT_PER_IP: usize = 1;
 const PUBLIC_MAX_MEMORY_BYTES: u64 = 1_000_000_000;
 
 /// Iteration cap (safety net — flop converges to <1% pot in <100 iters).
+/// This is the PUBLIC / anonymous / Free-tier cap and is UNCHANGED (ADR-085 adds
+/// the Pro/Max caps below ABOVE this baseline; it never lowers the public one).
 const PUBLIC_MAX_ITERATIONS: u32 = 800;
+
+/// ADR-085 §Entitlement Matrix — Pro-tier iteration cap (deeper convergence than
+/// the public/Free baseline). Applied to a signed-in Pro caller.
+const PRO_MAX_ITERATIONS: u32 = 3200;
+
+/// ADR-085 §Entitlement Matrix — Max-tier iteration cap (deepest convergence).
+/// Applied to a signed-in Max caller. The memory gate ([`PUBLIC_MAX_MEMORY_BYTES`])
+/// stays UNIFORM across tiers, so a wider Pro/Max tree that would exceed 1 GB is
+/// still rejected by the memory guard — tiers only relax the iteration cap and
+/// the pre-check bet/raise-size WIDTH below.
+const MAX_TIER_MAX_ITERATIONS: u32 = 8000;
+
+/// Max distinct FLOP bet/raise sizes allowed per tier. Free = 1 (the existing
+/// public cap — the flop tree is the memory-expensive one), Pro = 3, Max = "all"
+/// (bounded generously; the token-length cap + the memory gate remain the hard
+/// safety limits). Turn/river trees are tiny, so all tiers keep the existing 2.
+const PRO_MAX_FLOP_SIZES: usize = 3;
+const MAX_TIER_FLOP_SIZES: usize = 8;
+const MAX_TIER_TURN_RIVER_SIZES: usize = 8;
 
 /// Stop once exploitability reaches this fraction of the pot (0.5%).
 const PUBLIC_TARGET_EXPLOIT_PCT: f32 = 0.005;
@@ -813,13 +838,17 @@ fn spot_repr(req: &SolveRequest) -> String {
         Player::Ip => "ip",
     };
     format!(
-        "{street}|{board}|{}|{}|{}|{}|{}|{}|{player}",
+        "{street}|{board}|{}|{}|{}|{}|{}|{}|{player}|it{}",
         canonical_range(&req.oop_range),
         canonical_range(&req.ip_range),
         req.starting_pot,
         req.effective_stack,
         req.bet_sizes.to_ascii_lowercase().replace(' ', ""),
         req.raise_sizes.to_ascii_lowercase().replace(' ', ""),
+        // ADR-085: the iteration cap varies by membership tier for the SAME spot,
+        // so it partitions the cache — a Free 800-iter solve must not be served
+        // to a Max caller expecting 8000 iters (and vice-versa).
+        req.limits.max_iterations,
     )
 }
 
@@ -868,6 +897,9 @@ fn spot_key(req: &SolveRequest) -> u64 {
         Player::Oop => h.write_u8(0),
         Player::Ip => h.write_u8(1),
     }
+    // ADR-085: partition the cache by the tier-dependent iteration cap (see
+    // `spot_repr`), so different tiers never serve each other's convergence.
+    h.write_u32(req.limits.max_iterations);
     h.finish()
 }
 
@@ -1065,12 +1097,18 @@ fn map_solve_error(e: SolveError) -> axum::response::Response {
 /// `spawn_blocking` under a hard wall-clock timeout. The pre-allocation memory
 /// gate inside `gto-solver` rejects oversized spots before allocating.
 pub async fn solve_handler(
+    // ADR-085: tier resolution needs the pool. State is FromRequestParts, so it
+    // does not interfere with the body extractor below.
+    State(state): State<AppState>,
     // F1: the source IP gates the per-IP in-flight cap. Optional so a router that
     // mounts the handler WITHOUT `into_make_service_with_connect_info`
     // (e.g. a focused unit test) still works — a missing peer falls back to a
     // shared loopback sentinel (see `client_ip`). Production wires ConnectInfo via
     // `axum::serve(.., app.into_make_service_with_connect_info::<SocketAddr>())`.
     connect_info: Option<ConnectInfo<SocketAddr>>,
+    // ADR-085: this route stays PUBLIC/anonymous. OptionalAuthUser NEVER 401s — a
+    // signed-in Pro/Max caller is granted a deeper solve; anonymous = Free.
+    OptionalAuthUser(maybe_user): OptionalAuthUser,
     body: Result<Json<SolveRequestDto>, JsonRejection>,
 ) -> impl IntoResponse {
     // Malformed JSON → 400 in the poker-tools dialect (constant reason, never
@@ -1078,6 +1116,19 @@ pub async fn solve_handler(
     let Json(dto) = match body {
         Ok(json) => json,
         Err(_rejection) => return bad_request("invalid_input", "malformed request body"),
+    };
+
+    // ADR-085 §Entitlement Matrix — resolve the caller's tier (anonymous = Free).
+    // The public/Free baseline (800 iters, 1 flop size) is UNCHANGED; Pro/Max only
+    // get MORE iterations and a wider bet/raise tree ON TOP of it.
+    let tier = match &maybe_user {
+        Some(user) => entitlement::effective_tier(&state.pool, user.user_id).await,
+        None => Tier::Free,
+    };
+    let max_iterations = match tier {
+        Tier::Free => PUBLIC_MAX_ITERATIONS,
+        Tier::Pro => PRO_MAX_ITERATIONS,
+        Tier::Max => MAX_TIER_MAX_ITERATIONS,
     };
 
     // --- street ---
@@ -1180,15 +1231,24 @@ pub async fn solve_handler(
     // there. F2: raise_sizes is now counted+capped the SAME way as bet_sizes —
     // previously only bet_sizes was guarded, so a wide `raise_sizes` could still
     // expand the tree (an inconsistency + a residual CPU-DoS dimension).
-    let max_sizes = match street {
-        SolveStreet::Flop => 1,
-        SolveStreet::Turn | SolveStreet::River => 2,
+    //
+    // ADR-085 §Entitlement Matrix — Pro/Max may build a WIDER tree than the
+    // Free/public baseline: Pro = 3 flop sizes, Max = "all" (bounded). The turn
+    // /river cap stays 2 for Free/Pro (tiny trees), widened only for Max. The
+    // uniform memory gate ([`PUBLIC_MAX_MEMORY_BYTES`]) still rejects any tree
+    // that would exceed 1 GB regardless of tier.
+    let max_sizes = match (street, tier) {
+        (SolveStreet::Flop, Tier::Free) => 1,
+        (SolveStreet::Flop, Tier::Pro) => PRO_MAX_FLOP_SIZES,
+        (SolveStreet::Flop, Tier::Max) => MAX_TIER_FLOP_SIZES,
+        (SolveStreet::Turn | SolveStreet::River, Tier::Max) => MAX_TIER_TURN_RIVER_SIZES,
+        (SolveStreet::Turn | SolveStreet::River, _) => 2,
     };
     if count_bet_sizes(&bet_sizes) > max_sizes {
         return bad_request(
             "too_many_bet_sizes",
             format!(
-                "the free solver allows at most {max_sizes} bet size(s) on the {} — \
+                "your plan allows at most {max_sizes} bet size(s) on the {} — \
                  a wider tree exceeds the memory budget",
                 street_str(street)
             ),
@@ -1198,7 +1258,7 @@ pub async fn solve_handler(
         return bad_request(
             "too_many_raise_sizes",
             format!(
-                "the free solver allows at most {max_sizes} raise size(s) on the {} — \
+                "your plan allows at most {max_sizes} raise size(s) on the {} — \
                  a wider tree exceeds the memory budget",
                 street_str(street)
             ),
@@ -1247,8 +1307,10 @@ pub async fn solve_handler(
         hero,
         solving_player,
         limits: SolveLimits {
+            // Memory cap stays UNIFORM across tiers (ADR-085): only iterations +
+            // tree width are tier-scaled; a too-large tree is still memory-gated.
             max_memory_bytes: PUBLIC_MAX_MEMORY_BYTES,
-            max_iterations: PUBLIC_MAX_ITERATIONS,
+            max_iterations,
             target_exploitability_pct_of_pot: PUBLIC_TARGET_EXPLOIT_PCT,
         },
     };

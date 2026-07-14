@@ -35,8 +35,8 @@ pub use deck::Deck;
 pub use eval::{describe_hand, rank_hand, rank_players, HandRank, RankDescription};
 pub use event::EngineEvent;
 pub use game::{
-    blind_positions, BlindFinishError, BlindInjectError, GameHand, GameSnapshot, HandResult,
-    HandSeat, HoleSlot,
+    blind_positions, ActionTransitionPreview, BlindFinishError, BlindInjectError, GameHand,
+    GameSnapshot, HandResult, HandSeat, HoleSlot, StreetActionFact,
 };
 pub use hand::{BoardCards, HoleCards, Street};
 pub use player::{Chips, PlayerId, Position, Seat};

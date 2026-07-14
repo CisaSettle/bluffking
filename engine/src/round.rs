@@ -299,8 +299,34 @@ impl BettingRound {
         if self.done || self.players.is_empty() {
             return false;
         }
-        let ps = &self.players[self.current];
+        self.player_can_raise(self.current)
+    }
+
+    /// Whether `idx` may make an aggressive wager in the current state.
+    ///
+    /// Raise rights alone are insufficient: poker has no meaningful wager when
+    /// nobody with chips remains able to respond. In particular, the sole live
+    /// stack facing an all-in opponent may fold or call the outstanding amount,
+    /// but may not create an unmatched overage that would immediately be
+    /// refunded as a synthetic side pot.
+    fn player_can_raise(&self, idx: usize) -> bool {
+        let Some(ps) = self.players.get(idx) else {
+            return false;
+        };
         if ps.folded || ps.all_in {
+            return false;
+        }
+        // The actor must be able to put at least one chip beyond a call.
+        if ps.contributed.0.saturating_add(ps.stack.0) <= self.current_bet.0 {
+            return false;
+        }
+        // At least one other live stack must remain capable of responding.
+        if !self
+            .players
+            .iter()
+            .enumerate()
+            .any(|(other_idx, other)| other_idx != idx && !other.folded && !other.all_in)
+        {
             return false;
         }
         // A player who already acted may only re-raise if a full raise cleared
@@ -345,6 +371,19 @@ impl BettingRound {
             return Err(ActionError::AlreadyFolded);
         }
         if ps.all_in {
+            return Err(ActionError::InvalidAction);
+        }
+
+        // A wager above the current bet is an aggressive action regardless of
+        // whether it arrived as Raise(to=...) or AllIn. It is illegal unless the
+        // actor has raise rights, chips beyond the call, and another live stack
+        // that can respond. Exact/partial all-in calls remain legal.
+        let is_aggressive_attempt = match action {
+            PlayerAction::Raise { amount } => amount.0 > self.current_bet.0,
+            PlayerAction::AllIn => ps.contributed.0.saturating_add(ps.stack.0) > self.current_bet.0,
+            _ => false,
+        };
+        if is_aggressive_attempt && !self.player_can_raise(idx) {
             return Err(ActionError::InvalidAction);
         }
 
@@ -802,6 +841,16 @@ impl BettingRound {
                     self.done = true;
                     return;
                 }
+                // A short big blind floors the opening `current_bet` to the
+                // nominal blind while multiple live stacks can still enter for
+                // a full bring-in. Once folds leave a single live stack facing
+                // only that short all-in, however, its real decision is against
+                // the opponent's ACTUAL contribution. Lower the effective bet
+                // now so Call commits only the difference (e.g. SB 5 versus BB
+                // all-in 8 calls 3, not the phantom nominal 20).
+                if self.current_bet.0 > max_opp_contrib {
+                    self.current_bet = Chips(max_opp_contrib);
+                }
             }
         }
 
@@ -844,6 +893,15 @@ mod tests {
         vec![(pid(1), c(s1)), (pid(2), c(s2)), (pid(3), c(s3))]
     }
 
+    fn four_players(s1: u32, s2: u32, s3: u32, s4: u32) -> Vec<(PlayerId, Chips)> {
+        vec![
+            (pid(1), c(s1)),
+            (pid(2), c(s2)),
+            (pid(3), c(s3)),
+            (pid(4), c(s4)),
+        ]
+    }
+
     // U05 (dual-AI OSS review): a `Blind` is never a voluntary in-turn action —
     // blinds post internally during setup. Accepting it here would bypass every
     // betting rule, and the variant is wire-deserializable.
@@ -872,7 +930,7 @@ mod tests {
     #[test]
     fn cumulative_short_all_ins_reopen_action() {
         // P1 opens to 100 (full raise, last_raise_amount = 100).
-        let mut round = BettingRound::new(three_players(5000, 150, 220), 0, c(0), c(20));
+        let mut round = BettingRound::new(four_players(5000, 150, 220, 5000), 0, c(0), c(20));
         round
             .apply_action(pid(1), &PlayerAction::Raise { amount: c(100) })
             .unwrap();
@@ -880,6 +938,9 @@ mod tests {
         // reopens, but together they raise the bet 120 over the 100 full raise.
         round.apply_action(pid(2), &PlayerAction::AllIn).unwrap();
         round.apply_action(pid(3), &PlayerAction::AllIn).unwrap();
+        // P4 is still a live stack and calls, so it can respond if P1 re-raises.
+        // Without P4, P1 would be the sole chip-holder and could only call/fold.
+        round.apply_action(pid(4), &PlayerAction::Call).unwrap();
         // Action returns to P1 facing a cumulative full raise → may re-raise.
         assert_eq!(round.current_player(), Some(pid(1)));
         assert!(
@@ -890,6 +951,86 @@ mod tests {
             .apply_action(pid(1), &PlayerAction::Raise { amount: c(400) })
             .expect("re-raise must be legal when action is reopened cumulatively");
         assert_eq!(round.current_bet(), c(400));
+    }
+
+    /// A sole live stack facing an all-in opponent has a fold/call decision,
+    /// never a right to manufacture an unmatched overage. This is the exact HU
+    /// 10/20 failure that previously accepted RaiseTo(200) / AllIn(1000), then
+    /// created a meaningless side-pot layer that was immediately refunded.
+    #[test]
+    fn sole_live_stack_facing_all_in_cannot_raise_but_can_call() {
+        let mut round = BettingRound::new_preflop(
+            two_players(100, 1000),
+            0,
+            &[(pid(1), c(10)), (pid(2), c(20))],
+            c(20),
+        );
+        round.apply_action(pid(1), &PlayerAction::AllIn).unwrap();
+        assert_eq!(round.current_player(), Some(pid(2)));
+        assert_eq!(round.current_bet(), c(100));
+        assert!(!round.current_player_can_raise());
+
+        assert_eq!(
+            round
+                .apply_action(pid(2), &PlayerAction::Raise { amount: c(200) })
+                .unwrap_err(),
+            ActionError::InvalidAction
+        );
+        assert_eq!(
+            round
+                .apply_action(pid(2), &PlayerAction::AllIn)
+                .unwrap_err(),
+            ActionError::InvalidAction,
+            "an all-in above the call is still an illegal dry-side-pot raise"
+        );
+
+        round.apply_action(pid(2), &PlayerAction::Call).unwrap();
+        assert!(round.is_done());
+        assert_eq!(round.player_contributed(pid(1)), c(100));
+        assert_eq!(round.player_contributed(pid(2)), c(100));
+        assert_eq!(round.pot_total(), c(200));
+    }
+
+    #[test]
+    fn all_in_call_shapes_remain_legal_when_no_raise_is_possible() {
+        // Exact all-in call: P2 has exactly the 80 chips needed after its blind.
+        let mut exact = BettingRound::new_preflop(
+            two_players(100, 100),
+            0,
+            &[(pid(1), c(10)), (pid(2), c(20))],
+            c(20),
+        );
+        exact.apply_action(pid(1), &PlayerAction::AllIn).unwrap();
+        exact
+            .apply_action(pid(2), &PlayerAction::AllIn)
+            .expect("exact all-in call remains legal");
+        assert!(exact.is_done());
+
+        // Partial all-in call: P2 cannot cover the 100 bet but may commit its
+        // remaining 50; total_committed stays below current_bet.
+        let mut partial = BettingRound::new(two_players(100, 50), 0, c(0), c(20));
+        partial.apply_action(pid(1), &PlayerAction::AllIn).unwrap();
+        partial
+            .apply_action(pid(2), &PlayerAction::AllIn)
+            .expect("partial all-in call remains legal");
+        assert!(partial.is_done());
+        assert_eq!(partial.player_contributed(pid(2)), c(50));
+    }
+
+    #[test]
+    fn all_in_raises_remain_legal_with_a_live_responder() {
+        let mut short = BettingRound::new(three_players(150, 1000, 1000), 0, c(100), c(100));
+        assert!(short.current_player_can_raise());
+        short
+            .apply_action(pid(1), &PlayerAction::AllIn)
+            .expect("short all-in raise is legal while two live stacks can respond");
+        assert_eq!(short.current_bet(), c(150));
+
+        let mut full = BettingRound::new(three_players(300, 1000, 1000), 0, c(100), c(100));
+        assert!(full.current_player_can_raise());
+        full.apply_action(pid(1), &PlayerAction::AllIn)
+            .expect("full all-in raise is legal while two live stacks can respond");
+        assert_eq!(full.current_bet(), c(300));
     }
 
     // Negative control: a SINGLE sub-minimum all-in must NOT reopen action.
@@ -1067,12 +1208,20 @@ mod tests {
         let mut round = BettingRound::new(three_players(300, 600, 1000), 0, c(0), c(20));
         round.apply_action(pid(1), &PlayerAction::AllIn).unwrap();
         round.apply_action(pid(2), &PlayerAction::AllIn).unwrap();
-        round.apply_action(pid(3), &PlayerAction::AllIn).unwrap();
+        // P3 is now the sole live stack. It may call 600 but cannot shove an
+        // unmatched extra 400 into a dry side pot.
+        round.apply_action(pid(3), &PlayerAction::Call).unwrap();
         assert!(round.is_done());
 
         let pots = round.side_pots();
         let total: u32 = pots.iter().map(|p| p.amount.0).sum();
-        assert_eq!(total, 1900);
+        assert_eq!(total, 1500);
+        let p3 = round
+            .player_states()
+            .iter()
+            .find(|player| player.player_id == pid(3))
+            .unwrap();
+        assert_eq!(p3.stack, c(400));
     }
 
     /// REGRESSION (2026-05-29): a freshly-opened street with exactly ONE player
@@ -1120,6 +1269,40 @@ mod tests {
             round.is_done(),
             "round closes once the lone live stack matches the all-in"
         );
+    }
+
+    #[test]
+    fn lone_live_player_calls_only_actual_short_blind_contribution() {
+        // Nominal blinds are 10/20, but the BB can post only 8. UTG folds,
+        // leaving the SB (10 already posted) fully covering the all-in: no
+        // phantom action against the nominal 20.
+        let mut covered = BettingRound::new_preflop(
+            three_players(100, 100, 8),
+            0,
+            &[(pid(2), c(10)), (pid(3), c(20))],
+            c(20),
+        );
+        covered.apply_action(pid(1), &PlayerAction::Fold).unwrap();
+        assert!(covered.is_done());
+        assert_eq!(covered.current_player(), None);
+
+        // With an SB contribution of only 5, the same short BB leaves a real
+        // three-chip call. The effective bet must become 8, not stay at the
+        // nominal 20 floor.
+        let mut owing = BettingRound::new_preflop(
+            three_players(100, 100, 8),
+            0,
+            &[(pid(2), c(5)), (pid(3), c(20))],
+            c(20),
+        );
+        owing.apply_action(pid(1), &PlayerAction::Fold).unwrap();
+        assert!(!owing.is_done());
+        assert_eq!(owing.current_player(), Some(pid(2)));
+        assert_eq!(owing.current_bet(), c(8));
+        assert!(!owing.current_player_can_raise());
+        owing.apply_action(pid(2), &PlayerAction::Call).unwrap();
+        assert_eq!(owing.player_contributed(pid(2)), c(8));
+        assert!(owing.is_done());
     }
 
     #[test]

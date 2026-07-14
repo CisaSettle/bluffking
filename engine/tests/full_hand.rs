@@ -555,20 +555,19 @@ fn rigged_deck(prefix: &[Card]) -> Deck {
     Deck::from_cards(cards)
 }
 
-/// SPLIT POT — exact tie with an ODD-chip remainder.
+/// SPLIT POT — exact tie where both players play the board.
 ///
 /// Heads-up, both players all-in preflop for an EQUAL pot, and the board makes
 /// the hand for BOTH of them (quad aces + a K kicker on the board; neither
 /// player's two hole cards can beat a board K kicker, so they play the board).
-/// The pot is engineered to be ODD (2 × 1505 = 3010) so it does NOT divide
-/// evenly — the engine must split it without losing or minting a chip.
+/// Equal heads-up all-ins necessarily make an even pot (2 × 1505 = 3010), so
+/// this checks exact equal division. Odd-chip placement has a dedicated
+/// three-handed unit test in `game.rs`.
 ///
 /// Catches: a tie that mis-awards the whole pot to one seat (PartialEq winner
-/// pick instead of an equal-rank split), or an odd-chip split that drops the
-/// remainder (3010 → 1505 + 1504 with a chip vanishing).
+/// pick instead of an equal-rank split), or a split that drops a chip.
 #[test]
-fn split_pot_exact_tie_odd_chip_remainder_board_plays() {
-    // Odd starting stacks so the all-in pot total (3010) is odd.
+fn split_pot_exact_tie_board_plays() {
     let stack = 1505u32;
     let players = vec![(pid(1), c(stack), 0u8), (pid(2), c(stack), 1u8)];
 
@@ -608,9 +607,9 @@ fn split_pot_exact_tie_odd_chip_remainder_board_plays() {
 
     let result = hand.finish();
 
-    // Chip conservation: nothing minted or lost across the odd split.
+    // Chip conservation: nothing minted or lost across the split.
     let final_total: u32 = result.final_stacks.values().sum();
-    assert_eq!(final_total, stack * 2, "odd-chip split must conserve chips");
+    assert_eq!(final_total, stack * 2, "split pot must conserve chips");
 
     // BOTH seats must receive a share (it's a tie — not a single winner).
     let p1 = *result.chips_awarded.get(&1).unwrap_or(&0);
@@ -620,9 +619,7 @@ fn split_pot_exact_tie_odd_chip_remainder_board_plays() {
         "exact tie: both seats must win a share (got p1={p1}, p2={p2})"
     );
 
-    // Odd pot of 3010 splits 1505/1505 — but even if the engine awarded the odd
-    // chip to one seat (1506/1504), the two shares must differ by AT MOST 1 and
-    // sum to the whole pot. This asserts the split is fair AND complete.
+    // Even pot of 3010 must split 1505/1505 and sum to the whole pot.
     let pot_total: u32 = result.pots.iter().map(|p| p.amount.0).sum();
     assert_eq!(
         p1 + p2,
@@ -630,14 +627,236 @@ fn split_pot_exact_tie_odd_chip_remainder_board_plays() {
         "the two tied shares must sum to the whole pot"
     );
     let diff = p1.abs_diff(p2);
-    assert!(
-        diff <= 1,
-        "tied shares must differ by at most the odd chip (got diff={diff})"
-    );
+    assert_eq!(diff, 0, "even tied pot must split exactly equally");
 
     // The showdown must actually be a tie at the rank level (defensive: ensures
     // the board-plays setup held and we're not accidentally testing a fold).
     assert_eq!(result.show_order.len(), 2, "both players reach showdown");
+}
+
+/// A no-all-in hand has one canonical contestable pot across all streets.
+/// Splitting street fragments independently can award the same odd chip more
+/// than once and turn an exact 12/12 chop into 11/13.
+#[test]
+fn no_all_in_multistreet_tie_uses_one_canonical_pot() {
+    let players = vec![
+        (pid(1), c(100), 0u8),
+        (pid(2), c(100), 1u8),
+        (pid(3), c(100), 2u8),
+    ];
+    let prefix = [
+        Card::new(Rank::Ten, Suit::Clubs),
+        Card::new(Rank::Nine, Suit::Clubs),
+        Card::new(Rank::Ten, Suit::Diamonds),
+        Card::new(Rank::Three, Suit::Clubs),
+        Card::new(Rank::Eight, Suit::Clubs),
+        Card::new(Rank::Four, Suit::Clubs),
+        Card::new(Rank::Ace, Suit::Spades),
+        Card::new(Rank::King, Suit::Spades),
+        Card::new(Rank::Queen, Suit::Hearts),
+        Card::new(Rank::Jack, Suit::Hearts),
+        Card::new(Rank::Two, Suit::Diamonds),
+    ];
+    let mut hand = GameHand::new_with_deck(players, 0, c(2), c(1), rigged_deck(&prefix), [7u8; 32]);
+    hand.start().expect("start ok");
+
+    // Preflop: all three match the big blind (pot 6).
+    hand.apply_action(pid(1), PlayerAction::Call).unwrap();
+    hand.apply_action(pid(2), PlayerAction::Call).unwrap();
+    hand.apply_action(pid(3), PlayerAction::Check).unwrap();
+
+    // Flop and turn: three chips each (two street fragments of 9).
+    for _ in 0..2 {
+        hand.apply_action(pid(2), PlayerAction::Raise { amount: c(3) })
+            .unwrap();
+        hand.apply_action(pid(3), PlayerAction::Call).unwrap();
+        hand.apply_action(pid(1), PlayerAction::Call).unwrap();
+    }
+
+    // River checks through.
+    hand.apply_action(pid(2), PlayerAction::Check).unwrap();
+    hand.apply_action(pid(3), PlayerAction::Check).unwrap();
+    hand.apply_action(pid(1), PlayerAction::Check).unwrap();
+    assert!(hand.is_done());
+
+    let result = hand.finish();
+    let contestable: Vec<_> = result.pots.iter().filter(|pot| !pot.is_refund).collect();
+    assert_eq!(
+        contestable.len(),
+        1,
+        "no all-in hand must have one canonical pot"
+    );
+    assert_eq!(contestable[0].amount, c(24));
+    assert_eq!(result.chips_awarded.get(&1), Some(&12));
+    assert_eq!(result.chips_awarded.get(&3), Some(&12));
+    assert_eq!(result.final_stacks.get(&1), Some(&104));
+    assert_eq!(result.final_stacks.get(&3), Some(&104));
+}
+
+/// Folded players' unequal dead-money contributions do not create separate
+/// pots when the surviving players have the same entitlement to every layer.
+#[test]
+fn folded_dead_money_layers_merge_before_odd_chip_split() {
+    let players = (1u64..=5)
+        .map(|n| (pid(n), c(100), (n - 1) as u8))
+        .collect();
+    let prefix = [
+        Card::new(Rank::Two, Suit::Clubs),
+        Card::new(Rank::Three, Suit::Clubs),
+        Card::new(Rank::Four, Suit::Clubs),
+        Card::new(Rank::Five, Suit::Clubs),
+        Card::new(Rank::Six, Suit::Clubs),
+        Card::new(Rank::Two, Suit::Diamonds),
+        Card::new(Rank::Three, Suit::Diamonds),
+        Card::new(Rank::Four, Suit::Diamonds),
+        Card::new(Rank::Five, Suit::Diamonds),
+        Card::new(Rank::Six, Suit::Diamonds),
+        Card::new(Rank::Ace, Suit::Spades),
+        Card::new(Rank::King, Suit::Spades),
+        Card::new(Rank::Queen, Suit::Spades),
+        Card::new(Rank::Jack, Suit::Spades),
+        Card::new(Rank::Ten, Suit::Spades),
+    ];
+    let mut hand = GameHand::new_with_deck(players, 0, c(2), c(1), rigged_deck(&prefix), [8u8; 32]);
+    hand.start().unwrap();
+
+    hand.apply_action(pid(4), PlayerAction::Raise { amount: c(5) })
+        .unwrap();
+    hand.apply_action(pid(5), PlayerAction::Raise { amount: c(8) })
+        .unwrap();
+    hand.apply_action(pid(1), PlayerAction::Call).unwrap();
+    hand.apply_action(pid(2), PlayerAction::Fold).unwrap();
+    hand.apply_action(pid(3), PlayerAction::Fold).unwrap();
+    hand.apply_action(pid(4), PlayerAction::Fold).unwrap();
+
+    while !hand.is_done() {
+        let actor = hand.snapshot().current_actor.expect("two live players act");
+        hand.apply_action(actor, PlayerAction::Check).unwrap();
+    }
+    let snapshot = hand.snapshot();
+    assert_eq!(snapshot.side_pots.len(), 1);
+    assert_eq!(snapshot.side_pots[0].amount, c(24));
+    assert_eq!(snapshot.side_pots[0].cap, c(8));
+    assert_eq!(snapshot.side_pots[0].eligible, vec![pid(1), pid(5)]);
+    let result = hand.finish();
+    let contestable: Vec<_> = result.pots.iter().filter(|pot| !pot.is_refund).collect();
+    assert_eq!(
+        contestable.len(),
+        1,
+        "dead money must not fragment one entitlement"
+    );
+    assert_eq!(contestable[0].amount, c(24));
+    assert_eq!(result.chips_awarded.get(&1), Some(&12));
+    assert_eq!(result.chips_awarded.get(&5), Some(&12));
+    assert_eq!(result.final_stacks.get(&1), Some(&104));
+    assert_eq!(result.final_stacks.get(&5), Some(&104));
+}
+
+/// Contestable chips and a single-player uncalled overage may have the same
+/// eligible seat, but `refund_to` makes them semantically different layers.
+#[test]
+fn fold_around_keeps_contested_pot_separate_from_uncalled_refund() {
+    let players = vec![(pid(1), c(100), 0u8), (pid(2), c(100), 1u8)];
+    let mut hand = GameHand::new_with_rng(players, 0, c(2), c(1), PokerRng::from_seed(11));
+    hand.start().unwrap();
+    hand.apply_action(pid(1), PlayerAction::Raise { amount: c(8) })
+        .unwrap();
+    hand.apply_action(pid(2), PlayerAction::Fold).unwrap();
+    assert!(hand.is_done());
+
+    let snapshot = hand.snapshot();
+    assert_eq!(snapshot.side_pots.len(), 2);
+    assert_eq!(snapshot.side_pots[0].amount, c(4));
+    assert_eq!(snapshot.side_pots[0].cap, c(2));
+    assert_eq!(snapshot.side_pots[0].eligible, vec![pid(1)]);
+    assert!(snapshot.side_pots[0].refund_to.is_empty());
+    assert_eq!(snapshot.side_pots[1].amount, c(6));
+    assert_eq!(snapshot.side_pots[1].cap, c(8));
+    assert_eq!(snapshot.side_pots[1].eligible, vec![pid(1)]);
+    assert_eq!(snapshot.side_pots[1].refund_to, vec![pid(1)]);
+
+    let result = hand.finish();
+    assert_eq!(result.pots.len(), 2);
+    assert!(!result.pots[0].is_refund);
+    assert!(result.pots[1].is_refund);
+    assert_eq!(result.pots[0].amount, c(4));
+    assert_eq!(result.pots[1].amount, c(6));
+    assert_eq!(result.final_stacks.get(&1), Some(&102));
+    assert_eq!(result.final_stacks.get(&2), Some(&98));
+}
+
+/// The inclusive public chip-domain boundary is legal: a table totaling
+/// exactly u32::MAX must settle without intermediate overflow.
+#[test]
+fn table_total_exactly_u32_max_settles_canonical_pot() {
+    let deep = 1_717_986_916u32;
+    let players = vec![
+        (pid(1), c(deep), 0u8),
+        (pid(2), c(2), 1u8),
+        (pid(3), c(3), 2u8),
+        (pid(4), c(858_993_458), 3u8),
+        (pid(5), c(deep), 4u8),
+    ];
+    assert_eq!(
+        players
+            .iter()
+            .map(|(_, stack, _)| u64::from(stack.0))
+            .sum::<u64>(),
+        u64::from(u32::MAX)
+    );
+    let prefix = [
+        Card::new(Rank::Two, Suit::Clubs),
+        Card::new(Rank::Three, Suit::Clubs),
+        Card::new(Rank::Four, Suit::Clubs),
+        Card::new(Rank::Five, Suit::Clubs),
+        Card::new(Rank::Six, Suit::Clubs),
+        Card::new(Rank::Two, Suit::Diamonds),
+        Card::new(Rank::Three, Suit::Diamonds),
+        Card::new(Rank::Four, Suit::Diamonds),
+        Card::new(Rank::Five, Suit::Diamonds),
+        Card::new(Rank::Six, Suit::Diamonds),
+        Card::new(Rank::Ace, Suit::Spades),
+        Card::new(Rank::King, Suit::Spades),
+        Card::new(Rank::Queen, Suit::Spades),
+        Card::new(Rank::Jack, Suit::Spades),
+        Card::new(Rank::Ten, Suit::Spades),
+    ];
+    let mut hand = GameHand::new_with_deck(players, 0, c(2), c(1), rigged_deck(&prefix), [9u8; 32]);
+    hand.start().unwrap();
+    hand.apply_action(
+        pid(4),
+        PlayerAction::Raise {
+            amount: c(858_993_457),
+        },
+    )
+    .unwrap();
+    hand.apply_action(pid(5), PlayerAction::Raise { amount: c(deep) })
+        .unwrap();
+    hand.apply_action(pid(1), PlayerAction::Call).unwrap();
+    hand.apply_action(pid(2), PlayerAction::Fold).unwrap();
+    hand.apply_action(pid(3), PlayerAction::Fold).unwrap();
+    hand.apply_action(pid(4), PlayerAction::Fold).unwrap();
+    assert!(hand.is_done());
+
+    let snapshot = hand.snapshot();
+    assert_eq!(snapshot.side_pots.len(), 1);
+    assert_eq!(snapshot.side_pots[0].cap, c(deep));
+    assert_eq!(snapshot.side_pots[0].amount, c(u32::MAX - 3));
+    assert_eq!(snapshot.side_pots[0].eligible, vec![pid(1), pid(5)]);
+    let result = hand.finish();
+    assert_eq!(result.chips_awarded.get(&1), Some(&2_147_483_646));
+    assert_eq!(result.chips_awarded.get(&5), Some(&2_147_483_646));
+    assert_eq!(
+        result
+            .final_stacks
+            .values()
+            .map(|stack| u64::from(*stack))
+            .sum::<u64>(),
+        u64::from(u32::MAX)
+    );
+    for folded in [2u64, 3, 4] {
+        assert_eq!(result.final_stacks.get(&folded), Some(&1));
+    }
 }
 
 /// ALL-IN LADDER — 4 handed, three DISTINCT all-in stack sizes.
@@ -681,6 +900,27 @@ fn all_in_ladder_four_handed_three_distinct_stacks_main_plus_two_side_pots() {
         }
     }
     assert!(hand.is_done(), "all four all-in preflop must conclude");
+    let snapshot = hand.snapshot();
+    assert_eq!(snapshot.side_pots.len(), 4);
+    assert_eq!(snapshot.side_pots[0].cap, c(100));
+    assert_eq!(snapshot.side_pots[0].amount, c(400));
+    assert_eq!(
+        snapshot.side_pots[0].eligible,
+        vec![pid(1), pid(2), pid(3), pid(4)]
+    );
+    assert!(snapshot.side_pots[0].refund_to.is_empty());
+    assert_eq!(snapshot.side_pots[1].cap, c(200));
+    assert_eq!(snapshot.side_pots[1].amount, c(300));
+    assert_eq!(snapshot.side_pots[1].eligible, vec![pid(2), pid(3), pid(4)]);
+    assert!(snapshot.side_pots[1].refund_to.is_empty());
+    assert_eq!(snapshot.side_pots[2].cap, c(300));
+    assert_eq!(snapshot.side_pots[2].amount, c(200));
+    assert_eq!(snapshot.side_pots[2].eligible, vec![pid(3), pid(4)]);
+    assert!(snapshot.side_pots[2].refund_to.is_empty());
+    assert_eq!(snapshot.side_pots[3].cap, c(400));
+    assert_eq!(snapshot.side_pots[3].amount, c(100));
+    assert_eq!(snapshot.side_pots[3].eligible, vec![pid(4)]);
+    assert_eq!(snapshot.side_pots[3].refund_to, vec![pid(4)]);
     let result = hand.finish();
 
     // Chip conservation across the whole ladder.
