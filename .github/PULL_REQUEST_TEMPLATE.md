@@ -8,9 +8,9 @@
 - [ ] **DCO sign-off**: every commit carries a `Signed-off-by:` trailer
       (`git commit -s`). Sign-off is required — see
       [`CONTRIBUTING.md`](../CONTRIBUTING.md). PRs missing it will be asked to amend.
-- [ ] Local gates pass:
+- [ ] Local checks relevant to this change pass:
   - [ ] `cargo build`
-  - [ ] `cargo test --workspace`
+  - [ ] `cargo test --workspace` (engine/crypto/solver behavior changes; not required for docs/metadata/mechanical-only changes)
   - [ ] `cargo clippy --workspace -- -D warnings`
   - [ ] `cargo fmt --all -- --check`
   - [ ] `cargo deny check`
