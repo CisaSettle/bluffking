@@ -1214,3 +1214,133 @@ fn short_big_blind_posts_partial_all_in_blind_and_conserves_chips() {
         "short BB cannot win beyond the 3×{short_bb} main pot it funded; won {p3_won}"
     );
 }
+
+// ── issue #6 post-fold voluntary show: HandResult::folded_hole_cards ──────────
+//
+// A plaintext hand carries every FOLDED seat's dealt hole cards in
+// `HandResult::folded_hole_cards` so the server can resolve a folded human's OWN
+// cards for an opt-in post-hand show (folded players are still never
+// auto-exposed). A folded seat is `Plain` in plaintext mode, so the map is
+// populated from the seat's dealt holes. Non-folded seats never appear here.
+
+/// A folded seat's dealt hole cards appear in `folded_hole_cards` (keyed by
+/// `PlayerId` inner value); non-folded seats do NOT.
+#[test]
+fn folded_hole_cards_carries_folded_plaintext_seats() {
+    // 3-player. Dealer=0, so UTG=pid 1 (seat 0). UTG folds preflop; pid 2 and
+    // pid 3 play to showdown.
+    let players = vec![
+        (pid(1), c(1000), 0u8),
+        (pid(2), c(1000), 1u8),
+        (pid(3), c(1000), 2u8),
+    ];
+    let mut hand =
+        GameHand::new_with_rng(players, 0, c(20), c(10), PokerRng::from_seed(2026071801));
+    hand.start().expect("start ok");
+
+    // Capture UTG's dealt hole cards BEFORE they fold (the engine keeps the
+    // `Plain` slot after a fold — it is only masked at the server layer).
+    let utg_hole = hand
+        .seats()
+        .iter()
+        .find(|s| s.player_id == pid(1))
+        .and_then(|s| s.hole_cards())
+        .expect("plaintext folded seat still holds its dealt cards");
+
+    let utg = hand.snapshot().current_actor.expect("utg exists");
+    assert_eq!(utg, pid(1), "UTG is pid 1 in seat 0");
+    hand.apply_action(utg, PlayerAction::Fold).expect("fold");
+
+    // pid 2 completes, pid 3 checks; run the rest out check/call to showdown.
+    for _ in 0..12 {
+        if hand.is_done() {
+            break;
+        }
+        let snap = hand.snapshot();
+        let actor = match snap.current_actor {
+            Some(a) => a,
+            None => break,
+        };
+        let committed = snap
+            .players
+            .iter()
+            .find(|p| p.player_id == actor)
+            .map(|p| p.committed_this_street.0)
+            .unwrap_or(0);
+        let to_call = snap.current_bet.0.saturating_sub(committed);
+        if to_call > 0 {
+            hand.apply_action(actor, PlayerAction::Call).expect("call");
+        } else {
+            hand.apply_action(actor, PlayerAction::Check)
+                .expect("check");
+        }
+    }
+
+    assert!(hand.is_done(), "hand finished");
+    let result = hand.finish();
+
+    // The folded UTG (pid 1) is carried with its EXACT dealt holes.
+    assert_eq!(
+        result.folded_hole_cards.get(&pid(1).inner()),
+        Some(&utg_hole),
+        "folded plaintext seat's dealt holes must be carried for opt-in show"
+    );
+    // The two non-folded seats reached showdown and are NOT in folded_hole_cards.
+    assert!(
+        !result.folded_hole_cards.contains_key(&pid(2).inner()),
+        "a non-folded showdown seat is never in folded_hole_cards"
+    );
+    assert!(
+        !result.folded_hole_cards.contains_key(&pid(3).inner()),
+        "a non-folded showdown seat is never in folded_hole_cards"
+    );
+    // Folded players are still absent from showdown / show_order (unchanged).
+    assert!(
+        !result.show_order.contains(&pid(1)),
+        "folded player must not appear in show_order"
+    );
+    assert!(
+        result.showdown.iter().all(|e| e.player_id != pid(1)),
+        "folded player must not appear in showdown"
+    );
+}
+
+/// Fold-around: the lone winner never folded, so `folded_hole_cards` holds only
+/// the seat(s) that folded — and the winner is absent from it.
+#[test]
+fn folded_hole_cards_on_fold_around_excludes_the_lone_winner() {
+    // HU: SB acts first preflop and folds → fold-around, BB wins uncontested.
+    let players = vec![(pid(1), c(1000), 0u8), (pid(2), c(1000), 1u8)];
+    let mut hand =
+        GameHand::new_with_rng(players, 0, c(20), c(10), PokerRng::from_seed(2026071802));
+    hand.start().expect("start ok");
+
+    let sb = hand.snapshot().current_actor.expect("sb acts first");
+    let sb_hole = hand
+        .seats()
+        .iter()
+        .find(|s| s.player_id == sb)
+        .and_then(|s| s.hole_cards())
+        .expect("sb holds dealt cards");
+    hand.apply_action(sb, PlayerAction::Fold).expect("sb folds");
+
+    assert!(hand.is_done(), "fold-around ends the hand");
+    let result = hand.finish();
+
+    assert_eq!(
+        result.show_order.len(),
+        0,
+        "fold-around has empty show_order"
+    );
+    // The folder is carried; the lone winner is not.
+    assert_eq!(
+        result.folded_hole_cards.get(&sb.inner()),
+        Some(&sb_hole),
+        "the folder's dealt holes are carried for an opt-in show"
+    );
+    let winner = if sb == pid(1) { pid(2) } else { pid(1) };
+    assert!(
+        !result.folded_hole_cards.contains_key(&winner.inner()),
+        "the lone winner never folded → absent from folded_hole_cards"
+    );
+}

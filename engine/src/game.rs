@@ -217,6 +217,29 @@ pub struct HandResult {
     /// seat indexes via its seat map (no `rs_poker` types in public sigs —
     /// ADR-012; `PlayerId` is engine-owned).
     pub show_order: Vec<PlayerId>,
+    /// Dealt hole cards of players who FOLDED this hand, keyed by `PlayerId`
+    /// inner value (like `chips_awarded` / `final_stacks`).
+    ///
+    /// Populated **only for plaintext hands**; engine-blind (mental-poker)
+    /// hands leave this EMPTY. This is structural, not a runtime check: a
+    /// folded seat can never become `HoleSlot::Revealed`
+    /// ([`GameHand::inject_showdown_reveal`] rejects folded players), so a
+    /// folded blind seat is always `Opaque` and its value is never known to the
+    /// engine. The assembler additionally gates population on
+    /// `HandMode::Plaintext`, so no blind result ever carries a folded value.
+    ///
+    /// This backs the server's post-hand *voluntary* "show my folded cards"
+    /// affordance (issue #6 extension): at hand end the server can resolve a
+    /// folded human's OWN dealt holes for a plaintext hand, exactly as it
+    /// resolves a showdown loser's from `showdown`. Folded players are still
+    /// NEVER auto-exposed — this only enables their own opt-in reveal.
+    ///
+    /// It is never broadcast or persisted wholesale (the wire translation reads
+    /// only `showdown`; persist serializes only actions/pots/board), so it adds
+    /// no leak surface: a folded seat's cards leave the server solely through
+    /// the same identity-checked, opt-in `CardsShown` path a loser's cards do.
+    #[serde(default)]
+    pub folded_hole_cards: HashMap<u64, HoleCards>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1697,6 +1720,23 @@ impl GameHand {
             "final stacks must equal starting stacks"
         );
 
+        // Folded players' dealt hole cards — plaintext hands ONLY. In blind mode
+        // folded seats are `Opaque` (a folded seat can never be `Revealed` —
+        // `inject_showdown_reveal` rejects folded players), so filtering on
+        // `hole_cards()` already yields an empty map there; gating on
+        // `HandMode::Plaintext` makes engine-blind fail-closed doubly structural
+        // (no blind result ever carries a folded value). This backs the server's
+        // post-hand voluntary-show affordance for folded humans (issue #6).
+        let folded_hole_cards: HashMap<u64, HoleCards> = if self.mode == HandMode::Plaintext {
+            self.seats
+                .iter()
+                .filter(|s| s.folded)
+                .filter_map(|s| s.hole_cards().map(|h| (s.player_id.inner(), h)))
+                .collect()
+        } else {
+            HashMap::new()
+        };
+
         HandResult {
             deck_seed: self.deck_seed,
             board: self.board.clone(),
@@ -1706,6 +1746,7 @@ impl GameHand {
             actions: self.actions.clone(),
             showdown,
             show_order,
+            folded_hole_cards,
         }
     }
 

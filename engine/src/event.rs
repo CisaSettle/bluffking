@@ -36,6 +36,13 @@ use serde::{Deserialize, Serialize};
 /// All player-identity fields use `seat: u8` (the position number from
 /// [`crate::game::HandSeat::seat`]), never `PlayerId`. The translation is
 /// performed inside [`crate::game::GameHand::drain_events`].
+// `HandFinished` carries a `HandResult`, a large value type (board + several
+// pots/actions/showdown vectors + three maps, including `folded_hole_cards`). It
+// is emitted at most ONCE per hand and drained/consumed immediately, so the size
+// skew versus the small variants is not a hot-path concern — boxing it would only
+// add a per-hand heap allocation. Mirrors the documented trade-off on
+// `MpDealOutcome::Completed` (server/src/mp_engine_blind.rs).
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EngineEvent {
