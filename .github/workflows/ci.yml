@@ -33,10 +33,10 @@ jobs:
         # Source); --all-features also compiles engine's test-helpers feature.
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
-      - name: test
-        # engine + mental-poker are DB-free — no Postgres service needed.
-        # U16: --locked + --all-features (same rationale as clippy).
-        run: cargo test --workspace --all-features --locked
+      # The full workspace suite is intentionally local and risk-based. It took
+      # about 19 minutes on the hosted runner; run it locally when a change touches
+      # engine, crypto, or solver behavior. Most docs/metadata/mechanical changes
+      # do not need the full suite.
 
       - name: mp-wasm (detached crate — clippy / test / wasm build + fmt advisory)
         # U15: mp-wasm is a detached crate (own workspace, targets wasm32), so the

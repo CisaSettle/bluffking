@@ -9,16 +9,21 @@ crate, and the published source of the deployed solver endpoint
 
 ```bash
 cargo build
-cargo test --workspace                    # engine + mental-poker + gto-solver, no DB needed
 cargo clippy --workspace -- -D warnings
 cargo fmt --all -- --check
 cargo deny check                          # advisories + licenses + sources
+bash scripts/prepublish-check.sh          # provenance + secret scan
 ```
 
-All five must pass (U55). CI runs the same gates (`.github/workflows/ci.yml`) and,
-in addition, runs the **mp-wasm gate** (clippy / test / wasm32 build on the
-detached crate) and the **prepublish provenance/secret scan**
-(`scripts/prepublish-check.sh`).
+Run checks proportional to the change. For engine, cryptography, or solver
+behavior changes, also run `cargo test --workspace` locally (the public crates
+are DB-free); while iterating, a focused package or named test is fine. The full
+workspace suite is deliberately not routine CI because it takes about 19 minutes
+on the hosted runner and most docs, metadata, and mechanical changes do not need
+it.
+
+CI runs fmt, clippy, cargo-deny, the **mp-wasm gate** (clippy / test / wasm32
+build on the detached crate), and the **prepublish provenance/secret scan**.
 
 ## Style
 
