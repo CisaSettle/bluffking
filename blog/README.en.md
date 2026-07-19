@@ -1,6 +1,9 @@
 # BluffKing engineering blog (archived snapshot)
 
-This directory is an **archived snapshot of the first post** (`why-worktrees.html`) of BluffKing's bilingual (中文 / English) engineering "build notes" blog — a self-contained bilingual HTML file, zero build, no framework. The complete, up-to-date blog lives on the canonical site, not here; this directory keeps only that first post as an in-repo archive.
+This directory keeps selected snapshots from BluffKing's bilingual (中文 / English) engineering "build notes." Each article is a self-contained bilingual HTML file with zero build and no framework. The canonical site remains the complete, up-to-date blog.
+
+- `production-ai-coding-guide.html`: From Chatbot to Production-Grade AI Coding (2026-07-20)
+- `why-worktrees.html`: Why every AI coding agent needs its own git worktree (2026-06-20)
 
 - **Canonical site (complete blog):** https://bluffking.ai/en/blog/ · https://bluffking.ai/zh/blog/
 - **This directory** is part of the open-source code repo `CisaSettle/bluffking` (`blog/`); the earlier `CisaSettle/bluffking-blog` GitHub Pages repo has been archived. (U59)
