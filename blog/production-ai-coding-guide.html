@@ -1,0 +1,1164 @@
+<!doctype html>
+<html lang="zh" data-active-lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>AI 编程入门：从 GPT 对话到生产级 Agent 工程</title>
+<meta name="description" content="从 GPT 对话到生产级 Claude Code 与 OpenAI Codex 工作流：CLI、Remote Control、Memory、MCP、Skill、Plugin、Harness、Workflow、Hooks 与双 AI 交付。">
+<link rel="canonical" href="https://bluffking.ai/zh/blog/production-ai-coding-guide/">
+<link rel="alternate" hreflang="zh" href="https://bluffking.ai/zh/blog/production-ai-coding-guide/">
+<link rel="alternate" hreflang="en" href="https://bluffking.ai/en/blog/production-ai-coding-guide/">
+<link rel="alternate" hreflang="x-default" href="https://bluffking.ai/zh/blog/production-ai-coding-guide/">
+<style>
+  :root{
+    --green:#0b5d3b;--green2:#138055;--ink:#16221c;--muted:#607168;--line:#dce7e1;
+    --bg:#f4f8f5;--card:#fff;--soft:#eaf4ee;--amber:#a85b12;--amber-bg:#fff7e8;
+    --code:#10231a;--code-ink:#d9f3e4;--shadow:0 18px 50px rgba(13,64,42,.09);
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",Arial,sans-serif;line-height:1.78}
+  header{background:linear-gradient(135deg,#083f2a 0%,var(--green) 48%,#16815a 100%);color:#fff;padding:24px clamp(20px,5vw,72px) 72px;position:relative;overflow:hidden}
+  header::after{content:"";position:absolute;width:420px;height:420px;border:1px solid rgba(255,255,255,.12);border-radius:50%;right:-110px;top:-230px;box-shadow:0 0 0 70px rgba(255,255,255,.035),0 0 0 140px rgba(255,255,255,.02)}
+  .topbar,.hero{position:relative;z-index:1;max-width:1040px;margin:0 auto}
+  .topbar{display:flex;justify-content:space-between;align-items:center;gap:16px}
+  .draft{font-size:12px;font-weight:750;letter-spacing:.08em;text-transform:uppercase;background:rgba(255,255,255,.14);border:1px solid rgba(255,255,255,.22);padding:6px 11px;border-radius:999px}
+  .toggle{display:flex;background:rgba(255,255,255,.14);border:1px solid rgba(255,255,255,.18);border-radius:999px;padding:3px}
+  .langbtn{border:0;background:transparent;color:#fff;padding:7px 15px;border-radius:999px;cursor:pointer;font-weight:700;opacity:.76}
+  .langbtn.active{background:#fff;color:var(--green);opacity:1}
+  .hero{padding-top:66px;max-width:900px}
+  .eyebrow{font-size:13px;letter-spacing:.13em;text-transform:uppercase;opacity:.75;font-weight:750}
+  h1{font-size:clamp(34px,6vw,64px);line-height:1.08;letter-spacing:-.035em;margin:15px 0 22px;max-width:900px}
+  .dek{font-size:clamp(17px,2.2vw,23px);line-height:1.55;max-width:780px;color:rgba(255,255,255,.86);margin:0}
+  main{max-width:920px;margin:-34px auto 0;padding:0 22px 80px;position:relative;z-index:2}
+  section[data-lang],span[data-ui-lang],div[data-ui-lang]{display:none}
+  html[data-active-lang="zh"] [data-lang="zh"],html[data-active-lang="zh"] [data-ui-lang="zh"]{display:block}
+  html[data-active-lang="en"] [data-lang="en"],html[data-active-lang="en"] [data-ui-lang="en"]{display:block}
+  .review-note{background:var(--amber-bg);border:1px solid #efd2a8;border-left:5px solid var(--amber);border-radius:14px;padding:18px 21px;box-shadow:var(--shadow);margin-bottom:42px}
+  .review-note strong{color:#7b410d}
+  article{background:var(--card);border:1px solid var(--line);border-radius:22px;padding:clamp(24px,5vw,58px);box-shadow:var(--shadow)}
+  h2{font-size:clamp(24px,3.5vw,34px);line-height:1.3;letter-spacing:-.02em;margin:54px 0 16px}
+  h2:first-child{margin-top:0}
+  h3{font-size:19px;margin:28px 0 7px}
+  h4{font-size:16px;margin:22px 0 6px;color:#334d40}
+  p{margin:12px 0}
+  .lead{font-size:19px;line-height:1.82;color:#26372f}
+  blockquote{margin:28px 0;padding:20px 24px;background:var(--soft);border-left:5px solid var(--green2);border-radius:0 14px 14px 0;font-size:21px;line-height:1.62;font-weight:720;color:#0b5436}
+  ul,ol{padding-left:1.4em}
+  li{margin:8px 0}
+  .flow{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:24px 0}
+  .flow .step{background:var(--soft);border:1px solid #cfe4d7;border-radius:13px;padding:15px 13px;text-align:center;font-weight:720;position:relative}
+  .flow .step:not(:last-child)::after{content:"→";position:absolute;right:-10px;top:50%;transform:translate(50%,-50%);color:var(--green2);z-index:1;background:var(--card);border-radius:50%;width:22px;height:22px;line-height:20px}
+  .role-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin:22px 0}
+  .role{border:1px solid var(--line);border-radius:15px;padding:18px;background:#fbfdfc}
+  .role b{display:block;color:var(--green);font-size:17px;margin-bottom:5px}
+  .article-toc{background:linear-gradient(145deg,#f4faf6,#fbfdfc);border:1px solid #cfe0d6;border-radius:18px;padding:5px 22px 18px;margin:30px 0 22px;box-shadow:0 10px 28px rgba(13,64,42,.06)}
+  .article-toc summary{cursor:pointer;color:var(--green);font-size:18px;font-weight:800;padding:15px 0 10px;list-style:none}
+  .article-toc summary::-webkit-details-marker{display:none}
+  .article-toc summary::after{content:"−";float:right;width:25px;height:25px;border-radius:50%;background:var(--soft);text-align:center;line-height:23px;color:var(--green2)}
+  .article-toc details:not([open]) summary::after{content:"+"}
+  .article-toc .toc-hint{display:block;color:var(--muted);font-size:12px;font-weight:500;margin-top:2px}
+  .toc-groups{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px 28px;margin-top:8px}
+  .toc-group{border-top:1px solid #dbe8e0;padding-top:11px}
+  .toc-group b{display:block;color:var(--green);font-size:14px;margin-bottom:5px}
+  .article-toc ol{margin:0;padding-left:1.35em}
+  .article-toc li{break-inside:avoid;margin:7px 0;padding-left:2px;line-height:1.45}
+  .article-toc a{color:#28513d;text-decoration:none;border-bottom:1px solid transparent}
+  .article-toc a:hover,.article-toc a:focus{color:var(--green2);border-bottom-color:var(--green2)}
+  h2[id]{scroll-margin-top:24px}
+  .part-divider{margin:64px -14px 25px;padding:22px 24px;background:linear-gradient(135deg,#e7f3eb,#f8fbf9);border:1px solid #c9dfd1;border-left:6px solid var(--green2);border-radius:16px}
+  .part-divider:first-child{margin-top:0}
+  .article-toc + .part-divider{margin-top:34px}
+  .part-divider span{display:block;color:var(--green2);font-size:12px;font-weight:800;letter-spacing:.11em;text-transform:uppercase;margin-bottom:4px}
+  .part-divider b{display:block;color:#123e2c;font-size:clamp(20px,3vw,26px);line-height:1.35}
+  .part-divider p{color:#486055;font-size:14px;line-height:1.65;margin:7px 0 0}
+  .stack{display:grid;gap:8px;margin:24px 0}
+  .layer{display:grid;grid-template-columns:160px 1fr;gap:16px;align-items:center;border:1px solid var(--line);border-radius:13px;padding:13px 16px;background:#fbfdfc}
+  .layer b{color:var(--green);font-size:15px}
+  .layer small{color:var(--muted);font-size:13px;line-height:1.55}
+  .concept-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:13px;margin:20px 0 28px}
+  .concept{border:1px solid var(--line);border-radius:15px;padding:18px;background:#fff}
+  .concept h3{margin:0 0 7px;color:var(--green);font-size:17px}
+  .concept p{font-size:14px;line-height:1.68;margin:7px 0}
+  .concept .example{border-top:1px dashed #cbdad2;margin-top:11px;padding-top:10px;color:#42564b;font-size:13px}
+  .pill{display:inline-block;font-size:11px;line-height:1.4;font-weight:750;letter-spacing:.04em;text-transform:uppercase;background:var(--soft);color:var(--green);border-radius:999px;padding:4px 8px;margin-bottom:8px}
+  .project-map{background:linear-gradient(145deg,#0d2d20,#123f2d);color:#e8f7ee;border-radius:17px;padding:22px;margin:24px 0;overflow:auto}
+  .project-map .mapline{display:flex;align-items:stretch;gap:8px;min-width:720px}
+  .project-map .node{flex:1;border:1px solid rgba(255,255,255,.17);background:rgba(255,255,255,.07);border-radius:11px;padding:13px 10px;text-align:center;font-size:12px;line-height:1.45}
+  .project-map .arrow{align-self:center;color:#82d1a8;font-weight:800}
+  .project-map b{display:block;color:#fff;font-size:13px;margin-bottom:4px}
+  .compare{overflow-x:auto;margin:22px 0}
+  .compare table{min-width:720px;margin:0}
+  .aside{background:#eef5ff;border:1px solid #cadcf4;border-left:5px solid #4376b7;border-radius:0 14px 14px 0;padding:17px 20px;margin:23px 0;color:#233b59}
+  .outcome-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:13px;margin:22px 0}
+  .outcome{background:#f8fbf9;border:1px solid var(--line);border-radius:15px;padding:18px}
+  .outcome b{display:block;color:var(--green);font-size:17px;margin-bottom:6px}
+  .term{font-weight:800;color:var(--green)}
+  .mini{font-size:13px;color:var(--muted)}
+  pre{background:var(--code);color:var(--code-ink);border-radius:14px;padding:18px 20px;overflow:auto;white-space:pre-wrap;font:13px/1.65 "SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace;margin:18px 0}
+  code{font-family:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace}
+  :not(pre)>code{background:#eaf2ed;color:#17482f;padding:.14em .4em;border-radius:5px;font-size:.91em}
+  table{width:100%;border-collapse:collapse;margin:22px 0;font-size:14px}
+  th,td{border:1px solid var(--line);padding:11px 13px;text-align:left;vertical-align:top}
+  th{background:var(--soft);color:#174d33}
+  .rule{background:#f7faf8;border:1px solid var(--line);border-radius:14px;padding:17px 20px;margin:22px 0}
+  .rule strong{color:var(--green)}
+  .checklist{list-style:none;padding:0}
+  .checklist li{position:relative;padding-left:29px}
+  .checklist li::before{content:"□";position:absolute;left:0;color:var(--green2);font-size:19px;top:-1px}
+  .receipts{font-size:13px;color:var(--muted);border-top:1px solid var(--line);margin-top:52px;padding-top:22px}
+  footer{max-width:920px;margin:0 auto;padding:0 22px 45px;color:var(--muted);font-size:13px;text-align:center}
+  a{color:var(--green2)}
+  @media(max-width:700px){header{padding-bottom:58px}.hero{padding-top:48px}.flow{grid-template-columns:1fr}.flow .step:not(:last-child)::after{content:"↓";right:50%;top:auto;bottom:-18px;transform:translate(50%,0)}.role-grid,.concept-grid,.outcome-grid,.toc-groups{grid-template-columns:1fr}.layer{grid-template-columns:1fr;gap:3px}.article-toc{padding:3px 17px 15px}.part-divider{margin:52px 0 22px;padding:19px 18px}article{border-radius:17px}.topbar{align-items:flex-start;flex-direction:column}.toggle{align-self:flex-end}}
+  @media print{header{padding-bottom:35px}.toggle,.draft,.review-note{display:none!important}main{margin:0;padding-top:24px}article{box-shadow:none;border:0;padding:0}body{background:#fff}}
+</style>
+</head>
+<body>
+<header>
+  <div class="topbar">
+    <span class="draft" data-ui-lang="zh">已人工批准发布 · 2026-07-20</span>
+    <span class="draft" data-ui-lang="en">Owner-approved for publication · 2026-07-20</span>
+    <div class="toggle" aria-label="Language switch">
+      <button class="langbtn" data-l="zh">中文</button>
+      <button class="langbtn" data-l="en">English</button>
+    </div>
+  </div>
+  <div class="hero">
+    <div data-ui-lang="zh">
+      <div class="eyebrow">给用过 GPT 对话、但还没把 AI 带进生产环境的程序员</div>
+      <h1>从聊天机器人到生产级 AI 编程</h1>
+      <p class="dek">我在 Claude Code + OpenAI Codex 实战中用到的概念、架构、坑和证据：从 model、Terminal/CLI、本地/云端/Remote Control，到 memory、MCP、skill、plugin、harness、workflow、hooks 与双 AI 交付。</p>
+    </div>
+    <div data-ui-lang="en">
+      <div class="eyebrow">For programmers who have chatted with GPT but have not scaled AI into production</div>
+      <h1>From Chatbot to Production-Grade AI Coding</h1>
+      <p class="dek">The concepts, architecture, failures, and evidence behind my Claude Code + OpenAI Codex workflow—from models, terminal/CLI, local/cloud/remote control to memory, MCP, skills, plugins, harnesses, workflows, hooks, and dual-AI delivery.</p>
+    </div>
+  </div>
+</header>
+
+<main>
+  <div class="review-note" data-ui-lang="zh"><strong>审阅状态：</strong>正文已由 Codex 按真实提交、Hooks/工作流、canonical 状态文件、线上只读证据与官方产品文档完成全量事实审核，先前两轮 Claude Opus 独立复核均为 <code>APPROVED</code>、<code>OPEN=[]</code>。2026-07-20 根据 Loong 反馈重新编写结论并通过双语结构与真 Chromium 检查；Loong 随后完成人工审阅并明确批准发布，同时取消额外模型复核。这个状态表示人工批准，不表示 Fable 5 或 Terra 已完成新版结论审核。</div>
+  <div class="review-note" data-ui-lang="en"><strong>Review status:</strong> Codex completed the full body audit against real commits, hooks/workflows, canonical state files, live read-only evidence, and official product documentation; two earlier Claude Opus passes returned <code>APPROVED</code> with <code>OPEN=[]</code>. The conclusion was rewritten on 2026-07-20 after Loong found the previous version unclear, then passed bilingual-structure and real-Chromium checks. Loong subsequently reviewed it manually, explicitly approved publication, and cancelled the additional model review. This records owner approval; it does not claim that Fable 5 or Terra reviewed the replacement conclusion.</div>
+
+  <article>
+  <section data-lang="zh">
+
+    <nav class="article-toc" aria-label="文章目录">
+      <details open>
+        <summary>阅读目录<span class="toc-hint">按学习路径分为四部分；点击章节直接跳转</span></summary>
+        <div class="toc-groups">
+          <div class="toc-group"><b>第一部分 · 先动手</b><ol><li><a href="#zh-background">背景、读者与目标</a></li><li><a href="#zh-layers">模型、产品、Terminal 与 CLI</a></li><li><a href="#zh-remote">本地、云沙箱与 Remote Control</a></li><li><a href="#zh-first-task">第一次任务与五项任务卡</a></li><li><a href="#zh-copy-workflow">工作流与风险匹配的证据</a></li></ol></div>
+          <div class="toc-group"><b>第二部分 · 懂原理</b><ol><li><a href="#zh-model-context">模型、上下文、幻觉与 Memory</a></li><li><a href="#zh-agent-tools">Agent、Tool、权限与子 Agent</a></li><li><a href="#zh-mcp-skills">MCP、Connector、Skill 与 Plugin</a></li><li><a href="#zh-markdown">Markdown 指令与项目事实</a></li><li><a href="#zh-workflow-harness">Workflow、Harness、Hook 与 Gate</a></li></ol></div>
+          <div class="toc-group"><b>第三部分 · 进生产</b><ol><li><a href="#zh-project">真实项目、Agent Loop 与成果</a></li><li><a href="#zh-dual-ai-failure">双 AI 为什么仍会漏错</a></li><li><a href="#zh-traps">十二个常见坑与解决方案</a></li><li><a href="#zh-glossary">按需查阅的概念附录</a></li></ol></div>
+          <div class="toc-group"><b>第四部分 · 自己搭</b><ol><li><a href="#zh-four-week-path">四周入门路线</a></li><li><a href="#zh-faq">十个决策问题</a></li><li><a href="#zh-bootstrap">让 Agent 搭建最小可信闭环</a></li><li><a href="#zh-conclusion">结论：今天就能开始 AI 编程</a></li></ol></div>
+        </div>
+      </details>
+    </nav>
+
+    <div class="part-divider"><span>第一部分</span><b>从对话到动手：完成第一个可验证的小改动</b><p>先弄清代码在哪里运行、该用哪种工具，再用一个小任务跑通需求、修改、验证和审查。</p></div>
+
+    <h2 id="zh-background">我不想替 AI 吹水，也不想刻意贬低 AI</h2>
+    <p class="lead">这篇文章不是 AI 广告，也不是一篇用几个翻车案例证明“AI 果然不可靠”的文章。我想做一件更简单的事：把自己真实使用 AI 编程的生产账本摊开，说清它帮我做到了什么，在哪里犯错，以及我怎样把这些错误变成系统规则。</p>
+    <p>过去大约三个月，我同时高强度使用 Claude Code 和 OpenAI Codex。我订阅的是每月各 200 美元的 Claude Max 和 ChatGPT Pro，基本每周都会把两边的可用额度跑满。这些额度不是用来反复生成 demo，而是在持续开发和运营一个真实的德州扑克产品 BluffKing：Rust 游戏引擎、基于 Axum 与 WebSocket 的后端服务、PostgreSQL 数据库、Vue H5、Flutter 移动端、回放系统和本地 solver coach，都在同一个生产工程里长期演进。</p>
+    <p>我也把产品带进了 H5、iOS、Android 和 Telegram 四个真实客户端的生产/发布链路。产品已经在线运行；H5 支付入口与订阅、会员权益系统已部署到生产，取消和退款流程也已实现，并在相应测试或沙盒路径拥有闭环证据。但我不会把“代码已上线”、“沙盒/测试闭环”和“每个渠道都完成真实资金验收”混成一个状态：截至本文审阅时，部分钱包、原生商店和链上渠道仍在完成最后的生产实付或商店验收。这不是一个只能跑 demo 的项目，但也不应该被包装成“所有支付渠道全绿”。</p>
+    <p>AI 并没有单独完成这一切。我负责产品目标、风险取舍、账号身份、付款授权和最终责任。两个 AI 的分工也不对称：普通仓库任务谁都可以实现，再由另一方审查；需要已登录 Chrome、网页控制台、打包上传或商店操作时，我直接交给 Claude Code，Codex 主要审查 diff、命令输出和页面证据；Claude 额度中断或 Codex 主动承担实现时，则反过来由 Claude 审查。我真正想分享的，就是这条从“会聊天”到“可参与 production”的中间路径。</p>
+    <h3>这篇文章写给谁</h3>
+    <ul>
+      <li>已经用过 ChatGPT、Claude 等对话产品，也让 AI 写过函数或脚本；</li>
+      <li>自己有真实仓库、测试、CI 和生产环境，但还不敢让 Agent 大规模参与；</li>
+      <li>想提高开发速度，又担心幻觉、密钥、错误部署和“AI 说完成了”的假结论。</li>
+    </ul>
+    <h3>读完以后，你应该得到什么</h3>
+    <p>你不需要立刻复制我的全部系统。这篇文章的目标是让你先建立一张 AI 编程地图，分清 model、Terminal、Shell、CLI、agent、本地/云端/Remote Control、memory、MCP、skill、plugin、workflow、harness 和 hooks；再看懂它们怎样在真实项目中连起来；最后能安全完成第一个可验证、可回退、可审查的生产级小改动。</p>
+    <blockquote>我推荐 AI 编程，不是因为 AI 不会犯错，而是因为它的错误可以被工程化地约束、发现和修复，而它带来的生产力提升真实存在。</blockquote>
+
+    <h2 id="zh-layers">先把不同层放回各自的位置</h2>
+    <p>GPT、ChatGPT、Codex、Claude Code、Terminal 和 CLI 不是同类东西，不应放在一张“谁更强”的对比表里。它们是一条调用链上的不同层：</p>
+    <div class="concept-grid">
+      <div class="concept"><span class="pill">智力层</span><h3>Model</h3><p>GPT 或 Claude 模型负责理解、推理和生成，但它本身没有你的仓库、Terminal 或账号。</p></div>
+      <div class="concept"><span class="pill">产品层</span><h3>Chat product / Coding-agent product</h3><p>ChatGPT 这类对话产品偏问答与讨论；Codex 和 Claude Code 这类编程 Agent 产品把模型接到仓库、工具、权限和循环。</p></div>
+      <div class="concept"><span class="pill">入口层</span><h3>Terminal / IDE / Desktop</h3><p>这些是你与产品交互的地方。Terminal 只是承载命令行会话的工程现场，它不是 AI。</p></div>
+      <div class="concept"><span class="pill">命令层</span><h3>Shell / CLI</h3><p>Shell（zsh/bash/PowerShell）解释命令；CLI 是程序的文本入口。<code>git</code> 是 CLI 但不是 Agent；<code>codex</code> 和 <code>claude</code> 是启动编程 Agent 的 CLI。</p></div>
+    </div>
+    <div class="project-map" aria-label="Terminal 到编程 Agent 调用链">
+      <div class="mapline">
+        <div class="node"><b>Terminal</b>承载会话</div><div class="arrow">→</div>
+        <div class="node"><b>Shell</b>解释命令</div><div class="arrow">→</div>
+        <div class="node"><b>codex / claude CLI</b>启动产品</div><div class="arrow">→</div>
+        <div class="node"><b>Coding Agent</b>组合模型·上下文·工具·权限·循环</div><div class="arrow">→</div>
+        <div class="node"><b>Repository &amp; evidence</b>文件·Git·测试·浏览器·设备</div>
+      </div>
+    </div>
+    <h3>我给初学者的明确推荐</h3>
+    <p><strong>如果你的目标是让 AI 参与真实仓库，我最推荐的起点是：从项目目录的 Terminal 启动一个编程 Agent CLI——Codex CLI 或 Claude Code。</strong>不要先纠结哪个模型排名第一，先选一个能读你的仓库、执行现有测试、展示 diff 且有明确权限边界的 Agent。</p>
+    <ul>
+      <li><strong>为什么不以普通对话窗口为主：</strong>它适合解释和讨论，却不一定拥有当前仓库、命令执行和可核对证据。</li>
+      <li><strong>为什么先选 Terminal + CLI：</strong>当前目录、Git 状态、环境变量、测试输出和退出码都直接可见，也最容易进一步脚本化为 workflow 和 harness。</li>
+      <li><strong>IDE 怎么用：</strong>当作看代码、对比 diff 和手工调试的辅助界面；不必为了用 Agent 放弃你熟悉的 IDE。</li>
+      <li><strong>什么时候用双 AI：</strong>先用一个 Agent 跑通“小任务→diff→验证→回退”；稳定后再加第二个新会话、尽量只读的 reviewer。</li>
+    </ul>
+    <h3>Codex 还是 Claude Code：按你真正依赖的环境选</h3>
+    <div class="compare"><table>
+      <thead><tr><th>你的主要需求</th><th>更直接的选择</th><th>原因与边界</th></tr></thead>
+      <tbody>
+        <tr><td>纯仓库修改、命令、测试和 Git 自动化</td><td>Codex CLI 或 Claude Code 都可以</td><td>先选你更顺手、权限边界更清楚的一个；正确性来自任务合同与证据，不来自产品名字</td></tr>
+        <tr><td>必须从 CLI 使用已有登录态的 Chrome</td><td>优先 Claude Code</td><td><a href="https://code.claude.com/docs/en/chrome"><code>claude --chrome</code></a> 可连接 Claude in Chrome；页面操作可直接使用当前 Chrome 登录态</td></tr>
+        <tr><td>想用 OpenAI 内置 Browser / Computer Use</td><td>ChatGPT 网页或桌面端</td><td><a href="https://learn.chatgpt.com/docs/browser">OpenAI 官方说明</a>内置 Browser 不在 Codex CLI/IDE；需要本地项目、内置终端或 Computer Use 时更适合桌面端，CLI 仍可运行 Playwright 或通过额外的 MCP/Plugin 接浏览器</td></tr>
+        <tr><td>离开工位后继续本机任务</td><td>按远程入口选择</td><td>ChatGPT Remote 从 ChatGPT 移动端连接配对主机；Claude Code Remote Control 可从 claude.ai/code 或 Claude 移动端连接本机 CLI/VS Code session</td></tr>
+      </tbody>
+    </table></div>
+    <div class="rule"><strong>一句话结论：</strong>一般仓库开发任选其一；CLI 强依赖已有 Chrome 登录态时优先 Claude Code；要 OpenAI 内置浏览器时用 ChatGPT 网页或桌面端；要远程继续本机环境时，再按两家的 Remote Control 入口选择。</div>
+    <h3>为什么我的日常入口一直是 Terminal</h3>
+    <p>对我来说，Terminal 不是一个更“专业”的聊天框，而是工程现场。Agent 从正确的仓库或 worktree 启动后，当前目录、Git 状态、依赖、环境变量、命令输出和退出码都在同一条证据链上。</p>
+    <pre>cd /path/to/project
+git status
+codex        # 或者：claude</pre>
+    <p>我的常用路径是：进入项目目录 → 启动 Codex 或 Claude Code → 用自然语言说明目标、限制和完成条件 → Hook 检查当前 session 是否已经隔离。只读任务可以留在当前目录；如果 Agent 要在共享的 main 工作区写代码，Hook 会阻止写入，并要求它调用项目脚本创建独立 worktree，再在里面读文件、修改代码和执行测试。这样多个 session 才能并行工作而不共享同一个 HEAD 和未提交修改。最后，我再让另一个 AI 审查真实 diff 与验证证据。后文反复出现的命令、工作目录、Git、权限和 hooks，都是从这个入口展开的。</p>
+    <div class="aside"><strong>不需要先搭完后文的整套系统，Agent 才能开始写代码。</strong>一个 Agent 加一个小任务就可以起步。后面的 worktree、Hook、测试分层、独立审查和 release gate，是我在遇到并发冲突、误改、假绿和生产风险后逐步加上的护栏。项目越接近生产、并行 session 越多，越需要把这些护栏从“提醒”变成自动执行。</div>
+
+    <h2 id="zh-remote">“远程”也不是一回事：对话、云沙箱与远程控制本机</h2>
+    <p>判断一个 AI 工作方式时，最关键的问题不是“我在手机还是电脑上发 Prompt”，而是：<strong>代码和命令究竟在哪台机器上运行？</strong></p>
+    <div class="compare"><table>
+      <thead><tr><th>使用形态</th><th>代码在哪里跑</th><th>能不能用本机环境</th><th>Codex 与 Claude Code</th><th>适合什么</th></tr></thead>
+      <tbody>
+        <tr><td><strong>普通对话</strong></td><td>主要在产品服务端生成回答</td><td>默认不能；只看你上传或 connector 授权的内容</td><td>ChatGPT 与 Claude 的对话界面都属于这一类，有工具时能力才向 Agent 扩展</td><td>解释概念、写任务卡、讨论方案</td></tr>
+        <tr><td><strong>云端 Agent / 远程沙箱</strong></td><td>厂商管理的隔离容器，通常 checkout 连接的 Git 仓库</td><td>不能任意访问你笔记本的文件、进程、登录态或本地设备</td><td><a href="https://learn.chatgpt.com/docs/environments/cloud-environment">Codex cloud</a> 在 OpenAI 容器中运行；Claude Code on the web 在 Anthropic 云基础设施中运行</td><td>本机关机后继续、并行任务、为仓库生成 diff/PR</td></tr>
+        <tr><td><strong>本地编程 Agent</strong></td><td>你的电脑或你登录的开发机，受当前 sandbox 和 permission 约束</td><td>可以，但只限你授权的仓库、命令、MCP、浏览器和设备</td><td>Codex CLI/桌面 App/IDE 与 Claude Code CLI/IDE 都可作为本地 Agent 入口</td><td>需要本地依赖、未提交代码、本地 DB、浏览器或真机的日常开发</td></tr>
+        <tr><td><strong>Remote Control：远程控制本机 Agent</strong></td><td>仍然在你的 Mac/Windows/开发机上；手机或浏览器只是远程窗口</td><td>可以；使用的是那个本地 session 原有的文件、工具、配置和权限</td><td><a href="https://learn.chatgpt.com/docs/remote-connections">ChatGPT Remote</a> 通过移动端连接已配对的 Mac/Windows host；<a href="https://code.claude.com/docs/en/remote-control">Claude Code Remote Control</a> 用 claude.ai/code 或 Claude 移动端连到正在本机 CLI/VS Code 运行的 session</td><td>离开工位后继续看进度、转向、回答问题、审批动作和复查证据</td></tr>
+        <tr><td><strong>Remote MCP / Connector</strong></td><td>不是代码运行环境；它是远程服务暴露的数据与动作接口</td><td>只能看授权的服务范围，不等于获得整台电脑</td><td>两者都能连接远程 MCP/Connector；这与 Remote Control 是两个维度</td><td>读 GitHub、Sentry、Linear、Gmail 等云服务的当前数据或执行限定动作</td></tr>
+      </tbody>
+    </table></div>
+    <div class="rule"><strong>我的日常入口仍是本地 Terminal + Agent CLI。</strong>Remote Control 和云端沙箱不是“更高级”，而是按运行位置选：离开工位但必须继续使用同一本地 DB、MCP、浏览器或设备时选 Remote Control；本机可能关机、需要云端并行或不应触碰本机时，才选云端沙箱。</div>
+    <p><strong>Remote Control 也不等于 Computer Use。</strong>Remote Control 是“人在远程驱动一个本机 Agent session”；Computer Use 是“Agent 自己看、点、输入操作系统或应用界面”。两者可以组合，但权限和风险要分开评估。</p>
+    <div class="aside"><strong>远程控制的安全底线：</strong>主机必须保持运行和网络可达；使用账号认证与配对；保留本地 sandbox、审批和 Hook；并行 session 使用独立 worktree。不要因为你在手机上看不见所有细节，就给本机 Agent 长期 full access。</div>
+
+    <h3>Browser、Computer Use 与“接管我现有的 Chrome”是三条不同路径</h3>
+    <p>OpenAI 的内置 Browser 使用独立于日常浏览器的 profile；Computer Use 可以操作桌面应用和图形界面；只有 Chrome 扩展这条路径会接入我已经登录、正在使用的 Chrome。它们看起来都是“AI 在点浏览器”，实际依赖的权限、插件和故障边界完全不同。</p>
+    <div class="aside"><strong>一个我不会替 Codex 美化的真实缺点：</strong>在我的 Mac 和这套工作流中，Codex 直接控制 Chrome 的稳定性非常差。有几次 CLI 或桌面端只升级一个小版本，前一天还能用的连接就失效；修好后过几天又会复发，再次无法连接 Chrome。即使切到我当前使用的 GPT-5.6-SOL 也不会解决，因为出问题的通常是 Chrome 扩展、extension backend、Plugin 缓存或本地 runtime 之间的桥接，而不是模型推理。在同一台机器和同一套工作流里，我没有遇到 Claude Code 这样反复断连的问题。说得直接一点，这是我认为 Codex 目前做得非常差的一块。</div>
+    <p><strong>我的实际处理方式不是每次先测试 Codex，而是直接按工具稳定性分工：</strong>凡是需要使用已有登录态 Chrome 或操作网页后台的任务，我都交给 Claude Code，例如填写 Stripe 控制台表单，或打包上传 iOS、Android 应用并操作商店后台。Codex 在这类任务里主要充当 reviewer：审查代码 diff、命令输出、状态记录和 Claude 提供的页面证据，不负责浏览器执行。这不代表 Codex 的 Chrome 链路已经修好，只是我不会再让一条反复失效的工具链阻塞生产工作。</p>
+
+    <h3>一张能力图，而不是另一套章节编号</h3>
+    <p>下面只是一张系统关系图：它帮助你看清能力怎样叠加，不代表必须按六个阶段依次安装。</p>
+    <div class="stack" aria-label="AI 编程能力栈">
+      <div class="layer"><b>1 · Model &amp; Context</b><small>模型推理，当前对话、代码和规则提供上下文</small></div>
+      <div class="layer"><b>2 · Terminal / CLI / Agent &amp; Tools</b><small>终端承载 Shell 与 CLI，Agent 再调用文件、浏览器、Git 等工具</small></div>
+      <div class="layer"><b>3 · MCP / Skill / Plugin</b><small>连接外部系统，封装可复用能力，安装整套扩展</small></div>
+      <div class="layer"><b>4 · Rules &amp; Memory</b><small>用指令文件固化必须遵守的规则，用 memory 回忆历史背景</small></div>
+      <div class="layer"><b>5 · Workflow &amp; Harness</b><small>把多步任务编排成状态机，并用可执行程序控制环境与证据</small></div>
+      <div class="layer"><b>6 · Hooks &amp; Gates</b><small>在关键生命周期阻止越权、跳过测试或直接破坏主分支</small></div>
+    </div>
+
+    <h2 id="zh-first-task">第一次使用 AI 编程，任务要足够小</h2>
+    <p>不要从“重写整个项目”开始，也不要第一次就把支付、权限或数据库迁移交出去。最适合入门的任务应该范围清楚、结果可验证、失败后容易回退，例如：</p>
+    <ul>
+      <li>修复一个可以稳定复现的小 Bug；</li>
+      <li>给已有函数增加边界测试；</li>
+      <li>补一个表单校验或错误提示；</li>
+      <li>重构一个输入输出明确的函数；</li>
+      <li>先让 AI 解释一条调用链，不修改代码。</li>
+    </ul>
+    <p>第一次跑通一个可信的小闭环，比第一次生成几千行代码重要得多。</p>
+
+    <h3>给 AI 的任务卡：五项就够了</h3>
+    <p>提示词不需要神秘。把下面五件事说清楚，效果往往就会大幅改善：</p>
+    <pre><code>目标：登录失败时显示服务端返回的具体错误。
+
+现象：当前所有失败都显示“网络错误”。
+
+范围：只修改登录请求和错误展示，不调整页面设计。
+
+验收标准：
+1. 密码错误时显示正确提示；
+2. 断网时仍显示网络错误；
+3. 成功登录流程不受影响；
+4. 增加回归测试。
+
+限制：不修改接口协议，不增加新依赖。</code></pre>
+    <p>如果你自己还说不清验收标准，AI 大概率也只能猜。先定义“怎样才算正确”，再让它动手。</p>
+
+    <h2 id="zh-copy-workflow">一套可以直接照做的工作流</h2>
+    <h3>第一步：先保护现有工作，再隔离任务</h3>
+    <p>先记录当前分支、基线 commit、工作区状态与 worktree。若已有未提交修改，先确认它们属于谁；不要让 Agent 自行 stash、reset、clean 或整库 restore。每个新任务应在独立 feature worktree 中写，两个 AI 不得共用同一工作目录。</p>
+    <pre><code>git branch --show-current
+git rev-parse HEAD
+git status --short
+git worktree list
+
+# 确认基线和现有修改后，再从记录的基线创建隔离 worktree
+git worktree add ../project-login-fix -b fix/login-error-message HEAD
+cd ../project-login-fix</code></pre>
+
+    <h3>第二步：让实现者先调查，再修改</h3>
+    <pre><code>请先阅读项目规则和相关代码，确认根因后再修改。
+
+要求：
+1. 控制修改范围，不改变无关行为；
+2. 为问题增加能够失败后再通过的回归测试；
+3. 运行相关测试或真实环境验证；
+4. 最后列出修改文件、验证结果和剩余风险；
+5. 证据不足时，不要声称已经完成。</code></pre>
+
+    <h3>第三步：把实际差异和证据交给第二个 AI</h3>
+    <p>我的实际流程里，这一步由另一个 AI 完成，不是我先逐行人工审 diff。审查者使用独立上下文，直接读取真实差异、相关代码和测试证据。</p>
+    <pre><code>你是独立代码审查者，没有参与前面的实现。
+
+请检查实际 diff 以及必要的上下游代码，重点寻找：
+1. 逻辑错误和边界条件；
+2. 安全、隐私、并发或兼容性问题；
+3. 新增回归风险；
+4. 缺失、无效或验证层级错误的测试；
+5. 与项目现有规则冲突的修改。
+
+不要因为测试通过就默认代码正确。
+
+输出：
+VERDICT: APPROVED 或 CHANGES_REQUESTED
+OPEN: 尚未解决的问题列表</code></pre>
+
+    <h3>第四步：在流程内部闭环</h3>
+    <p>审查者发现确认的问题后，不要停在报告，也不要把决定重新抛给人。直接进入“修复 → 测试 → 重新审查”，直到证据通过、审查明确批准并且 <code>OPEN</code> 为空。</p>
+
+    <h3>第五步：人在本地或生产环境验收结果</h3>
+    <p>我通常不逐行检查代码差异，主要介入最终结果验证：根据任务在本地或 prod 实际操作关键流程，确认功能是否真的可用、是否满足需求。发现问题后，我把复现步骤和真实现象交回 AI，继续“修复 → 测试 → 审查”。必须由账号持有者完成的身份确认、2FA、签名和付款授权仍由我控制；打包、上传、提交审核或已明确授权的发布操作，则可以由 Claude Code 执行并由 Codex 复核，不需要假装每一步都是我手动点完。</p>
+
+    <h3>证据应该与风险匹配</h3>
+    <p>先把验证层写进完成条件。第三部分会用真实案例解释为什么单元测试、浏览器、设备与生产证据不能互相替代。</p>
+    <blockquote>完成是一项主张，证据才是事实。</blockquote>
+    <div class="compare"><table>
+      <thead><tr><th>改动类型</th><th>最低证据</th><th>常见误区</th></tr></thead>
+      <tbody>
+        <tr><td>纯函数或算法</td><td>针对性单元测试、边界用例</td><td>只跑旧测试，没有证明新问题被覆盖</td></tr>
+        <tr><td>接口或状态流程</td><td>集成测试、真实请求、错误路径</td><td>只验证成功路径</td></tr>
+        <tr><td>前端视觉或动画</td><td>真实浏览器、关键视口、视觉证据</td><td>把 jsdom 通过当作浏览器通过</td></tr>
+        <tr><td>移动端或原生能力</td><td>设备或模拟器验证、构建结果</td><td>只检查共享业务代码</td></tr>
+        <tr><td>权限、支付、迁移</td><td>跨厂商独立审查、回滚方案、失败路径；方案高度不确定时再考虑双实现</td><td>把双实现当成所有高风险任务的默认流程</td></tr>
+      </tbody>
+    </table></div>
+    <div class="rule"><strong>我真正长期使用的是“一写一审”：</strong>一个 AI 实现，另一个不同厂商的 AI 审查真实 diff 和证据。两个 AI 在不同 worktree 中独立实现的 DualForge 我确实用过，例如 BNB-USDT HD 托管这类资金链路，但它不是所有高风险任务的默认流程；不少支付和认证加固仍然是 Codex 实现、Claude 审查。对初学者，先把“一写一审”跑稳定；只有任务风险、方案分歧和额外成本都值得时，再升级到双实现。</div>
+
+    <div class="part-divider"><span>第二部分</span><b>把概念弄明白：Agent 到底靠什么工作</b><p>动手做过一次以后，再理解 Memory、MCP、Skill、Plugin、Markdown 指令、Workflow、Harness 与 Hooks，这些词才不会变成一堆术语。</p></div>
+
+    <h2 id="zh-model-context">模型、Token、上下文、幻觉与 Memory</h2>
+    <div class="concept-grid">
+      <div class="concept"><span class="pill">基础</span><h3>Token</h3><p>模型读写信息的计量单位，不等于字数。代码、日志、工具输出和对话都会消耗 Token。</p><p class="example"><strong>坑：</strong>同时塞进大量无关日志，会让关键需求被淹没，成本也会上升。</p></div>
+      <div class="concept"><span class="pill">基础</span><h3>Context Window 上下文窗口</h3><p>模型一次能“看见”的信息范围。窗口很大也不等于每个细节都能被稳定记住。</p><p class="example"><strong>可执行做法：</strong>主线保留目标、决策和验收标准；大段日志放到文件证据，只在任务真的独立时才交给受限子 Agent。</p></div>
+      <div class="concept"><span class="pill">任务</span><h3>Prompt</h3><p>当前任务的指令。好 Prompt 不是口令，而是一张任务卡：目标、上下文、限制、完成条件。</p><p class="example"><strong>坑：</strong>只说“帮我修一下”，等于授权 Agent 自己猜业务目标。</p></div>
+      <div class="concept"><span class="pill">风险</span><h3>Hallucination 幻觉</h3><p>模型生成了语法流畅、听起来合理，却没有事实依据的内容。代码里可能表现为不存在的 API、文件或“已经测试”。</p><p class="example"><strong>对策：</strong>要求文件路径、diff、命令输出、浏览器或设备证据。</p></div>
+      <div class="concept"><span class="pill">跨会话</span><h3>Memory</h3><p>让 Agent 从旧任务中回忆你的偏好、历史决策和常见路径。它是检索层，不是数据库事实层。</p><p class="example"><strong>我的教训：</strong>私有 memory 可以记住“应该去哪里查”，但不能决定 App Store、支付或部署的当前状态。</p></div>
+      <div class="concept"><span class="pill">事实</span><h3>Source of Truth 单一事实源</h3><p>对一类状态最权威的位置，可以是代码、数据库、控制台或仓库内的状态文件。</p><p class="example"><strong>BluffKing：</strong>移动商店状态读 <code>store-release-status.json</code>，公开发布读 <code>changelog.json</code>，不用任一模型的记忆替代。</p></div>
+    </div>
+    <div class="aside"><strong>一条很重要的生产规则：</strong> memory 适合存“背景和路由”，不适合存“随时会变的当前状态”。我的项目后来加入了共享 handoff ledger、ops ledger 和仓库状态文件，就是为了防止 Claude 与 Codex 读到不同的过期记忆。</div>
+
+    <h2 id="zh-agent-tools">Agent、Tool、Permission、Sandbox 与子 Agent</h2>
+    <div class="concept-grid">
+      <div class="concept"><span class="pill">执行者</span><h3>Agent</h3><p>“模型 + 上下文 + 工具 + 权限 + 循环”组成的任务执行者。它不只回答，还会查文件、修代码、跑测试并根据结果继续。</p><p class="example"><strong>区别：</strong>聊天模式主要给答案；Agent 模式主要完成可验证的任务。</p></div>
+      <div class="concept"><span class="pill">执行</span><h3>Tool / Tool Call</h3><p>Agent 能调用的原子能力：读文件、执行 shell、搜索代码、访问浏览器、查 GitHub 等。每次调用都应该有清晰的输入输出。</p><p class="example"><strong>坑：</strong>有工具不等于有权限；有权限也不等于应该使用。</p></div>
+      <div class="concept"><span class="pill">安全</span><h3>Permission / Approval</h3><p>决定 Agent 执行某个动作前是自动进行，还是必须获得批准。读代码与删生产数据，绝不应共用同一权限级别。</p><p class="example"><strong>我的边界：</strong>OTP、2FA、签名、付款、真实身份和不可逆操作仍由人控制。</p></div>
+      <div class="concept"><span class="pill">隔离</span><h3>Sandbox</h3><p>对 Agent 可读、可写、可联网和可执行范围的系统级限制。它是“不信任默认输入”的环境边界。</p><p class="example"><strong>Bug-free gate：</strong>确定性阶段会禁止外部网络，预热依赖后将其变为只读，减少供应链变量。</p></div>
+      <div class="concept"><span class="pill">分工</span><h3>Subagent / Agent Team</h3><p>主 Agent 把独立子任务交给专门角色，例如后端审查、前端视觉检查或日志分析。适合可并行、读多写少的工作。</p><p class="example"><strong>坑：</strong>子 Agent 会额外消耗 Token；多个 Agent 同时写同一目录，协调成本可能大于收益。</p></div>
+      <div class="concept"><span class="pill">连续性</span><h3>Session / Thread / Handoff</h3><p>Session 是一次运行上下文，thread 是对话与工具记录。Handoff 是把分支、已改文件、最后成功/失败命令和下一步显式交给另一个 Agent。</p><p class="example"><strong>我的做法：</strong>Claude 额度用完时，Codex 从实际 worktree、Git 状态和持久化 handoff 继续，不依赖一句“差不多做完了”。</p></div>
+    </div>
+
+    <h2 id="zh-mcp-skills">MCP、Connector、Skill、Plugin 到底有什么区别</h2>
+    <div class="compare"><table>
+      <thead><tr><th>概念</th><th>它是什么</th><th>什么时候用</th><th>我项目中的用法</th></tr></thead>
+      <tbody>
+        <tr><td><span class="term">MCP</span><br><span class="mini">Model Context Protocol</span></td><td>让 Agent 以标准方式连接外部工具与上下文的协议。MCP server 可暴露 tools、resources 和 prompts。</td><td>需要访问 GitHub、浏览器、Figma、文档服务、内部系统或另一个 Agent 时</td><td>这个项目的反向路径并不对称：Claude 可通过配置的 Codex 工具/MCP 请 Codex 审查；Codex 产出则调用仓库固定的 <code>scripts/claude-review.mjs</code> 交给 Claude。MCP 是能力连接层，不是所有交叉审查都必须经过的唯一路径</td></tr>
+        <tr><td><span class="term">Connector / App</span></td><td>对某个服务的授权连接，通常处理登录、权限和结构化操作</td><td>需要读取私有 GitHub、Gmail、Calendar 等数据时，比网页搜索或模型记忆更可靠</td><td>我当前的 Codex 环境可接入 GitHub、Gmail、Calendar、Browser 和 Chrome；项目中有明确使用证据的主要是 GitHub、Gmail 与浏览器类能力。“已安装/可调用”不等于“这个项目已经实际使用”，发送、删除和发布还要单独分权</td></tr>
+        <tr><td><span class="term">Skill</span></td><td>可复用的任务方法包，通常由 <code>SKILL.md</code> 加可选 scripts、references、assets 组成</td><td>当一项工作会重复发生，且需要稳定步骤、专业知识或辅助脚本时</td><td><code>bug-free-codex</code>、<code>visual-fidelity</code>、<code>visual-animation-verify</code>、<code>hot-fix</code>、<code>social-post</code> 和 <code>memory-audit</code> 都是项目 skill</td></tr>
+        <tr><td><span class="term">Plugin</span></td><td>可安装的分发单元，可以把 skills、MCP-backed apps/connectors、hooks 与 assets 打包在一起</td><td>当你想直接安装一整套已组装好的能力，或向团队分发自己的工作方法时</td><td>浏览器、Chrome 和 GitHub 等能力以 plugin 形式安装；任务命中后再按需加载相应 skill</td></tr>
+        <tr><td><span class="term">Slash Command</span></td><td>用 <code>/</code> 显式触发的命令或工作流入口</td><td>当你想清楚选择一种模式或可重复任务时</td><td><code>bug-free-codex</code> 这类明确触发词会启动固定质量门，而不是只发一段普通提示词</td></tr>
+      </tbody>
+    </table></div>
+    <blockquote>Skill 告诉 Agent “这类任务应该怎样做”；MCP 给它“能用什么外部工具”；Plugin 则把这些能力组装成可安装的包。</blockquote>
+    <p>一个常见误区是安装越多 plugin 就越强。实际上，过多工具和 skill 会占用发现上下文、增加选错工具的概率。我曾因 skills-context 预算警告检查全局配置，最后关闭不必要的 plugin，而不是继续往 Agent 里塞更多描述。</p>
+
+    <h2 id="zh-markdown">Markdown 文件不只是文档，而是 Agent 的长期操作系统</h2>
+    <div class="compare"><table>
+      <thead><tr><th>文件</th><th>主要读者</th><th>用来存什么</th><th>BluffKing 里的作用</th></tr></thead>
+      <tbody>
+        <tr><td><code>README.md</code></td><td>人和 Agent</td><td>产品概览、快速开始、仓库布局</td><td>说明 Rust 引擎、Vue H5、PostgreSQL 数据库、WebSocket 房间与回放架构</td></tr>
+        <tr><td><code>AGENTS.md</code></td><td>Codex 等 Agent</td><td>每次任务自动加载的仓库规则、命令、禁止项与验收方式</td><td>规定一任务一 worktree、不能直改 main、不同风险对应不同测试</td></tr>
+        <tr><td><code>CLAUDE.md</code></td><td>Claude Code</td><td>Claude 端对应的持久指令</td><td>与 <code>AGENTS.md</code> 共享核心合同，并用同步检查避免两个 Agent 规则分叉</td></tr>
+        <tr><td><code>SKILL.md</code></td><td>被选中的 Agent</td><td>某一类任务的触发条件、边界、步骤、辅助脚本和结束标准</td><td><code>bug-free-codex/SKILL.md</code> 定义从本地回归到生产验证的固定入口</td></tr>
+        <tr><td><code>ADR-NNN.md</code></td><td>工程团队与 Agent</td><td>重要架构决策、为什么这样做、替代方案与状态</td><td>只有 Accepted/Locked 的 ADR 才是约束；Superseded 必须追踪后继决策</td></tr>
+        <tr><td><code>PLANS.md</code> / task plan</td><td>Agent 与审查者</td><td>复杂任务的可执行步骤、依赖和验收点</td><td>适合长任务；简单修复不需要为了“看起来完整”强行写大计划</td></tr>
+      </tbody>
+    </table></div>
+    <p><span class="term">Markdown 指令的优势</span>是人和 AI 都能读、可进 Git、可审查、可追踪。它的局限也很明显：<strong>它主要是指令，不是强制执行。</strong>Agent 可能忘记、误解或遇到冲突。所以重要规则要向 hooks、测试、CI 和可执行 gate 升级。</p>
+    <div class="rule"><strong>我的规则升级方法：</strong>偶发提醒放在 Prompt；重复经验放在 Memory；每次必须遵守的放在 <code>AGENTS.md/CLAUDE.md</code>；可复用任务做成 Skill；不允许再犯的错误用 Hook 或 Gate 机械阻止。</div>
+
+    <h2 id="zh-workflow-harness">Workflow、Harness、Hook、Gate、CI 不要混用</h2>
+    <div class="concept-grid">
+      <div class="concept"><span class="pill">编排</span><h3>Workflow</h3><p>从开始到结束的有序步骤和状态转移。它回答“先做什么、失败后去哪里、什么时候结束”。</p><p class="example"><strong>项目流程：</strong><code>audit → fix → re-verify</code>，以及 <code>produce → opposite-vendor review → reconcile → act</code>。</p></div>
+      <div class="concept"><span class="pill">执行容器</span><h3>Harness</h3><p>把 Agent、环境、测试、超时、输出格式和证据收集包起来的可执行程序。它不只描述流程，而是真正跑起来并给出结果。</p><p class="example"><strong>BluffKing：</strong><code>trusted-local-launcher.mjs</code>、<code>bug-free-codex-pipeline.mjs</code> 和 <code>mobile-multi-human-regress.sh</code> 组成了质量 harness。</p></div>
+      <div class="concept"><span class="pill">事件拦截</span><h3>Hook</h3><p>在 SessionStart、使用工具前后、提交、推送或结束等生命周期自动运行的脚本。可以提醒，也可以直接拒绝动作。</p><p class="example"><strong>项目里：</strong><code>block-main-edits.sh</code> 阻止主工作树编辑，Git <code>pre-commit</code> 阻止 main 直接提交。</p></div>
+      <div class="concept"><span class="pill">准入</span><h3>Gate / Guardrail</h3><p>一个动作能否继续的机械判定条件。Hook 是触发点，Gate 是通过/拒绝的政策，两者经常配合。</p><p class="example"><strong>合并条件：</strong>只接受独立审查明确 <code>APPROVED</code> 且 <code>OPEN=[]</code>。</p></div>
+      <div class="concept"><span class="pill">安全默认</span><h3>Fail-closed</h3><p>当结果缺失、格式错误、审查超时或无法确认权限时，默认停止，而不是“先当成通过”。</p><p class="example"><strong>我的审查 runner：</strong>只有结构正确的明确批准才返回成功；超时、模型失联、预算用完都不会被包装成绿灯。</p></div>
+      <div class="concept"><span class="pill">远程自动化</span><h3>CI/CD</h3><p>CI 在提交或推送后自动构建、检查和测试；CD 继续处理发布或部署。它不等于本地 Agent workflow，两者应当分工。</p><p class="example"><strong>BluffKing：</strong>本地 bug-free 负责重行为回归；GitHub Actions 的 main-push gate 负责发布构建和 changelog 合同。</p></div>
+      <div class="concept"><span class="pill">定时</span><h3>Automation / Heartbeat</h3><p>按时间或事件触发的无人值守任务。Heartbeat 不只“看一眼”，还需要锁、幂等、状态机、证据和升级规则。</p><p class="example"><strong>已有证据的能力：</strong>每小时 AI team manager 定时运行，会检查 production HTTP/Playwright、后端编译状态，并把失败分类、指派 owner、写入 ledger。最近运行有真实 GREEN 回执和失败记录；但这不等于已经用一段程序证明“发现 → 自动修复 → 合并 → 发布”全链路无人闭环。</p></div>
+      <div class="concept"><span class="pill">证据</span><h3>Artifact / Receipt / Ledger</h3><p>Artifact 是报告、截图、日志和测试输出；receipt 证明审查或动作发生过；ledger 保存跨 Agent 可共享的当前状态。</p><p class="example"><strong>原则：</strong>报告不是授权。在我的合并流中，持久化 receipt 只是审计证据，最终权限绑定当前精确 diff 与实时审查结果。</p></div>
+    </div>
+    <p>这些词之间最容易混淆的地方是：<strong>Skill 是方法，Workflow 是次序，Harness 是执行容器，Hook 是触发点，Gate 是准入判定，Artifact 是结果证据。</strong>成熟的 AI 编程系统通常会同时用到它们，而不是选其一。</p>
+
+    <div class="part-divider"><span>第三部分</span><b>把 AI 真正带进生产：流程、审查与防线</b><p>结合 BluffKing 的真实工程，看多层 Agent Loop、双 AI 审查、机械 Gate 和十二个常见风险怎样连成一套系统。</p></div>
+
+    <h2 id="zh-project">我在 BluffKing 中怎样把这些概念连起来</h2>
+    <div class="project-map" aria-label="BluffKing AI 编程交付链">
+      <div class="mapline">
+        <div class="node"><b>目标或巡检发现</b>产品意图·线上证据·风险</div><div class="arrow">→</div>
+        <div class="node"><b>规则与事实</b>AGENTS/CLAUDE·ADR·status</div><div class="arrow">→</div>
+        <div class="node"><b>隔离实现</b>branch·worktree·skill</div><div class="arrow">→</div>
+        <div class="node"><b>Harness 验证</b>Rust·Vue·Flutter·Browser·Device</div><div class="arrow">→</div>
+        <div class="node"><b>双 AI 审查</b>Claude ↔ Codex·OPEN=[]</div><div class="arrow">→</div>
+        <div class="node"><b>Gate 交付</b>finish-session·main·CI/CD</div>
+      </div>
+    </div>
+    <ol>
+      <li><strong>任务进来：</strong>任务可能来自我的 Prompt，也可能来自定时巡检和共享 ledger；<code>AGENTS.md</code> 与 <code>CLAUDE.md</code> 自动补上仓库的长期规则。</li>
+      <li><strong>先找事实：</strong>代码、Accepted ADR、实时控制台或 canonical JSON 决定当前状态；memory 只负责帮助定位。</li>
+      <li><strong>隔离修改：</strong><code>new-session.sh</code> 从 main 创建独立分支和 worktree，每个 AI session 有自己的文件和 HEAD。</li>
+      <li><strong>按任务选 Skill：</strong>视觉修改触发真实浏览器验证，发布回归触发 <code>bug-free-codex</code>，紧急修复有独立 hot-fix 边界。</li>
+      <li><strong>用 Harness 生成证据：</strong>从 Rust 引擎、需要 PostgreSQL 的服务端集成测试、Vue/Vitest 到 Flutter、Playwright、iOS/Android/H5/Telegram 多端房间，确定性与外部设备证据分开记录。</li>
+      <li><strong>跨厂商审查：</strong>Codex 写的补丁由 Claude 审，Claude 写的由 Codex 审。发现的确认问题在同一 workflow 内直接修复并重审。</li>
+      <li><strong>结构性防越过：</strong>Agent hook 禁止在共享 main 工作树编辑，Git hooks 禁止直提交/隐藏改 main，<code>finish-session.sh</code> 是受信任的合并边界。</li>
+      <li><strong>交付后持续运行：</strong>CI/CD 验证发布合同，heartbeat manager 定时巡检并分类、指派问题，ledger 让 Claude、Codex 和后续 session 看到同一当前状态。</li>
+    </ol>
+    <p>这才是我所说的“大规模把 AI 用到 production”：不是让 Agent 拥有无限权限，而是让它在明确的规则、工具、隔离、验证和审查中自主完成尽可能多的工作。</p>
+
+    <h3>我有没有做 Agent Loop？做了，但不同层的成熟度不同</h3>
+    <p>Agent loop 并没有一个行业唯一标准。它的共同核心是：读取目标 → 调用工具 → 观察结果 → 根据结果继续修复，而不是每一步都等人类复制输出、再发下一条 Prompt。把循环写进 workflow 或 harness 后，还要增加状态、最大轮数、失败分类和退出条件，否则只是在无限“再试一次”。</p>
+    <div class="compare"><table>
+      <thead><tr><th>循环层</th><th>我项目中的实际闭环</th><th>比“再试一次”多了什么</th></tr></thead>
+      <tbody>
+        <tr><td>Agent 内循环</td><td>读取上下文 → 调用工具 → 观测输出 → 决定下一步</td><td>Codex/Claude Code 本身的 agent loop，不需要人手工复制命令输出</td></tr>
+        <tr><td>实现与验证循环</td><td><code>scripts/loop/run.mjs</code> 执行 QA → 分类失败 → 可选调用 Claude fix driver → 重跑</td><td>仓库已经实现有状态、最大轮数和 fail-closed；但不能据此声称每个失败都已自动修复</td></tr>
+        <tr><td>审查循环</td><td>作者 → 异构 reviewer → 修复 confirmed finding → 测试 → 重审，直到 <code>OPEN=[]</code> 或达到轮数上限</td><td>审查者绑定真实 diff 和证据，不靠同一模型自我说服</td></tr>
+        <tr><td>运营巡检循环</td><td>定时 patrol → production/Playwright/编译证据 → triage → owner → ledger</td><td>这一段已有真实 GREEN 与失败回执；AI Team Manager 能主动发现、分类和记录，而不是只等人报 bug</td></tr>
+        <tr><td>工程学习循环</td><td>真实失败 → 定位缺失能力 → 增加 regression/Skill/Hook/facts guard → 之后自动防范</td><td>不只修当前 bug，还会修“为什么流程没发现这个 bug”</td></tr>
+      </tbody>
+    </table></div>
+    <p><strong>所以，这套系统不是“没有 loop，只能靠人逐步操作”，也不是“已经无人值守交付一切”。</strong>已证实的是 Agent 内循环、跨模型审查循环和定时巡检；仓库也实现了有界 QA→修复→重跑能力。尚未由运行证据证明的是“自动发现 → 修复 → 审查 → 合并 → 发布”整条链路长期无人闭环。</p>
+    <div class="aside"><strong>人仍在哪里介入：</strong>我负责产品意图与最终验收；身份、2FA、签名、付款、法律确认等步骤必须由账号持有人完成。已明确授权、可回滚并经过 Gate 的打包、上传、提审或发布操作可以由 Agent 执行，不等于每次都要我手工点击。</div>
+
+    <h3>我用这套方法真正改善了什么</h3>
+    <p>亮点不是“我同时打开了两个 AI”，而是在大量普通任务中把人从逐步盯命令、复制日志和反复批准中移出，将时间集中到产品意图、最终验收和高风险边界。下面每一项都有对应的代码、脚本、Hook、提交或运行记录。</p>
+    <div class="outcome-grid">
+      <div class="outcome"><b>从一次性生成到持续交付</b>Agent 不再只生成一次性代码，而是沿同一套隔离、验证、审查与发布合同持续维护一个线上产品。</div>
+      <div class="outcome"><b>从人肉催促到有界 Agent Loop</b><code>scripts/loop/run.mjs</code> 能分类 QA 失败、在配置 fix driver 时调用修复并重跑，以最大轮数和 fail-closed 停止；它是已落地的能力，不包装成所有任务都已自动闭环。</div>
+      <div class="outcome"><b>从等人报 bug 到主动巡检</b>每小时 heartbeat 能读取 production、Playwright 和编译证据，triage 问题、分派 owner 并写入 ledger；后续修复是否自动闭环仍由外层 Agent、工具可用性和权限 Gate 决定。</div>
+      <div class="outcome"><b>从“测试绿了”到证据分层</b>算法、接口、浏览器、设备与 prod 现在各有独立证据层；任何一层绿色都不能替代另一层，视觉正确也不再由功能测试代答。</div>
+      <div class="outcome"><b>从规则文档到无法静默绕过</b>共享 main 编辑、未审查合并、缺失 verdict、过期 review receipt 会被 hooks、runner 和 ref-transaction gate 直接拒绝。</div>
+      <div class="outcome"><b>从双 AI 投票到多失败检测器</b>跨厂商 review 绑定真实 diff 与 <code>OPEN=[]</code>，但还需同时经过 regression、真实环境、facts guard、prod 反馈和人类产品验收。</div>
+    </div>
+    <div class="aside"><strong>这不等于无人公司：</strong>我仍定义产品目标、做本地或 production 最终验收，处理身份、资金、法律等账号持有人动作，并承担最终责任。Claude 可以在授权后操作控制台、打包和上传，Codex 再审查；改善在于人不再是每个工具调用的审批员。</div>
+
+    <h2 id="zh-dual-ai-failure">为什么一个 AI 会自信地犯错，两个 AI 也会一起漏</h2>
+    <p>AI 最大的问题通常不是完全不会写，而是会沿着一个错误前提持续向前，而且表达得非常确定。它可能：</p>
+    <ul>
+      <li>修复眼前现象，却没有找到根因；</li>
+      <li>只阅读一个文件，漏掉上下游协议或状态变化；</li>
+      <li>让现有测试通过，却没有补上能复现问题的回归测试；</li>
+      <li>在前端单元测试通过后，默认真实浏览器也正确；</li>
+      <li>用一段漂亮的总结掩盖没有真正运行过的验证。</li>
+    </ul>
+    <p>同一个 AI 写完再让它“检查一下”，经常仍会沿用自己的原始假设。第二个 AI 可以增加一条判断路径，但它不是正确性证明：两个模型可能共同误解需求、共同相信一组不完整的测试，或者在同一份过期事实之上达成一致。</p>
+
+    <h3>我的 Git 历史里，双 AI 以后仍然会出现什么问题</h3>
+    <div class="compare"><table>
+      <thead><tr><th>真实记录</th><th>两个模型为什么也可能漏</th><th>后来增加的防线</th></tr></thead>
+      <tbody>
+        <tr><td><code>46c9b57d</code>：9 个 Vitest 都通过，真实 Chromium 中扑克牌仍保持背面</td><td>作者和审查者都可能接受了错误的验证层；jsdom 能证明元素存在，不能证明 CSS 变换真的可见</td><td><code>visual-animation-verify</code>：动画必须在真实 Chromium 中验证可见结果</td></tr>
+        <tr><td>Phase 3 Table：构建、758 个测试和 10/10 smoke 都绿，但实现悄悄简化了设计</td><td>功能测试回答“能不能用”，没有回答“是不是用户要求的样子”</td><td><code>visual-fidelity</code>：完成声明绑定设计源、关键视口和并排视觉报告</td></tr>
+        <tr><td><code>7767eede</code>：第三轮审查修复又引入空 SHA 去重 bug，第四轮才发现</td><td>修复本身也是新代码；“已处理 finding”不代表没有新增回归</td><td>每轮修复都补 RED→GREEN 回归，并重新跑测试和审查，而不是只复核旧 finding</td></tr>
+        <tr><td><code>4083b0d8</code>、<code>a23646c7</code>：营销事实和支付状态与真实产品、Stripe 控制台发生漂移</td><td>两个模型阅读同一份过期文档，只会更一致地得出旧结论</td><td>canonical status、live read-back、facts guard 与 ledger；变化后由机器检查所有消费者</td></tr>
+      </tbody>
+    </table></div>
+    <p>这几类问题分别来自验证层错误、需求验收缺失、修复引入回归和外部事实漂移。它们不可能只靠“多投一票”解决。</p>
+
+    <h3>我真正使用的是多层防线，不是双 AI 魔法</h3>
+    <p>下面是系统控制层，不是另一张测试类型清单：前面的证据表回答“该跑什么”，这里回答“谁负责阻止错误继续流动”。</p>
+    <div class="compare"><table>
+      <thead><tr><th>防线</th><th>主要解决什么</th><th>我项目中的落地方式</th></tr></thead>
+      <tbody>
+        <tr><td>1 · 任务合同</td><td>两个 AI 一起误解需求</td><td>任务卡写目标、范围、禁止项、验收标准；视觉工作额外绑定设计源和目标视口</td></tr>
+        <tr><td>2 · 状态隔离</td><td>多 Agent 覆盖文件、切错分支、污染结果</td><td>一任务一 branch/worktree，作者与审查者不共享可写状态</td></tr>
+        <tr><td>3 · 当前事实源</td><td>Memory、文档或总结已经过期</td><td>以代码、数据库、canonical status、ledger、真实控制台和 live read-back 为准</td></tr>
+        <tr><td>4 · 风险匹配的证据</td><td>错误层级的绿色测试</td><td>算法跑单测，接口跑集成，动画跑真实浏览器，移动端跑设备，发布后跑 production smoke</td></tr>
+        <tr><td>5 · 回归与不变量</td><td>修复旧 bug 时制造新 bug</td><td>先写能失败的回归，再修到通过；支付、筹码、并发等关键逻辑再检查守恒与顺序不变量</td></tr>
+        <tr><td>6 · 独立审查</td><td>作者盲点和证据缺口</td><td>新上下文、只读权限、真实 diff、相关调用链、明确 rubric、<code>VERDICT</code> 与 <code>OPEN</code></td></tr>
+        <tr><td>7 · 机械执行</td><td>AI 忘记 Markdown 规则或擅自宣布完成</td><td>Hooks、CI、harness、fail-closed gate 和受信任合并入口直接阻止违规动作</td></tr>
+        <tr><td>8 · 线上反馈与人类验收</td><td>自动化没有覆盖的真实体验和外部变化</td><td>监控、日志、prod 回归、可回滚发布；产品需求、视觉取舍、身份、付款与不可逆动作由人负责</td></tr>
+      </tbody>
+    </table></div>
+    <blockquote>可靠性不是两个模型投票投出来的，而是多个相互独立的失败检测器叠出来的。</blockquote>
+
+    <h3>双 AI 的正确定位：多一道独立检查，不是正确性证明</h3>
+    <div class="role-grid">
+      <div class="role"><b>人：定义者与最终责任人</b>决定真正要解决的问题、不可触碰的边界、验收标准，以及哪些操作不能自动执行。</div>
+      <div class="role"><b>AI A：实现者</b>阅读仓库规则，调查根因，做最小改动，补回归测试，并报告实际验证结果。</div>
+      <div class="role"><b>AI B：独立审查者</b>直接阅读实际差异和相关调用链，寻找逻辑错误、遗漏、回归与证据缺口。</div>
+      <div class="role"><b>工具：证据层</b>Git diff、测试、构建、浏览器、设备和运行日志提供可重复证据；但证据层也要检查覆盖范围和 harness 是否可信。</div>
+    </div>
+    <div class="flow" aria-label="双 AI 工作流">
+      <div class="step">定义与调查</div><div class="step">实现与测试</div><div class="step">独立审查</div><div class="step">修复并复验</div>
+    </div>
+    <p>Claude 和 Codex 谁写、谁审并不是关键。关键是角色分离、审查独立，以及审查者必须看到真实代码和证据，而不是只读实现者写的总结。即使两个 AI 都批准，也只能说明它们在给定上下文里没有发现问题，不能说明用户需求已经被完整满足。</p>
+
+    <h4>同一个模型的不同版本，可以互相审查吗？</h4>
+    <p><strong>可以，基本思路相同：制造第二条判断路径；但独立性不是同一个等级。</strong>不同版本的能力、上下文窗口和推理行为可能不同，因此通常比“同一会话自检”更有价值；但同一模型家族仍可能共享训练偏好、表达风格、工具习惯和盲点。</p>
+    <div class="compare"><table>
+      <thead><tr><th>安排</th><th>能带来的价值</th><th>适合怎样使用</th></tr></thead>
+      <tbody>
+        <tr><td>同一模型、同一会话自检</td><td>成本最低，但最容易沿用原假设</td><td>只用于快速找明显遗漏，不作为独立批准</td></tr>
+        <tr><td>同一模型、新会话</td><td>切断部分上下文锚定，能重新阅读 diff</td><td>普通低风险改动的第二遍检查</td></tr>
+        <tr><td>同一厂商、不同版本</td><td>能力和行为有差异，但错误相关性仍可能较高</td><td>可以做 reviewer；必须配合测试、真实环境证据和明确 rubric</td></tr>
+        <tr><td>不同厂商或模型家族</td><td>训练、工具和对齐路径更不同，通常能增加盲点多样性</td><td>高风险或重要改动优先采用，但仍不能替代验证与人类验收</td></tr>
+      </tbody>
+    </table></div>
+    <div class="aside"><strong>比换模型名字更重要的独立性：</strong>让 reviewer 使用新会话和只读权限，直接读取需求、真实 diff、相关源代码与验证证据；要求逐项核对验收标准，并让最终结论受测试、浏览器、设备、线上状态和人类产品判断约束。</div>
+
+    <h2 id="zh-traps">把 AI 带进生产最常见的十二个坑</h2>
+    <p>这些不是已经“永久消失”的问题，而是现有流程持续防范的风险。目标不是零 bug，而是让错误更容易被发现、被拦下、被回退，并且不会在下一个 session 里被忘掉。</p>
+    <div class="compare"><table>
+      <thead><tr><th>坑</th><th>最低可执行解法</th><th>我项目里的实际机制</th></tr></thead>
+      <tbody>
+        <tr><td>1·把模型当成 Agent</td><td>开始先确认当前目录、仓库、工具、网络、sandbox 和读写权限；没有工具就只出方案</td><td>从项目 Terminal 启动 CLI Agent；Hook 发现写任务落在共享 main 时，阻断并引导创建独立 worktree</td></tr>
+        <tr><td>2·一次交给 AI 太大范围</td><td>一张任务卡只解决一个问题，写明范围、禁止项和可执行验收标准</td><td>一任务一 branch/worktree，大任务拆成可独立验证的阶段</td></tr>
+        <tr><td>3·把 Memory 当成实时事实库</td><td>Memory 只用于定位；回答状态前重读代码、ledger、数据库或真实控制台</td><td>canonical status JSON、ops/bug-free ledger、live read-back 和 facts guard</td></tr>
+        <tr><td>4·只看总结，不看 diff</td><td>审查真实 diff、变更文件、执行命令与原始证据；总结只是索引</td><td>reviewer 绑定精确 patch 与验证回执，不审批一段“已完成”文案</td></tr>
+        <tr><td>5·把 Markdown 规则当成强制机制</td><td>规则可先写入指令文件；高风险或反复犯错的部分下沉到 Hook、测试或 Gate</td><td><code>AGENTS.md</code>/<code>CLAUDE.md</code> 说明，Agent hooks、Git hooks 和 <code>finish-session.sh</code> 负责阻止越过</td></tr>
+        <tr><td>6·安装所有 Plugin</td><td>按工作流做最小允许列表；说不出用例、权限和验证方式的扩展先不装</td><td>视觉、发布、审查等场景按需触发 Skill，不让所有工具常驻每次对话</td></tr>
+        <tr><td>7·MCP 给了过大权限</td><td>读、写、删、发送、发布分层授权；默认只读，外部动作需明确身份、目标和审计</td><td>账号身份、2FA、签名、付款和不可逆操作保留人类边界，证据不记密钥</td></tr>
+        <tr><td>8·把测试通过等同于功能正确</td><td>先问“这个测试真正观测了什么”；再按风险加集成、真浏览器、设备、prod smoke 和人类验收</td><td>Vitest 不代替 Chromium，harness 分层记录证据，发布后继续验证</td></tr>
+        <tr><td>9·两个 AI 共用一个目录</td><td>每个写入者使用独立 branch/worktree；reviewer 尽量只读</td><td><code>new-session.sh</code> 创建隔离环境，Hook 禁止修改共享 main 工作树</td></tr>
+        <tr><td>10·无节制地开子 Agent</td><td>只并行无共享写状态的独立任务；其余由单一主线编排，并指定唯一 owner</td><td>多端验证可并行，合并、共享状态和强依赖修复走受控 workflow 与 ledger</td></tr>
+        <tr><td>11·让第二个 AI 审查第一份总结</td><td>新会话+只读权限，直接给实际 diff、需求、调用链与测试输出，逐项对验收标准</td><td>Claude/Codex 交叉审查，输出 <code>VERDICT</code> 和 <code>OPEN</code>；修复后重跑闭环</td></tr>
+        <tr><td>12·没有结束条件和权限边界</td><td>把“完成”改写为可执行命令、可观测结果、回滚方案、明确 verdict 和空遗留列表</td><td>Gate 默认 fail closed；验证码、密钥、付款、删库由人控制；发布需要显式授权、回滚方案和 Gate，也可以由 Agent 执行</td></tr>
+      </tbody>
+    </table></div>
+
+    <h2 id="zh-glossary">附录：需要时再查的 Claude/Codex 术语</h2>
+    <p>这些词不是开始 AI 编程的前置考试。遇到相关场景时回来查即可；第一遍阅读可以直接跳过。</p>
+    <div class="compare"><table>
+      <thead><tr><th>概念</th><th>一句话解释</th><th>在真实项目中怎样用</th></tr></thead>
+      <tbody>
+        <tr><td><span class="term">Plan Mode</span></td><td>先调查、拆分、确认验收点，再进入修改</td><td>适合复杂、模糊或高风险任务；已能清楚验收的小修复不要过度规划</td></tr>
+        <tr><td><span class="term">Reasoning Effort</span></td><td>模型为任务分配的推理强度</td><td>简单机械修改用低/中，架构、认证、支付、并发和难调试用高强度；不用“最强”替代测试</td></tr>
+        <tr><td><span class="term">Context Rot / Compaction</span></td><td>对话过长后重点被噪音淹没，或历史被压缩为摘要</td><td>将必须保真的规则写入文件，将分支、失败命令和下一步写入 handoff，不把整个项目系于一个聊天窗口</td></tr>
+        <tr><td><span class="term">RAG / Retrieval</span></td><td>先检索相关文档或数据，再将结果放进当前上下文</td><td>适合大型文档、内部知识和历史记录；它不等于训练模型，检索出的过期内容仍要验证</td></tr>
+        <tr><td><span class="term">Fine-tuning</span></td><td>用数据调整模型的固定行为模式</td><td>对普通仓库编程通常不是第一选择；先用 Prompt、AGENTS、Skill、MCP 和 eval 解决</td></tr>
+        <tr><td><span class="term">Config</span><br><span class="mini"><code>config.toml</code> / settings</span></td><td>保存模型、推理、sandbox、approval、MCP、hooks、plugins 等持久默认值</td><td>个人默认放全局配置，仓库特有行为放项目配置，一次性覆盖不要偷偷变成永久规则</td></tr>
+        <tr><td><span class="term">Environment Variable / Secret</span></td><td>运行环境提供的配置值；secret 是不应进代码、日志、Prompt 或 memory 的敏感值</td><td><code>.env</code> 应忽略提交，使用最小权限与专用 secret store；证据报告只记录“已配置/未配置”</td></tr>
+        <tr><td><span class="term">Prompt Injection</span></td><td>不可信页面、文件或工具输出尝试诱导 Agent 违反真正指令</td><td>把外部内容当数据，不当权限源；用 sandbox、工具白名单、审批，以及高风险操作的禁止/审批边界</td></tr>
+        <tr><td><span class="term">Test vs Eval</span></td><td>Test 验证软件行为；Eval 验证模型或 Agent workflow 在一组任务上的表现</td><td>既要测代码是否正确，也要用固定失败样例测 harness 会不会误报绿灯</td></tr>
+        <tr><td><span class="term">Deterministic / Nondeterministic</span></td><td>相同输入是否可重复得到相同结果</td><td>单元测试、锁定依赖尽量确定性；真机、网络、商店、时间相关验证单独记录外部证据</td></tr>
+        <tr><td><span class="term">Trace / Log</span></td><td>Agent 的工具调用、输出、状态转移和错误记录</td><td>用于回放“为什么得到这个结论”，但要限制大小、脱敏，并区分原始记录与最终 verdict</td></tr>
+        <tr><td><span class="term">Idempotency / Lock</span></td><td>重复执行不会重复造成效果；锁用来防止两个运行互相冲突</td><td>定时 heartbeat 必须有 run lock、可重复状态和最终释放证据，否则 Agent 可能重复发布或重复修复</td></tr>
+      </tbody>
+    </table></div>
+
+    <div class="part-divider"><span>第四部分</span><b>在自己的项目里落地：四周搭起最小闭环</b><p>按照四周路线、决策型 FAQ 和一份可直接交给 Agent 的 Prompt，把这套方法放进自己的仓库。</p></div>
+
+    <h2 id="zh-four-week-path">从 GPT 对话用户到 AI 编程入门：四周路线</h2>
+    <p>这不是第二套正文，而是一条执行索引：每周只增加一个能力层，并回到前文完成对应练习。</p>
+    <h3>第一周：只读理解，建立信任校准</h3>
+    <p>先按<a href="#zh-layers">入口选择</a>和<a href="#zh-remote">运行位置</a>启动 Agent。让它只读解释架构、画一条调用链、找测试入口；抽查事实，观察它会在哪里猜测。</p>
+    <h3>第二周：完成第一个可回退小改动</h3>
+    <p>按<a href="#zh-first-task">小任务与任务卡</a>选择一个可回退改动，再照<a href="#zh-copy-workflow">五步工作流</a>跑通“调查 → 修改 → AI 审查 → 本地或测试环境验收 → 必要时回退”。</p>
+    <h3>第三周：把重复经验变成系统</h3>
+    <p>回看<a href="#zh-mcp-skills">能力扩展</a>、<a href="#zh-markdown">Markdown 指令</a>与<a href="#zh-workflow-harness">机械约束</a>：创建一份简短准确的 <code>AGENTS.md</code>，把一个重复任务做成 Skill，再用一个简单 Hook 阻止明确错误。</p>
+    <h3>第四周：加入第二个 AI 和证据化 Gate</h3>
+    <p>按<a href="#zh-dual-ai-failure">双 AI 失效模式</a>与<a href="#zh-traps">十二个坑</a>形成“实现 → 独立审查 → 修复 → 重新验证”闭环。Reviewer 只是一个传感器，最终结论仍受真实环境证据与人类验收约束。</p>
+
+    <h2 id="zh-faq">跳读用 FAQ：初学者面对的十个决策</h2>
+    <p>它是前文索引，不是第二套教程。想快速做决定时先看直接答案，再沿关键词回到对应章节。</p>
+    <div class="compare"><table>
+      <thead><tr><th>问题</th><th>直接答案</th></tr></thead>
+      <tbody>
+        <tr><td>我要先学“提示词工程”吗？</td><td>不用。先会写目标、现象、范围、验收标准和限制这五项，比记忆神秘口令更有用。</td></tr>
+        <tr><td>我不熟悉 Terminal，能开始吗？</td><td>能。先只掌握 <code>cd</code>、<code>git status</code>、启动 Agent、运行项目测试和 <code>git diff</code>；不需要先成为 Shell 专家。</td></tr>
+        <tr><td>必须像你一样买两个 Max 订阅吗？</td><td>不必。一个有仓库工具的 Agent 就能跑通入门闭环；双 AI 是增加审查独立性，不是入场费。</td></tr>
+        <tr><td>必须先装 Memory、MCP、Skill 和 Plugin 吗？</td><td>不必。第一周只需 Agent、仓库、一张任务卡和现有测试；只在真实重复问题出现后再加扩展。</td></tr>
+        <tr><td>测试全绿，为什么还不能直接交付？</td><td>因为测试只观测它被写来观测的东西。视觉、设备、支付、权限和线上状态需要不同证据层。</td></tr>
+        <tr><td>用了两个 AI，我是不是就不用看了？</td><td>可以不逐行看 diff，也不必盯每条命令；但必须定义可观察的验收结果，并像我一样在本地或 production 实际验证最终行为。</td></tr>
+        <tr><td>Agent 是否应该每一步都问我？</td><td>不应该。本地、可逆、已在 sandbox 内的读写和测试可自主完成；身份、密钥、付款和删除等敏感动作由人控制，已授权且可回滚的发布可由 Agent 执行。</td></tr>
+        <tr><td>我在手机上发任务，就是调用本地电脑吗？</td><td>不一定。Cloud Agent 在云容器运行；只有 Remote Control/Dispatch 明确连接本机 host 时，才会使用本地文件与工具。</td></tr>
+        <tr><td>把这篇文章贴给 AI，能一次复制你的全部系统吗？</td><td>不能保证。它能指导有工具的 Agent 搭出最小闭环；成熟系统需要根据每次真实失败逐步演进。</td></tr>
+        <tr><td>最后谁对代码和生产结果负责？</td><td>人。Agent 可以获得高度自主执行权，但产品、法律、财务、身份与最终交付责任不会因为模型批准而转移。</td></tr>
+      </tbody>
+    </table></div>
+
+    <h2 id="zh-bootstrap">把这篇文章直接喂给你的 AI，它真能搭起来吗？</h2>
+    <p><strong>可以搭出一套最小可用版，但不是把 HTML 丢进普通聊天窗口就会自动完成。</strong>你需要从仓库目录启动能读文件、写代码和执行命令的编程 Agent CLI，再把本文与下面的 Prompt 一起交给它。只有聊天能力、没有仓库工具的 AI，最多只能给你一份搭建方案。</p>
+    <div class="rule"><strong>合理的第一版产物：</strong>精简的项目指令文件、任务卡模板、可执行验证脚本或 harness、独立 review 合同与默认失败的 gate，以及如何运行和回退的说明。只有 reviewer 真实可调用并通过正反例验证，独立 Review 才能标为 READY；否则就诚实标为 UNSUPPORTED。Memory、MCP、Plugin、多 Agent 和自动发布不必一次全装。</div>
+    <p>下面的默认权限边界故意比我的成熟项目更保守：初学者先禁止 commit、push、merge 和 deploy；等自己的 review、回滚与发布 Gate 真实跑通后，再逐项授权 Agent 执行。这是启动配置，不是对我当前工作流的反向描述。</p>
+    <h3>可直接复制给 Codex 或 Claude Code 的启动 Prompt</h3>
+    <pre><code>你现在位于我的项目仓库中。我附上了一篇《从聊天机器人到生产级 AI 编程》。
+请不要照抄文章里 BluffKing 的路径、命令或技术栈，而是为当前仓库搭建一套“最小可信 AI 编程闭环”。
+
+工作方式：
+1. 先只读盘点：识别技术栈、Git/CI、测试入口、现有指令文件、hooks/scripts、高风险区域与你当前的工具/权限。记录当前 branch、基线 commit、git status --short、git worktree list 与改前 diff；不要猜测，也不要输出可能包含密钥的内容。
+2. 写入前保护现有工作：若当前是共享 main、存在不属于本任务的未提交修改，或无法辨认修改归属，不得在当前目录写。优先进入现有隔离 feature worktree；若 Git 状态允许，可从记录的基线新建独立 worktree；否则标记 NEEDS_USER。禁止自行 stash、reset、clean、rebase 或整库 restore。
+3. 先输出“现状 → 缺口 → 最小改造”表，然后只在隔离 worktree 内实施安全、本地、可回退的修改；不要等我对每个普通文件确认。
+4. 复用现有约定，避免平行造第二套体系。指令文件保持精简；重复性关键规则改为可执行检查。
+5. 最少交付：
+   - 适配当前 Agent 的项目指令文件（已存在则修正，不要盲目覆盖）；
+   - 包含目标/现象/范围/验收/限制的任务卡模板；
+   - 调用项目现有测试的最小验证脚本或 harness，错误时非零退出；
+   - 独立 review gate：先检测第二个独立 session/model 是否真的可调用；可调用时，用新会话、只读权限审查一个无害 patch，必须读真实 diff/需求/证据并输出可解析的 VERDICT 和 OPEN。只有模板不算 READY；不可调用就标记 UNSUPPORTED 或 NEEDS_USER，交付 gate 必须保持关闭；
+   - 从 branch/worktree 到验证、审查、回退的运行说明。
+6. 用项目已有命令验证新闭环。失败自测只能新建一次性 fixture、注入临时环境变量或调用明确的 false 命令；不得破坏现有业务代码、测试或配置。测试前后比较精确 status/diff，删除自己创建的 fixture，并证明用户原有状态未变化。
+7. 对 review gate 至少验证四条路径：真实独立 reviewer 对无害 patch 的端到端 dry run；reviewer 缺失或超时；非法 verdict；OPEN 非空。后三种都必须阻断；若没有可调用的独立 reviewer，第一条标记 UNSUPPORTED，不能伪造绿色。
+8. 最后列出：变更文件、实际命令与结果、未实施项及原因、剩余风险、完整回退方法。回退只能删除本次新建文件或反向应用本次精确 patch，禁止用整库恢复覆盖原有工作。
+9. 输出能力矩阵：Memory、MCP、Skill、Plugin、Markdown 指令、Hooks、Harness、Workflow、Worktree、独立 Review、Automation、Remote Control。每项标记 READY / BUILD_NOW / NOT_NEEDED / UNSUPPORTED / NEEDS_USER，并给出证据与最小下一步。READY 必须代表真实可调用且通过正反例验证，不得只凭模板或配置文件。不要为了齐全而安装。
+
+默认权限边界：
+- 不安装全局软件，不新增付费服务，不读取或输出密钥。
+- 不修改 Git 全局配置，不直接安装 hook；可在仓库内生成待审查的 hook/gate 脚本与安装说明。
+- 不碰改前已存在的修改，不自行 stash、reset、clean、rebase 或整库 restore。
+- 不 commit、push、merge、deploy、发送外部消息或写入生产数据。
+- 遇到验证码、2FA、签名、付款、删除数据、生产发布或不可逆操作时停止，精确说明所需的人类动作。
+- 证据不足就标记 NOT_VERIFIED，不得声称完成。</code></pre>
+    <p>这份 Prompt 能让 Agent 搭起“最小闭环”，不能保证一次复制出我用了三个月演进的全部系统。正确顺序是：先跑通一个小任务，再根据真实遇到的失败，逐步增加 Skill、Hook、MCP、Memory、双 AI 与发布 Gate。</p>
+
+    <h2 id="zh-conclusion">最后：AI 编程值得用，而且你今天就能开始</h2>
+    <p>如果你已经用过 ChatGPT 或 Claude 对话，就不需要等学完 Memory、MCP、Skill 和 Hooks 才开始。真正的第一步，是从项目目录的 Terminal 启动 Codex CLI 或 Claude Code，让它直接读取仓库、修改代码和运行现有测试；你负责说明要解决什么，以及怎样才算真的解决。</p>
+    <p>我已经用这种方式，让一个人配合 Claude Code 和 Codex，持续开发和维护一个横跨 H5、iOS、Android 与 Telegram 的线上产品，也处理支付、订阅、退款、商店发布和线上问题。这说明 AI 已经能承担大量真实工程工作。但它仍会写错、漏需求，两个 AI 也可能一起漏，所以“Agent 说完成了”不能直接当成结果；最后仍要看测试、浏览器、设备、线上状态，或者你亲自操作后的真实表现。</p>
+    <h3>明天开始时，只做这四件事</h3>
+    <ol>
+      <li>进入一个你熟悉的项目目录，启动一个编程 Agent CLI。</li>
+      <li>交给它一个可回退的小任务，写清目标、现象、范围、验收标准和禁止项。</li>
+      <li>让 Agent 自己调查、修改和运行测试，并报告实际改了什么、执行了什么。</li>
+      <li>你在本地或测试环境操作一次，确认最终结果真的符合需求；不符合就把现象交回去继续修。</li>
+    </ol>
+    <p>做到这里，你就已经从“会用 GPT 聊天”进入了 AI 编程。等这个流程稳定后，再增加第二个 AI 审查、独立 worktree、Skill、Hook、MCP 和自动化 Gate。本文介绍这些概念，不是让你一次装齐，而是让你每遇到一个真实问题，都知道下一层能力该加在哪里。</p>
+
+    <div class="receipts"><strong>事实与概念依据：</strong>项目实践可在 <code>README.md</code>、<code>AGENTS.md</code>、<code>CLAUDE.md</code>、<code>docs/AGENTS-CONTRACT.md</code>、<code>docs/ops/HEARTBEAT-SOP.md</code>、<code>docs/architecture/ai-team-manager.html</code>、<code>docs/mobile/store-release-status.json</code>、<code>docs/ops/billing-provider-status.json</code>、<code>scripts/ai-team-manager.mjs</code>、<code>scripts/loop/run.mjs</code>、<code>scripts/bugfree/trusted-local-launcher.mjs</code>、<code>scripts/claude-review.mjs</code>、<code>.agents/skills/visual-animation-verify/SKILL.md</code> 与 <code>.agents/skills/visual-fidelity/SKILL.md</code> 中核对；本文引用的真实修复与工作流提交包括 <code>46c9b57d</code>、<code>7767eede</code>、<code>4083b0d8</code>、<code>a23646c7</code>、<code>7c3142bb</code>、<code>af86fbcd</code> 与 <code>5b3e01b0</code>。概念和产品边界参考 OpenAI 官方 <a href="https://developers.openai.com/codex/concepts/customization">Customization</a>、<a href="https://developers.openai.com/codex/config-advanced#hooks">Hooks</a>、<a href="https://developers.openai.com/codex/plugins/build">Plugins</a>、<a href="https://learn.chatgpt.com/docs/environments/cloud-environment">Cloud environments</a>、<a href="https://learn.chatgpt.com/docs/browser">Browser</a>、<a href="https://learn.chatgpt.com/docs/remote-connections">ChatGPT Remote</a> 与 <a href="https://openai.com/index/harness-engineering/">Harness engineering</a>，以及 Anthropic 官方 <a href="https://code.claude.com/docs/en/chrome">Claude Code with Chrome</a> 与 <a href="https://code.claude.com/docs/en/remote-control">Claude Code Remote Control</a>。模型审查偏差的论述也参考了 ACL 发表的 <a href="https://aclanthology.org/2024.emnlp-main.474/">LLM-as-a-judge 偏差研究</a> 与 <a href="https://aclanthology.org/2024.acl-long.826/">自我修正偏差研究</a>。产品状态、Remote 能力与官方概念按 2026-07-19 核对，后续可能变化；文中未使用无法追溯的效率、速度或缺陷率数字。</div>
+  </section>
+
+  <section data-lang="en">
+
+    <nav class="article-toc" aria-label="Article table of contents">
+      <details open>
+        <summary>Reading map<span class="toc-hint">Four learning paths; select any chapter to jump there</span></summary>
+        <div class="toc-groups">
+          <div class="toc-group"><b>Part I · Start</b><ol><li><a href="#en-background">Background, reader, and goal</a></li><li><a href="#en-layers">Models, products, terminal, and CLI</a></li><li><a href="#en-remote">Local, cloud sandbox, and Remote Control</a></li><li><a href="#en-first-task">Your first task and five-part brief</a></li><li><a href="#en-copy-workflow">A workflow with risk-matched evidence</a></li></ol></div>
+          <div class="toc-group"><b>Part II · Components</b><ol><li><a href="#en-model-context">Models, context, hallucination, and Memory</a></li><li><a href="#en-agent-tools">Agents, tools, permissions, and subagents</a></li><li><a href="#en-mcp-skills">MCP, connectors, Skills, and Plugins</a></li><li><a href="#en-markdown">Markdown instructions and project facts</a></li><li><a href="#en-workflow-harness">Workflows, Harnesses, Hooks, and Gates</a></li></ol></div>
+          <div class="toc-group"><b>Part III · Production</b><ol><li><a href="#en-project">A real project, agent loops, and outcomes</a></li><li><a href="#en-dual-ai-failure">Why dual AI still misses defects</a></li><li><a href="#en-traps">Twelve traps and executable fixes</a></li><li><a href="#en-glossary">Reference appendix</a></li></ol></div>
+          <div class="toc-group"><b>Part IV · Adopt</b><ol><li><a href="#en-four-week-path">A four-week path</a></li><li><a href="#en-faq">Ten decision questions</a></li><li><a href="#en-bootstrap">Have an agent build the minimum loop</a></li><li><a href="#en-conclusion">Conclusion: start AI coding today</a></li></ol></div>
+        </div>
+      </details>
+    </nav>
+
+    <div class="part-divider"><span>Part I</span><b>Choose a surface and complete one trustworthy change</b><p>First locate where the agent runs and which entry point fits your work. Then use one small task to complete the loop from requirement to evidence.</p></div>
+
+    <h2 id="en-background">I do not want to hype AI—or perform skepticism by underrating it</h2>
+    <p class="lead">This is neither an AI advertisement nor an article built from a few failure stories to prove that AI is inherently unreliable. I want to do something simpler: open the real production ledger of how I use coding agents, explain what they helped me achieve, where they failed, and how those failures became engineering rules.</p>
+    <p>For roughly three months, I have been using Claude Code and OpenAI Codex side by side at high intensity. I pay $200 per month each for Claude Max and ChatGPT Pro, and routinely exhaust the weekly allowance on both. That capacity does not go into generating disposable demos. It supports sustained development and operations for BluffKing, a real Texas Hold’em product whose Rust game engine, Axum/WebSocket backend, PostgreSQL database, Vue H5 client, Flutter clients, replay system, and local solver coach evolve inside one production codebase.</p>
+    <p>I also brought the product into real production or release paths across H5, iOS, Android, and Telegram. The product is online; H5 payment entry points plus the subscription and entitlement system are deployed, and cancellation and refund flows are implemented with closed-loop evidence in their corresponding test or sandbox paths. I will not collapse “code deployed,” “sandbox/test loop proven,” and “every rail has passed real-money production acceptance” into one status: at the time of this review, some wallet, native-store, and on-chain rails still need final production payment or store acceptance. This is not a demo-only project, but it should not be marketed as “every payment rail is green.”</p>
+    <p>AI did not accomplish this alone. I own product intent, risk tradeoffs, account identity, payment authorization, and final accountability. The division between the two AIs is asymmetric: either can implement ordinary repository work and the other reviews it; work that depends on my signed-in Chrome, a web console, packaging/upload, or a store console goes directly to Claude Code, while Codex mainly reviews the diff, command output, and page evidence. When Claude hits a quota interruption or Codex takes implementation ownership, Claude becomes the reviewer. The useful story is the path between “can chat” and “can participate in production.”</p>
+    <h3>Who this article is for</h3>
+    <ul>
+      <li>You have used ChatGPT, Claude, or a similar conversation product and asked AI to write functions or scripts.</li>
+      <li>You maintain a real repository, tests, CI, and a production environment, but you do not yet trust an agent to participate at scale.</li>
+      <li>You want the speed while worrying—correctly—about hallucinations, secrets, bad deployments, and polished but false claims of completion.</li>
+    </ul>
+    <h3>What you should gain from reading it</h3>
+    <p>You do not need to copy my entire system. The goal is to build a map of AI coding—model, terminal, shell, CLI, agent, local/cloud/remote control, memory, MCP, skill, plugin, workflow, harness, and hooks—then see how those layers connect in a real project, and finally complete one small production-grade change that is verifiable, reversible, and reviewable.</p>
+    <blockquote>I recommend AI coding not because AI stops making mistakes, but because those mistakes can be constrained, detected, and repaired through engineering—while the productivity gain is real.</blockquote>
+
+    <h2 id="en-layers">Put each concept back in its own layer</h2>
+    <p>GPT, ChatGPT, Codex, Claude Code, a terminal, and a CLI are not competing instances of the same thing. They belong to different layers of one execution chain:</p>
+    <div class="concept-grid">
+      <div class="concept"><span class="pill">Intelligence</span><h3>Model</h3><p>A GPT or Claude model understands, reasons, and generates. By itself it does not possess your repository, terminal, or accounts.</p></div>
+      <div class="concept"><span class="pill">Product</span><h3>Chat product / coding-agent product</h3><p>A conversation product such as ChatGPT emphasizes questions and discussion. Coding-agent products such as Codex and Claude Code connect a model to repositories, tools, permissions, and an execution loop.</p></div>
+      <div class="concept"><span class="pill">Surface</span><h3>Terminal / IDE / desktop</h3><p>These are places where you interact with the product. A terminal is simply the worksite that hosts a command-line session; it is not AI.</p></div>
+      <div class="concept"><span class="pill">Command</span><h3>Shell / CLI</h3><p>A shell such as zsh, bash, or PowerShell interprets commands. A CLI is a program’s text entry point. <code>git</code> is a CLI but not an agent; <code>codex</code> and <code>claude</code> are CLI entry points that start coding agents.</p></div>
+    </div>
+    <div class="project-map" aria-label="Terminal-to-coding-agent execution chain">
+      <div class="mapline">
+        <div class="node"><b>Terminal</b>hosts the session</div><div class="arrow">→</div>
+        <div class="node"><b>Shell</b>interprets commands</div><div class="arrow">→</div>
+        <div class="node"><b>codex / claude CLI</b>starts the product</div><div class="arrow">→</div>
+        <div class="node"><b>Coding agent</b>model·context·tools·permissions·loop</div><div class="arrow">→</div>
+        <div class="node"><b>Repository &amp; evidence</b>files·Git·tests·browser·device</div>
+      </div>
+    </div>
+    <h3>My explicit recommendation for a beginner</h3>
+    <p><strong>If your goal is to bring AI into a real repository, start a coding-agent CLI—Codex CLI or Claude Code—from that repository’s terminal.</strong> Do not begin by chasing whichever model tops a temporary ranking. Pick an agent that can inspect your repository, run its existing tests, show a real diff, and expose a clear permission boundary.</p>
+    <ul>
+      <li><strong>Why not make a normal chat window the primary surface:</strong> it is excellent for explanation and discussion, but may not have the current repository, command execution, or verifiable evidence.</li>
+      <li><strong>Why terminal + CLI first:</strong> the working directory, Git state, environment, test output, and exit codes are directly visible, and the same path can later become a scripted workflow or harness.</li>
+      <li><strong>Where the IDE fits:</strong> keep using it to read code, inspect diffs, and debug manually. Adopting an agent does not require abandoning the editor you know.</li>
+      <li><strong>When to add dual AI:</strong> first complete one small “task → diff → verification → rollback” loop with one agent; then add a second reviewer in a fresh, preferably read-only context.</li>
+    </ul>
+    <h3>Codex or Claude Code: choose by the environment you actually need</h3>
+    <div class="compare"><table>
+      <thead><tr><th>Your main need</th><th>Most direct choice</th><th>Reason and boundary</th></tr></thead>
+      <tbody>
+        <tr><td>Repository edits, commands, tests, and Git automation</td><td>Either Codex CLI or Claude Code</td><td>Start with the one whose workflow and permission boundary you understand better; correctness comes from the task contract and evidence, not the product name</td></tr>
+        <tr><td>Use an already signed-in Chrome profile directly from the CLI</td><td>Prefer Claude Code</td><td><a href="https://code.claude.com/docs/en/chrome"><code>claude --chrome</code></a> connects Claude in Chrome and can use the current browser login state</td></tr>
+        <tr><td>Use OpenAI’s built-in Browser / Computer Use</td><td>ChatGPT web or desktop</td><td><a href="https://learn.chatgpt.com/docs/browser">OpenAI’s documentation</a> says built-in Browser is not in Codex CLI/IDE; desktop is the better fit when you need a local project, integrated terminal, or Computer Use, while the CLI can still run Playwright or use an additional browser MCP/plugin</td></tr>
+        <tr><td>Continue a local task away from the desk</td><td>Choose by remote entry point</td><td>ChatGPT Remote connects ChatGPT mobile to a paired host; Claude Code Remote Control connects claude.ai/code or Claude mobile to a local CLI/VS Code session</td></tr>
+      </tbody>
+    </table></div>
+    <div class="rule"><strong>One-line conclusion:</strong> either is a sound starting point for ordinary repository work; prefer Claude Code when a CLI must use an existing Chrome login; use ChatGPT web or desktop for OpenAI’s built-in browser; then choose the matching Remote Control entry point when you need the same local host away from your desk.</div>
+    <h3>Why the terminal has always been my daily entry point</h3>
+    <p>For me, the terminal is not a more “professional” chat box. It is the engineering worksite. When the agent starts in the correct repository or worktree, the current directory, Git state, dependencies, environment variables, command output, and exit codes belong to one evidence chain.</p>
+    <pre>cd /path/to/project
+git status
+codex        # or: claude</pre>
+    <p>My usual path is: enter the project directory → start Codex or Claude Code → state the goal, constraints, and definition of done in natural language → let the hooks check whether the session is already isolated. A read-only task can stay in the current directory. If the agent tries to write code in the shared main worktree, a hook blocks the write and requires it to call the project script that creates a dedicated worktree. The agent then reads files, changes code, and runs tests there. This is what lets multiple sessions work in parallel without sharing one HEAD or one set of uncommitted changes. Finally, I have the other AI review the actual diff and verification evidence. The commands, working directories, Git rules, permissions, and hooks later in this article all grow from this entry point.</p>
+    <div class="aside"><strong>You do not need to build the entire system described later before an agent can write code.</strong> Start with one agent and one small task. I added worktrees, hooks, layered testing, independent review, and release gates gradually after encountering concurrent-session collisions, unintended edits, false-green verification, and production risk. The closer a project gets to production—and the more sessions run in parallel—the more these guardrails should move from reminders into automatic enforcement.</div>
+
+    <h2 id="en-remote">“Remote” is not one thing: conversation, cloud sandbox, and control of a local agent</h2>
+    <p>The most important question is not whether you send the prompt from a phone or computer. It is: <strong>which machine actually runs the code and commands?</strong></p>
+    <div class="compare"><table>
+      <thead><tr><th>Surface</th><th>Where code runs</th><th>Local-machine access</th><th>Codex and Claude Code</th><th>Best use</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Ordinary conversation</strong></td><td>Primarily produces an answer on the product service</td><td>No by default; it sees uploaded or connector-authorized content</td><td>ChatGPT and Claude chat surfaces both fit here until tools extend them toward agency</td><td>Concept explanation, task briefs, and solution discussion</td></tr>
+        <tr><td><strong>Cloud agent / remote sandbox</strong></td><td>An isolated vendor-managed container, usually checking out a connected Git repository</td><td>No arbitrary access to laptop files, processes, login state, or devices</td><td><a href="https://learn.chatgpt.com/docs/environments/cloud-environment">Codex cloud</a> runs in OpenAI-managed containers; Claude Code on the web runs on Anthropic-managed infrastructure</td><td>Continue with the laptop off, parallel tasks, and repository diffs or PRs</td></tr>
+        <tr><td><strong>Local coding agent</strong></td><td>Your computer or development host, constrained by its sandbox and permissions</td><td>Yes, limited to the repository, commands, MCP, browser, and devices you authorize</td><td>Codex CLI/app/IDE and Claude Code CLI/IDE can act as local-agent surfaces</td><td>Daily work needing local dependencies, uncommitted code, databases, browsers, or devices</td></tr>
+        <tr><td><strong>Remote Control of a local agent</strong></td><td>Still your Mac, Windows PC, or development host; phone and browser are remote windows</td><td>Yes; the session retains its local files, tools, configuration, and permissions</td><td><a href="https://learn.chatgpt.com/docs/remote-connections">ChatGPT Remote</a> connects ChatGPT mobile to a paired Mac/Windows host; <a href="https://code.claude.com/docs/en/remote-control">Claude Code Remote Control</a> connects claude.ai/code or Claude mobile to a local CLI/VS Code session</td><td>Check progress, redirect, answer questions, approve actions, and inspect evidence away from the desk</td></tr>
+        <tr><td><strong>Remote MCP / connector</strong></td><td>Not an execution environment; it exposes scoped data and actions from a remote service</td><td>Only the authorized service scope, not the whole computer</td><td>Both products can connect to remote MCP/connectors; this is independent of Remote Control</td><td>Current data and scoped actions in GitHub, Sentry, Linear, Gmail, and other cloud services</td></tr>
+      </tbody>
+    </table></div>
+    <div class="rule"><strong>My daily entry point remains a local terminal + agent CLI.</strong> Remote Control and cloud sandboxes are choices about execution location, not higher tiers: choose Remote Control when away from the desk but the task must retain the same local database, MCP, browser, or device; choose a cloud sandbox when the computer may be off, you need cloud parallelism, or the task should not touch the host.</div>
+    <p><strong>Remote Control is also not Computer Use.</strong> Remote Control means a person drives a local agent session from elsewhere. Computer Use means the agent itself sees, clicks, and types in an operating-system or application UI. They can be combined, but their authority and risk are separate.</p>
+    <div class="aside"><strong>Remote-control safety floor:</strong> keep the host running and reachable; use account authentication and pairing; preserve local sandboxing, approvals, and hooks; and isolate concurrent sessions with worktrees. Do not grant a local agent permanent full access merely because the phone view hides implementation detail.</div>
+
+    <h3>Browser, Computer Use, and “control my existing Chrome” are three different paths</h3>
+    <p>OpenAI’s built-in Browser uses a profile separate from your everyday browser. Computer Use can operate desktop applications and graphical interfaces. Only the Chrome-extension path connects to the Chrome profile I am already signed into and using. All three can look like “the AI is clicking a browser,” but they have different permissions, dependencies, and failure boundaries.</p>
+    <div class="aside"><strong>One Codex weakness I will not sugarcoat:</strong> on my Mac and in this workflow, direct Chrome control has been extremely unreliable. More than once, a minor CLI or desktop-app update broke a connection that had worked the day before. I repaired it, only for the failure to return a few days later. Switching to the GPT-5.6-SOL model I currently use does not fix it, because the failing layer is usually the bridge between the Chrome extension, extension backend, plugin cache, and local runtime—not model reasoning. On the same machine and in the same workflow, I have not seen Claude Code suffer this repeated disconnect cycle. Put bluntly, this is one of the worst parts of the current Codex engineering experience for me.</div>
+    <p><strong>My actual workaround is not to test Codex before every browser task; I route the work by tool reliability.</strong> Anything that needs my signed-in Chrome session or a web console goes to Claude Code—for example, filling out Stripe dashboard forms, packaging and uploading iOS or Android apps, and working in the store consoles. Codex serves mainly as the reviewer for this work: it checks the code diff, command output, recorded state, and the browser evidence produced by Claude instead of performing the browser operation itself. This does not mean the Codex Chrome path is fixed. It means I do not let a repeatedly failing toolchain block production work.</p>
+
+    <h3>One capability map—not another chapter numbering scheme</h3>
+    <p>This is a relationship map: it shows how capabilities stack, not six installation stages you must follow in order.</p>
+    <div class="stack" aria-label="AI coding capability stack">
+      <div class="layer"><b>1 · Model &amp; Context</b><small>The model reasons while the conversation, code, and rules supply working context</small></div>
+      <div class="layer"><b>2 · Terminal / CLI / Agent &amp; Tools</b><small>The terminal hosts the shell and CLI; the agent then invokes files, browser, Git, and other tools</small></div>
+      <div class="layer"><b>3 · MCP / Skill / Plugin</b><small>External systems connect in, reusable capabilities are packaged, and extensions are installed</small></div>
+      <div class="layer"><b>4 · Rules &amp; Memory</b><small>Instruction files hold required behavior while memory recalls historical context</small></div>
+      <div class="layer"><b>5 · Workflow &amp; Harness</b><small>Multi-step work becomes a state machine executed in a controlled environment with evidence</small></div>
+      <div class="layer"><b>6 · Hooks &amp; Gates</b><small>Lifecycle controls prevent unauthorized actions, skipped verification, or damage to the main branch</small></div>
+    </div>
+
+    <h2 id="en-first-task">Make your first AI task deliberately small</h2>
+    <p>Do not begin with “rewrite my entire application.” Do not hand over payments, authorization, or a database migration on day one. A good first task has a clear boundary, a testable result, and an easy rollback:</p>
+    <ul>
+      <li>fix one reliably reproducible bug;</li>
+      <li>add boundary tests to an existing function;</li>
+      <li>add one form validation or error message;</li>
+      <li>refactor a function with explicit inputs and outputs;</li>
+      <li>ask the AI to explain one call path without changing code.</li>
+    </ul>
+    <p>Your first trustworthy small loop matters more than your first thousand generated lines.</p>
+
+    <h3>A five-part task brief is enough</h3>
+    <p>You do not need prompt magic. State these five things clearly:</p>
+    <pre><code>Goal: Show the server’s specific error when login fails.
+
+Observed behavior: Every failure currently says “Network error.”
+
+Scope: Change only the login request and error display. Do not redesign the page.
+
+Acceptance criteria:
+1. A wrong password shows the correct message.
+2. A disconnected network still shows the network error.
+3. Successful login remains unchanged.
+4. Add a regression test.
+
+Constraints: Do not change the API contract or add a dependency.</code></pre>
+    <p>If you cannot define what “correct” means, the model can only guess. Write the acceptance criteria before asking it to implement.</p>
+
+    <h2 id="en-copy-workflow">A workflow you can copy today</h2>
+    <h3>Step 1: protect existing work, then isolate the change</h3>
+    <p>Record the current branch, baseline commit, working-tree status, and worktree list first. If uncommitted changes already exist, determine who owns them; never let an agent stash, reset, clean, or restore the whole repository on its own. Write each new task only in an isolated feature worktree, and never let two agents share one working directory.</p>
+    <pre><code>git branch --show-current
+git rev-parse HEAD
+git status --short
+git worktree list
+
+# After confirming the baseline and existing changes, isolate the task
+git worktree add ../project-login-fix -b fix/login-error-message HEAD
+cd ../project-login-fix</code></pre>
+
+    <h3>Step 2: require investigation before implementation</h3>
+    <pre><code>Read the repository rules and relevant code before changing anything.
+
+Requirements:
+1. Keep the patch narrow and preserve unrelated behavior.
+2. Add a regression that fails before the fix and passes after it.
+3. Run the relevant tests or real-environment verification.
+4. List changed files, executed evidence, and remaining risks.
+5. Do not claim completion when evidence is missing.</code></pre>
+
+    <h3>Step 3: give the actual diff and evidence to a second AI</h3>
+    <p>In my real workflow, another AI performs this step; I do not manually review the diff line by line first. The reviewer starts from an independent context and reads the actual patch, relevant code, and test evidence.</p>
+    <pre><code>You are an independent reviewer and did not author this change.
+
+Inspect the actual diff and any necessary upstream or downstream code. Focus on:
+1. Logic errors and edge cases.
+2. Security, privacy, concurrency, and compatibility issues.
+3. New regression risks.
+4. Missing, ineffective, or wrong-layer tests.
+5. Conflicts with existing repository rules.
+
+Do not assume the code is correct because tests passed.
+
+Return:
+VERDICT: APPROVED or CHANGES_REQUESTED
+OPEN: every unresolved item</code></pre>
+
+    <h3>Step 4: close the loop inside the workflow</h3>
+    <p>When the reviewer confirms a problem, do not stop at a report or throw the decision back to the human. Continue through “fix → test → re-review” until the evidence passes, the reviewer explicitly approves, and <code>OPEN</code> is empty.</p>
+
+    <h3>Step 5: validate the result locally or in production</h3>
+    <p>I do not usually inspect the code diff line by line. My main involvement is outcome validation: I exercise the relevant flow locally or in production and check that it actually works and satisfies the requirement. If it fails, I return the reproduction steps and observed behavior to the AIs for another fix → test → review loop. Account-holder identity, 2FA, signatures, and payment approval remain with me; packaging, upload, review submission, or an explicitly authorized release can be executed by Claude Code and then checked by Codex. I do not pretend that I click every step manually.</p>
+
+    <h3>Match evidence to risk</h3>
+    <p>Put the validation layer into the definition of done. Part III uses a real failure to show why unit, browser, device, and production evidence cannot substitute for one another.</p>
+    <blockquote>Done is a claim. Evidence is the fact.</blockquote>
+    <div class="compare"><table>
+      <thead><tr><th>Change</th><th>Minimum evidence</th><th>Common mistake</th></tr></thead>
+      <tbody>
+        <tr><td>Pure function or algorithm</td><td>Focused unit tests and boundary cases</td><td>Running only old tests</td></tr>
+        <tr><td>API or state flow</td><td>Integration test, real request, error path</td><td>Testing only the happy path</td></tr>
+        <tr><td>Frontend visual or animation</td><td>Real browser, key viewports, visual evidence</td><td>Treating jsdom as browser proof</td></tr>
+        <tr><td>Mobile or native behavior</td><td>Device or emulator check plus build evidence</td><td>Inspecting only shared logic</td></tr>
+        <tr><td>Auth, payments, migrations</td><td>Cross-vendor review, rollback, and failure paths; add dual implementation only for genuine design uncertainty</td><td>Treating dual implementation as the default for every high-risk task</td></tr>
+      </tbody>
+    </table></div>
+    <div class="rule"><strong>The pattern I use consistently is one implementer plus one reviewer:</strong> one AI writes the change, and an AI from the other vendor reviews the actual diff and evidence. I have used DualForge—two independent implementations in separate worktrees—for selected high-risk work such as the BNB-USDT HD custody path, but it is not my default for every sensitive change. Several payment and authentication hardening tasks still followed a Codex-implements, Claude-reviews flow. Beginners should first make the one-writer, one-reviewer loop reliable, then pay for dual implementation only when the risk and genuine design uncertainty justify it.</div>
+
+    <div class="part-divider"><span>Part II</span><b>Understand the components behind an agent</b><p>After one practical run, Memory, MCP, Skills, Plugins, Markdown instructions, Workflows, Harnesses, and Hooks become useful parts of a system instead of a vocabulary dump.</p></div>
+
+    <h2 id="en-model-context">Models, tokens, context, hallucinations, and memory</h2>
+    <div class="concept-grid">
+      <div class="concept"><span class="pill">Foundation</span><h3>Token</h3><p>The unit a model uses to read and write information; it is not the same as a character or word. Code, logs, tool output, and conversation all consume tokens.</p><p class="example"><strong>Trap:</strong> dumping unrelated logs into one thread buries the actual requirement and increases cost.</p></div>
+      <div class="concept"><span class="pill">Foundation</span><h3>Context window</h3><p>The information the model can see during one run. A large window does not mean every detail remains equally salient or reliable.</p><p class="example"><strong>Executable practice:</strong> keep goals, decisions, and acceptance criteria in the main thread; move noisy logs into evidence files, and use a bounded subagent only when the task is genuinely independent.</p></div>
+      <div class="concept"><span class="pill">Task</span><h3>Prompt</h3><p>The current task instruction. A useful prompt is not an incantation; it is a task brief containing goal, context, constraints, and a definition of done.</p><p class="example"><strong>Trap:</strong> “Please fix this” gives the agent permission to invent the business objective.</p></div>
+      <div class="concept"><span class="pill">Risk</span><h3>Hallucination</h3><p>A fluent and plausible claim with no factual support. In code it can look like a nonexistent API, file, option, or an assertion that tests were run when they were not.</p><p class="example"><strong>Countermeasure:</strong> require file paths, diffs, command output, browser evidence, or device evidence.</p></div>
+      <div class="concept"><span class="pill">Across sessions</span><h3>Memory</h3><p>A recall layer for preferences, old decisions, and useful routes from previous work. It is not a real-time operational database.</p><p class="example"><strong>My lesson:</strong> private memory can remember where to look, but it cannot decide current App Store, payment, or deployment state.</p></div>
+      <div class="concept"><span class="pill">Facts</span><h3>Source of truth</h3><p>The most authoritative current location for a class of facts: code, database, live console, or a canonical repository status file.</p><p class="example"><strong>BluffKing:</strong> mobile-store state comes from <code>store-release-status.json</code>; public release state comes from <code>changelog.json</code>, never from either model’s recollection.</p></div>
+    </div>
+    <div class="aside"><strong>A production rule worth keeping:</strong> memory is for background and routing, not volatile current state. My project added a shared handoff ledger, ops ledger, and canonical status files after Claude and Codex could otherwise inherit different stale memories.</div>
+
+    <h2 id="en-agent-tools">Agents, tools, permissions, sandboxes, and subagents</h2>
+    <div class="concept-grid">
+      <div class="concept"><span class="pill">Executor</span><h3>Agent</h3><p>A task executor made from a model, context, tools, permissions, and a loop. It inspects files, changes code, runs tests, and reacts to results instead of merely returning an answer.</p><p class="example"><strong>Difference:</strong> chat mode optimizes for an answer; agent mode optimizes for a verifiable outcome.</p></div>
+      <div class="concept"><span class="pill">Execution</span><h3>Tool / tool call</h3><p>An atomic capability the agent can invoke: read a file, run a shell command, search code, control a browser, or query GitHub. Each call should have clear inputs and outputs.</p><p class="example"><strong>Trap:</strong> having a tool does not imply having authorization; having authorization does not imply it should be used.</p></div>
+      <div class="concept"><span class="pill">Safety</span><h3>Permission / approval</h3><p>Determines whether an action runs automatically or needs approval. Reading code and deleting production data must never share the same authority level.</p><p class="example"><strong>My boundary:</strong> OTP, 2FA, signatures, payments, live identity, and irreversible steps remain human-controlled.</p></div>
+      <div class="concept"><span class="pill">Isolation</span><h3>Sandbox</h3><p>A system boundary over what the agent can read, write, execute, or access over the network. It assumes inputs are untrusted by default.</p><p class="example"><strong>Bug-free gate:</strong> the deterministic lane blocks external networking, prewarms dependencies, and makes hydrated dependency roots read-only.</p></div>
+      <div class="concept"><span class="pill">Delegation</span><h3>Subagent / agent team</h3><p>The main agent delegates independent slices to specialized roles such as backend review, visual inspection, or log analysis. It works best for parallel, read-heavy tasks.</p><p class="example"><strong>Trap:</strong> subagents consume extra tokens, and multiple agents writing the same directory can cost more coordination than they save.</p></div>
+      <div class="concept"><span class="pill">Continuity</span><h3>Session / thread / handoff</h3><p>A session is a running context; a thread is the conversation and tool trace. A handoff explicitly transfers branch, changed files, last successful and failed commands, and next step.</p><p class="example"><strong>My practice:</strong> when Claude quota ends, Codex resumes from the actual worktree, Git state, and durable handoff—not from “it was nearly done.”</p></div>
+    </div>
+
+    <h2 id="en-mcp-skills">MCP, connectors, skills, and plugins</h2>
+    <div class="compare"><table>
+      <thead><tr><th>Concept</th><th>What it is</th><th>When to use it</th><th>How I use it</th></tr></thead>
+      <tbody>
+        <tr><td><span class="term">MCP</span><br><span class="mini">Model Context Protocol</span></td><td>A standard protocol connecting an agent to external tools and context. An MCP server can expose tools, resources, and prompts.</td><td>When work needs GitHub, a browser, Figma, documentation, internal systems, or another agent surface</td><td>The cross-review paths are asymmetric: Claude can ask Codex to review through the configured Codex tool/MCP path; Codex-authored work goes through the repository-pinned <code>scripts/claude-review.mjs</code>. MCP is a capability layer, not the mandatory route for every review</td></tr>
+        <tr><td><span class="term">Connector / app</span></td><td>An authorized connection to a service that usually handles identity, scope, and structured actions</td><td>For private GitHub, Gmail, Calendar, and other account data where search or model memory is inappropriate</td><td>My current Codex environment can connect to GitHub, Gmail, Calendar, Browser, and Chrome; the strongest project-use evidence is for GitHub, Gmail, and browser capabilities. “Installed/callable” is not the same as “used in this project,” and send, delete, and publish remain separately authorized</td></tr>
+        <tr><td><span class="term">Skill</span></td><td>A reusable method package, usually a <code>SKILL.md</code> plus optional scripts, references, and assets</td><td>For repeated work that needs stable steps, domain knowledge, examples, or helper programs</td><td><code>bug-free-codex</code>, <code>visual-fidelity</code>, <code>visual-animation-verify</code>, <code>hot-fix</code>, <code>social-post</code>, and <code>memory-audit</code></td></tr>
+        <tr><td><span class="term">Plugin</span></td><td>An installable distribution unit that can bundle skills, MCP-backed apps/connectors, hooks, and assets</td><td>When you want a complete capability bundle or need to distribute one across a team</td><td>Browser, Chrome, and GitHub capabilities are installed as plugins, then task-specific skills load on demand</td></tr>
+        <tr><td><span class="term">Slash command</span></td><td>An explicit <code>/</code> entry point for a command or repeatable workflow</td><td>When the operator should deliberately choose a mode or named routine</td><td>A trigger such as <code>bug-free-codex</code> starts a fixed quality gate rather than sending a generic prompt</td></tr>
+      </tbody>
+    </table></div>
+    <blockquote>A skill tells the agent how this kind of task should be done. MCP tells it which external capabilities are available. A plugin packages those capabilities into something installable.</blockquote>
+    <p>Installing every plugin is not a maturity strategy. Too many tools and skills consume discovery context and increase tool-selection noise. I once investigated a skills-context budget warning and fixed it by disabling unneeded plugins in global configuration, not by adding more descriptions to the agent.</p>
+
+    <h2 id="en-markdown">Markdown files are part of the agent operating system</h2>
+    <div class="compare"><table>
+      <thead><tr><th>File</th><th>Primary reader</th><th>What belongs there</th><th>BluffKing use</th></tr></thead>
+      <tbody>
+        <tr><td><code>README.md</code></td><td>Humans and agents</td><td>Product overview, quick start, and repository layout</td><td>Explains the Rust engine, Vue H5, PostgreSQL database, WebSocket rooms, and replay architecture</td></tr>
+        <tr><td><code>AGENTS.md</code></td><td>Codex and compatible agents</td><td>Automatically loaded repository rules, commands, constraints, and verification expectations</td><td>Enforces one task per worktree, no direct main edits, and risk-matched testing</td></tr>
+        <tr><td><code>CLAUDE.md</code></td><td>Claude Code</td><td>Claude-side durable instructions</td><td>Mirrors the core contract in <code>AGENTS.md</code>; sync checks prevent the two agents from inheriting divergent rules</td></tr>
+        <tr><td><code>SKILL.md</code></td><td>An agent after the skill is selected</td><td>Triggers, boundaries, steps, scripts, and finish conditions for a task family</td><td><code>bug-free-codex/SKILL.md</code> defines the fixed local-to-production validation entry point</td></tr>
+        <tr><td><code>ADR-NNN.md</code></td><td>Engineers and agents</td><td>An important architecture decision, rationale, alternatives, and status</td><td>Only Accepted/Locked ADRs bind; Superseded ADRs must lead to their successors</td></tr>
+        <tr><td><code>PLANS.md</code> / task plan</td><td>Agent and reviewer</td><td>Executable steps, dependencies, and acceptance points for complex work</td><td>Useful for long tasks; a small fix should not grow a giant plan merely to look formal</td></tr>
+      </tbody>
+    </table></div>
+    <p><span class="term">Markdown instructions</span> are readable by both humans and AI, versionable in Git, reviewable, and traceable. Their limitation is equally important: <strong>they instruct; they do not mechanically enforce.</strong> An agent can forget, misunderstand, or hit a conflict. Critical rules must eventually move into hooks, tests, CI, and executable gates.</p>
+    <div class="rule"><strong>My promotion ladder:</strong> keep one-off direction in the prompt; repeated context in memory; always-on rules in <code>AGENTS.md/CLAUDE.md</code>; repeatable tasks in skills; and mistakes that must not recur in hooks or gates.</div>
+
+    <h2 id="en-workflow-harness">Do not confuse workflows, harnesses, hooks, gates, and CI</h2>
+    <div class="concept-grid">
+      <div class="concept"><span class="pill">Orchestration</span><h3>Workflow</h3><p>An ordered sequence and state transition from start to finish. It answers what comes next, where failure goes, and what counts as terminal.</p><p class="example"><strong>Project flows:</strong> <code>audit → fix → re-verify</code> and <code>produce → opposite-vendor review → reconcile → act</code>.</p></div>
+      <div class="concept"><span class="pill">Execution container</span><h3>Harness</h3><p>An executable program wrapping agents, environment, tests, timeouts, output schemas, and evidence collection. It does not merely describe the workflow; it runs and reports it.</p><p class="example"><strong>BluffKing:</strong> <code>trusted-local-launcher.mjs</code>, <code>bug-free-codex-pipeline.mjs</code>, and <code>mobile-multi-human-regress.sh</code>.</p></div>
+      <div class="concept"><span class="pill">Lifecycle interception</span><h3>Hook</h3><p>A script triggered at session start, before or after tool use, on commit or push, or when a turn stops. It may remind or hard-block.</p><p class="example"><strong>Project:</strong> <code>block-main-edits.sh</code> blocks shared-main edits; Git <code>pre-commit</code> blocks direct commits to main.</p></div>
+      <div class="concept"><span class="pill">Admission</span><h3>Gate / guardrail</h3><p>A mechanical condition deciding whether an action may continue. The hook is the event point; the gate is the policy.</p><p class="example"><strong>Merge requirement:</strong> an independent review must explicitly return <code>APPROVED</code> with <code>OPEN=[]</code>.</p></div>
+      <div class="concept"><span class="pill">Safe default</span><h3>Fail-closed</h3><p>Missing output, invalid schema, review timeout, or uncertain authority stops the action instead of silently becoming a pass.</p><p class="example"><strong>My review runner:</strong> only a schema-valid explicit approval succeeds; timeout, quota exhaustion, or model failure never becomes green.</p></div>
+      <div class="concept"><span class="pill">Remote automation</span><h3>CI/CD</h3><p>CI builds and checks after commits or pushes; CD continues into release or deployment. It complements a local agent workflow rather than replacing it.</p><p class="example"><strong>BluffKing:</strong> local bug-free owns heavy behavioral regression; the main-push GitHub Actions gate owns release builds and the changelog contract.</p></div>
+      <div class="concept"><span class="pill">Scheduled</span><h3>Automation / heartbeat</h3><p>Unattended work triggered by time or events. A serious heartbeat needs locks, idempotency, state transitions, evidence, and escalation rules.</p><p class="example"><strong>Evidence-backed capability:</strong> an hourly AI team manager checks production HTTP/Playwright and backend compilation, classifies failures, assigns an owner, and writes the ledger. Recent runs contain real GREEN receipts and failure records; that is not proof of an unattended discover → repair → merge → release chain.</p></div>
+      <div class="concept"><span class="pill">Evidence</span><h3>Artifact / receipt / ledger</h3><p>Artifacts are reports, screenshots, logs, and test output; receipts prove a review or action occurred; ledgers hold current shared state across agents.</p><p class="example"><strong>Principle:</strong> a receipt is not authority. My merge flow binds authorization to the current exact diff and live review result.</p></div>
+    </div>
+    <p>The clean distinction is: <strong>a skill is the method, a workflow is the order, a harness is the executable container, a hook is the trigger point, a gate is the admission decision, and an artifact is the evidence.</strong> A mature system usually combines them.</p>
+
+    <div class="part-divider"><span>Part III</span><b>Turn personal technique into a production system</b><p>BluffKing shows how layered agent loops, dual-AI review, mechanical gates, and twelve recurring risks fit into one operating system.</p></div>
+
+    <h2 id="en-project">How I connect the whole stack in BluffKing</h2>
+    <div class="project-map" aria-label="BluffKing AI coding delivery chain">
+      <div class="mapline">
+        <div class="node"><b>Goal or patrol finding</b>Product intent·live evidence·risk</div><div class="arrow">→</div>
+        <div class="node"><b>Rules and truth</b>AGENTS/CLAUDE·ADR·status</div><div class="arrow">→</div>
+        <div class="node"><b>Isolated implementation</b>branch·worktree·skill</div><div class="arrow">→</div>
+        <div class="node"><b>Harness evidence</b>Rust·Vue·Flutter·Browser·Device</div><div class="arrow">→</div>
+        <div class="node"><b>Dual-AI review</b>Claude ↔ Codex·OPEN=[]</div><div class="arrow">→</div>
+        <div class="node"><b>Gated delivery</b>finish-session·main·CI/CD</div>
+      </div>
+    </div>
+    <ol>
+      <li><strong>Task intake:</strong> work may begin with my prompt or with a scheduled patrol and shared-ledger finding; <code>AGENTS.md</code> and <code>CLAUDE.md</code> supply durable repository constraints.</li>
+      <li><strong>Find current truth:</strong> code, accepted ADRs, live consoles, or canonical JSON decide state; memory only helps route the investigation.</li>
+      <li><strong>Isolate the change:</strong> <code>new-session.sh</code> creates a branch and worktree from main so each AI session owns its files and HEAD.</li>
+      <li><strong>Select the skill:</strong> visual changes trigger real-browser evidence; releases trigger <code>bug-free-codex</code>; emergency release work has a separate hot-fix boundary.</li>
+      <li><strong>Generate evidence through harnesses:</strong> the stack covers the Rust engine, PostgreSQL-backed server integration tests, Vue/Vitest, Flutter, Playwright, and iOS/Android/H5/Telegram multi-client rooms, with deterministic and external-device evidence recorded separately.</li>
+      <li><strong>Review across vendors:</strong> Codex-authored patches go to Claude; Claude-authored patches go to Codex. Confirmed findings are fixed and re-reviewed inside the same workflow.</li>
+      <li><strong>Prevent bypass structurally:</strong> agent hooks block editing the shared main checkout; Git hooks block direct or hidden main mutations; <code>finish-session.sh</code> is the trusted merge boundary.</li>
+      <li><strong>Continue after delivery:</strong> CI/CD checks the release contract, the heartbeat manager patrols, classifies, and assigns findings on a schedule, and ledgers keep later Claude, Codex, and sessions on the same current state.</li>
+    </ol>
+    <p>This is what I mean by using AI at production scale: not unlimited authority, but as much autonomy as possible inside explicit rules, tools, isolation, verification, and independent review.</p>
+
+    <h3>Did I build agent loops? Yes, but the layers have different maturity</h3>
+    <p>There is no single industry-standard agent loop. The common core is goal → tool call → observation → repair, without a human copying every result into another prompt. Once that loop moves into a workflow or harness, it still needs state, a round cap, failure classes, and terminal conditions; otherwise it is just an infinite “try again.”</p>
+    <div class="compare"><table>
+      <thead><tr><th>Loop layer</th><th>The actual loop in my project</th><th>What it adds beyond “try again”</th></tr></thead>
+      <tbody>
+        <tr><td>Inner agent loop</td><td>Read context → call a tool → observe output → choose the next step</td><td>The native Codex/Claude Code loop; humans do not copy every command result back into chat</td></tr>
+        <tr><td>Implementation and verification loop</td><td><code>scripts/loop/run.mjs</code> runs QA → classifies failure → optionally invokes a Claude fix driver → reruns</td><td>The repository implements state, round caps, and fail-closed terminals, but that does not prove every failure has been repaired automatically</td></tr>
+        <tr><td>Review loop</td><td>Author → heterogeneous reviewer → fix confirmed finding → test → re-review until <code>OPEN=[]</code> or the cap is reached</td><td>The reviewer is bound to the real diff and evidence instead of self-persuasion</td></tr>
+        <tr><td>Operations patrol loop</td><td>Scheduled patrol → production/Playwright/build evidence → triage → owner → ledger</td><td>This segment has real GREEN and failure receipts; the AI Team Manager discovers, classifies, and records findings instead of only waiting for human bug reports</td></tr>
+        <tr><td>Engineering-learning loop</td><td>Real failure → identify missing capability → add regression/skill/hook/facts guard → prevent recurrence automatically</td><td>The system fixes why the workflow missed a bug, not only the current bug</td></tr>
+      </tbody>
+    </table></div>
+    <p><strong>This is neither “there is no loop, so a human must operate every step” nor “the whole delivery system is already unattended.”</strong> The inner-agent loop, cross-model review loop, and scheduled patrol are proven; the repository also implements bounded QA → repair → rerun capability. What the execution record does not yet prove is a durable unattended chain from discovery through repair, review, merge, and release.</p>
+    <div class="aside"><strong>Where the human remains involved:</strong> I own product intent and final acceptance. Account-holder identity, 2FA, signatures, payment, and legal attestations remain human actions. Packaging, upload, review submission, or release may be performed by an agent when explicitly authorized, reversible, and gated; I do not need to click every step myself.</div>
+
+    <h3>What this system actually improved</h3>
+    <p>The highlight is not that I opened two AI products at once. Across many ordinary tasks, human time moved away from babysitting commands, copying logs, and approving every retry, and toward product intent, final acceptance, and high-risk boundaries. Every item below has corresponding code, scripts, hooks, commits, or execution records.</p>
+    <div class="outcome-grid">
+      <div class="outcome"><b>From one-shot generation to sustained delivery</b>Agents no longer generate one-off code; they maintain a live product through the same isolation, validation, review, and release contract.</div>
+      <div class="outcome"><b>From human prompting to bounded agent loops</b><code>scripts/loop/run.mjs</code> can classify QA failures, invoke a configured fix driver, and rerun with a round cap and fail-closed terminal. It is implemented capability, not a claim that every task already closes automatically.</div>
+      <div class="outcome"><b>From waiting for bug reports to proactive patrol</b>The hourly heartbeat reads production, Playwright, and compilation evidence, triages findings, assigns an owner, and writes the ledger. Whether repair closes automatically still depends on the outer agent, tool availability, and authority gates.</div>
+      <div class="outcome"><b>From “tests are green” to layered evidence</b>Algorithms, APIs, browsers, devices, and production now have independent evidence layers. Green at one layer cannot substitute for another, and functional tests no longer answer visual correctness.</div>
+      <div class="outcome"><b>From rules in prose to silent bypass being impossible</b>Shared-main edits, unreviewed merges, missing verdicts, and stale review receipts are rejected by hooks, bounded runners, and a reference-transaction gate.</div>
+      <div class="outcome"><b>From dual-AI voting to multiple failure detectors</b>Cross-vendor review binds to the actual diff and <code>OPEN=[]</code>, while regressions, real environments, facts guards, production feedback, and human product acceptance remain separate checks.</div>
+    </div>
+    <div class="aside"><strong>This is not a company with no humans:</strong> I still define product goals, perform final local or production acceptance, handle account-holder identity, money, and legal actions, and retain accountability. Claude can operate consoles, package, and upload after authorization, with Codex reviewing; the human is no longer the approver of every tool call.</div>
+
+    <h2 id="en-dual-ai-failure">Why one AI can be confidently wrong—and two AIs can still miss together</h2>
+    <p>The common failure is not total incompetence. It is a model continuing from a bad premise while sounding certain. It may:</p>
+    <ul>
+      <li>patch the symptom without finding the root cause;</li>
+      <li>read one file and miss an upstream protocol or downstream state transition;</li>
+      <li>make old tests pass without adding a regression that reproduces the bug;</li>
+      <li>assume a real browser is correct because a frontend unit test passed;</li>
+      <li>hide missing verification behind a polished summary.</li>
+    </ul>
+    <p>Asking the same AI to “check its work” often preserves its original assumptions. A second AI adds another reasoning path, but it is not proof of correctness. Two models can misunderstand the same requirement, trust the same incomplete tests, or agree on the same stale fact.</p>
+
+    <h3>What still failed after dual-AI work in my Git history</h3>
+    <div class="compare"><table>
+      <thead><tr><th>Real record</th><th>Why two models can still miss it</th><th>Defense added afterward</th></tr></thead>
+      <tbody>
+        <tr><td><code>46c9b57d</code>: nine Vitest cases passed while cards still remained face-down in real Chromium</td><td>Both author and reviewer can accept the wrong evidence layer; jsdom can prove that an element exists, not that a CSS transform is visibly correct</td><td><code>visual-animation-verify</code>: animation changes require real-Chromium outcome evidence</td></tr>
+        <tr><td>Phase 3 Table: build, 758 tests, and 10/10 smoke were green, but the implementation had silently simplified the design</td><td>Functional checks answer “does it work?”, not “is this what the user asked to see?”</td><td><code>visual-fidelity</code>: completion binds to the design source, target viewports, and side-by-side visual evidence</td></tr>
+        <tr><td><code>7767eede</code>: a round-three review fix introduced an empty-SHA deduplication bug found only in round four</td><td>A review fix is new code; closing one finding does not prove that no new regression was created</td><td>Every fix adds RED→GREEN coverage and reruns tests plus review, rather than merely checking the old finding</td></tr>
+        <tr><td><code>4083b0d8</code> and <code>a23646c7</code>: marketing and payment status drifted away from the product and Stripe control plane</td><td>Two models reading one stale document only agree more consistently on an obsolete answer</td><td>Canonical status, live read-back, facts guards, and ledgers that validate downstream consumers</td></tr>
+      </tbody>
+    </table></div>
+    <p>These failures came from the wrong verification layer, missing requirement acceptance, regressions introduced during repair, and external fact drift. An extra vote cannot solve them by itself.</p>
+
+    <h3>What I actually use is layered defense, not dual-AI magic</h3>
+    <p>These are system-control layers, not another list of test types: the earlier evidence table answers “what should run”; this one answers “what stops an error from moving forward.”</p>
+    <div class="compare"><table>
+      <thead><tr><th>Defense</th><th>Primary failure addressed</th><th>How it works in my project</th></tr></thead>
+      <tbody>
+        <tr><td>1 · Task contract</td><td>Both AIs misunderstand the requirement</td><td>A task card states goal, scope, prohibitions, and acceptance; visual work also binds design source and target viewports</td></tr>
+        <tr><td>2 · State isolation</td><td>Agents overwrite files, switch branches, or contaminate results</td><td>One branch/worktree per task; author and reviewer do not share writable state</td></tr>
+        <tr><td>3 · Current sources of truth</td><td>Memory, documents, or summaries are stale</td><td>Code, databases, canonical status, ledgers, live consoles, and control-plane read-back decide current state</td></tr>
+        <tr><td>4 · Risk-matched evidence</td><td>A green result from the wrong layer</td><td>Units for algorithms, integration for APIs, real browsers for animations, devices for native behavior, and production smoke after release</td></tr>
+        <tr><td>5 · Regressions and invariants</td><td>A fix creates a new bug</td><td>Write a failing regression first; critical money, chip, and concurrency paths also check conservation and ordering invariants</td></tr>
+        <tr><td>6 · Independent review</td><td>Author blind spots and evidence gaps</td><td>Fresh context, read-only access, actual diff, related call paths, an explicit rubric, <code>VERDICT</code>, and <code>OPEN</code></td></tr>
+        <tr><td>7 · Mechanical enforcement</td><td>An AI forgets a Markdown rule or declares victory early</td><td>Hooks, CI, harnesses, fail-closed gates, and a trusted merge entry point block bypasses</td></tr>
+        <tr><td>8 · Production feedback and human acceptance</td><td>Uncovered user experience or external change</td><td>Monitoring, logs, production regression, rollback; humans retain product, identity, money, and irreversible decisions</td></tr>
+      </tbody>
+    </table></div>
+    <blockquote>Reliability is not voted into existence by two models. It emerges from multiple independent failure detectors.</blockquote>
+
+    <h3>The right role for dual AI: another independent check, not proof</h3>
+    <div class="role-grid">
+      <div class="role"><b>Human: definer and accountable owner</b>Sets the actual problem, protected boundaries, acceptance criteria, and which operations must never run automatically.</div>
+      <div class="role"><b>AI A: implementer</b>Reads repository rules, investigates the root cause, makes the smallest change, adds a regression, and reports executed verification.</div>
+      <div class="role"><b>AI B: independent reviewer</b>Reads the real diff and relevant call paths, then searches for logic errors, omissions, regressions, and evidence gaps.</div>
+      <div class="role"><b>Tools: evidence layer</b>Git diffs, tests, builds, browsers, devices, and runtime logs provide repeatable evidence, but their coverage and harness validity must also be checked.</div>
+    </div>
+    <div class="flow" aria-label="Dual-AI workflow">
+      <div class="step">Define &amp; inspect</div><div class="step">Implement &amp; test</div><div class="step">Independent review</div><div class="step">Fix &amp; re-verify</div>
+    </div>
+    <p>Whether Claude writes and Codex reviews, or the reverse, is secondary. What matters is role separation, reviewer independence, and access to the actual code and evidence instead of the author’s summary. Even two approvals mean only that neither reviewer found an issue in the supplied context; they do not prove that the full user requirement is satisfied.</p>
+
+    <h4>Can different versions of the same model review each other?</h4>
+    <p><strong>Yes. The core idea is still to create a second judgment path, but the degree of independence is different.</strong> Versions may differ in capability, context, and reasoning behavior, so this is usually more useful than self-review in one session. Yet models from the same family may still share training preferences, tool habits, and blind spots.</p>
+    <div class="compare"><table>
+      <thead><tr><th>Arrangement</th><th>Value</th><th>Appropriate use</th></tr></thead>
+      <tbody>
+        <tr><td>Same model, same session</td><td>Cheapest, but most anchored to the original premise</td><td>Quickly find obvious omissions; never treat as independent approval</td></tr>
+        <tr><td>Same model, fresh session</td><td>Breaks part of the contextual anchoring and forces a reread</td><td>A second pass for routine low-risk changes</td></tr>
+        <tr><td>Same vendor, different versions</td><td>Behavior differs, but correlated errors can remain high</td><td>A valid reviewer when paired with tests, real-environment evidence, and an explicit rubric</td></tr>
+        <tr><td>Different vendors or model families</td><td>More diverse training, tools, and alignment paths</td><td>Prefer for important or high-risk changes, while still requiring verification and human acceptance</td></tr>
+      </tbody>
+    </table></div>
+    <div class="aside"><strong>Independence that matters more than the model label:</strong> use a fresh session and read-only reviewer; provide the requirement, actual diff, related source, and executed evidence; check every acceptance criterion; and constrain the verdict with tests, browsers, devices, live state, and human product judgment.</div>
+
+    <h2 id="en-traps">Twelve traps when bringing AI into production</h2>
+    <p>These risks have not vanished permanently; the workflow keeps defending against them. The goal is not zero bugs. It is to make errors easier to detect, block, roll back, and remember across sessions.</p>
+    <div class="compare"><table>
+      <thead><tr><th>Trap</th><th>Minimum executable fix</th><th>Mechanism in my project</th></tr></thead>
+      <tbody>
+        <tr><td>1 · Treating a model as an agent</td><td>Confirm working directory, repository, tools, network, sandbox, and read/write permissions first; without tools, ask only for a plan</td><td>Start the CLI agent from the project terminal; if a write task lands in shared main, a hook blocks it and directs creation of an isolated worktree</td></tr>
+        <tr><td>2 · Giving the AI an enormous scope</td><td>One task card solves one problem and names scope, prohibitions, and executable acceptance criteria</td><td>One branch/worktree per task; large work is split into independently verifiable stages</td></tr>
+        <tr><td>3 · Treating memory as live truth</td><td>Use memory for routing; reread code, ledger, database, or live console before reporting current state</td><td>Canonical status JSON, ops/bug-free ledgers, live read-back, and facts guards</td></tr>
+        <tr><td>4 · Reading the summary instead of the diff</td><td>Inspect the actual diff, changed files, executed commands, and raw evidence; treat prose as an index</td><td>The reviewer binds to the exact patch and evidence receipt rather than approving a “done” paragraph</td></tr>
+        <tr><td>5 · Treating Markdown as enforcement</td><td>Document the rule first; promote recurring or high-risk failures into a hook, test, or gate</td><td><code>AGENTS.md</code>/<code>CLAUDE.md</code> explain; agent hooks, Git hooks, and <code>finish-session.sh</code> block bypasses</td></tr>
+        <tr><td>6 · Installing every plugin</td><td>Use a minimal allowlist; skip an extension until you can name its use case, authority, and verification path</td><td>Visual, release, and review skills load on demand instead of placing every tool in every conversation</td></tr>
+        <tr><td>7 · Giving MCP excessive authority</td><td>Separate read, write, delete, send, and publish; default to read-only and require explicit identity, target, and audit for external acts</td><td>Identity, 2FA, signatures, payments, and irreversible actions retain human boundaries; evidence excludes secrets</td></tr>
+        <tr><td>8 · Treating green tests as complete correctness</td><td>Ask what the test actually observes, then add integration, real-browser, device, production smoke, and human acceptance as risk requires</td><td>Vitest does not replace Chromium; the harness records layered evidence and continues verification after release</td></tr>
+        <tr><td>9 · Letting two AIs share one directory</td><td>Give every writer a separate branch/worktree; keep reviewers read-only where possible</td><td><code>new-session.sh</code> creates isolation; hooks block changes in the shared main checkout</td></tr>
+        <tr><td>10 · Spawning subagents without discipline</td><td>Parallelize only independent work with no shared write state; otherwise use one orchestrated owner path</td><td>Multi-surface verification can parallelize, while merges and tightly dependent repairs use a controlled workflow and ledger</td></tr>
+        <tr><td>11 · Reviewing the author’s summary</td><td>Use a fresh, read-only session with the real diff, requirement, call paths, and test output; check each acceptance criterion</td><td>Claude/Codex cross-review returns <code>VERDICT</code> and <code>OPEN</code>; fixes rerun the loop</td></tr>
+        <tr><td>12 · No stop condition or authority boundary</td><td>Define completion as commands, observable outcomes, rollback, explicit verdict, and an empty open list</td><td>Gates fail closed; humans control OTPs, secrets, payments, and destructive data actions; releases need explicit authority, rollback, and gates but may be executed by an agent</td></tr>
+      </tbody>
+    </table></div>
+
+    <h2 id="en-glossary">Reference appendix: Claude and Codex terms to look up when needed</h2>
+    <p>These terms are not a prerequisite exam for AI coding. Return when a relevant situation appears; on a first read, you can skip this appendix.</p>
+    <div class="compare"><table>
+      <thead><tr><th>Concept</th><th>One-line meaning</th><th>Production use</th></tr></thead>
+      <tbody>
+        <tr><td><span class="term">Plan mode</span></td><td>Inspect, decompose, and define acceptance points before editing</td><td>Use for ambiguous, complex, or high-risk work; do not over-plan a tiny fix whose acceptance criteria are already clear</td></tr>
+        <tr><td><span class="term">Reasoning effort</span></td><td>How much inference effort the model spends on a task</td><td>Use lower settings for mechanical edits and higher settings for architecture, auth, payments, concurrency, and difficult debugging; never substitute it for tests</td></tr>
+        <tr><td><span class="term">Context rot / compaction</span></td><td>Long threads bury important facts or compress history into summaries</td><td>Put must-preserve rules in files and branch, failure, and next-step state in handoffs; do not bind the whole project to one chat window</td></tr>
+        <tr><td><span class="term">RAG / retrieval</span></td><td>Retrieve relevant documents or data before placing them into current context</td><td>Useful for large docs and internal knowledge; it is not model training, and retrieved stale content still needs verification</td></tr>
+        <tr><td><span class="term">Fine-tuning</span></td><td>Adjust a model’s persistent behavior using training data</td><td>Usually not the first answer for repository coding; try prompts, AGENTS, skills, MCP, and evals first</td></tr>
+        <tr><td><span class="term">Config</span><br><span class="mini"><code>config.toml</code> / settings</span></td><td>Durable defaults for models, reasoning, sandbox, approvals, MCP, hooks, and plugins</td><td>Keep personal defaults global, repository behavior local, and one-off overrides temporary</td></tr>
+        <tr><td><span class="term">Environment variable / secret</span></td><td>Runtime configuration; a secret must not enter code, logs, prompts, or memory</td><td>Git-ignore <code>.env</code>, use least privilege and a secret store, and record only configured/not-configured status in evidence</td></tr>
+        <tr><td><span class="term">Prompt injection</span></td><td>Untrusted pages, files, or tool output try to override the real instruction hierarchy</td><td>Treat external content as data, not authority; use sandboxing, tool allowlists, approvals, and explicit deny-or-approve boundaries for high-risk actions</td></tr>
+        <tr><td><span class="term">Test vs eval</span></td><td>Tests verify software behavior; evals measure model or workflow behavior across tasks</td><td>Test the code and also test whether the harness misclassifies known failure fixtures as green</td></tr>
+        <tr><td><span class="term">Deterministic / nondeterministic</span></td><td>Whether the same input reliably produces the same result</td><td>Keep units and locked dependencies deterministic; record device, network, store, and time-dependent checks as a separate external-evidence lane</td></tr>
+        <tr><td><span class="term">Trace / log</span></td><td>The record of tool calls, outputs, transitions, and errors</td><td>Use it to replay why a verdict occurred, but bound size, redact secrets, and distinguish raw logs from final verdicts</td></tr>
+        <tr><td><span class="term">Idempotency / lock</span></td><td>Repeating a run does not duplicate effects; a lock prevents conflicting runs</td><td>A scheduled heartbeat needs a run lock, repeat-safe state transitions, and evidence of final release</td></tr>
+      </tbody>
+    </table></div>
+
+    <div class="part-divider"><span>Part IV</span><b>Transfer the method into your own repository</b><p>Use a four-week path, a decision-oriented FAQ, and a prompt you can hand to an agent to build the smallest trustworthy loop.</p></div>
+
+    <h2 id="en-four-week-path">From GPT chat user to AI-coding beginner: a four-week path</h2>
+    <p>This is an execution index, not a second copy of the article: add one capability layer each week and return to the corresponding exercise above.</p>
+    <h3>Week 1: read-only understanding and trust calibration</h3>
+    <p>Use the <a href="#en-layers">surface recommendation</a> and <a href="#en-remote">execution-location guide</a> to start an agent. Ask it to explain architecture, map one call path, and locate tests without editing; spot-check where it guesses.</p>
+    <h3>Week 2: complete one reversible change</h3>
+    <p>Choose a reversible change using the <a href="#en-first-task">small-task brief</a>, then follow the <a href="#en-copy-workflow">five-step workflow</a> through “inspect → change → AI review → local or test-environment acceptance → rollback if needed.”</p>
+    <h3>Week 3: turn repeated lessons into a system</h3>
+    <p>Return to <a href="#en-mcp-skills">capability extensions</a>, <a href="#en-markdown">Markdown instructions</a>, and <a href="#en-workflow-harness">mechanical controls</a>: create a short <code>AGENTS.md</code>, turn one repeated routine into a Skill, and add one Hook that blocks an obvious failure.</p>
+    <h3>Week 4: add the second AI and evidence-based gates</h3>
+    <p>Use the <a href="#en-dual-ai-failure">dual-AI failure modes</a> and <a href="#en-traps">twelve traps</a> to build “implement → independent review → fix → re-verify.” The reviewer is one sensor; real-environment evidence and human acceptance still constrain the result.</p>
+
+    <h2 id="en-faq">Skimmable FAQ: ten decisions beginners face</h2>
+    <p>This is an index into the argument, not a second tutorial. Use the direct answer to decide, then return to the relevant chapter when you need the reasoning.</p>
+    <div class="compare"><table>
+      <thead><tr><th>Question</th><th>Direct answer</th></tr></thead>
+      <tbody>
+        <tr><td>Do I need to learn “prompt engineering” first?</td><td>No. Learn to state goal, observed behavior, scope, acceptance criteria, and constraints. That is more useful than memorizing incantations.</td></tr>
+        <tr><td>Can I start if I am not comfortable in a terminal?</td><td>Yes. Begin with <code>cd</code>, <code>git status</code>, starting the agent, running the project’s test command, and <code>git diff</code>. You do not need to become a shell expert first.</td></tr>
+        <tr><td>Do I need two Max subscriptions?</td><td>No. One repository-capable agent is enough for the beginner loop. Dual AI increases reviewer independence; it is not the entry fee.</td></tr>
+        <tr><td>Must I install memory, MCP, skills, and plugins first?</td><td>No. Week one needs an agent, a repository, a task card, and the existing tests. Add extensions only after real repeated problems justify them.</td></tr>
+        <tr><td>If every test is green, why not ship?</td><td>Tests observe only what they were written to observe. Visual, device, payment, authorization, and production-state changes need different evidence layers.</td></tr>
+        <tr><td>With two AIs, can I stop looking?</td><td>You do not need to read every diff line or supervise every command, but you must define observable acceptance and, as I do, validate the final behavior locally or in production.</td></tr>
+        <tr><td>Should an agent ask me before every step?</td><td>No. Local, reversible work inside the sandbox can proceed autonomously. Humans control identity, secrets, payments, and deletion; an authorized, reversible release can be executed by an agent.</td></tr>
+        <tr><td>If I send a task from my phone, does it run on my computer?</td><td>Not necessarily. A cloud agent runs in a hosted container. Only Remote Control or Dispatch explicitly connected to a host uses that host’s local files and tools.</td></tr>
+        <tr><td>Will pasting this article reproduce your entire system?</td><td>Not in one shot. It can guide a tool-using agent to build a minimum loop. A mature system grows from the failures it actually encounters.</td></tr>
+        <tr><td>Who remains accountable for production?</td><td>The human. Agent autonomy does not transfer product, legal, financial, identity, or final-delivery accountability.</td></tr>
+      </tbody>
+    </table></div>
+
+    <h2 id="en-bootstrap">Can your AI really build this if you paste in the article?</h2>
+    <p><strong>It can build a minimum viable version, but pasting HTML into an ordinary chat window will not install a system.</strong> Start a coding-agent CLI with file, edit, and command tools from the repository directory, then give it this article and the prompt below. An AI without repository tools can produce only a proposal.</p>
+    <div class="rule"><strong>A reasonable first deliverable:</strong> a concise project instruction file, task-card template, executable verification script or harness, an independent-review contract with a fail-closed gate, and operating plus rollback instructions. Independent Review is READY only when a reviewer is genuinely callable and passes positive and negative tests; otherwise mark it UNSUPPORTED. Memory, MCP, plugins, multiple agents, and automated release do not need to arrive together.</div>
+    <p>The default authority below is intentionally more conservative than my mature project. A beginner should initially block commit, push, merge, and deploy, then authorize agent execution one capability at a time only after review, rollback, and release gates really work. It is a bootstrap policy, not a reverse description of my current workflow.</p>
+    <h3>Bootstrap prompt to paste into Codex or Claude Code</h3>
+    <pre><code>You are running inside my project repository. I have attached an article titled “From Chatbot to Production-Grade AI Coding.”
+Do not copy BluffKing-specific paths, commands, or technology. Adapt a “minimum trustworthy AI-coding loop” to this repository.
+
+Working method:
+1. Begin with read-only inventory. Identify the stack, Git/CI, test entry points, existing instruction files, hooks/scripts, high-risk areas, and your current tools and permissions. Record the current branch, baseline commit, git status --short, git worktree list, and pre-change diff. Do not guess or print content that may contain secrets.
+2. Protect existing work before writing. If this is a shared main tree, contains changes unrelated to this task, or ownership is unclear, do not write here. Prefer an existing isolated feature worktree; if Git state permits, create a new worktree from the recorded baseline; otherwise mark NEEDS_USER. Never stash, reset, clean, rebase, or restore the whole repository on your own.
+3. First output a “current state → gap → minimum change” table. Then implement only safe, local, reversible changes inside the isolated worktree; do not wait for confirmation on every ordinary file.
+4. Reuse existing conventions instead of creating a parallel system. Keep instruction files concise. Turn recurring critical rules into executable checks.
+5. Deliver at minimum:
+   - A project instruction file for the current agent; improve an existing file instead of overwriting it blindly.
+   - A task-card template with goal, observation, scope, acceptance criteria, and constraints.
+   - A minimum verification script or harness that calls existing project tests and exits non-zero on failure.
+   - An independent-review gate: first detect whether a second independent session/model is genuinely callable. If it is, use a fresh read-only session to review a harmless patch; it must read the real diff, requirement, and evidence and return parseable VERDICT and OPEN. A template alone is not READY. If no independent reviewer is callable, mark UNSUPPORTED or NEEDS_USER and keep the delivery gate closed.
+   - Operating instructions from branch/worktree creation through verification, review, and rollback.
+6. Verify the new loop with existing project commands. Failure self-tests may only create a disposable fixture, inject a temporary environment variable, or call an explicit false command; never damage existing business source, tests, or configuration. Compare exact status/diff before and after, remove only the fixture you created, and prove the user’s original state is unchanged.
+7. Exercise at least four review-gate paths: an end-to-end dry run where a real independent reviewer examines a harmless patch; reviewer missing or timed out; malformed verdict; and non-empty OPEN. The last three must block. If no reviewer is callable, mark the first path UNSUPPORTED rather than manufacturing a green result.
+8. Finish with changed files, commands actually executed and results, intentionally unimplemented items and reasons, remaining risks, and the complete rollback method. Rollback may remove only files created in this run or reverse this run’s exact patch; never use a repository-wide restore that overwrites prior work.
+9. Output a capability matrix for Memory, MCP, Skill, Plugin, Markdown instructions, Hooks, Harness, Workflow, Worktree, independent Review, Automation, and Remote Control. Mark each READY / BUILD_NOW / NOT_NEEDED / UNSUPPORTED / NEEDS_USER, with evidence and the smallest next step. READY means genuinely callable and verified with positive and negative cases, not merely represented by a template or config file. Do not install capabilities merely for completeness.
+
+Default authority boundary:
+- Do not install global software, add paid services, or read or print secrets.
+- Do not change global Git configuration or install hooks directly. You may create reviewable repository-local hook/gate scripts and installation instructions.
+- Do not touch pre-existing changes or run stash, reset, clean, rebase, or a repository-wide restore on your own.
+- Do not commit, push, merge, deploy, send external messages, or write production data.
+- Stop at OTP, 2FA, signatures, payments, data deletion, production release, or any irreversible action and state the exact human step required.
+- If evidence is missing, mark NOT_VERIFIED and do not claim completion.</code></pre>
+    <p>This prompt can bootstrap a minimum loop; it cannot reproduce in one pass a system that evolved over three months. Run one small task first. Add skills, hooks, MCP, memory, dual AI, and release gates only as real failures reveal the need.</p>
+
+    <h2 id="en-conclusion">AI coding is worth using—and you can start today</h2>
+    <p>If you have already used ChatGPT or Claude, you do not need to master memory, MCP, skills, and hooks before you begin. The real first step is to open your project in a terminal and start Codex CLI or Claude Code. Let it read the repository, change code, and run the existing tests. Your job is to explain the problem and define what a correct result looks like.</p>
+    <p>I now use this setup—one founder working with Claude Code and Codex—to develop and operate a live product across H5, iOS, Android, and Telegram, including payment, subscription, refund, store-release, and production work. That is enough evidence for me that agents can handle substantial real engineering. They still write bugs and miss requirements, and two AIs can miss the same problem. “The agent says it is done” is therefore not the result. Tests, browsers, devices, live state, or your own use of the feature must confirm it.</p>
+    <h3>Tomorrow, do only these four things</h3>
+    <ol>
+      <li>Open a project you know in a terminal and start one coding-agent CLI.</li>
+      <li>Give it one reversible task with the goal, observed behavior, scope, acceptance criteria, and prohibitions.</li>
+      <li>Let the agent inspect, edit, and test on its own, then report exactly what changed and what it ran.</li>
+      <li>Exercise the result once in your local or test environment. If it does not meet the requirement, return the observed behavior and let the agent continue fixing it.</li>
+    </ol>
+    <p>At that point, you have moved beyond chatting with GPT and started AI coding. Once this basic workflow is reliable, add a second AI reviewer, isolated worktrees, skills, hooks, MCP, and automated gates. These concepts are not a shopping list to install at once. They are the next tools to add when a real failure shows you what your current workflow is missing.</p>
+
+    <div class="receipts"><strong>Sources and receipts:</strong> Project practice can be verified in <code>README.md</code>, <code>AGENTS.md</code>, <code>CLAUDE.md</code>, <code>docs/AGENTS-CONTRACT.md</code>, <code>docs/ops/HEARTBEAT-SOP.md</code>, <code>docs/architecture/ai-team-manager.html</code>, <code>docs/mobile/store-release-status.json</code>, <code>docs/ops/billing-provider-status.json</code>, <code>scripts/ai-team-manager.mjs</code>, <code>scripts/loop/run.mjs</code>, <code>scripts/bugfree/trusted-local-launcher.mjs</code>, <code>scripts/claude-review.mjs</code>, <code>.agents/skills/visual-animation-verify/SKILL.md</code>, and <code>.agents/skills/visual-fidelity/SKILL.md</code>. Real fixes and workflow commits cited include <code>46c9b57d</code>, <code>7767eede</code>, <code>4083b0d8</code>, <code>a23646c7</code>, <code>7c3142bb</code>, <code>af86fbcd</code>, and <code>5b3e01b0</code>. Product and concept boundaries follow official OpenAI documentation for <a href="https://developers.openai.com/codex/concepts/customization">customization</a>, <a href="https://developers.openai.com/codex/config-advanced#hooks">hooks</a>, <a href="https://developers.openai.com/codex/plugins/build">plugins</a>, <a href="https://learn.chatgpt.com/docs/environments/cloud-environment">cloud environments</a>, <a href="https://learn.chatgpt.com/docs/browser">Browser</a>, <a href="https://learn.chatgpt.com/docs/remote-connections">ChatGPT Remote</a>, and <a href="https://openai.com/index/harness-engineering/">harness engineering</a>, plus Anthropic’s official <a href="https://code.claude.com/docs/en/chrome">Claude Code with Chrome</a> and <a href="https://code.claude.com/docs/en/remote-control">Claude Code Remote Control</a> documentation. Claims about reviewer bias also draw on ACL-published research on <a href="https://aclanthology.org/2024.emnlp-main.474/">LLM-as-a-judge bias</a> and <a href="https://aclanthology.org/2024.acl-long.826/">self-correction bias</a>. Product status, Remote capabilities, and official concepts were checked on 2026-07-19 and may evolve. No unsupported productivity, speed, or defect-rate figures are used.</div>
+  </section>
+  </article>
+</main>
+
+<footer>
+  <span data-ui-lang="zh">AI 编程长文母稿 · 中文/英文切换 · 项目事实可追溯</span>
+  <span data-ui-lang="en">AI-coding long-form source · Chinese/English toggle · project claims are traceable</span>
+</footer>
+
+<script>
+  function setLang(lang){
+    var next=(lang==='en')?'en':'zh';
+    document.documentElement.setAttribute('data-active-lang',next);
+    document.documentElement.lang=next;
+    document.querySelectorAll('.langbtn').forEach(function(button){
+      var active=button.getAttribute('data-l')===next;
+      button.classList.toggle('active',active);
+      button.setAttribute('aria-pressed',active?'true':'false');
+    });
+    document.title=next==='zh'?'AI 编程入门：从 GPT 对话到生产级 Agent 工程':'AI Coding: From GPT Chat to Production-Grade Agent Engineering';
+    try{localStorage.setItem('bluffking-dual-ai-article-lang',next);}catch(error){}
+  }
+  document.querySelectorAll('.langbtn').forEach(function(button){button.addEventListener('click',function(){setLang(button.getAttribute('data-l'));});});
+  var saved='zh';
+  try{saved=localStorage.getItem('bluffking-dual-ai-article-lang')||'zh';}catch(error){}
+  setLang(saved);
+</script>
+</body>
+</html>
