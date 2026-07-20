@@ -63,6 +63,12 @@ pub enum EngineEvent {
         big_blind: u64,
         /// Small blind amount in chips.
         small_blind: u64,
+        /// Seat that posted the live UTG straddle, if enabled for this hand.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        straddle_seat: Option<u8>,
+        /// Requested straddle amount in chips, if enabled for this hand.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        straddle_amount: Option<u64>,
         /// Deck seed (for per-bot RNG derivation — ADR-024 §6, ADR-062 §2).
         /// 256-bit; the server projects it to a `u64` for the bot RNG.
         ///
@@ -144,8 +150,9 @@ pub enum EngineEvent {
         next_actor_seat: Option<u8>,
         /// ADR-079 (F2) — the engine-authoritative per-hand action sequence number
         /// for THIS action. Mirrors the recorded [`crate::game::ActionRecord::seq`].
-        /// Blinds consume seq 0 (SB) and 1 (BB); the **first voluntary action is
-        /// seq 2** (verified by `first_voluntary_action_seq_is_2_after_blinds`).
+        /// Blinds consume seq 0 (SB) and 1 (BB). Without a live straddle the
+        /// first voluntary action is seq 2; a posted straddle consumes seq 2,
+        /// so the first voluntary action is seq 3.
         ///
         /// The engine-blind signed-action chain (ADR-079 §3.3) binds this value
         /// into each signed `actionClaim`; the server forwards it to the web client

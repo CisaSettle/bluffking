@@ -374,6 +374,11 @@ pub struct GameHand {
     dealer_idx: usize,
     big_blind: Chips,
     small_blind: Chips,
+    /// Optional live UTG straddle amount. When present on a 3+ handed table,
+    /// the seat immediately left of the big blind posts before cards are dealt,
+    /// action opens to that seat's left, and a fully-funded straddle becomes
+    /// the preflop bring-in / minimum raise increment.
+    forced_straddle: Option<Chips>,
     /// Card-source mode. `Plaintext` deals from `deck`; `Blind` ignores it.
     mode: HandMode,
     deck: Deck,
@@ -555,6 +560,7 @@ impl GameHand {
             dealer_idx,
             big_blind,
             small_blind,
+            forced_straddle: None,
             mode: HandMode::Plaintext,
             deck,
             deck_seed: seed,
@@ -618,6 +624,7 @@ impl GameHand {
             dealer_idx,
             big_blind,
             small_blind,
+            forced_straddle: None,
             mode: HandMode::Blind,
             // Empty deck: blind mode never deals from it. Any accidental
             // `self.deck.deal()` would error (HandFinished) rather than leak a
@@ -636,6 +643,15 @@ impl GameHand {
             pending_board_street: None,
             finished_street: None,
         }
+    }
+
+    /// Enable a live, forced UTG straddle for this hand.
+    ///
+    /// A zero amount disables the option. Heads-up hands never post a
+    /// straddle, even when the table-level setting remains enabled.
+    pub fn with_forced_straddle(mut self, amount: Chips) -> Self {
+        self.forced_straddle = (amount.0 > 0).then_some(amount);
+        self
     }
 
     /// Start the hand: post blinds, deal hole cards, begin preflop betting.
@@ -663,6 +679,11 @@ impl GameHand {
         let (sb_idx, bb_idx) = blind_positions(self.dealer_idx, n);
         let sb_id = self.seats[sb_idx].player_id;
         let bb_id = self.seats[bb_idx].player_id;
+        let straddle_idx = self
+            .forced_straddle
+            .filter(|_| n >= 3)
+            .map(|_| (bb_idx + 1) % n);
+        let straddle_id = straddle_idx.map(|idx| self.seats[idx].player_id);
 
         // Emit HandStarted as the FIRST event (ADR-024 §5.2, ADR-025 §4).
         // Must be emitted before any ActionApplied { Blind, .. } events.
@@ -680,6 +701,8 @@ impl GameHand {
                 bb_seat,
                 big_blind: self.big_blind.0 as u64,
                 small_blind: self.small_blind.0 as u64,
+                straddle_seat: straddle_idx.map(|idx| self.seats[idx].seat),
+                straddle_amount: self.forced_straddle.filter(|_| n >= 3).map(|v| v.0 as u64),
                 deck_seed: self.deck_seed,
             });
         }
@@ -743,6 +766,41 @@ impl GameHand {
         );
         self.action_seq = self.action_seq.saturating_add(1); // saturating (U33)
 
+        // Record the forced UTG straddle after the two standard blinds. A
+        // short stack posts what it has; that partial post does not create a
+        // larger nominal bring-in (resolved below), but action still begins to
+        // the straddler's left.
+        let straddle_record = straddle_idx.zip(straddle_id).and_then(|(idx, id)| {
+            let requested = self.forced_straddle?;
+            let stack_start = self.seats[idx].stack;
+            let posted = requested.0.min(stack_start.0);
+            let seq = self.action_seq;
+            let pot_before = sb_blind_amount.saturating_add(bb_blind_amount);
+            self.actions.push(ActionRecord {
+                seq,
+                street: Street::Preflop,
+                player_id: id,
+                action: PlayerAction::Blind {
+                    kind: BlindKind::Straddle,
+                    amount: Chips(posted),
+                },
+                amount: Chips(posted),
+                stack_before: stack_start,
+                stack_after: Chips(stack_start.0 - posted),
+                pot_before: Chips(pot_before),
+                pot_after: Chips(pot_before.saturating_add(posted)),
+            });
+            self.last_action.insert(
+                id.inner(),
+                PlayerAction::Blind {
+                    kind: BlindKind::Straddle,
+                    amount: Chips(posted),
+                },
+            );
+            self.action_seq = self.action_seq.saturating_add(1);
+            Some((idx, id, posted, requested, seq))
+        });
+
         // Deal hole cards (two passes over all active seats).
         //
         // Blind mode (ADR-066 P1): deal NOTHING from the deck. Seats keep their
@@ -771,20 +829,34 @@ impl GameHand {
         let preflop_players: Vec<(PlayerId, Chips)> =
             self.seats.iter().map(|s| (s.player_id, s.stack)).collect();
 
-        // UTG acts first preflop; seats and round players are in the same order,
-        // so the seat index is also the round player index.
-        let first_actor_in_round = (bb_idx + 1) % n;
+        // UTG acts first without a straddle. With a straddle, action opens one
+        // seat to the straddler's left.
+        let first_actor_in_round = straddle_record
+            .map(|(idx, _, _, _, _)| (idx + 1) % n)
+            .unwrap_or((bb_idx + 1) % n);
 
-        let blinds = vec![
+        let mut blinds = vec![
             (sb_id, Chips(sb_blind_amount)),
             (bb_id, Chips(bb_blind_amount)),
         ];
+        if let Some((_, id, posted, _, _)) = straddle_record {
+            blinds.push((id, Chips(posted)));
+        }
+
+        // A fully funded live straddle is the opening wager and therefore the
+        // minimum raise increment (2 BB straddle → first legal raise to 4 BB).
+        // A short all-in straddle remains a forced post but does not inflate the
+        // nominal bring-in above the big blind.
+        let preflop_bring_in = match straddle_record {
+            Some((_, _, posted, requested, _)) if posted >= requested.0 => requested,
+            _ => self.big_blind,
+        };
 
         let round = BettingRound::new_preflop(
             preflop_players,
             first_actor_in_round,
             &blinds,
-            self.big_blind,
+            preflop_bring_in,
         );
 
         self.phase = Phase::Betting(Street::Preflop);
@@ -793,9 +865,9 @@ impl GameHand {
         // Sync seat stacks from round (blinds have been applied inside round).
         self.sync_stacks_from_round();
 
-        // Now that the round is constructed, read post-blind betting state for
-        // the blind ActionApplied events.  Both blind events carry the SAME
-        // post-round state (the final state after both blinds are posted).
+        // Now that the round is constructed, read post-forced-bet state for the
+        // Blind ActionApplied events. Every forced post carries the SAME final
+        // state after SB, BB, and the optional straddle are posted.
         let post_blind_current_bet = self
             .betting_round
             .as_ref()
@@ -844,9 +916,30 @@ impl GameHand {
             action_seq: bb_action_seq,
         });
 
-        // Emit PotUpdated after both blinds are posted.
+        // The forced-post event stream remains chronological: SB (seq 0), BB
+        // (seq 1), then the optional live straddle (seq 2).
+        if let Some((idx, _, posted, _, seq)) = straddle_record {
+            self.events.push(EngineEvent::ActionApplied {
+                seat: self.seats[idx].seat,
+                action: PlayerAction::Blind {
+                    kind: BlindKind::Straddle,
+                    amount: Chips(posted),
+                },
+                contributed: posted as u64,
+                current_bet: post_blind_current_bet,
+                min_raise_to: post_blind_min_raise_to,
+                next_actor_seat: post_blind_next_actor_seat,
+                action_seq: seq,
+            });
+        }
+
+        // Emit PotUpdated after all forced posts are made.
         // Blinds are never all-in for normal stacks; compute accurately anyway.
-        let total_blind_pot = sb_blind_amount as u64 + bb_blind_amount as u64;
+        let total_blind_pot = sb_blind_amount as u64
+            + bb_blind_amount as u64
+            + straddle_record
+                .map(|(_, _, posted, _, _)| posted as u64)
+                .unwrap_or(0);
         let has_all_in_after_blinds = self.seats.iter().any(|s| s.all_in);
         self.events.push(EngineEvent::PotUpdated {
             pot: total_blind_pot,
@@ -1161,6 +1254,20 @@ impl GameHand {
     /// without exposing the private `Phase` enum.
     pub fn is_started(&self) -> bool {
         self.phase != Phase::NotStarted
+    }
+
+    /// Live straddle seat and requested amount for this hand, when configured
+    /// and the hand has at least three players. This is public table topology;
+    /// reconnect snapshots may expose it without revealing card state.
+    pub fn straddle_position(&self) -> Option<(u8, Chips)> {
+        let amount = self.forced_straddle?;
+        let n = self.seats.len();
+        if n < 3 {
+            return None;
+        }
+        let (_, bb_idx) = blind_positions(self.dealer_idx, n);
+        let idx = (bb_idx + 1) % n;
+        Some((self.seats[idx].seat, amount))
     }
 
     /// Drain all events accumulated since the last call.
@@ -3264,6 +3371,141 @@ mod tests {
             result_actions[0].seq, result_actions[1].seq,
             "SB and BB blind seq must be distinct (was the P0 bug)"
         );
+    }
+
+    #[test]
+    fn live_utg_straddle_posts_and_moves_first_action_left() {
+        let mut hand = GameHand::new_with_rng(
+            vec![
+                (pid(1), c(1000), 0),
+                (pid(2), c(1000), 1),
+                (pid(3), c(1000), 2),
+                (pid(4), c(1000), 3),
+            ],
+            0,
+            c(20),
+            c(10),
+            PokerRng::from_seed(43),
+        )
+        .with_forced_straddle(c(40));
+
+        let snap = hand.start().expect("straddled hand starts");
+        assert_eq!(hand.actions.len(), 3);
+        assert!(matches!(
+            hand.actions[2].action,
+            PlayerAction::Blind {
+                kind: BlindKind::Straddle,
+                amount: Chips(40)
+            }
+        ));
+        assert_eq!(hand.actions[2].seq, 2);
+        assert_eq!(snap.pot, c(70));
+        assert_eq!(snap.current_bet, c(40));
+        assert_eq!(snap.min_raise_to, Some(c(80)));
+        assert_eq!(
+            snap.current_actor,
+            Some(pid(1)),
+            "action opens left of UTG straddler"
+        );
+
+        let events = hand.drain_events();
+        let action_seqs: Vec<u16> = events
+            .iter()
+            .filter_map(|event| match event {
+                EngineEvent::ActionApplied { action_seq, .. } => Some(*action_seq),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            action_seqs,
+            vec![0, 1, 2],
+            "forced posts stay chronological"
+        );
+        assert!(matches!(
+            events.first(),
+            Some(EngineEvent::HandStarted {
+                straddle_seat: Some(3),
+                straddle_amount: Some(40),
+                ..
+            })
+        ));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            EngineEvent::ActionApplied {
+                seat: 3,
+                action: PlayerAction::Blind {
+                    kind: BlindKind::Straddle,
+                    ..
+                },
+                current_bet: 40,
+                min_raise_to: Some(80),
+                next_actor_seat: Some(0),
+                action_seq: 2,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn configured_straddle_is_suppressed_heads_up() {
+        let mut hand = GameHand::new_with_rng(
+            vec![(pid(1), c(1000), 0), (pid(2), c(1000), 1)],
+            0,
+            c(20),
+            c(10),
+            PokerRng::from_seed(44),
+        )
+        .with_forced_straddle(c(40));
+
+        let snap = hand.start().expect("heads-up starts without straddle");
+        assert_eq!(hand.actions.len(), 2);
+        assert_eq!(snap.pot, c(30));
+        assert_eq!(snap.current_bet, c(20));
+        assert_eq!(snap.min_raise_to, Some(c(40)));
+        assert!(matches!(
+            hand.drain_events().first(),
+            Some(EngineEvent::HandStarted {
+                straddle_seat: None,
+                straddle_amount: None,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn short_all_in_straddle_does_not_inflate_the_bring_in() {
+        let mut hand = GameHand::new_with_rng(
+            vec![
+                (pid(1), c(15), 0),
+                (pid(2), c(1000), 1),
+                (pid(3), c(1000), 2),
+            ],
+            0,
+            c(20),
+            c(10),
+            PokerRng::from_seed(45),
+        )
+        .with_forced_straddle(c(40));
+
+        let snap = hand.start().expect("short straddled hand starts");
+        assert_eq!(snap.pot, c(45));
+        assert_eq!(snap.current_bet, c(20));
+        assert_eq!(snap.min_raise_to, Some(c(40)));
+        assert_eq!(
+            snap.current_actor,
+            Some(pid(2)),
+            "action still opens left of straddler"
+        );
+        let short = snap.players.iter().find(|p| p.player_id == pid(1)).unwrap();
+        assert_eq!(short.stack, c(0));
+        assert!(short.all_in);
+        assert!(matches!(
+            hand.actions[2].action,
+            PlayerAction::Blind {
+                kind: BlindKind::Straddle,
+                amount: Chips(15)
+            }
+        ));
     }
 
     #[test]

@@ -13,7 +13,7 @@ pub enum BlindKind {
     Small,
     /// Big blind.
     Big,
-    /// Straddle (reserved; errors if used in M1).
+    /// Live forced UTG straddle.
     Straddle,
 }
 
