@@ -18,11 +18,12 @@ uuid = { version = "1", features = ["v4", "v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 
 # Rust review standard (L0/L1): in-repo Clippy policy so a bare `cargo clippy`
-# is strict locally and matches the `-D warnings` CI gate. Crates opt in with
+# is strict in local and bug-free verification. Main-push CI is intentionally a
+# build-only deploy gate and does not run Clippy. Crates opt in with
 # `[lints] workspace = true`.
-# NOTE: do NOT add `pedantic`/`nursery`/`restriction` here — the CI gate runs
-# `clippy -- -D warnings`, which would promote those (noisy, allow-by-default)
-# groups to hard errors. Keep this aligned with the gate: `all` only.
+# NOTE: do NOT add `pedantic`/`nursery`/`restriction` here: local
+# `clippy -- -D warnings` would promote those noisy, allow-by-default groups to
+# hard errors. Keep the maintained policy at `all` only.
 [workspace.lints.clippy]
 all = "deny"
 
