@@ -201,6 +201,12 @@ pub struct DetectedDraws {
 /// — the caller then requires an explicit outs value. Made hands (already a
 /// straight/flush) are NOT reported as draws.
 ///
+/// Hero must PARTICIPATE in a draw for it to count (POKER-PRO-F1 / BUG-201): a
+/// four-flush needs at least one hero card of that suit, and a four-to-a-straight
+/// needs at least one hero rank inside the five-rank window that the board does
+/// not already supply. A pattern lying entirely on the board improves every
+/// opponent identically and is not hero's draw (0 outs).
+///
 /// Straight detection treats the Ace as both high and low (A-2-3-4-5 wheel and
 /// T-J-Q-K-A). Pairs/duplicate ranks collapse for straight purposes (a straight
 /// uses distinct ranks). Returned outs combine flush + straight conservatively
@@ -222,11 +228,20 @@ pub fn detect_draws(hero: &HoleCards, board: &BoardCards) -> DetectedDraws {
 
     let mut draws = Vec::new();
 
-    if has_flush_draw(&cards) {
+    let hero_suits = [hero.card1.suit, hero.card2.suit];
+    if has_flush_draw(&hero_suits, &cards) {
         draws.push(DrawKind::FlushDraw);
     }
 
-    if let Some(kind) = detect_straight_draw(&cards) {
+    // Hero rank-presence bitmask (bit i = Rank::ALL[i]), restricted to ranks the
+    // BOARD does not already hold: a hero card duplicating a board rank adds no
+    // rank to any straight, so it cannot be hero's participation.
+    let board_cards = board.all_cards();
+    let hero_bits: u16 = [hero.card1, hero.card2]
+        .iter()
+        .filter(|hc| board_cards.iter().all(|bc| bc.rank != hc.rank))
+        .fold(0u16, |bits, hc| bits | (1u16 << rank_index(hc.rank)));
+    if let Some(kind) = detect_straight_draw(&cards, hero_bits) {
         draws.push(kind);
     }
 
@@ -237,12 +252,15 @@ pub fn detect_draws(hero: &HoleCards, board: &BoardCards) -> DetectedDraws {
     DetectedDraws { draws, outs }
 }
 
-/// True iff exactly four cards share one suit (a flush DRAW). Five+ of a suit is
-/// a made flush, not a draw, so it does not count.
-fn has_flush_draw(cards: &[Card]) -> bool {
+/// True iff exactly four cards share one suit (a flush DRAW) AND hero holds at
+/// least one of them. Five+ of a suit is a made flush, not a draw, so it does not
+/// count; four on the board with none in hero's hand is the board's draw, not
+/// hero's.
+fn has_flush_draw(hero_suits: &[Suit; 2], cards: &[Card]) -> bool {
     for &suit in Suit::ALL.iter() {
         let n = cards.iter().filter(|c| c.suit == suit).count();
-        if n == 4 {
+        let hero_n = hero_suits.iter().filter(|&&s| s == suit).count();
+        if n == 4 && hero_n >= 1 {
             return true;
         }
     }
@@ -251,7 +269,11 @@ fn has_flush_draw(cards: &[Card]) -> bool {
 
 /// Detect the strongest straight draw (OESD > gutshot) among the distinct ranks,
 /// or `None` if the hand already makes a straight or has no four-to-a-straight.
-fn detect_straight_draw(cards: &[Card]) -> Option<DrawKind> {
+///
+/// `hero_bits` is the rank-presence bitmask (bit i = `Rank::ALL[i]`) of hero's
+/// hole ranks that the board does not already hold; a four-card window only
+/// counts as hero's draw when it contains at least one such rank.
+fn detect_straight_draw(cards: &[Card], hero_bits: u16) -> Option<DrawKind> {
     // Rank-presence bitmask, low→high. Bit i (0..=12) = Rank::ALL[i] present.
     // Ace also occupies a virtual "bit -1" via a separate wheel check.
     let mut present = [false; 13];
@@ -280,7 +302,10 @@ fn detect_straight_draw(cards: &[Card]) -> Option<DrawKind> {
         };
         let window_idxs = [high - 4, high - 3, high - 2, high - 1, high];
         let count = window_idxs.iter().filter(|&&i| in_window(i)).count();
-        if count == 4 {
+        // Hero must hold at least one rank of the window (a board-only run is not
+        // hero's draw).
+        let window_bits: u16 = window_idxs.iter().fold(0u16, |b, &i| b | (1u16 << i));
+        if count == 4 && (window_bits & hero_bits) != 0 {
             let kind = classify_window(&present, &window_idxs);
             best = Some(stronger(best, kind));
         }
@@ -290,7 +315,8 @@ fn detect_straight_draw(cards: &[Card]) -> Option<DrawKind> {
     {
         let wheel = [ace, present[0], present[1], present[2], present[3]];
         let count = wheel.iter().filter(|&&p| p).count();
-        if count == 4 {
+        let wheel_bits: u16 = (1u16 << 12) | 0b1111;
+        if count == 4 && (wheel_bits & hero_bits) != 0 {
             // The wheel can only ever be a gutshot for draw purposes here: a true
             // OESD requires open ends, and the wheel's low end (A) and high end
             // (6, which would extend 2-3-4-5-6) are asymmetric. We classify it by
@@ -1124,6 +1150,219 @@ mod tests {
         let preflop = detect_draws(&hero, &BoardCards::empty());
         assert!(preflop.draws.is_empty());
         assert_eq!(preflop.outs, 0);
+    }
+
+    // --- hero participation (POKER-PRO-F1 / BUG-201) ---
+    //
+    // A four-flush or four-straight lying ENTIRELY on the board is not hero's
+    // draw: every completing card improves every opponent identically. The
+    // detector must require at least one hero card in the pattern.
+
+    #[test]
+    fn board_only_four_flush_is_not_hero_flush_draw() {
+        // Hero AhKd, board Ks-Qs-7s-2s (turn): four spades, none in hero's hand.
+        let hero = HoleCards::new(c(Rank::Ace, Suit::Hearts), c(Rank::King, Suit::Diamonds));
+        let board = BoardCards {
+            flop: Some([
+                c(Rank::King, Suit::Spades),
+                c(Rank::Queen, Suit::Spades),
+                c(Rank::Seven, Suit::Spades),
+            ]),
+            turn: Some(c(Rank::Two, Suit::Spades)),
+            river: None,
+        };
+        let d = detect_draws(&hero, &board);
+        assert!(
+            !d.draws.contains(&DrawKind::FlushDraw),
+            "board-only four-flush must not be hero's flush draw, got {:?}",
+            d.draws
+        );
+        assert!(d.draws.is_empty(), "no draws expected, got {:?}", d.draws);
+        assert_eq!(d.outs, 0, "hero has zero flush outs");
+    }
+
+    #[test]
+    fn board_only_four_straight_is_not_hero_straight_draw() {
+        // Hero AcKd, board 5h-6s-7d-8c (turn): 5-6-7-8 run entirely on the board.
+        let hero = HoleCards::new(c(Rank::Ace, Suit::Clubs), c(Rank::King, Suit::Diamonds));
+        let board = BoardCards {
+            flop: Some([
+                c(Rank::Five, Suit::Hearts),
+                c(Rank::Six, Suit::Spades),
+                c(Rank::Seven, Suit::Diamonds),
+            ]),
+            turn: Some(c(Rank::Eight, Suit::Clubs)),
+            river: None,
+        };
+        let d = detect_draws(&hero, &board);
+        assert!(
+            !d.draws.contains(&DrawKind::OpenEndedStraightDraw)
+                && !d.draws.contains(&DrawKind::Gutshot),
+            "board-only four-run must not be hero's straight draw, got {:?}",
+            d.draws
+        );
+        assert!(d.draws.is_empty(), "no draws expected, got {:?}", d.draws);
+        assert_eq!(d.outs, 0);
+    }
+
+    #[test]
+    fn board_only_gutshot_is_not_hero_draw() {
+        // Hero KdQc, board 5h-6s-8d-9c (turn): 5-6-_-8-9 gutshot entirely on the board.
+        let hero = HoleCards::new(c(Rank::King, Suit::Diamonds), c(Rank::Queen, Suit::Clubs));
+        let board = BoardCards {
+            flop: Some([
+                c(Rank::Five, Suit::Hearts),
+                c(Rank::Six, Suit::Spades),
+                c(Rank::Eight, Suit::Diamonds),
+            ]),
+            turn: Some(c(Rank::Nine, Suit::Clubs)),
+            river: None,
+        };
+        let d = detect_draws(&hero, &board);
+        assert!(d.draws.is_empty(), "no draws expected, got {:?}", d.draws);
+        assert_eq!(d.outs, 0);
+    }
+
+    #[test]
+    fn board_only_wheel_draw_is_not_hero_draw() {
+        // Hero 9hTh, board Ad-2c-3s-4h (turn): A-2-3-4 wheel draw entirely on the board.
+        let hero = HoleCards::new(c(Rank::Nine, Suit::Hearts), c(Rank::Ten, Suit::Hearts));
+        let board = BoardCards {
+            flop: Some([
+                c(Rank::Ace, Suit::Diamonds),
+                c(Rank::Two, Suit::Clubs),
+                c(Rank::Three, Suit::Spades),
+            ]),
+            turn: Some(c(Rank::Four, Suit::Hearts)),
+            river: None,
+        };
+        let d = detect_draws(&hero, &board);
+        assert!(d.draws.is_empty(), "no draws expected, got {:?}", d.draws);
+        assert_eq!(d.outs, 0);
+    }
+
+    #[test]
+    fn hero_rank_duplicating_board_run_is_not_participation() {
+        // Hero 8h2c, board 5d-6s-7c-8s (turn): hero's 8 duplicates the board's 8, so
+        // hero adds no rank to the 5-6-7-8 run — still not hero's draw.
+        let hero = HoleCards::new(c(Rank::Eight, Suit::Hearts), c(Rank::Two, Suit::Clubs));
+        let board = BoardCards {
+            flop: Some([
+                c(Rank::Five, Suit::Diamonds),
+                c(Rank::Six, Suit::Spades),
+                c(Rank::Seven, Suit::Clubs),
+            ]),
+            turn: Some(c(Rank::Eight, Suit::Spades)),
+            river: None,
+        };
+        let d = detect_draws(&hero, &board);
+        assert!(d.draws.is_empty(), "no draws expected, got {:?}", d.draws);
+        assert_eq!(d.outs, 0);
+    }
+
+    #[test]
+    fn board_four_run_with_hero_overcard_is_gutshot_not_oesd() {
+        // Hero TdKc, board 5h-6s-7d-8c (turn): the board-only 5-6-7-8 OESD is not
+        // hero's, but hero's T makes 6-7-_-9-T a genuine gutshot (a 9 gives hero
+        // the T-high straight over the board's 9-high). Expect Gutshot / 4, not
+        // OESD / 8.
+        let hero = HoleCards::new(c(Rank::Ten, Suit::Diamonds), c(Rank::King, Suit::Clubs));
+        let board = BoardCards {
+            flop: Some([
+                c(Rank::Five, Suit::Hearts),
+                c(Rank::Six, Suit::Spades),
+                c(Rank::Seven, Suit::Diamonds),
+            ]),
+            turn: Some(c(Rank::Eight, Suit::Clubs)),
+            river: None,
+        };
+        let d = detect_draws(&hero, &board);
+        assert_eq!(d.draws, vec![DrawKind::Gutshot], "got {:?}", d.draws);
+        assert_eq!(d.outs, 4);
+    }
+
+    #[test]
+    fn hero_one_suited_card_plus_three_board_is_flush_draw() {
+        // Hero AsKd, board Qs-7s-2s (flop): hero contributes one spade to a four-flush.
+        let hero = HoleCards::new(c(Rank::Ace, Suit::Spades), c(Rank::King, Suit::Diamonds));
+        let board = BoardCards {
+            flop: Some([
+                c(Rank::Queen, Suit::Spades),
+                c(Rank::Seven, Suit::Spades),
+                c(Rank::Two, Suit::Spades),
+            ]),
+            turn: None,
+            river: None,
+        };
+        let d = detect_draws(&hero, &board);
+        assert!(
+            d.draws.contains(&DrawKind::FlushDraw),
+            "hero holding one of the four spades is a flush draw, got {:?}",
+            d.draws
+        );
+        assert_eq!(d.outs, 9);
+    }
+
+    #[test]
+    fn hero_card_completing_four_run_is_oesd() {
+        // Hero 9dKc, board 6h-7c-8s (flop): hero's 9 completes 6-7-8-9 = OESD (8 outs).
+        let hero = HoleCards::new(c(Rank::Nine, Suit::Diamonds), c(Rank::King, Suit::Clubs));
+        let board = BoardCards {
+            flop: Some([
+                c(Rank::Six, Suit::Hearts),
+                c(Rank::Seven, Suit::Clubs),
+                c(Rank::Eight, Suit::Spades),
+            ]),
+            turn: None,
+            river: None,
+        };
+        let d = detect_draws(&hero, &board);
+        assert!(
+            d.draws.contains(&DrawKind::OpenEndedStraightDraw),
+            "hero completing the four-run is an OESD, got {:?}",
+            d.draws
+        );
+        assert_eq!(d.outs, 8);
+    }
+
+    #[test]
+    fn hero_card_completing_gutshot_window_is_gutshot() {
+        // Hero Td2c, board 6h-7c-9s (flop): hero's T makes 6-7-_-9-T = gutshot (4 outs).
+        let hero = HoleCards::new(c(Rank::Ten, Suit::Diamonds), c(Rank::Two, Suit::Clubs));
+        let board = BoardCards {
+            flop: Some([
+                c(Rank::Six, Suit::Hearts),
+                c(Rank::Seven, Suit::Clubs),
+                c(Rank::Nine, Suit::Spades),
+            ]),
+            turn: None,
+            river: None,
+        };
+        let d = detect_draws(&hero, &board);
+        assert_eq!(d.draws, vec![DrawKind::Gutshot], "got {:?}", d.draws);
+        assert_eq!(d.outs, 4);
+    }
+
+    #[test]
+    fn hero_card_in_wheel_window_is_gutshot() {
+        // Hero 5c9d, board Ah-2s-3d-Kc (turn): hero's 5 joins A-2-3-_-5 = wheel gutshot.
+        let hero = HoleCards::new(c(Rank::Five, Suit::Clubs), c(Rank::Nine, Suit::Diamonds));
+        let board = BoardCards {
+            flop: Some([
+                c(Rank::Ace, Suit::Hearts),
+                c(Rank::Two, Suit::Spades),
+                c(Rank::Three, Suit::Diamonds),
+            ]),
+            turn: Some(c(Rank::King, Suit::Clubs)),
+            river: None,
+        };
+        let d = detect_draws(&hero, &board);
+        assert!(
+            d.draws.contains(&DrawKind::Gutshot),
+            "hero's 5 in the wheel window is a gutshot, got {:?}",
+            d.draws
+        );
+        assert_eq!(d.outs, 4);
     }
 
     // --- pot odds ---
