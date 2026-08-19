@@ -123,6 +123,23 @@ pub struct SolverInput {
     pub to_call: u32,
     pub stack_before: u32,
     pub num_players_in_hand: u8,
+    /// Seat of the hand's current **aggressor** — the player who made the most
+    /// recent wager increase (bet / raise) so far on ANY street: the current
+    /// street if it has seen aggression, otherwise the latest earlier street
+    /// that did (blind posts never count). This is the poker aggressor that
+    /// survives street boundaries — the preflop raiser c-betting the flop, the
+    /// flop bettor barrelling the turn — and is what ADR-043 §3.4.2's
+    /// `is_aggressor` (R3 c-bet / R6 semi-bluff barrel) reads.
+    ///
+    /// NOT the current-street-only `PersistedDecisionContext.last_aggressor_seat`
+    /// (persist.rs). Feeding that here made R3/R6 unreachable — whenever hero
+    /// can check nobody has raised THIS street, so `can_check && is_aggressor`
+    /// was always false and every checked-to / first-to-act spot came back
+    /// `Check` regardless of strength (discovery-r1 BUG-236). Producers:
+    /// `GameHand::last_aggressor_player_id` (live session.rs),
+    /// `coach::hand_last_aggressor_seat` (persisted re-analysis) and the
+    /// self-play acceptance harness `server/examples/gto_selfplay.rs`
+    /// (`build_solver_input`) — keep all three in step.
     pub last_aggressor_seat: Option<u8>,
     /// Hero's own seat (for `is_aggressor` comparison).
     pub hero_seat: u8,
@@ -269,7 +286,23 @@ fn analyze_preflop(
     let equity_pct = eq.equity_pct();
     let pot_odds_pct = pot_odds(input.pot_before, input.to_call);
 
-    let gto_action = recommend_preflop(pos, bucket, &key);
+    let hs = classify(input.hero, &input.board);
+    let gto_action = recommend_preflop_spot(
+        pos,
+        bucket,
+        &key,
+        &PostflopRuleCtx {
+            equity_pct,
+            pot_odds_pct,
+            spr: stack_to_pot_ratio(input.stack_before, input.pot_before),
+            hand_strength: hs,
+            to_call: input.to_call,
+            stack_before: input.stack_before,
+            can_check: input.to_call == 0,
+            is_aggressor: input.last_aggressor_seat == Some(input.hero_seat),
+            street: input.street,
+        },
+    );
 
     // F6: respect MIXED-strategy cells. The chart emits genuine mixed frequencies;
     // the headline `gto_action` collapses a cell to one action, but in a mixed cell
@@ -288,7 +321,6 @@ fn analyze_preflop(
         pot_odds_pct,
     );
 
-    let hs = classify(input.hero, &input.board);
     let reasoning = render_with_mode(
         &RenderContext {
             verdict,
@@ -349,6 +381,54 @@ pub(crate) fn recommend_preflop(
         }
         // Chart says fold OR chart missing — fold safe.
         Some(_) | None => SolverAction::Fold,
+    }
+}
+
+/// Preflop recommendation for a concrete SPOT — [`recommend_preflop`] plus the
+/// ADR-043 §3.4.1 step-3 safety net.
+///
+/// The chart's Fold (a missing / low-frequency cell) is a response to a WAGER.
+/// When `to_call == 0` there is nothing to fold — the big blind checking its
+/// free option in a limped pot (`FacingLimp`), where e.g. 72o/83o are absent
+/// from the BB `facing_limp` table. Recommending Fold there told players to
+/// surrender a free look and stamped the Phase 11 GTO pill with `fold`
+/// (discovery-r1 BUG-235). Per §3.4.1 step 3 such a miss falls through to the
+/// postflop rule table with `street = Preflop`, which resolves the free option
+/// to Check (R7/R8) — or an iso-raise via R3 when hero is the aggressor.
+/// A charted continue (freq ≥ 0.5) is returned unchanged, and a Fold that
+/// answers a real wager (`to_call > 0`) stays a Fold: the v3 charts are sparse
+/// (absent = fold), so the fall-through is confined to the free-check case.
+///
+/// The free option is a property of the SPOT SHAPE, not of `to_call` alone:
+/// preflop it exists only in the `FacingLimp` bucket (the BB behind limpers
+/// has already matched the highest bet). In every other bucket the blinds or
+/// an open are an unmatched wager for hero — an RFI seat always owes the BB
+/// (`session.rs` / `coach.rs` feed `to_call = current_bet − committed`), so a
+/// `to_call == 0` there is a caller-side inconsistency, not a free look, and
+/// the chart's Fold vs. trash (72o BTN RFI, rubric P5) must stand. Gate on the
+/// bucket so a malformed input can never turn "fold the worst hand" into
+/// "check".
+pub(crate) fn recommend_preflop_spot(
+    pos: super::preflop_charts::PositionBucket,
+    bucket: ActionBucket,
+    key: &str,
+    postflop_ctx: &PostflopRuleCtx,
+) -> SolverAction {
+    let chart_action = recommend_preflop(pos, bucket, key);
+    let free_option = bucket == ActionBucket::FacingLimp && postflop_ctx.to_call == 0;
+    if chart_action == SolverAction::Fold && free_option {
+        // Never Fold a free option — §3.4.1 step 3 fall-through.
+        let fallback = recommend_postflop(postflop_ctx);
+        // The postflop table cannot answer a free option with Fold either
+        // (R8 catches `to_call == 0`), but pin it so a future rule edit can
+        // never re-introduce a Fold here.
+        if fallback == SolverAction::Fold {
+            SolverAction::Check
+        } else {
+            fallback
+        }
+    } else {
+        chart_action
     }
 }
 
@@ -717,6 +797,163 @@ mod tests {
         input.to_call = 0;
         // Must not panic on div-by-zero in SPR calc.
         let _ = analyze(&input).unwrap();
+    }
+
+    /// discovery-r1 BUG-235 — the big blind checking its FREE option in a
+    /// limped pot (bucket = FacingLimp, 72o absent from the BB `facing_limp`
+    /// table). The chart's Fold answers a wager; with `to_call == 0` there is
+    /// nothing to fold, so ADR-043 §3.4.1 step 3 falls through to the postflop
+    /// rule table → Check. Recommending Fold told players to surrender a free
+    /// look and stamped the Phase 11 GTO pill `fold`.
+    #[test]
+    fn preflop_bb_free_option_never_recommends_fold() {
+        let mut input = empty_input();
+        input.street = Street::Preflop;
+        input.position = Position::BigBlind;
+        input.hero = HoleCards::new(c(Rank::Seven, Suit::Spades), c(Rank::Two, Suit::Hearts));
+        input.board = BoardCards::empty();
+        input.preflop_action = Some(PreflopAction::FacingLimp);
+        input.pot_before = 30; // sb 5 + bb 10 + one limp 10 (+ sb complete)
+        input.to_call = 0;
+        input.last_aggressor_seat = None;
+        input.hero_seat = 2;
+        input.hero_action_taken = Some(SolverAction::Check);
+        assert!(
+            lookup(
+                super::super::preflop_charts::PositionBucket::BB,
+                ActionBucket::FacingLimp,
+                "72o"
+            )
+            .is_none(),
+            "precondition: 72o is a chart miss in BB facing_limp"
+        );
+
+        let out = analyze(&input).unwrap();
+        assert_eq!(
+            out.gto_action,
+            SolverAction::Check,
+            "a free option is never a Fold — §3.4.1 step 3 fall-through"
+        );
+        assert_eq!(
+            out.verdict,
+            SolverVerdict::Good,
+            "checking the option is the line"
+        );
+        assert!(
+            !out.reasoning_zh.contains("弃牌"),
+            "copy must not advise folding a free check: {}",
+            out.reasoning_zh
+        );
+
+        // Same hand, same bucket, but the chart's Fold answers a REAL wager
+        // (a limp-raise / any to_call > 0): stays Fold — the fall-through is
+        // confined to the free-check case (v3 charts are sparse: absent = fold).
+        input.to_call = 20;
+        input.hero_action_taken = Some(SolverAction::Fold);
+        let facing_wager = analyze(&input).unwrap();
+        assert_eq!(facing_wager.gto_action, SolverAction::Fold);
+    }
+
+    /// BUG-235 guard (rubric P5 regression, L1 r1-post-codex-a1) — the
+    /// free-option safety net is confined to the `FacingLimp` bucket. An RFI
+    /// seat always owes the big blind, so `Rfi` + `to_call == 0` is a malformed
+    /// input, not a free look: the chart's Fold vs. trash (72o BTN) must stand
+    /// and never resolve to Check.
+    #[test]
+    fn preflop_rfi_trash_stays_fold_even_with_zero_to_call() {
+        let mut input = empty_input();
+        input.street = Street::Preflop;
+        input.position = Position::Dealer;
+        input.table_size = TableSize::SixMax;
+        input.hero = HoleCards::new(c(Rank::Seven, Suit::Hearts), c(Rank::Two, Suit::Spades));
+        input.board = BoardCards::empty();
+        input.preflop_action = Some(PreflopAction::Rfi);
+        input.pot_before = 150;
+        input.to_call = 0;
+        input.stack_before = 10_000;
+        input.num_players_in_hand = 6;
+        input.last_aggressor_seat = None;
+        input.hero_seat = 0;
+        input.hero_action_taken = Some(SolverAction::Fold);
+        let out = analyze(&input).unwrap();
+        assert_eq!(out.gto_action, SolverAction::Fold, "72o BTN RFI is a fold");
+        assert_eq!(out.verdict, SolverVerdict::Good);
+
+        // The genuine live shape (BTN owes the BB) is unchanged too.
+        input.to_call = 100;
+        assert_eq!(analyze(&input).unwrap().gto_action, SolverAction::Fold);
+    }
+
+    /// BUG-235 companion — a charted iso-raise (freq ≥ 0.5) on the BB option
+    /// is untouched by the free-option safety net.
+    #[test]
+    fn preflop_bb_free_option_keeps_a_charted_iso_raise() {
+        let key = "AA";
+        let cell = lookup(
+            super::super::preflop_charts::PositionBucket::BB,
+            ActionBucket::FacingLimp,
+            key,
+        )
+        .expect("AA is charted in BB facing_limp");
+        assert!(cell.frequency >= 0.5);
+        let mut input = empty_input();
+        input.street = Street::Preflop;
+        input.position = Position::BigBlind;
+        input.hero = HoleCards::new(c(Rank::Ace, Suit::Spades), c(Rank::Ace, Suit::Hearts));
+        input.board = BoardCards::empty();
+        input.preflop_action = Some(PreflopAction::FacingLimp);
+        input.pot_before = 30;
+        input.to_call = 0;
+        let out = analyze(&input).unwrap();
+        assert_eq!(out.gto_action, SolverAction::Raise);
+    }
+
+    /// discovery-r1 BUG-236 — with `last_aggressor_seat` carrying the hand-level
+    /// aggressor (the preflop raiser), a checked-to c-bet spot with a strong
+    /// hand reaches R3 (`eq >= 50 && can_check && is_aggressor` → Raise) instead
+    /// of collapsing to R8's default Check; the same spot for the NON-aggressor
+    /// (checked to, no initiative) stays Check.
+    #[test]
+    fn postflop_checked_to_aggressor_with_strong_hand_is_a_cbet() {
+        let mut input = empty_input();
+        input.street = Street::Flop;
+        input.position = Position::Dealer;
+        input.hero = HoleCards::new(c(Rank::Ace, Suit::Spades), c(Rank::Ace, Suit::Hearts));
+        input.board = BoardCards {
+            flop: Some([
+                c(Rank::King, Suit::Diamonds),
+                c(Rank::Seven, Suit::Clubs),
+                c(Rank::Two, Suit::Spades),
+            ]),
+            turn: None,
+            river: None,
+        };
+        input.pot_before = 130;
+        input.to_call = 0; // BB checked to hero
+        input.stack_before = 940;
+        input.num_players_in_hand = 2;
+        input.hero_seat = 0;
+        input.hero_action_taken = Some(SolverAction::Raise);
+
+        // Hero was the preflop raiser: the hand-level aggressor.
+        input.last_aggressor_seat = Some(0);
+        let aggressor = analyze(&input).unwrap();
+        assert!(aggressor.equity_estimate_pct >= 50);
+        assert_eq!(
+            aggressor.gto_action,
+            SolverAction::Raise,
+            "R3 c-bet must be reachable on the live path"
+        );
+        assert_eq!(aggressor.verdict, SolverVerdict::Good);
+
+        // Hero was NOT the aggressor (villain 3-bet, hero called): checked to,
+        // the table keeps Check (R8) — no initiative to c-bet with.
+        input.last_aggressor_seat = Some(1);
+        let caller = analyze(&input).unwrap();
+        assert_eq!(caller.gto_action, SolverAction::Check);
+        // A limped pot with no aggressor anywhere: also Check.
+        input.last_aggressor_seat = None;
+        assert_eq!(analyze(&input).unwrap().gto_action, SolverAction::Check);
     }
 
     #[test]

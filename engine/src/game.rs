@@ -2035,7 +2035,44 @@ impl GameHand {
     /// Both disappear once the projection starts from the same opening wager
     /// `BettingRound::new_preflop` was handed.
     pub fn current_street_action_facts(&self) -> Vec<StreetActionFact> {
-        let current_street = self.current_street();
+        self.street_action_facts(self.current_street())
+    }
+
+    /// The seat-agnostic identity of the hand's current **aggressor** — the
+    /// player who made the most recent wager increase (bet / raise / short
+    /// all-in raise) so far, on ANY street: the current street if it has seen
+    /// aggression, otherwise the latest earlier street that did. Blind posts
+    /// never count. `None` for a hand with no wager increase yet (limped pot
+    /// checked down so far).
+    ///
+    /// This is the poker "aggressor" that survives street boundaries — the
+    /// preflop raiser who c-bets the flop, the flop bettor who barrels the
+    /// turn — and is what ADR-043 §3.4.2's `is_aggressor` (rules R3 c-bet /
+    /// R6 semi-bluff barrel) means. It differs from
+    /// [`Self::current_street_action_facts`]-derived aggression, which resets at
+    /// every street: whenever hero can check nobody has raised THIS street yet,
+    /// so a current-street-only reading made R3/R6 unreachable on the live
+    /// coach path (discovery-r1 BUG-236) and every checked-to / first-to-act
+    /// spot was graded as a Check regardless of strength.
+    pub fn last_aggressor_player_id(&self) -> Option<PlayerId> {
+        const ORDER: [Street; 4] = [Street::Preflop, Street::Flop, Street::Turn, Street::River];
+        let current = self.current_street();
+        let dealt = ORDER.iter().position(|s| *s == current).unwrap_or(0);
+        ORDER[..=dealt].iter().rev().copied().find_map(|street| {
+            self.street_action_facts(street)
+                .into_iter()
+                .rev()
+                .find(|fact| fact.increased_bet)
+                .map(|fact| fact.player_id)
+        })
+    }
+
+    /// [`Self::current_street_action_facts`] for an arbitrary `street` of this
+    /// hand (empty when that street has not been dealt yet). Same replay
+    /// semantics: preflop starts from the nominal bring-in, later streets from
+    /// zero, blinds are commitment but never aggression.
+    pub fn street_action_facts(&self, street: Street) -> Vec<StreetActionFact> {
+        let current_street = street;
         let preflop = current_street == Street::Preflop;
         // Preflop the opening wager IS the minimum raise increment. Postflop the
         // increment reverts to the big blind, matching `BettingRound::new`
@@ -3623,6 +3660,102 @@ mod tests {
             PlayerAction::Raise { amount: c(170) },
             "a full 3-bet must NOT be projected down to Call (BUG-196)"
         );
+    }
+
+    /// discovery-r1 BUG-236 — the hand-level aggressor survives the street
+    /// boundary. UTG opens, BB calls; on the flop the BB checks to the raiser.
+    /// The CURRENT-street facts carry no wager increase (nobody has bet the
+    /// flop yet), but `last_aggressor_player_id` must still name the preflop
+    /// raiser — that is the c-bet owner ADR-043 R3 reads. Feeding the
+    /// current-street-only reading to the solver made `can_check &&
+    /// is_aggressor` unreachable.
+    #[test]
+    fn last_aggressor_carries_the_preflop_raiser_onto_a_checked_flop() {
+        let mut hand = GameHand::new_with_rng(
+            vec![
+                (pid(1), c(1000), 0), // BTN/UTG in 3-max
+                (pid(2), c(1000), 1), // SB
+                (pid(3), c(1000), 2), // BB
+            ],
+            0,
+            c(20),
+            c(10),
+            PokerRng::from_seed(49),
+        );
+        hand.start().expect("hand starts");
+        assert_eq!(
+            hand.last_aggressor_player_id(),
+            None,
+            "blind posts are never aggression"
+        );
+
+        hand.apply_action(pid(1), PlayerAction::Raise { amount: c(60) })
+            .expect("open is legal");
+        hand.apply_action(pid(2), PlayerAction::Fold)
+            .expect("fold is legal");
+        hand.apply_action(pid(3), PlayerAction::Call)
+            .expect("call is legal");
+        // Flop dealt; BB is first to act and checks to the raiser.
+        assert_eq!(
+            hand.last_aggressor_player_id(),
+            Some(pid(1)),
+            "at the start of the flop the preflop raiser is still the aggressor"
+        );
+        hand.apply_action(pid(3), PlayerAction::Check)
+            .expect("check is legal");
+
+        // The street-local projection resets…
+        assert!(
+            hand.current_street_action_facts()
+                .iter()
+                .all(|fact| !fact.increased_bet),
+            "no flop wager increase yet"
+        );
+        // …the hand-level aggressor does NOT.
+        assert_eq!(hand.last_aggressor_player_id(), Some(pid(1)));
+
+        // A flop bet by the BB donk moves the aggressor identity forward.
+        // (Re-run the spot: raiser bets, BB raises.)
+        hand.apply_action(pid(1), PlayerAction::Raise { amount: c(40) })
+            .expect("c-bet is legal");
+        hand.apply_action(pid(3), PlayerAction::Raise { amount: c(120) })
+            .expect("check-raise is legal");
+        assert_eq!(
+            hand.last_aggressor_player_id(),
+            Some(pid(3)),
+            "the most recent wager increase wins, on the current street"
+        );
+    }
+
+    /// BUG-236 companion — a limped pot checked down has NO aggressor on any
+    /// street, so the solver must not invent one.
+    #[test]
+    fn last_aggressor_is_none_in_a_limped_pot_checked_down() {
+        let mut hand = GameHand::new_with_rng(
+            vec![
+                (pid(1), c(1000), 0),
+                (pid(2), c(1000), 1),
+                (pid(3), c(1000), 2),
+            ],
+            0,
+            c(20),
+            c(10),
+            PokerRng::from_seed(50),
+        );
+        hand.start().expect("hand starts");
+        hand.apply_action(pid(1), PlayerAction::Call).expect("limp");
+        hand.apply_action(pid(2), PlayerAction::Call)
+            .expect("complete");
+        hand.apply_action(pid(3), PlayerAction::Check)
+            .expect("option");
+        // Flop: SB, BB check.
+        hand.apply_action(pid(2), PlayerAction::Check)
+            .expect("check");
+        hand.apply_action(pid(3), PlayerAction::Check)
+            .expect("check");
+        assert_eq!(hand.last_aggressor_player_id(), None);
+        // `street_action_facts` for a not-yet-dealt street is empty.
+        assert!(hand.street_action_facts(Street::River).is_empty());
     }
 
     /// BUG-175 guard — the fix must not disturb the NO-straddle baseline, and
