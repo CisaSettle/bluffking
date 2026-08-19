@@ -18,10 +18,13 @@ use crate::hand::HoleCards;
 /// the file is `preflop_v2.json` (filename kept for include stability), its
 /// embedded `"version"` field is **3** (CFR approx.-equilibrium regen with
 /// MIXED frequencies; v1/v2 were binary), and the solver-output version
-/// constant `super::PREFLOP_V` is **4**. History: v2 added the `facing_open`
+/// constant `super::PREFLOP_V` is **5**. History: v2 added the `facing_open`
 /// action bucket — distinct from `RFI` (no opens yet) per audit fix B-2
 /// (R4 ADR-043 audit, 2026-05-23); v3 replaced the hand-authored binary
-/// charts with the CFR-generated mixed-frequency charts.
+/// charts with the CFR-generated mixed-frequency charts; PREFLOP_V 4 (ADR-082,
+/// coach estimator early-stop) and 5 (BUG-230, preflop starting-hand
+/// templates in `templates_zh.rs`) were paired `PROMPT_V` bumps with the chart
+/// JSON still at `"version": 3` and the data unchanged.
 const PREFLOP_V2_JSON: &str = include_str!("../../data/preflop_v2.json");
 
 /// One chart cell: the recommended preflop action and the published mix

@@ -331,6 +331,7 @@ fn analyze_preflop(
             hero_action: input.hero_action_taken,
             hand_label: &key,
             position: input.position.short_label(),
+            preflop: true,
         },
         input.seed,
         mode,
@@ -587,6 +588,7 @@ fn analyze_postflop(
             hero_action: input.hero_action_taken,
             hand_label: &hand_key(input.hero),
             position: input.position.short_label(),
+            preflop: false,
         },
         input.seed,
         mode,
@@ -1554,6 +1556,106 @@ mod tests {
                     "[{label}] seed={seed}: verdict FLIPPED early-stop={:?} full={:?} (eq es={} full={})",
                     es.verdict, full.verdict, es.equity_estimate_pct, full.equity_estimate_pct
                 );
+            }
+        }
+    }
+
+    /// BUG-230 (discovery r1): `classify` is documented (ADR-043 §3.3) to return a
+    /// COARSE pocket-pair hint preflop — PairWeak for every unpaired hand,
+    /// PairMiddle for 77–TT, Overpair for JJ+ — "solely as a hint to advisor for
+    /// templating". The zh templates rendered that hint through the POSTFLOP band
+    /// label table, so the delivered preflop coach text called AKs / AQo a 弱对
+    /// (weak pair), 88 a 中对 (middle pair) and JJ+ a 超对 (overpair), and spoke of
+    /// 这块面 (this board) with zero board cards. Preflop copy must describe the
+    /// STARTING HAND, never a postflop made-hand band.
+    #[test]
+    fn preflop_reasoning_never_uses_postflop_made_hand_bands() {
+        const POSTFLOP_ONLY: [&str; 11] = [
+            "弱对",
+            "中对",
+            "超对",
+            "顶对",
+            "两对",
+            "暗三条",
+            "顺子",
+            "葫芦",
+            "听牌",
+            "这块面",
+            "无对无听",
+        ];
+        let hands: [(Card, Card, &str); 5] = [
+            (
+                c(Rank::Ace, Suit::Spades),
+                c(Rank::King, Suit::Spades),
+                "AKs",
+            ),
+            (
+                c(Rank::Ace, Suit::Spades),
+                c(Rank::Queen, Suit::Hearts),
+                "AQo",
+            ),
+            (
+                c(Rank::Jack, Suit::Spades),
+                c(Rank::Jack, Suit::Hearts),
+                "JJ",
+            ),
+            (
+                c(Rank::Eight, Suit::Spades),
+                c(Rank::Eight, Suit::Hearts),
+                "88",
+            ),
+            (
+                c(Rank::Five, Suit::Clubs),
+                c(Rank::Five, Suit::Diamonds),
+                "55",
+            ),
+        ];
+        let heros = [
+            Some(SolverAction::Raise),
+            Some(SolverAction::Call),
+            Some(SolverAction::Fold),
+            Some(SolverAction::AllIn),
+            None,
+        ];
+        for (c1, c2, label) in hands {
+            for hero_action in heros {
+                for seed in 0..6u64 {
+                    let mut input = empty_input();
+                    input.street = Street::Preflop;
+                    input.board = BoardCards::empty();
+                    input.position = Position::Dealer;
+                    input.hero = HoleCards::new(c1, c2);
+                    input.preflop_action = Some(PreflopAction::Rfi);
+                    input.pot_before = 3;
+                    input.to_call = 2;
+                    input.stack_before = 200;
+                    input.hero_action_taken = hero_action;
+                    input.seed = seed;
+                    let out = analyze(&input).unwrap();
+                    for bad in POSTFLOP_ONLY {
+                        assert!(
+                            !out.reasoning_zh.contains(bad),
+                            "preflop {label} hero={hero_action:?} seed={seed} verdict={:?}: copy uses postflop band word {bad:?}: {}",
+                            out.verdict,
+                            out.reasoning_zh
+                        );
+                    }
+                    assert!(
+                        out.reasoning_zh.contains("胜率"),
+                        "preflop {label} seed={seed}: copy must still state equity: {}",
+                        out.reasoning_zh
+                    );
+                    // Chat mode shares the template set.
+                    let chat =
+                        analyze_chat(&input, "00000000-0000-0000-0000-000000000000").unwrap();
+                    for bad in POSTFLOP_ONLY {
+                        assert!(
+                            !chat.reasoning_zh.contains(bad),
+                            "preflop chat {label} seed={seed}: {bad:?} in {}",
+                            chat.reasoning_zh
+                        );
+                    }
+                }
             }
         }
     }

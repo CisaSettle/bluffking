@@ -26,6 +26,12 @@ pub struct RenderContext<'a> {
     pub hand_label: &'a str,
     /// Position label (e.g. "BTN", "SB"). English.
     pub position: &'a str,
+    /// `true` for a preflop spot (empty board). BUG-230: preflop `hs` is only the
+    /// coarse pocket-pair HINT documented in ADR-043 §3.3 (PairWeak for every
+    /// unpaired hand, PairMiddle 77–TT, Overpair JJ+) — it must never be rendered
+    /// through the postflop made-hand band table (弱对 / 中对 / 超对 / 这块面), so
+    /// preflop copy goes through [`pick_preflop_template`] + [`preflop_band_zh`].
+    pub preflop: bool,
 }
 
 /// Render a Chinese reasoning sentence for the solver output.
@@ -51,6 +57,9 @@ pub fn render_chat_reply(ctx: &RenderContext<'_>, hand_id: &str, seed: u64) -> S
 // ---------------------------------------------------------------------------
 
 fn pick_template(ctx: &RenderContext<'_>, seed: u64) -> String {
+    if ctx.preflop {
+        return pick_preflop_template(ctx, seed);
+    }
     let action_zh = action_zh(ctx.recommended);
     let hero_zh = ctx
         .hero_action
@@ -176,6 +185,69 @@ fn pick_template(ctx: &RenderContext<'_>, seed: u64) -> String {
     }
 }
 
+/// Preflop sentence library (BUG-230). Preflop there is no board, so the
+/// postflop made-hand bands (弱对 / 中对 / 超对 / 顶对 / 听牌 / 这块面) are all
+/// false statements about a starting hand; these templates describe the hand
+/// via [`preflop_band_zh`] (口袋对 tier / 同花 / 杂色 起手牌) instead and never
+/// name a board. Same 3 verdicts × 3 seed variants shape as the postflop set.
+fn pick_preflop_template(ctx: &RenderContext<'_>, seed: u64) -> String {
+    let action_zh = action_zh(ctx.recommended);
+    let hero_zh = ctx
+        .hero_action
+        .map(crate::solver::templates_zh::action_zh)
+        .unwrap_or("无操作");
+    let band = preflop_band_zh(ctx.hs, ctx.hand_label);
+    let eq = ctx.equity_pct;
+    let po = ctx.pot_odds_pct;
+    let label = ctx.hand_label;
+    let pos = ctx.position;
+    let variant = (seed % 3) as usize;
+
+    match ctx.verdict {
+        SolverVerdict::Good => match variant {
+            0 => {
+                let dir = eq_vs_po_zh(eq, po);
+                format!(
+                    "{action_zh} 是 {label}（{band}）在 {pos} 翻前的最佳处理：胜率 {eq}% {dir}对方所需赔率 {po}%。"
+                )
+            }
+            1 => format!("{label}（{band}）在 {pos} 翻前 {action_zh} 长期 +EV：胜率 {eq}%。"),
+            _ => format!("教练评价：{action_zh} 正确。{label} 这类{band}翻前应按此线行进（胜率 {eq}%）。"),
+        },
+        SolverVerdict::Ok => match variant {
+            0 => format!("{label}（{band}，胜率 {eq}%）：{hero_zh} 可以接受，{action_zh} 在 {pos} 翻前更标准。"),
+            1 => format!("近似 +EV：胜率 {eq}%、赔率 {po}%。{action_zh} 是求解器翻前策略，{hero_zh} 偏差不大。"),
+            _ => format!("{label} 在 {pos} 翻前属于{band}（胜率 {eq}%）：{hero_zh} 可行，{action_zh} 更平衡。"),
+        },
+        SolverVerdict::Mistake => match variant {
+            0 => format!("{label}（{band}）在 {pos} 翻前：胜率 {eq}%、赔率 {po}%；{action_zh} 才是 +EV，{hero_zh} 长期亏。"),
+            1 => format!("{band} {label}（胜率 {eq}%）：{hero_zh} 是 -EV 选择，翻前正确应该 {action_zh}。"),
+            _ => format!("教练评价：{label} 在 {pos} 翻前的求解器策略是 {action_zh}；{hero_zh} 与求解器偏差较大（胜率 {eq}% vs 赔率 {po}%）。"),
+        },
+    }
+}
+
+/// Preflop starting-hand descriptor (BUG-230). Mirrors the coarse preflop
+/// classification in `hand_strength::classify` (ADR-043 §3.3) but words it as
+/// a STARTING hand: pocket pairs by tier (JJ+ 大 / 77–TT 中 / ≤66 小 口袋对),
+/// unpaired hands by suitedness from the 169-grid label (`AKs` / `AQo`).
+pub fn preflop_band_zh(hs: HandStrength, hand_label: &str) -> &'static str {
+    let chars: Vec<char> = hand_label.chars().collect();
+    let is_pair = chars.len() == 2 && chars[0] == chars[1];
+    if is_pair {
+        return match hs {
+            HandStrength::Overpair => "大口袋对",
+            HandStrength::PairMiddle => "中口袋对",
+            _ => "小口袋对",
+        };
+    }
+    match chars.last() {
+        Some('s') => "同花起手牌",
+        Some('o') => "杂色起手牌",
+        _ => "起手牌",
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Localized labels
 // ---------------------------------------------------------------------------
@@ -245,6 +317,7 @@ mod tests {
             hero_action: Some(SolverAction::Call),
             hand_label: "AKs",
             position: "BTN",
+            preflop: false,
         }
     }
 
@@ -274,6 +347,70 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// BUG-230: preflop copy (any verdict × any coarse preflop band × any seed,
+    /// hint AND chat mode) must describe the STARTING hand — never a postflop
+    /// made-hand band or a board — and stay ≤ 280 chars.
+    #[test]
+    fn preflop_templates_describe_starting_hand_not_postflop_band() {
+        const POSTFLOP_ONLY: [&str; 11] = [
+            "弱对",
+            "中对",
+            "超对",
+            "顶对",
+            "两对",
+            "暗三条",
+            "顺子",
+            "葫芦",
+            "听牌",
+            "这块面",
+            "无对无听",
+        ];
+        // (hs the preflop classifier can emit, 169-grid label, expected descriptor)
+        let cases: [(HandStrength, &str, &str); 6] = [
+            (HandStrength::PairWeak, "AKs", "同花起手牌"),
+            (HandStrength::PairWeak, "AQo", "杂色起手牌"),
+            (HandStrength::PairWeak, "72o", "杂色起手牌"),
+            (HandStrength::Overpair, "JJ", "大口袋对"),
+            (HandStrength::PairMiddle, "88", "中口袋对"),
+            (HandStrength::PairWeak, "55", "小口袋对"),
+        ];
+        for &verdict in &[
+            SolverVerdict::Good,
+            SolverVerdict::Ok,
+            SolverVerdict::Mistake,
+        ] {
+            for (hs, label, band) in cases {
+                assert_eq!(preflop_band_zh(hs, label), band, "band for {label}");
+                for seed in 0..3u64 {
+                    let mut ctx = ctx_for(verdict, hs);
+                    ctx.hand_label = label;
+                    ctx.preflop = true;
+                    for rendered in [render(&ctx, seed), render_chat_reply(&ctx, "h1", seed)] {
+                        assert!(
+                            rendered.chars().count() <= MAX_REASONING_CHARS,
+                            "preflop {verdict:?} {label} seed={seed} too long: {rendered}"
+                        );
+                        for bad in POSTFLOP_ONLY {
+                            assert!(
+                                !rendered.contains(bad),
+                                "preflop {verdict:?} {label} seed={seed}: postflop band word {bad:?} in {rendered}"
+                            );
+                        }
+                        assert!(
+                            rendered.contains("胜率"),
+                            "preflop {verdict:?} {label} seed={seed}: must state equity: {rendered}"
+                        );
+                    }
+                }
+            }
+        }
+        // The postflop set is untouched: the same ctx with `preflop: false`
+        // still renders the made-hand band.
+        let mut ctx = ctx_for(SolverVerdict::Mistake, HandStrength::PairWeak);
+        ctx.preflop = false;
+        assert!(render(&ctx, 0).contains("弱对"));
     }
 
     #[test]
@@ -341,6 +478,7 @@ mod tests {
                 hero_action: Some(SolverAction::Call),
                 hand_label: "72o",
                 position: pos,
+                preflop: false,
             }
         }
 
