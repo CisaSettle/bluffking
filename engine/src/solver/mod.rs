@@ -77,7 +77,13 @@ pub use tool_math::{
 /// `PREFLOP_V` (and the paired `server::coach::PROMPT_V`) so stale `coach_hints`
 /// rows computed under the full-10k estimate miss-and-recompute. The chart JSON
 /// `version` field is still `3` — only the coach estimator moved.
-pub const PREFLOP_V: u32 = 4;
+///
+/// v5 (2026-08-19, BUG-230): chart DATA and estimator unchanged; the paired
+/// bump is for `templates_zh.rs` — preflop spots now render starting-hand
+/// templates instead of the postflop made-hand band (ADR-043 §5(c): any
+/// template change invalidates cached hints). `server::coach::PROMPT_V` 4→5
+/// in lock-step.
+pub const PREFLOP_V: u32 = 5;
 
 /// Default Monte Carlo trial count for equity estimation (ADR-043 §3.1).
 pub const DEFAULT_MC_TRIALS: u32 = 10_000;

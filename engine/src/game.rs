@@ -379,6 +379,17 @@ pub struct GameHand {
     /// action opens to that seat's left, and a fully-funded straddle becomes
     /// the preflop bring-in / minimum raise increment.
     forced_straddle: Option<Chips>,
+    /// The preflop opening wager / minimum raise increment ACTUALLY handed to
+    /// [`BettingRound::new_preflop`] when the hand started: the big blind
+    /// normally, the straddle when a live straddle was fully funded (a SHORT
+    /// all-in straddle does not inflate it — see `start()`).
+    ///
+    /// Stored because it is the authoritative preflop baseline and
+    /// [`Self::current_street_action_facts`] must project raise depth from the
+    /// same number the betting round enforces. Seeded to `big_blind` so a hand
+    /// that has not started yet reads the no-straddle baseline
+    /// (discovery-r1 BUG-175).
+    preflop_bring_in: Chips,
     /// Card-source mode. `Plaintext` deals from `deck`; `Blind` ignores it.
     mode: HandMode,
     deck: Deck,
@@ -561,6 +572,7 @@ impl GameHand {
             big_blind,
             small_blind,
             forced_straddle: None,
+            preflop_bring_in: big_blind,
             mode: HandMode::Plaintext,
             deck,
             deck_seed: seed,
@@ -625,6 +637,7 @@ impl GameHand {
             big_blind,
             small_blind,
             forced_straddle: None,
+            preflop_bring_in: big_blind,
             mode: HandMode::Blind,
             // Empty deck: blind mode never deals from it. Any accidental
             // `self.deck.deal()` would error (HandFinished) rather than leak a
@@ -851,6 +864,9 @@ impl GameHand {
             Some((_, _, posted, requested, _)) if posted >= requested.0 => requested,
             _ => self.big_blind,
         };
+        // Remember it: `current_street_action_facts` must project preflop raise
+        // depth from the SAME baseline the betting round enforces (BUG-175).
+        self.preflop_bring_in = preflop_bring_in;
 
         let round = BettingRound::new_preflop(
             preflop_players,
@@ -1998,17 +2014,73 @@ impl GameHand {
     /// An `AllIn` token alone is ambiguous.  This projection distinguishes an
     /// all-in call/under-call, a short all-in raise, and a full raise by
     /// replaying only public commitment totals.  Preflop starts from the
-    /// nominal big-blind bring-in even when the posted BB was short; later
-    /// streets start from zero.  `last_full_raise` changes only after a full
-    /// wager, exactly like [`BettingRound`].
+    /// nominal bring-in even when the posted blind was short; later streets
+    /// start from zero.  `last_full_raise` changes only after a full wager,
+    /// exactly like [`BettingRound`].
+    ///
+    /// The preflop baseline is [`Self::preflop_bring_in`], NOT `big_blind`
+    /// (discovery-r1 BUG-175). On a live-straddle table those differ, and
+    /// seeding the baseline from `big_blind` OVER-reports aggression, because
+    /// every commitment is measured against a bar that sits one straddle too
+    /// low. With a 2 BB straddle (bring-in 40, big blind 20):
+    ///
+    /// * An all-in for exactly 40 merely CALLS the straddle, but `40 > 20` read
+    ///   as `increased_bet`, and its phantom 20 delta cleared the equally
+    ///   phantom 20 increment, so it was recorded as a FULL RAISE — inventing a
+    ///   raise level for the bots and the coach out of a call.
+    /// * An all-in strictly between the big blind and the straddle (say 30) is
+    ///   an UNDER-call, yet `30 > 20` flagged it `increased_bet` too, so
+    ///   [`StreetActionFact::is_call_like`] stopped counting it as a caller.
+    ///
+    /// Both disappear once the projection starts from the same opening wager
+    /// `BettingRound::new_preflop` was handed.
     pub fn current_street_action_facts(&self) -> Vec<StreetActionFact> {
-        let current_street = self.current_street();
-        let mut current_bet = if current_street == Street::Preflop {
-            self.big_blind.0
-        } else {
-            0
-        };
-        let mut last_full_raise = self.big_blind.0;
+        self.street_action_facts(self.current_street())
+    }
+
+    /// The seat-agnostic identity of the hand's current **aggressor** — the
+    /// player who made the most recent wager increase (bet / raise / short
+    /// all-in raise) so far, on ANY street: the current street if it has seen
+    /// aggression, otherwise the latest earlier street that did. Blind posts
+    /// never count. `None` for a hand with no wager increase yet (limped pot
+    /// checked down so far).
+    ///
+    /// This is the poker "aggressor" that survives street boundaries — the
+    /// preflop raiser who c-bets the flop, the flop bettor who barrels the
+    /// turn — and is what ADR-043 §3.4.2's `is_aggressor` (rules R3 c-bet /
+    /// R6 semi-bluff barrel) means. It differs from
+    /// [`Self::current_street_action_facts`]-derived aggression, which resets at
+    /// every street: whenever hero can check nobody has raised THIS street yet,
+    /// so a current-street-only reading made R3/R6 unreachable on the live
+    /// coach path (discovery-r1 BUG-236) and every checked-to / first-to-act
+    /// spot was graded as a Check regardless of strength.
+    pub fn last_aggressor_player_id(&self) -> Option<PlayerId> {
+        const ORDER: [Street; 4] = [Street::Preflop, Street::Flop, Street::Turn, Street::River];
+        let current = self.current_street();
+        let dealt = ORDER.iter().position(|s| *s == current).unwrap_or(0);
+        ORDER[..=dealt].iter().rev().copied().find_map(|street| {
+            self.street_action_facts(street)
+                .into_iter()
+                .rev()
+                .find(|fact| fact.increased_bet)
+                .map(|fact| fact.player_id)
+        })
+    }
+
+    /// [`Self::current_street_action_facts`] for an arbitrary `street` of this
+    /// hand (empty when that street has not been dealt yet). Same replay
+    /// semantics: preflop starts from the nominal bring-in, later streets from
+    /// zero, blinds are commitment but never aggression.
+    pub fn street_action_facts(&self, street: Street) -> Vec<StreetActionFact> {
+        let current_street = street;
+        let preflop = current_street == Street::Preflop;
+        // Preflop the opening wager IS the minimum raise increment. Postflop the
+        // increment reverts to the big blind, matching `BettingRound::new`
+        // (which is constructed with `current_bet = 0, big_blind`) — a straddle
+        // never raises the postflop increment.
+        let bring_in = self.preflop_bring_in.0.max(self.big_blind.0);
+        let mut current_bet = if preflop { bring_in } else { 0 };
+        let mut last_full_raise = if preflop { bring_in } else { self.big_blind.0 };
         let mut committed_by_player: HashMap<u64, u32> = HashMap::new();
         let mut facts = Vec::new();
 
@@ -3444,6 +3516,279 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    /// discovery-r1 BUG-175 — an all-in that exactly MATCHES the straddle is a
+    /// call, and must not be projected as a raise.
+    ///
+    /// This is the discriminating case. With a 2 BB straddle the opening wager
+    /// is 40; seeding `current_bet` and `last_full_raise` from `big_blind` (20)
+    /// made a 40 all-in look like a 20-over-20 raise — `increased_bet` AND
+    /// `full_raise` — so `strategy_action()` handed the bots and the coach a
+    /// 3-bet that never happened.
+    #[test]
+    fn straddled_all_in_matching_the_bring_in_is_a_call_not_a_raise() {
+        let mut hand = GameHand::new_with_rng(
+            vec![
+                (pid(1), c(40), 0), // exactly the straddle: an all-in CALL
+                (pid(2), c(1000), 1),
+                (pid(3), c(1000), 2),
+                (pid(4), c(1000), 3),
+            ],
+            0,
+            c(20),
+            c(10),
+            PokerRng::from_seed(45),
+        )
+        .with_forced_straddle(c(40));
+
+        let snap = hand.start().expect("straddled hand starts");
+        // The engine's own view: the opening wager IS the straddle. (No
+        // `min_raise_to` assertion here — the first actor holds exactly 40, so
+        // the engine correctly offers them no raise at all.)
+        assert_eq!(snap.current_bet, c(40));
+
+        hand.apply_action(pid(1), PlayerAction::AllIn)
+            .expect("all-in for exactly the straddle is legal");
+
+        let facts = hand.current_street_action_facts();
+        let all_in_fact = facts
+            .iter()
+            .find(|fact| fact.player_id == pid(1))
+            .expect("the all-in is projected");
+        assert!(
+            !all_in_fact.increased_bet,
+            "40 only MATCHES the 40 straddle — it does not increase the wager; \
+             the big-blind baseline (20) reported an increase"
+        );
+        assert!(
+            !all_in_fact.full_raise,
+            "an all-in call is never a full raise; the big-blind baseline made \
+             its phantom 20 delta clear a phantom 20 increment"
+        );
+        assert_eq!(
+            all_in_fact.strategy_action(),
+            PlayerAction::Call,
+            "a non-full-raise projects to Call — this is the fabricated raise \
+             level the bots and coach were fed (BUG-175)"
+        );
+        assert!(all_in_fact.is_call_like(), "an all-in call is call-like");
+    }
+
+    /// BUG-175 companion — an all-in strictly BETWEEN the big blind and the
+    /// straddle is an under-call, so it must not read as a raise either.
+    #[test]
+    fn straddled_short_all_in_below_the_bring_in_is_not_an_increase() {
+        let mut hand = GameHand::new_with_rng(
+            vec![
+                (pid(1), c(30), 0), // short stack: can only reach 30 < 40
+                (pid(2), c(1000), 1),
+                (pid(3), c(1000), 2),
+                (pid(4), c(1000), 3),
+            ],
+            0,
+            c(20),
+            c(10),
+            PokerRng::from_seed(46),
+        )
+        .with_forced_straddle(c(40));
+
+        hand.start().expect("straddled hand starts");
+        hand.apply_action(pid(1), PlayerAction::AllIn)
+            .expect("short all-in call is legal");
+
+        let facts = hand.current_street_action_facts();
+        let all_in_fact = facts
+            .iter()
+            .find(|fact| fact.player_id == pid(1))
+            .expect("the all-in is projected");
+        assert!(
+            !all_in_fact.increased_bet,
+            "30 < the 40 straddle bring-in, so this is an under-call, not a \
+             raise; the big-blind baseline (20) wrongly flagged it increased"
+        );
+        assert!(all_in_fact.is_call_like(), "an under-call is call-like");
+    }
+
+    /// discovery-r1 BUG-196 (same defect as BUG-175, reported with the raise
+    /// ladder) — a legal 3-bet over a straddled open must stay a FULL raise.
+    ///
+    /// BB 20 / straddle 40. An open to 100 is a 60 increment, so the next full
+    /// raise must be to >= 170. Measuring from the big blind instead of the
+    /// straddle recorded that open as an 80 increment, so the legal 3-bet to 170
+    /// (delta 70) fell short of the phantom 80 and was classified
+    /// `full_raise = false` — `strategy_action()` then handed the bot and the
+    /// coach a `Call` where a 3-bet had happened, collapsing a whole level of
+    /// preflop chart depth.
+    #[test]
+    fn straddled_three_bet_keeps_full_raise_depth() {
+        let mut hand = GameHand::new_with_rng(
+            vec![
+                (pid(1), c(1000), 0),
+                (pid(2), c(1000), 1),
+                (pid(3), c(1000), 2),
+                (pid(4), c(1000), 3),
+            ],
+            0,
+            c(20),
+            c(10),
+            PokerRng::from_seed(48),
+        )
+        .with_forced_straddle(c(40));
+
+        hand.start().expect("straddled hand starts");
+        // pid(1) opens to 100 (a 60 increment over the 40 bring-in).
+        hand.apply_action(pid(1), PlayerAction::Raise { amount: c(100) })
+            .expect("open to 100 is legal");
+        // pid(2) 3-bets to 170 — exactly the minimum (70 >= 60 increment).
+        hand.apply_action(pid(2), PlayerAction::Raise { amount: c(170) })
+            .expect("min 3-bet to 170 is legal");
+
+        let facts = hand.current_street_action_facts();
+        let three_bet = facts
+            .iter()
+            .find(|fact| fact.player_id == pid(2))
+            .expect("the 3-bet is projected");
+        assert!(three_bet.increased_bet, "170 > 100 increases the wager");
+        assert!(
+            three_bet.full_raise,
+            "delta 70 >= the real 60 increment — a full 3-bet; the big-blind \
+             baseline inflated the open's increment to 80 and lost this"
+        );
+        assert_eq!(
+            three_bet.strategy_action(),
+            PlayerAction::Raise { amount: c(170) },
+            "a full 3-bet must NOT be projected down to Call (BUG-196)"
+        );
+    }
+
+    /// discovery-r1 BUG-236 — the hand-level aggressor survives the street
+    /// boundary. UTG opens, BB calls; on the flop the BB checks to the raiser.
+    /// The CURRENT-street facts carry no wager increase (nobody has bet the
+    /// flop yet), but `last_aggressor_player_id` must still name the preflop
+    /// raiser — that is the c-bet owner ADR-043 R3 reads. Feeding the
+    /// current-street-only reading to the solver made `can_check &&
+    /// is_aggressor` unreachable.
+    #[test]
+    fn last_aggressor_carries_the_preflop_raiser_onto_a_checked_flop() {
+        let mut hand = GameHand::new_with_rng(
+            vec![
+                (pid(1), c(1000), 0), // BTN/UTG in 3-max
+                (pid(2), c(1000), 1), // SB
+                (pid(3), c(1000), 2), // BB
+            ],
+            0,
+            c(20),
+            c(10),
+            PokerRng::from_seed(49),
+        );
+        hand.start().expect("hand starts");
+        assert_eq!(
+            hand.last_aggressor_player_id(),
+            None,
+            "blind posts are never aggression"
+        );
+
+        hand.apply_action(pid(1), PlayerAction::Raise { amount: c(60) })
+            .expect("open is legal");
+        hand.apply_action(pid(2), PlayerAction::Fold)
+            .expect("fold is legal");
+        hand.apply_action(pid(3), PlayerAction::Call)
+            .expect("call is legal");
+        // Flop dealt; BB is first to act and checks to the raiser.
+        assert_eq!(
+            hand.last_aggressor_player_id(),
+            Some(pid(1)),
+            "at the start of the flop the preflop raiser is still the aggressor"
+        );
+        hand.apply_action(pid(3), PlayerAction::Check)
+            .expect("check is legal");
+
+        // The street-local projection resets…
+        assert!(
+            hand.current_street_action_facts()
+                .iter()
+                .all(|fact| !fact.increased_bet),
+            "no flop wager increase yet"
+        );
+        // …the hand-level aggressor does NOT.
+        assert_eq!(hand.last_aggressor_player_id(), Some(pid(1)));
+
+        // A flop bet by the BB donk moves the aggressor identity forward.
+        // (Re-run the spot: raiser bets, BB raises.)
+        hand.apply_action(pid(1), PlayerAction::Raise { amount: c(40) })
+            .expect("c-bet is legal");
+        hand.apply_action(pid(3), PlayerAction::Raise { amount: c(120) })
+            .expect("check-raise is legal");
+        assert_eq!(
+            hand.last_aggressor_player_id(),
+            Some(pid(3)),
+            "the most recent wager increase wins, on the current street"
+        );
+    }
+
+    /// BUG-236 companion — a limped pot checked down has NO aggressor on any
+    /// street, so the solver must not invent one.
+    #[test]
+    fn last_aggressor_is_none_in_a_limped_pot_checked_down() {
+        let mut hand = GameHand::new_with_rng(
+            vec![
+                (pid(1), c(1000), 0),
+                (pid(2), c(1000), 1),
+                (pid(3), c(1000), 2),
+            ],
+            0,
+            c(20),
+            c(10),
+            PokerRng::from_seed(50),
+        );
+        hand.start().expect("hand starts");
+        hand.apply_action(pid(1), PlayerAction::Call).expect("limp");
+        hand.apply_action(pid(2), PlayerAction::Call)
+            .expect("complete");
+        hand.apply_action(pid(3), PlayerAction::Check)
+            .expect("option");
+        // Flop: SB, BB check.
+        hand.apply_action(pid(2), PlayerAction::Check)
+            .expect("check");
+        hand.apply_action(pid(3), PlayerAction::Check)
+            .expect("check");
+        assert_eq!(hand.last_aggressor_player_id(), None);
+        // `street_action_facts` for a not-yet-dealt street is empty.
+        assert!(hand.street_action_facts(Street::River).is_empty());
+    }
+
+    /// BUG-175 guard — the fix must not disturb the NO-straddle baseline, and
+    /// postflop keeps the big blind as its raise increment (a straddle only
+    /// raises the PREFLOP opening wager).
+    #[test]
+    fn unstraddled_preflop_facts_keep_the_big_blind_baseline() {
+        let mut hand = GameHand::new_with_rng(
+            vec![
+                (pid(1), c(1000), 0),
+                (pid(2), c(1000), 1),
+                (pid(3), c(1000), 2),
+            ],
+            0,
+            c(20),
+            c(10),
+            PokerRng::from_seed(47),
+        );
+
+        let snap = hand.start().expect("plain hand starts");
+        assert_eq!(snap.current_bet, c(20), "no straddle → BB is the bring-in");
+
+        hand.apply_action(pid(1), PlayerAction::AllIn)
+            .expect("all-in is legal");
+        let facts = hand.current_street_action_facts();
+        let fact = facts
+            .iter()
+            .find(|fact| fact.player_id == pid(1))
+            .expect("the all-in is projected");
+        assert!(
+            fact.increased_bet && fact.full_raise,
+            "a 1000 all-in over a 20 big blind is still a full raise"
+        );
     }
 
     #[test]
