@@ -390,20 +390,6 @@ pub struct RankDescription {
     pub board: Vec<String>,
 }
 
-impl RankDescription {
-    /// Minimal description carrying only the category — used when caller
-    /// cannot supply hole + board (e.g. legacy ShowdownEntry without cards).
-    pub fn category_only(category: impl Into<String>) -> Self {
-        Self {
-            category: category.into(),
-            primary: None,
-            secondary: None,
-            kicker: None,
-            board: Vec::new(),
-        }
-    }
-}
-
 fn rank_str(r: Rank) -> String {
     r.char().to_string()
 }

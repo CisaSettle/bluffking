@@ -732,15 +732,6 @@ impl BettingRound {
         &self.players
     }
 
-    /// Non-folded players.
-    pub fn eligible_players(&self) -> Vec<PlayerId> {
-        self.players
-            .iter()
-            .filter(|p| !p.folded)
-            .map(|p| p.player_id)
-            .collect()
-    }
-
     // ---------------------------------------------------------------------------
     // Private helpers
     // ---------------------------------------------------------------------------

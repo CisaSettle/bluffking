@@ -123,9 +123,4 @@ impl DealingProviderKind {
             other => other,
         }
     }
-
-    /// `true` if this kind relies on dev-only mock crypto.
-    pub fn uses_mock_crypto(self) -> bool {
-        matches!(self, Self::MentalPokerMock | Self::PreferMentalPoker)
-    }
 }

@@ -11,7 +11,7 @@
 use crate::card_id::{is_valid_card_id, DECK_SIZE};
 use crate::crypto::{card_commit, deck_hash, EncCard, Salt};
 use crate::events::*;
-use crate::hash::{canonical_json, ds_hash, hex_hash, parse_hash, Hash, ZERO_HASH};
+use crate::hash::{canonical_json, ds_hash, hex_hash, parse_hash, Hash};
 
 /// Hash of the canonical plaintext starting deck `[0, 1, …, 51]` as a
 /// **wire deck** (52 single-byte card-id parts).
@@ -717,11 +717,6 @@ pub fn canonical_initial_deck() -> Vec<EncCard> {
 /// Hash of [`canonical_initial_deck`].
 pub fn canonical_initial_deck_hash() -> Hash {
     deck_hash(&canonical_initial_deck())
-}
-
-/// Zero hash convenience re-export for the first event's `previous_event_hash`.
-pub fn genesis_prev_hash() -> Hash {
-    ZERO_HASH
 }
 
 fn parse<T: serde::de::DeserializeOwned>(payload: &Value) -> Result<T, StateError> {

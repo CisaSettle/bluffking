@@ -82,21 +82,6 @@ impl PositionBucket {
             PositionBucket::BB => "BB",
         }
     }
-
-    /// Map back to a representative engine `Position` (inverse of
-    /// [`position_to_bucket`]; `MP` → `Hijack`). Used by the spot analyzer to
-    /// reuse the advisor's `Position`-keyed rule pipeline (M1 §1b).
-    pub fn to_position(&self) -> crate::player::Position {
-        use crate::player::Position;
-        match self {
-            PositionBucket::UTG => Position::Utg,
-            PositionBucket::MP => Position::Hijack,
-            PositionBucket::CO => Position::Cutoff,
-            PositionBucket::BTN => Position::Dealer,
-            PositionBucket::SB => Position::SmallBlind,
-            PositionBucket::BB => Position::BigBlind,
-        }
-    }
 }
 
 /// Preflop action bucket.
