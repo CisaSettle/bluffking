@@ -26,12 +26,6 @@ rand = "0.8"
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# ADR-078 — the per-hand Ed25519 showdown-attestation signer. Already a
-# `mental-poker` dep (the audited Ed25519SignatureProvider); mp-wasm re-exposes
-# it at the wasm boundary via WasmSigner. Keygen rides the existing OsRng →
-# getrandom (js/wasm_js) path; signing is RFC-8032 deterministic.
-ed25519-dalek = "2.2"
-
 # WASM CSPRNG plumbing (browser/node crypto.getRandomValues):
 #   rand 0.8 → getrandom 0.2  ⇒ "js" feature
 #   transitive getrandom 0.3  ⇒ "wasm_js" feature + the cfg in .cargo/config.toml

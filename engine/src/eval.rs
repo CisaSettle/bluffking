@@ -156,38 +156,7 @@ impl HandRank {
 /// guarantees the invariant internally (the deck deals unique cards; the
 /// solver pre-validates), so external callers must do the same.
 pub fn rank_hand(hole: &HoleCards, board: &BoardCards) -> HandRank {
-    let mut all_cards: Vec<RsCard> = Vec::with_capacity(7);
-    all_cards.push(card_to_rs(hole.card1));
-    all_cards.push(card_to_rs(hole.card2));
-    for c in board.all_cards() {
-        all_cards.push(card_to_rs(c));
-    }
-    // `Hand::new_with_cards` is bitset-backed and silently DEDUPLICATES
-    // identical cards — a duplicate (e.g. a hole card that collides with a board
-    // card) collapses the 7-card multiset to fewer distinct cards and yields a
-    // silently WRONG rank. Engine callers always pass disjoint hole+board cards
-    // (the deck deals unique cards; the solver pre-validates), so this is a
-    // latent guard: surface the invariant violation loudly in dev/tests instead
-    // of returning a quietly wrong rank in production (audit 2026-06-03).
-    debug_assert!(
-        !has_duplicate_cards(&all_cards),
-        "rank_hand received duplicate/overlapping cards; result would be wrong"
-    );
-    let hand = Hand::new_with_cards(all_cards);
-    rs_rank_to_hand_rank(hand.rank())
-}
-
-/// True if any two of the `rs_poker` cards are identical. Used only by a
-/// `debug_assert!` in [`rank_hand`].
-fn has_duplicate_cards(cards: &[RsCard]) -> bool {
-    for (i, a) in cards.iter().enumerate() {
-        for b in &cards[i + 1..] {
-            if a == b {
-                return true;
-            }
-        }
-    }
-    false
+    rank_with_board(&board_eval(board), hole)
 }
 
 /// Rank multiple players' hands against the same board, returning a list sorted
@@ -198,9 +167,10 @@ pub fn rank_players(
     players: &[(PlayerId, HoleCards)],
     board: &BoardCards,
 ) -> Vec<(PlayerId, HandRank)> {
+    let board = board_eval(board);
     let mut ranked: Vec<(PlayerId, HandRank)> = players
         .iter()
-        .map(|(pid, hole)| (*pid, rank_hand(hole, board)))
+        .map(|(pid, hole)| (*pid, rank_with_board(&board, hole)))
         .collect();
 
     // Sort descending — best hand first.
@@ -212,17 +182,8 @@ pub fn rank_players(
 // Allocation-free fast path for the equity Monte Carlo hot loop
 // ---------------------------------------------------------------------------
 //
-// `rank_hand` allocates two throwaway `Vec`s per call (the `RsCard` buffer plus
-// the `board.all_cards()` vec) and re-converts the shared board for every
-// player. In the MC loop the board is IDENTICAL for hero + all opponents within
-// a trial, so we pre-convert it ONCE into an `rs_poker` bitset `Hand` (which is
-// `Copy`) and evaluate each player by copying that bitset and inserting only
-// their two hole cards — no heap allocation, no per-player board re-conversion.
-// `rs_poker` types stay INTERNAL (ADR-012: none may appear in a public
-// signature): `BoardEval` is `pub` but wraps its `rs_poker` `Hand` in a
-// PRIVATE field, so no `rs_poker` type leaks into any public signature.
-// (U68, dual-AI OSS review: this comment previously contradicted the actual
-// `pub` visibility documented on the struct below.)
+// Convert the shared board once and copy its bitset for each player. All hand
+// evaluation entrypoints use this path; external poker types stay private.
 
 /// A board pre-converted to an `rs_poker` bitset, reusable across the players in
 /// one Monte Carlo trial. The wrapped `rs_poker` type is a PRIVATE field, so no
@@ -250,6 +211,7 @@ pub fn board_eval(board: &BoardCards) -> BoardEval {
     if let Some(r) = board.river {
         hand.insert(card_to_rs(r));
     }
+    debug_assert_eq!(hand.count(), board.count(), "board contains duplicate cards");
     BoardEval { hand }
 }
 
@@ -260,6 +222,11 @@ pub fn rank_with_board(be: &BoardEval, hole: &HoleCards) -> HandRank {
     let mut hand = be.hand; // `Hand` wraps a `Copy` CardBitSet — this is a stack copy.
     hand.insert(card_to_rs(hole.card1));
     hand.insert(card_to_rs(hole.card2));
+    debug_assert_eq!(
+        hand.count(),
+        be.hand.count() + 2,
+        "rank_hand received duplicate/overlapping cards; result would be wrong"
+    );
     rs_rank_to_hand_rank(hand.rank())
 }
 
@@ -272,8 +239,37 @@ mod fast_eval_tests {
         Card::new(r, s)
     }
 
-    /// The allocation-free fast path must agree with `rank_hand` on every board
-    /// street, for many disjoint hole/board combinations.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn duplicate_cards_still_trip_the_debug_guard() {
+        let ace = c(Rank::Ace, Suit::Spades);
+        let king = c(Rank::King, Suit::Hearts);
+        let two = c(Rank::Two, Suit::Clubs);
+        for (hole, board) in [
+            (HoleCards::new(ace, ace), BoardCards::empty()),
+            (
+                HoleCards::new(ace, king),
+                BoardCards {
+                    flop: Some([ace, two, king]),
+                    turn: None,
+                    river: None,
+                },
+            ),
+            (
+                HoleCards::new(ace, king),
+                BoardCards {
+                    flop: Some([two, two, two]),
+                    turn: None,
+                    river: None,
+                },
+            ),
+        ] {
+            assert!(std::panic::catch_unwind(|| rank_hand(&hole, &board)).is_err());
+        }
+    }
+
+    /// Both entrypoints must agree with direct evaluator construction on every
+    /// board street, for disjoint hole/board combinations.
     #[test]
     fn rank_with_board_matches_rank_hand() {
         let boards = [
@@ -329,9 +325,13 @@ mod fast_eval_tests {
                 if board_set.contains(&hole.card1) || board_set.contains(&hole.card2) {
                     continue;
                 }
+                let cards = hole.as_array().into_iter().chain(board.all_cards());
+                let reference = Hand::new_with_cards(cards.map(card_to_rs).collect());
+                let expected = rs_rank_to_hand_rank(reference.rank());
+                assert_eq!(rank_hand(hole, board), expected);
                 assert_eq!(
                     rank_with_board(&be, hole),
-                    rank_hand(hole, board),
+                    expected,
                     "fast eval disagreed with rank_hand for hole {hole:?} board {board:?}"
                 );
             }

@@ -1,9 +1,7 @@
 //! `pf_demo_hand` — emit a REAL, end-to-end verifiable commit-reveal hand record
 //! (ADR-064), so `pf_verify` has a working, shipped fixture source.
 //!
-//! Unlike `server/examples/dump_hand_detail` (whose pf fields are illustrative
-//! placeholders in a different — replay-mock — JSON shape, and therefore do NOT
-//! satisfy the verifier), this binary deals a *real* engine hand from a fixed
+//! This binary deals a real engine hand from a fixed
 //! `server_seed`, captures the actual hole cards + board, and prints a
 //! `HandRecord` whose `seed_commit`, `deck_seed`, and cards all reproduce. Pipe
 //! it straight into the verifier to prove the dealing was fair:

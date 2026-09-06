@@ -855,8 +855,8 @@ fn verify_reenc(
     //
     // (1) The aggregate output combination (public, computable by verifier):
     //       Lhs1 = Σ_k e_k·D_out[k].c1 ;  Lhs2 = Σ_k e_k·D_out[k].c2
-    let lhs1: RistrettoPoint = msm(e, &d_out.iter().map(|c| c.c1).collect::<Vec<_>>());
-    let lhs2: RistrettoPoint = msm(e, &d_out.iter().map(|c| c.c2).collect::<Vec<_>>());
+    let lhs1: RistrettoPoint = RistrettoPoint::multiscalar_mul(e, d_out.iter().map(|c| c.c1));
+    let lhs2: RistrettoPoint = RistrettoPoint::multiscalar_mul(e, d_out.iter().map(|c| c.c2));
 
     // (2) f-knowledge over the input deck:  z_f·D_in == Tf + c·(Σ f_j·D_in[j]).
     //     We don't know Σ f_j·D_in[j] directly, but the homomorphic relation says
@@ -876,8 +876,8 @@ fn verify_reenc(
     //   and Σ f_j·D_in[j].c1 + R·G = Lhs1 (the homomorphic identity, c1 coord),
     //   so LHS-A1 = Tf1 + T1 + c·Lhs1 = RHS-A1. A cheating output deck breaks
     //   the homomorphic identity, so Eq-A holds only for a genuine shuffle.
-    let zf_din_c1: RistrettoPoint = msm(&z_f, &d_in.iter().map(|c| c.c1).collect::<Vec<_>>());
-    let zf_din_c2: RistrettoPoint = msm(&z_f, &d_in.iter().map(|c| c.c2).collect::<Vec<_>>());
+    let zf_din_c1: RistrettoPoint = RistrettoPoint::multiscalar_mul(&z_f, d_in.iter().map(|c| c.c1));
+    let zf_din_c2: RistrettoPoint = RistrettoPoint::multiscalar_mul(&z_f, d_in.iter().map(|c| c.c2));
 
     let eq_a1 = (zf_din_c1 + z_r * G) == (tf1 + t1 + c * lhs1);
     let eq_a2 = (zf_din_c2 + z_r * q) == (tf2 + t2 + c * lhs2);
@@ -988,16 +988,8 @@ fn verify_permutation(
 }
 
 // ===========================================================================
-// Helpers: MSM, deck (de)coding, attestation (de)serialization, uniform sampling
+// Helpers: deck (de)coding, attestation (de)serialization, uniform sampling
 // ===========================================================================
-
-/// Multi-scalar multiplication `Σ scalars[i]·points[i]` (constant-time MSM).
-fn msm(scalars: &[Scalar], points: &[RistrettoPoint]) -> RistrettoPoint {
-    if scalars.is_empty() {
-        return RistrettoPoint::identity();
-    }
-    RistrettoPoint::multiscalar_mul(scalars.iter().copied(), points.iter().copied())
-}
 
 fn decode_deck(wire: &[CtWire]) -> Option<Vec<Ct>> {
     wire.iter().map(Ct::from_wire).collect()

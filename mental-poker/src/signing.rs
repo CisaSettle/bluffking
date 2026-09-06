@@ -118,25 +118,13 @@ impl SignatureProvider for MockSignatureProvider {
             Some(k) => k,
             None => return false,
         };
-        let expected = hex::decode(Self::sign_with_key(key, message));
-        let actual = hex::decode(signature);
-        match (expected, actual) {
-            (Ok(e), Ok(a)) => constant_time_eq(&e, &a),
-            _ => false,
-        }
+        let Ok(signature) = hex::decode(signature) else {
+            return false;
+        };
+        let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+        mac.update(message);
+        mac.verify_slice(&signature).is_ok()
     }
-}
-
-/// Constant-time byte comparison to avoid timing leaks on signature checks.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 #[cfg(test)]
@@ -166,6 +154,14 @@ mod tests {
         let p = MockSignatureProvider::from_seed(b"seed", &signers());
         let sig = p.sign("party:0", b"hello");
         assert!(!p.verify("party:0", b"hell0", &sig));
+    }
+
+    #[test]
+    fn malformed_and_wrong_length_signatures_fail() {
+        let p = MockSignatureProvider::from_seed(b"seed", &signers());
+        for signature in ["", "0", "zz", "00", &"00".repeat(33)] {
+            assert!(!p.verify("party:0", b"hello", &signature.to_string()));
+        }
     }
 
     #[test]

@@ -1049,8 +1049,7 @@ impl GameHand {
         let round_closed_after = round_after_action.is_done();
 
         let mut hand_after = self.clone();
-        hand_after.apply_action(player_id, action.clone())?;
-        let after_snapshot = hand_after.snapshot();
+        let after_snapshot = hand_after.apply_action(player_id, action.clone())?;
         let after = after_snapshot
             .players
             .iter()
@@ -1982,8 +1981,7 @@ impl GameHand {
 
     /// Read-only reference to the active betting round, if any.
     ///
-    /// Used by the session layer to query `players_yet_to_act()` without
-    /// duplicating the round-access pattern already inside `snapshot()`.
+    /// Used by the session layer to query the current actor's raise permission.
     pub fn betting_round_ref(&self) -> Option<&BettingRound> {
         self.betting_round.as_ref()
     }
@@ -2603,30 +2601,8 @@ impl GameHand {
                 // Read post-construction betting state for the StreetRevealed event.
                 // If all players are all-in, the round is immediately done and there
                 // is no next actor — `next_actor_seat` and `min_raise_to` will be None.
-                let new_street_current_bet = self
-                    .betting_round
-                    .as_ref()
-                    .map(|r| r.current_bet().0 as u64)
-                    .unwrap_or(0);
-                let new_street_min_raise_to = self.betting_round.as_ref().and_then(|r| {
-                    if r.is_done() {
-                        None
-                    } else {
-                        Some(r.min_raise_to().0 as u64)
-                    }
-                });
-                let new_street_next_actor_seat = self.betting_round.as_ref().and_then(|r| {
-                    if r.is_done() {
-                        None
-                    } else {
-                        r.current_player().and_then(|pid| {
-                            self.seats
-                                .iter()
-                                .find(|s| s.player_id == pid)
-                                .map(|s| s.seat)
-                        })
-                    }
-                });
+                let (new_street_current_bet, new_street_min_raise_to, new_street_next_actor_seat) =
+                    self.new_street_betting_state();
 
                 // Patch the StreetRevealed event that was pushed above with the
                 // now-known betting state fields.  We pushed it before constructing
@@ -2927,6 +2903,26 @@ pub fn blind_positions(dealer_idx: usize, n: usize) -> (usize, usize) {
     }
 }
 
+/// Place odd chips in button-relative order, with player id breaking ties.
+fn odd_chip_recipients(
+    ids: &[PlayerId],
+    rem: u32,
+    button_order: &HashMap<u64, usize>,
+) -> Vec<PlayerId> {
+    if rem == 0 {
+        return Vec::new();
+    }
+    let mut sorted = ids.to_vec();
+    sorted.sort_by_key(|pid| {
+        (
+            button_order.get(&pid.inner()).copied().unwrap_or(usize::MAX),
+            pid.inner(),
+        )
+    });
+    sorted.truncate(rem as usize);
+    sorted
+}
+
 /// Distribute each pot to winner(s).
 ///
 /// `button_order` maps each player to its button-relative seat order (0 = first
@@ -2955,25 +2951,6 @@ fn distribute_pots(
         return vec![];
     }
 
-    // TDA Rule 25: a split pot's `rem` odd chips are spread ONE PER SEAT to the
-    // `rem` tied winners in the earliest positions (lowest button-relative
-    // order), breaking ties by player id for determinism — never piled on one
-    // seat. Returns those recipients (the first `rem` players in button order).
-    let odd_chip_recipients = |ids: &[PlayerId], rem: u32| -> Vec<PlayerId> {
-        let mut sorted: Vec<PlayerId> = ids.to_vec();
-        sorted.sort_by_key(|pid| {
-            (
-                button_order
-                    .get(&pid.inner())
-                    .copied()
-                    .unwrap_or(usize::MAX),
-                pid.inner(),
-            )
-        });
-        sorted.truncate(rem as usize);
-        sorted
-    };
-
     pots.iter()
         .enumerate()
         .filter_map(|(idx, pot)| {
@@ -2998,7 +2975,7 @@ fn distribute_pots(
                 let n = refund_ids.len() as u32;
                 let base = pot.amount.0 / n;
                 let rem = pot.amount.0 % n;
-                let odd_recipients = odd_chip_recipients(refund_ids, rem);
+                let odd_recipients = odd_chip_recipients(refund_ids, rem, button_order);
                 let winners = refund_ids
                     .iter()
                     .map(|pid| PotWinner {
@@ -3062,7 +3039,7 @@ fn distribute_pots(
                         let count = shared.len() as u32;
                         let base = pot.amount.0 / count;
                         let rem = pot.amount.0 % count;
-                        let odd_recipients = odd_chip_recipients(&shared, rem);
+                        let odd_recipients = odd_chip_recipients(&shared, rem, button_order);
                         shared
                             .iter()
                             .map(|pid| PotWinner {
@@ -3093,7 +3070,7 @@ fn distribute_pots(
                 }
                 let base = pot.amount.0 / n;
                 let rem = pot.amount.0 % n;
-                let odd_recipients = odd_chip_recipients(refund_ids, rem);
+                let odd_recipients = odd_chip_recipients(refund_ids, rem, button_order);
                 let winners = refund_ids
                     .iter()
                     .map(|pid| PotWinner {
@@ -3131,7 +3108,7 @@ fn distribute_pots(
                 // TDA Rule 25: the odd chip goes to the tied winner in the
                 // earliest position (first seat left of the button), NOT to
                 // whoever is first in action order (audit 2026-06-03).
-                let odd_recipients = odd_chip_recipients(&shared, rem);
+                let odd_recipients = odd_chip_recipients(&shared, rem, button_order);
                 shared
                     .iter()
                     .map(|pid| PotWinner {
@@ -3176,23 +3153,6 @@ fn distribute_pots_uncontested(
         return vec![];
     }
 
-    // Split a pot's `rem` odd chips one-per-seat to the earliest-position
-    // recipients (TDA Rule 25), identical to `distribute_pots`.
-    let odd_chip_recipients = |ids: &[PlayerId], rem: u32| -> Vec<PlayerId> {
-        let mut sorted: Vec<PlayerId> = ids.to_vec();
-        sorted.sort_by_key(|pid| {
-            (
-                button_order
-                    .get(&pid.inner())
-                    .copied()
-                    .unwrap_or(usize::MAX),
-                pid.inner(),
-            )
-        });
-        sorted.truncate(rem as usize);
-        sorted
-    };
-
     let refund = |idx: usize, pot: &SidePot| -> Option<PotResult> {
         // Prefer an explicit `refund_to` (uncalled overage); else the eligible
         // contributors of the layer.
@@ -3207,7 +3167,7 @@ fn distribute_pots_uncontested(
         }
         let base = pot.amount.0 / n;
         let rem = pot.amount.0 % n;
-        let odd_recipients = odd_chip_recipients(refund_ids, rem);
+        let odd_recipients = odd_chip_recipients(refund_ids, rem, button_order);
         let winners = refund_ids
             .iter()
             .map(|pid| PotWinner {
@@ -3283,23 +3243,6 @@ fn distribute_pots_among_survivors(
         return vec![];
     }
 
-    // Spread `rem` odd chips one-per-seat to the earliest-position recipients
-    // (TDA Rule 25), identical to `distribute_pots_uncontested`.
-    let odd_chip_recipients = |ids: &[PlayerId], rem: u32| -> Vec<PlayerId> {
-        let mut sorted: Vec<PlayerId> = ids.to_vec();
-        sorted.sort_by_key(|pid| {
-            (
-                button_order
-                    .get(&pid.inner())
-                    .copied()
-                    .unwrap_or(usize::MAX),
-                pid.inner(),
-            )
-        });
-        sorted.truncate(rem as usize);
-        sorted
-    };
-
     // Split a pot's `amount` equally among `recipients` (>=1), with `is_refund`
     // controlling the flag on the resulting `PotResult`.
     let split = |idx: usize,
@@ -3313,7 +3256,7 @@ fn distribute_pots_among_survivors(
         }
         let base = pot.amount.0 / n;
         let rem = pot.amount.0 % n;
-        let odd = odd_chip_recipients(recipients, rem);
+        let odd = odd_chip_recipients(recipients, rem, button_order);
         let winners = recipients
             .iter()
             .map(|pid| PotWinner {

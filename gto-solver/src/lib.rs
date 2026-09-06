@@ -313,6 +313,10 @@ pub enum SolveError {
 /// checks as the single source of truth, so callers that skip this are still
 /// safe — it is a cheap fast-fail, not the only guard.
 pub fn validate_request(req: &SolveRequest) -> Result<(), SolveError> {
+    parse_request(req).map(|_| ())
+}
+
+fn parse_request(req: &SolveRequest) -> Result<(CardConfig, BetSizeOptions), SolveError> {
     let (flop, turn, river) = parse_board(req)?;
     let (oop, ip) = parse_ranges(req)?;
 
@@ -337,8 +341,7 @@ pub fn validate_request(req: &SolveRequest) -> Result<(), SolveError> {
     }
 
     validate_stakes(req)?;
-    BetSizeOptions::try_from((req.bet_sizes.as_str(), req.raise_sizes.as_str()))
-        .map(|_| ())
+    let bet_sizes = BetSizeOptions::try_from((req.bet_sizes.as_str(), req.raise_sizes.as_str()))
         .map_err(SolveError::InvalidBetSize)?;
     // F1: on every postflop tree OOP acts first, so the root actor is ALWAYS
     // OOP — only the OOP view has a well-defined root strategy here. Reject an
@@ -350,7 +353,15 @@ pub fn validate_request(req: &SolveRequest) -> Result<(), SolveError> {
             root_actor: "oop".into(),
         });
     }
-    Ok(())
+    Ok((
+        CardConfig {
+            range: [oop, ip],
+            flop,
+            turn,
+            river,
+        },
+        bet_sizes,
+    ))
 }
 
 /// Parse + validate the board into `(flop, turn, river)` solver cards, enforcing
@@ -521,29 +532,12 @@ pub fn solve_spot(req: &SolveRequest) -> Result<SolveOutput, SolveError> {
     // crate safe for any caller (the server's call is then a redundant fast-fail,
     // not the only guard). The board/range/stakes results are re-parsed below
     // (cheap) for the game build.
-    validate_request(req)?;
-
-    // Board legality + street consistency, ranges (parse + non-empty), and
-    // stakes bounds — re-parsed into the concrete types the game build needs.
-    let (flop, turn, river) = parse_board(req)?;
-    let (oop, ip) = parse_ranges(req)?;
-    validate_stakes(req)?;
-
-    // --- Bet sizing ---------------------------------------------------------
-    let bet_sizes = BetSizeOptions::try_from((req.bet_sizes.as_str(), req.raise_sizes.as_str()))
-        .map_err(SolveError::InvalidBetSize)?;
+    let (card_config, bet_sizes) = parse_request(req)?;
 
     let initial_state = match req.street {
         SolveStreet::Flop => BoardState::Flop,
         SolveStreet::Turn => BoardState::Turn,
         SolveStreet::River => BoardState::River,
-    };
-
-    let card_config = CardConfig {
-        range: [oop, ip],
-        flop,
-        turn,
-        river,
     };
 
     let tree_config = TreeConfig {
@@ -687,13 +681,13 @@ fn project_output(
     // the solver's canonical hole strings, matching `solver_hole_string`.
     let labels = holes_to_strings(private).map_err(SolveError::Internal)?;
     let mut hands = Vec::with_capacity(num_hands);
-    for (idx, label) in labels.iter().enumerate().take(num_hands) {
+    for (idx, label) in labels.into_iter().enumerate().take(num_hands) {
         let mut freqs = Vec::with_capacity(num_actions);
         for i in 0..num_actions {
             freqs.push(strategy.get(i * num_hands + idx).copied().unwrap_or(0.0));
         }
         hands.push(HandStrategy {
-            hand: label.clone(),
+            hand: label,
             frequencies: freqs,
             equity: equity_vec.get(idx).copied().unwrap_or(0.0),
             ev: ev_vec.get(idx).copied().unwrap_or(0.0),

@@ -37,12 +37,8 @@ pub fn hex_hash(h: &Hash) -> String {
 
 /// Decode a hex string back into a [`Hash`]. Returns `None` on malformed input.
 pub fn parse_hash(s: &str) -> Option<Hash> {
-    let bytes = hex::decode(s).ok()?;
-    if bytes.len() != 32 {
-        return None;
-    }
     let mut out = [0u8; 32];
-    out.copy_from_slice(&bytes);
+    hex::decode_to_slice(s, &mut out).ok()?;
     Some(out)
 }
 
@@ -91,8 +87,7 @@ fn write_canonical(value: &Value, out: &mut Vec<u8>) {
 
 fn write_json_string(s: &str, out: &mut Vec<u8>) {
     // serde_json produces a correctly escaped JSON string literal.
-    let encoded = serde_json::to_string(s).expect("string always serializes");
-    out.extend_from_slice(encoded.as_bytes());
+    serde_json::to_writer(out, s).expect("string always serializes");
 }
 
 #[cfg(test)]

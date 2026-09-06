@@ -257,37 +257,6 @@ impl BettingRound {
         self.pot_total
     }
 
-    /// Number of players who still need to act this street, **excluding** the
-    /// current actor.
-    ///
-    /// Used by the bot module (ADR-024 §3) to build `DecisionContext.players_to_act_after_me`.
-    /// Returns 0 when the round is done or the current actor is the last to act.
-    pub fn players_yet_to_act(&self) -> usize {
-        if self.done {
-            return 0;
-        }
-        // Derive the count from live state rather than `actions_remaining`: a
-        // player still owes an action if they are active (non-folded, non-all-in)
-        // and either still owe a call (`contributed < current_bet`) or have not
-        // acted since the last reopen (`!has_acted`). Exclude the current actor.
-        //
-        // `actions_remaining` alone is wrong after a non-reopening (sub-minimum)
-        // all-in that RAISED `current_bet`: it is decremented to 0 even though
-        // the already-acted players now owe the new difference and must still
-        // call or fold (audit 2026-06-03). The round correctly stays open via
-        // the `all_matched` guard in `check_done`; this reporting must agree.
-        self.players
-            .iter()
-            .enumerate()
-            .filter(|(i, p)| {
-                *i != self.current
-                    && !p.folded
-                    && !p.all_in
-                    && (p.contributed.0 < self.current_bet.0 || !p.has_acted)
-            })
-            .count()
-    }
-
     /// Whether the current actor is allowed to raise/re-raise this turn.
     ///
     /// `false` when the actor has already acted this street and the betting was
@@ -1569,13 +1538,9 @@ mod tests {
         );
     }
 
-    /// Regression (audit 2026-06-03): after a non-reopening (sub-minimum) all-in
-    /// that RAISES `current_bet`, `players_yet_to_act()` must still count the
-    /// already-acted players who now owe the new difference. Previously it read
-    /// `actions_remaining` (driven to 0 by the non-aggression decrement) and
-    /// reported 0 while two players still owed a call.
+    /// A short all-in keeps the round open until both earlier callers respond.
     #[test]
-    fn players_yet_to_act_counts_owers_after_non_reopening_all_in() {
+    fn short_all_in_requires_both_earlier_callers_to_respond() {
         // Postflop 3-way, current_bet 0, bb 100. P1 bets 100, P2 calls 100,
         // P3 short all-in to 150 (delta 50 < 100 min → non-reopening).
         let mut round = BettingRound::new(three_players(1000, 1000, 150), 0, c(0), c(100));
@@ -1591,13 +1556,12 @@ mod tests {
             "P1 and P2 still owe 50 — round must stay open"
         );
         assert_eq!(round.current_player(), Some(pid(1)));
-        // P1 is the current actor (excluded); P2 still owes 50 and is not all-in
-        // → players_yet_to_act must be 1, not 0.
-        assert_eq!(
-            round.players_yet_to_act(),
-            1,
-            "P2 still owes a call after the non-reopening all-in"
-        );
+        round.apply_action(pid(1), &PlayerAction::Call).unwrap();
+        assert!(!round.is_done(), "P2 still owes the additional 50 chips");
+        assert_eq!(round.current_player(), Some(pid(2)));
+        round.apply_action(pid(2), &PlayerAction::Call).unwrap();
+        assert!(round.is_done());
+        assert_eq!(round.pot_total(), c(450));
     }
 
     // A FULL raise must still reopen action for a player who already acted.

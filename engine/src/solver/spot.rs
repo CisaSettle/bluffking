@@ -249,7 +249,7 @@ pub fn analyze_spot(req: &SpotRequest) -> Result<SpotAnalysis, SolverError> {
             let cell_freq = preflop_charts::lookup(req.hero_position, bucket, &key)
                 .map(|c| c.frequency)
                 .unwrap_or(0.0);
-            let continue_action = advisor::preflop_continue_action(req.hero_position, bucket, &key);
+            let continue_action = advisor::preflop_continue_action(bucket);
             advisor::preflop_verdict(
                 Some(hero),
                 recommended,
@@ -491,7 +491,7 @@ fn board_prefix_for_street(board: &BoardCards, street: Street) -> BoardCards {
 ///   3-bet" range; returning `FacingOpen` here would wrongly analyze the most
 ///   common postflop spot vs a tight 3-bet range. So this returns `None` and the
 ///   caller routes `Rfi` postflop to the derived flat-defend range instead.
-fn villain_chart_bucket(line: PreflopLine, _street: Street) -> Option<ActionBucket> {
+fn villain_chart_bucket(line: PreflopLine) -> Option<ActionBucket> {
     match line {
         // RFI (preflop OR postflop) maps to NO single chart bucket here. Preflop:
         // villain has not acted ⇒ random. Postflop: hero opened + villain CALLED
@@ -524,9 +524,7 @@ fn flat_defend_range(vpos: PositionBucket) -> Vec<(HandKey, f32)> {
     use std::collections::BTreeMap;
     // Hands the villain would voluntarily play (their open range) = the widest
     // honest superset of a flat-call defend range available in the v3 chart.
-    let rfi: BTreeMap<HandKey, f32> = preflop_charts::range_entries(vpos, ActionBucket::Rfi)
-        .into_iter()
-        .collect();
+    let rfi = preflop_charts::range_entries(vpos, ActionBucket::Rfi);
     if rfi.is_empty() {
         return Vec::new();
     }
@@ -535,7 +533,7 @@ fn flat_defend_range(vpos: PositionBucket) -> Vec<(HandKey, f32)> {
         preflop_charts::range_entries(vpos, ActionBucket::FacingOpen)
             .into_iter()
             .collect();
-    let mut out: Vec<(HandKey, f32)> = rfi
+    rfi
         .into_iter()
         .filter_map(|(key, rfi_f)| {
             let tb = threebet.get(&key).copied().unwrap_or(0.0);
@@ -546,9 +544,7 @@ fn flat_defend_range(vpos: PositionBucket) -> Vec<(HandKey, f32)> {
                 None
             }
         })
-        .collect();
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    out
+        .collect()
 }
 
 /// The action bucket for HERO's own chart lookup (recommendation/grid).
@@ -588,15 +584,15 @@ fn villain_range(req: &SpotRequest) -> (OpponentSpec, RangeSummary) {
     let (entries, code): (Vec<(HandKey, f32)>, String) = match req.preflop_line {
         PreflopLine::Rfi if is_postflop => (
             flat_defend_range(vpos),
-            format!("{}_flat_defend", lower(vpos.key())),
+            format!("{}_flat_defend", vpos.key().to_ascii_lowercase()),
         ),
         _ => {
-            let Some(vbucket) = villain_chart_bucket(req.preflop_line, req.street) else {
+            let Some(vbucket) = villain_chart_bucket(req.preflop_line) else {
                 return fallback();
             };
             (
                 preflop_charts::range_entries(vpos, vbucket),
-                format!("{}_{}", lower(vpos.key()), lower(vbucket.key())),
+                format!("{}_{}", vpos.key().to_ascii_lowercase(), vbucket.key().to_ascii_lowercase()),
             )
         }
     };
@@ -613,11 +609,11 @@ fn villain_range(req: &SpotRequest) -> (OpponentSpec, RangeSummary) {
     // summary number was wrong; this aligns the shown size with the actual range.
     let mut buckets = Vec::with_capacity(entries.len());
     let mut weighted_combos: f32 = 0.0;
-    for (key, freq) in &entries {
+    for (key, freq) in entries {
         let f = freq.clamp(0.0, 1.0);
-        weighted_combos += preflop_charts::combos_for_key(key) as f32 * f;
+        weighted_combos += preflop_charts::combos_for_key(&key) as f32 * f;
         buckets.push(RangeBucket {
-            hand_key: key.clone(),
+            hand_key: key,
             weight: f,
         });
     }
@@ -650,7 +646,7 @@ fn build_grid(req: &SpotRequest, hero_key: &str) -> Vec<GridCell> {
         .map(|key| {
             let cell: Option<ChartCell> = preflop_charts::lookup(pos, bucket, &key);
             let freq = cell.map(|c| c.frequency).unwrap_or(0.0);
-            let action = grid_action(req.preflop_line, freq);
+            let action = grid_action(freq);
             let is_hero = key == hero_key;
             GridCell {
                 hand_key: key,
@@ -663,7 +659,7 @@ fn build_grid(req: &SpotRequest, hero_key: &str) -> Vec<GridCell> {
 }
 
 /// Map a chart frequency to a grid action, given the line's "continue" action.
-fn grid_action(line: PreflopLine, freq: f32) -> GridAction {
+fn grid_action(freq: f32) -> GridAction {
     if freq <= 0.0 {
         return GridAction::Fold;
     }
@@ -671,17 +667,7 @@ fn grid_action(line: PreflopLine, freq: f32) -> GridAction {
         return GridAction::Mix;
     }
     // freq ~1.0 → the bucket's full-frequency continue action.
-    match line {
-        // F2 (2026-06-25): vs_4bet continue is a 5-bet JAM (all-in raise), NOT a
-        // flat-call — see `advisor::recommend_preflop` + `preflop_cfr::pot_model`
-        // (`hero_allin = true`). The 169-grid's 4-action legend has no separate
-        // all-in swatch, so a jam is painted as the aggressive `Raise` action —
-        // consistent with the headline (which says AllIn) and never the
-        // contradictory `Call` the user saw before. An all-in IS a raise (to
-        // stack); the previous `Call` told premiums to flat a 4-bet.
-        PreflopLine::Vs4bet => GridAction::Raise,
-        _ => GridAction::Raise,
-    }
+    GridAction::Raise
 }
 
 // ---------------------------------------------------------------------------
@@ -838,9 +824,7 @@ fn round2(v: f32) -> f32 {
     (v * 100.0).round() / 100.0
 }
 
-fn lower(s: &str) -> String {
-    s.to_ascii_lowercase()
-}
+
 
 #[cfg(test)]
 mod tests {
@@ -1401,13 +1385,9 @@ mod tests {
 
     #[test]
     fn grid_maps_freq_to_actions() {
-        assert_eq!(grid_action(PreflopLine::Rfi, 1.0), GridAction::Raise);
-        assert_eq!(grid_action(PreflopLine::Rfi, 0.0), GridAction::Fold);
-        assert_eq!(grid_action(PreflopLine::Rfi, 0.5), GridAction::Mix);
-        // F2: a pure vs_4bet continue is a 5-bet JAM (all-in raise), painted as the
-        // aggressive `Raise` action — NOT the contradictory `Call` it was before
-        // (the headline says AllIn; the grid's 4-action legend has no all-in swatch).
-        assert_eq!(grid_action(PreflopLine::Vs4bet, 1.0), GridAction::Raise);
+        assert_eq!(grid_action(1.0), GridAction::Raise);
+        assert_eq!(grid_action(0.0), GridAction::Fold);
+        assert_eq!(grid_action(0.5), GridAction::Mix);
     }
 
     // -----------------------------------------------------------------------

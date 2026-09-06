@@ -44,9 +44,7 @@ pub const DS_DECK_SEED: &str = "pf:deck-seed:v1";
 /// A persisted hand record. The canonical, end-to-end **verifiable** fixture
 /// source is `cargo run -p mental-poker --bin pf_demo_hand` (it deals a real
 /// engine hand and emits a record whose `server_seed`/`seed_commit`/cards all
-/// satisfy the verifier). `dump_hand_detail` emits a *different* (replay-mock)
-/// shape and ILLUSTRATIVE-only pf fields — it is NOT a `pf_verify` input.
-/// Never hand-authored, per [[lock-interface-spec-first]].
+/// satisfy the verifier).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandRecord {
     /// UUID string (e.g. "01972f3a-...").
@@ -180,7 +178,7 @@ pub fn verify_hand(rec: &HandRecord) -> Result<PfVerifyReport, PfVerifyError> {
     let deck = Deck::new(&mut rng);
     let cards = deck.cards();
     let n = rec.num_players;
-    let needed = 2 * n + rec.community.len();
+    let needed = n.saturating_mul(2).saturating_add(rec.community.len());
     if cards.len() < needed {
         return Err(PfVerifyError(format!(
             "deck has {} cards but the hand needs {} (2*{n} hole + {} board)",
@@ -427,6 +425,21 @@ mod tests {
             dealt_seats: seats.to_vec(),
             hole_cards: hole,
             community: board,
+        }
+    }
+
+    #[test]
+    fn oversized_player_count_is_rejected_without_overflow() {
+        let mut rec = build_and_record(
+            [0x11; 32],
+            BTreeMap::new(),
+            uuid::Uuid::from_bytes([0xAB; 16]),
+            2,
+        );
+        for count in [usize::MAX, usize::MAX / 2 + 1] {
+            rec.num_players = count;
+            let error = verify_hand(&rec).unwrap_err();
+            assert!(error.0.contains("deck has 52 cards"));
         }
     }
 

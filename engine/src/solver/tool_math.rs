@@ -212,11 +212,6 @@ pub struct DetectedDraws {
 /// uses distinct ranks). Returned outs combine flush + straight conservatively
 /// (see [`DetectedDraws::outs`]).
 pub fn detect_draws(hero: &HoleCards, board: &BoardCards) -> DetectedDraws {
-    let mut cards: Vec<Card> = Vec::with_capacity(6);
-    cards.push(hero.card1);
-    cards.push(hero.card2);
-    cards.extend(board.all_cards());
-
     // Only flop (5 cards total) or turn (6 cards total) are meaningful.
     let board_count = board.count();
     if board_count != 3 && board_count != 4 {
@@ -225,6 +220,12 @@ pub fn detect_draws(hero: &HoleCards, board: &BoardCards) -> DetectedDraws {
             outs: 0,
         };
     }
+
+    let board_cards = board.all_cards();
+    let mut cards = Vec::with_capacity(2 + board_cards.len());
+    cards.push(hero.card1);
+    cards.push(hero.card2);
+    cards.extend_from_slice(&board_cards);
 
     let mut draws = Vec::new();
 
@@ -236,7 +237,6 @@ pub fn detect_draws(hero: &HoleCards, board: &BoardCards) -> DetectedDraws {
     // Hero rank-presence bitmask (bit i = Rank::ALL[i]), restricted to ranks the
     // BOARD does not already hold: a hero card duplicating a board rank adds no
     // rank to any straight, so it cannot be hero's participation.
-    let board_cards = board.all_cards();
     let hero_bits: u16 = [hero.card1, hero.card2]
         .iter()
         .filter(|hc| board_cards.iter().all(|bc| bc.rank != hc.rank))

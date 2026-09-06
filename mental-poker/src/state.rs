@@ -505,7 +505,7 @@ impl ProtocolState {
                 ));
             }
         }
-        self.final_deck_hash = Some(p.final_deck_hash.clone());
+        self.final_deck_hash = Some(p.final_deck_hash);
         self.final_deck_commits = p.deck;
         self.phase = Phase::Committed;
         Ok(())
@@ -523,12 +523,12 @@ impl ProtocolState {
         }
         let committed = self
             .final_deck_hash
-            .clone()
+            .as_ref()
             .expect("final deck hash set in Committed phase");
-        if p.final_deck_hash != committed {
+        if &p.final_deck_hash != committed {
             return Err(StateError::ForkedFinalDeck {
                 acked: p.final_deck_hash,
-                committed,
+                committed: committed.clone(),
             });
         }
         if self.acked_seats.contains(&seat) {
@@ -589,9 +589,9 @@ impl ProtocolState {
         }
         let base = 2 * self.n();
         let (want_phase, next_phase, indices) = match p.stage.as_str() {
-            "flop" => (Phase::Dealing, Phase::Flop, vec![base, base + 1, base + 2]),
-            "turn" => (Phase::Flop, Phase::Turn, vec![base + 3]),
-            "river" => (Phase::Turn, Phase::River, vec![base + 4]),
+            "flop" => (Phase::Dealing, Phase::Flop, base..base + 3),
+            "turn" => (Phase::Flop, Phase::Turn, base + 3..base + 4),
+            "river" => (Phase::Turn, Phase::River, base + 4..base + 5),
             other => {
                 return Err(StateError::StageOutOfOrder(format!(
                     "unknown stage '{other}'"
@@ -612,8 +612,8 @@ impl ProtocolState {
                 p.cards.len()
             )));
         }
-        for (card, expected_idx) in p.cards.iter().zip(indices.iter()) {
-            if card.deck_index != *expected_idx {
+        for (card, expected_idx) in p.cards.iter().zip(indices) {
+            if card.deck_index != expected_idx {
                 return Err(StateError::BadDeckIndex(format!(
                     "stage '{}' expected index {expected_idx}, got {}",
                     p.stage, card.deck_index
@@ -642,7 +642,7 @@ impl ProtocolState {
             return Err(StateError::DuplicateCard(card.card_id as u32));
         }
         // Salt + card id must reconstruct the committed final-deck commitment.
-        let salt = parse_salt(&card.salt)
+        let salt = parse_hash(&card.salt)
             .ok_or_else(|| StateError::MalformedPayload("salt not 32 hex bytes".into()))?;
         let expected = self
             .final_deck_commits
@@ -720,13 +720,10 @@ pub fn canonical_initial_deck_hash() -> Hash {
 }
 
 fn parse<T: serde::de::DeserializeOwned>(payload: &Value) -> Result<T, StateError> {
-    serde_json::from_value(payload.clone()).map_err(|e| StateError::MalformedPayload(e.to_string()))
+    T::deserialize(payload).map_err(|e| StateError::MalformedPayload(e.to_string()))
 }
 
-fn parse_salt(hex_str: &str) -> Option<Salt> {
-    // `Salt` and `Hash` are both `[u8; 32]`; reuse the shared hex→32-byte decoder.
-    parse_hash(hex_str)
-}
+
 
 /// Extract the seat from a canonical `party:N` id.
 pub fn seat_of_party(party_id: &str) -> Option<u8> {

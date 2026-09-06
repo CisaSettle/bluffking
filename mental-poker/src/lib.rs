@@ -29,8 +29,7 @@
 //! production and rejects the generic `mental_poker_production` provider
 //! (engine-blind selects real crypto via `resolve_mp_crypto_mode`).
 //! `mental_poker_prefer` may run in production as a best-effort transcript mode,
-//! but it must not be described as server-blind cryptographic Mental Poker. See
-//! `docs/mental-poker-dealing-refactor.md`.
+//! but it must not be described as server-blind cryptographic Mental Poker.
 //!
 //! Pure crate: no async, no IO, no DB — `cargo test -p mental-poker` needs no
 //! database.
@@ -129,14 +128,14 @@ pub fn guard_provider_allowed(kind: DealingProviderKind, app_env: &str) -> Resul
                 Ok(())
             }
         }
-        // The GENERIC unaudited real-crypto path stays rejected EVERYWHERE.
-        // ADR-070 §6 cage point 2 keeps this caged (only the engine-blind
-        // composition below is un-caged).
+        // The generic real-crypto provider is rejected in every environment.
+        // Only the engine-blind composition below is allowed, under ADR-101's
+        // trusted-single-operator scope.
         DealingProviderKind::MentalPokerProduction => Err(
             "DEALING_PROVIDER=mental_poker_production is the generic UNAUDITED \
-             real-crypto path and stays rejected everywhere; ADR-070 un-cages \
-             ONLY the cross-vendor-AI-audited engine-blind composition (see \
-             docs/architecture/adr/ADR-070-engine-blind-production-ga.md §6)"
+             real-crypto path and stays rejected everywhere; ONLY the \
+             engine-blind composition is allowed under the trusted-single-operator \
+             scope (see docs/architecture/adr/ADR-101-engine-blind-honest-operator-scope.html)"
                 .to_string(),
         ),
         // ADR-070 P5 — the cross-vendor-AI-audited engine-blind n-of-n composition is

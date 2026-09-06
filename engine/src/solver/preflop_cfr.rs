@@ -80,7 +80,7 @@
 use crate::card::{Card, Rank, Suit};
 use crate::hand::{BoardCards, HoleCards};
 use crate::solver::equity::{equity, EquityInput, OpponentSpec};
-use crate::solver::preflop_charts::all_hand_keys;
+use crate::solver::preflop_charts::{all_hand_keys, combos_for_key};
 
 /// Number of canonical 169 hand classes.
 pub const N_CLASSES: usize = 169;
@@ -473,7 +473,6 @@ fn class_prior(keys: &[String]) -> Vec<f64> {
 /// continuing junk -EV (the villain that is HERE holds a strong, narrow range).
 type VillainRange = Vec<f64>;
 fn solve_with_matrix(keys: &[String], matrix: EquityMatrix) -> SolveResult {
-    let n = N_CLASSES;
     let prior = class_prior(keys);
 
     // A flat reach (full dealing prior) for spots where the villain is the field
@@ -514,7 +513,7 @@ fn solve_with_matrix(keys: &[String], matrix: EquityMatrix) -> SolveResult {
     for (pi, &pos) in Position::ALL.iter().enumerate() {
         for &bucket in &Bucket::ALL {
             let solved = match bucket {
-                Bucket::Rfi => rfi[pi].as_ref().map(clone_bucket),
+                Bucket::Rfi => rfi[pi].take(),
                 Bucket::FacingOpen => {
                     if matches!(pos, Position::Utg) {
                         None
@@ -555,7 +554,6 @@ fn solve_with_matrix(keys: &[String], matrix: EquityMatrix) -> SolveResult {
             out[pi].push(solved);
         }
     }
-    let _ = n;
 
     SolveResult {
         buckets: out,
@@ -609,9 +607,7 @@ fn continue_reach(b: &SolvedBucket) -> VillainRange {
     (0..N_CLASSES).map(|c| prior[c] * b.freq[c]).collect()
 }
 
-fn clone_bucket(b: &SolvedBucket) -> SolvedBucket {
-    SolvedBucket { freq: b.freq }
-}
+
 
 /// Number of players still to act BEHIND hero when hero open-raises (RFI / iso).
 /// This is the position lever: UTG (5 behind) opens far tighter than BTN (2). An
@@ -1283,15 +1279,7 @@ fn bucket_exploitability(sol: &BucketSolution, matrix: &EquityMatrix) -> Exploit
 }
 
 /// Combo count for a 169 key (pair=6, suited=4, offsuit=12).
-fn combos_for_key(key: &str) -> u32 {
-    let b = key.as_bytes();
-    match b.len() {
-        2 if b[0] == b[1] => 6,
-        3 if b[2] == b's' => 4,
-        3 if b[2] == b'o' => 12,
-        _ => 0,
-    }
-}
+
 
 // --------------------------------------------------------------------------
 // Convenience: the canonical key order (re-exported for the generator/tests).

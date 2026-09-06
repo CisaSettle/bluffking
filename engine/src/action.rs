@@ -45,23 +45,6 @@ pub enum PlayerAction {
     },
 }
 
-impl PlayerAction {
-    /// Returns `true` for the [`AllIn`](PlayerAction::AllIn) variant.
-    pub fn is_all_in(&self) -> bool {
-        matches!(self, PlayerAction::AllIn)
-    }
-
-    /// Returns `true` for the [`Raise`](PlayerAction::Raise) variant.
-    pub fn is_raise(&self) -> bool {
-        matches!(self, PlayerAction::Raise { .. })
-    }
-
-    /// Returns `true` for the [`Fold`](PlayerAction::Fold) variant.
-    pub fn is_fold(&self) -> bool {
-        matches!(self, PlayerAction::Fold)
-    }
-}
-
 /// One betting action taken during a hand, with chip context.
 ///
 /// The `stack_before` field is populated by the engine at action time —
@@ -119,73 +102,7 @@ pub enum ActionError {
     /// The hand has not started yet.
     #[error("hand not started")]
     HandNotStarted,
-    /// The provided `hand_id` does not match the active hand.
-    #[error("stale hand reference")]
-    StaleHand,
-    /// The provided street does not match the active street.
-    #[error("stale street reference")]
-    StaleStreet,
-    /// The `client_action_seq` does not match the server's counter.
-    #[error("action out of sequence")]
-    OutOfSequence,
-    /// The `all_in` amount does not equal the player's remaining stack.
-    #[error("invalid all-in amount")]
-    InvalidAllInAmount,
     /// Cannot act: the player has already folded.
     #[error("player has folded")]
     AlreadyFolded,
-    /// Straddle is reserved and cannot be used in M1.
-    #[error("straddle is not supported in M1")]
-    StraddleNotSupported,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn player_action_all_in_present() {
-        let action = PlayerAction::AllIn;
-        assert!(action.is_all_in());
-        assert!(!action.is_fold());
-    }
-
-    #[test]
-    fn player_action_fold() {
-        let action = PlayerAction::Fold;
-        assert!(action.is_fold());
-        assert!(!action.is_all_in());
-    }
-
-    #[test]
-    fn player_action_match_exhaustive() {
-        // This test ensures all variants are reachable.
-        let actions = [
-            PlayerAction::Fold,
-            PlayerAction::Check,
-            PlayerAction::Call,
-            PlayerAction::Raise { amount: Chips(100) },
-            PlayerAction::AllIn,
-            PlayerAction::Blind {
-                kind: BlindKind::Small,
-                amount: Chips(10),
-            },
-        ];
-        for action in &actions {
-            match action {
-                PlayerAction::Fold => {}
-                PlayerAction::Check => {}
-                PlayerAction::Call => {}
-                PlayerAction::Raise { .. } => {}
-                PlayerAction::AllIn => {}
-                PlayerAction::Blind { .. } => {}
-            }
-        }
-    }
-
-    #[test]
-    fn action_error_display() {
-        let e = ActionError::NotYourTurn;
-        assert!(!e.to_string().is_empty());
-    }
 }

@@ -1,8 +1,8 @@
 //! Offline transcript verifier.
 //!
-//! [`verify`] replays an exported [`Transcript`] and checks **every** rule in
-//! `docs/mental-poker-dealing-refactor.md` §5. It is pure: no DB, no network,
-//! no clock. Anyone — a player, an auditor, a regulator — can run it against an
+//! [`verify`] replays an exported [`Transcript`] and validates its signatures,
+//! event order, deck commitments, and reveal proofs. It uses no DB, network,
+//! or clock. Anyone — a player, an auditor, a regulator — can run it against an
 //! exported transcript and a key directory to confirm the hand was dealt
 //! honestly.
 //!
@@ -23,7 +23,7 @@
 //! `shuffle_pubkey`) their client actually generated.
 
 use crate::crypto::{
-    DecryptionProvider, MockDecryptionProvider, MockShuffleProofProvider, Salt,
+    DecryptionProvider, MockDecryptionProvider, MockShuffleProofProvider,
     ShuffleProofProvider,
 };
 use crate::events::*;
@@ -31,6 +31,7 @@ use crate::hash::{canonical_json, ds_hash, hex_hash, parse_hash, Hash, ZERO_HASH
 use crate::signing::{MockSignatureProvider, SignatureProvider};
 use crate::state::{Phase, ProtocolState, StateError};
 use crate::transcript::{Transcript, TranscriptEvent, PROTOCOL_VERSION};
+use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
 
@@ -616,7 +617,7 @@ pub fn verify(transcript: &Transcript) -> Result<VerifyReport, VerifyError> {
             let pok: crate::crypto_real::dkg::SchnorrPok = event
                 .payload
                 .get("key_pok")
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .and_then(|v| serde::Deserialize::deserialize(v).ok())
                 .ok_or_else(|| {
                     err(
                         seq,
@@ -633,7 +634,9 @@ pub fn verify(transcript: &Transcript) -> Result<VerifyReport, VerifyError> {
         }
 
         // (8 / 12) cryptographic proof checks via the provider interfaces.
-        let expected_joint_key = if bind_shuffle_key {
+        let expected_joint_key = if bind_shuffle_key
+            && event.event_type == event_type::SHUFFLE_CONTRIBUTION
+        {
             joint_key_acc.map(|q| crate::crypto_real::ec::point_to_hex(&q))
         } else {
             None
@@ -659,7 +662,7 @@ pub fn verify(transcript: &Transcript) -> Result<VerifyReport, VerifyError> {
         events_checked: transcript.events.len(),
         final_phase: state.phase,
         num_players: state.num_players,
-        revealed_card_ids: state.opened_card_ids.clone(),
+        revealed_card_ids: state.opened_card_ids,
         // BUG-108: record whether the proof systems are the real (sound) schemes
         // or dev-only mocks, so no consumer mistakes a consistent mock-crypto
         // replay for a cryptographic fairness guarantee. The schemes were already
@@ -775,7 +778,7 @@ fn check_decryption(
     party: &str,
     card: &OpenedCard,
 ) -> Result<(), VerifyError> {
-    let salt = parse_salt(&card.salt).ok_or_else(|| err(seq, malformed("salt")))?;
+    let salt = parse_hash(&card.salt).ok_or_else(|| err(seq, malformed("salt")))?;
     if !decryption.verify_decryption(party, card.deck_index, card.card_id, &salt, &card.proof) {
         return Err(err(
             seq,
@@ -1031,20 +1034,16 @@ fn final_ciphertext_deck(
     use crate::crypto_real::ec::{deck_hash as ct_deck_hash, Ct, DECK_SIZE};
 
     // The seq of `final_deck_committed`, for error attribution (0 if absent).
-    let committed_seq = transcript
+    let committed_event = transcript
         .events
         .iter()
-        .find(|e| e.event_type == event_type::FINAL_DECK_COMMITTED)
-        .map(|e| e.sequence_number)
-        .unwrap_or(0);
+        .find(|e| e.event_type == event_type::FINAL_DECK_COMMITTED);
+    let committed_seq = committed_event.map(|e| e.sequence_number).unwrap_or(0);
 
     // (1) The ciphertext deck bound on `final_deck_committed.deck_ct`. Decode
     // strictly: present, exactly 52 entries, every point valid.
-    let from_committed: Option<Vec<Ct>> = transcript
-        .events
-        .iter()
-        .find(|e| e.event_type == event_type::FINAL_DECK_COMMITTED)
-        .and_then(|ev| serde_json::from_value::<FinalDeckCommittedPayload>(ev.payload.clone()).ok())
+    let from_committed: Option<Vec<Ct>> = committed_event
+        .and_then(|ev| FinalDeckCommittedPayload::deserialize(&ev.payload).ok())
         .and_then(|payload| payload.deck_ct)
         .map(|wire| {
             if wire.len() != DECK_SIZE {
@@ -1080,7 +1079,7 @@ fn final_ciphertext_deck(
             match last_shuffle {
                 Some(ev) => {
                     let payload: ShuffleContributionPayload =
-                        serde_json::from_value(ev.payload.clone()).map_err(|e| {
+                        ShuffleContributionPayload::deserialize(&ev.payload).map_err(|e| {
                             err(
                                 ev.sequence_number,
                                 VerifyErrorKind::MalformedPayload(e.to_string()),
@@ -1100,7 +1099,7 @@ fn final_ciphertext_deck(
         // genuine `final_deck_hash` + verified shuffle proof but substitutes
         // `deck_ct` is caught here even before the state-machine bind.
         (Some(committed), Some(proof)) => {
-            if hex_hash(&ct_deck_hash(&committed)) != hex_hash(&ct_deck_hash(&proof)) {
+            if ct_deck_hash(&committed) != ct_deck_hash(&proof) {
                 return Err(err(
                     committed_seq,
                     VerifyErrorKind::CiphertextDeckUnbound(
@@ -1133,7 +1132,7 @@ fn final_ciphertext_deck(
 }
 
 fn parse<T: serde::de::DeserializeOwned>(seq: u64, payload: &Value) -> Result<T, VerifyError> {
-    serde_json::from_value(payload.clone())
+    T::deserialize(payload)
         .map_err(|e| err(seq, VerifyErrorKind::MalformedPayload(e.to_string())))
 }
 
@@ -1141,15 +1140,7 @@ fn malformed(what: &str) -> VerifyErrorKind {
     VerifyErrorKind::MalformedPayload(what.to_string())
 }
 
-fn parse_salt(hex_str: &str) -> Option<Salt> {
-    let bytes = hex::decode(hex_str).ok()?;
-    if bytes.len() != 32 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&bytes);
-    Some(out)
-}
+
 
 // ---------------------------------------------------------------------------
 // Tests

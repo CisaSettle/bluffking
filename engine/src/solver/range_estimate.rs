@@ -104,15 +104,14 @@ impl RangeEstimate {
 pub fn estimate_range(position: PositionBucket, action: ActionBucket) -> RangeEstimate {
     let entries = preflop_charts::range_entries(position, action);
 
-    let mut hand_classes: Vec<RangeClass> = entries
-        .iter()
+    let hand_classes: Vec<RangeClass> = entries
+        .into_iter()
         .filter(|(_, freq)| *freq > 0.0)
         .map(|(key, freq)| RangeClass {
-            key: key.clone(),
-            frequency: *freq,
+            key,
+            frequency: freq,
         })
         .collect();
-    hand_classes.sort_by(|a, b| a.key.cmp(&b.key));
 
     // Combo-weight the range: each class contributes `combos_for_key * freq`
     // combos. Sum / 1326 is the "top N%" figure.
@@ -126,7 +125,7 @@ pub fn estimate_range(position: PositionBucket, action: ActionBucket) -> RangeEs
     let basis = basis_label(position, action, hand_classes.is_empty());
 
     RangeEstimate {
-        position: position_label(position).to_string(),
+        position: position.key().to_string(),
         action: action.key().to_string(),
         top_pct,
         combos,
@@ -135,16 +134,11 @@ pub fn estimate_range(position: PositionBucket, action: ActionBucket) -> RangeEs
     }
 }
 
-/// Canonical short position label for a bucket (BTN/CO/MP/UTG/SB/BB).
-fn position_label(position: PositionBucket) -> &'static str {
-    position.key()
-}
-
 /// Human-readable derivation statement (the honesty label). Stated in English;
 /// the client localizes / re-renders for display, but the *content* always
 /// names position + the observed action and disclaims literal-card precision.
 fn basis_label(position: PositionBucket, action: ActionBucket, empty: bool) -> String {
-    let pos = position_label(position);
+    let pos = position.key();
     let act = match action {
         ActionBucket::Rfi => "an opening raise (RFI)",
         ActionBucket::FacingOpen => "a call/raise facing one open",

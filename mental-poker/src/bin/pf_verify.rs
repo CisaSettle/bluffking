@@ -3,8 +3,7 @@
 //! Recomputes the deck of any `existing_server` hand from its revealed secrets
 //! and confirms it matches the persisted cards. Reads a JSON `HandRecord`.
 //!
-//! For a working, end-to-end verifiable fixture, use the sibling demo binary
-//! (`dump_hand_detail`'s pf fields are illustrative-only and do NOT verify):
+//! For a working, end-to-end verifiable fixture, use the sibling demo binary:
 //!
 //! ```text
 //! cargo run -p mental-poker --bin pf_demo_hand \

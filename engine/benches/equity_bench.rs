@@ -13,7 +13,7 @@
 //! Run:  cargo bench -p engine --bench equity_bench
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use engine::solver::equity::{equity, EquityInput, OpponentSpec};
+use engine::solver::equity::{equity, EquityInput, OpponentSpec, RangeBucket};
 use engine::{rank_hand, BoardCards, Card, HoleCards, Rank, Suit};
 use std::hint::black_box;
 
@@ -98,6 +98,38 @@ fn bench_equity(crit: &mut Criterion) {
                 hero: aa(),
                 board: flop_board(),
                 opponents: OpponentSpec::Random(2),
+                trials: 600,
+                seed: 0xC0FFEE,
+                early_stop: None,
+            }))
+        })
+    });
+
+    g.bench_function("known_flop_exact", |b| {
+        b.iter(|| {
+            equity(black_box(EquityInput {
+                hero: aa(),
+                board: flop_board(),
+                opponents: OpponentSpec::Known(vec![HoleCards::new(
+                    card(Rank::King, Suit::Spades),
+                    card(Rank::King, Suit::Hearts),
+                )]),
+                trials: 600,
+                seed: 0xC0FFEE,
+                early_stop: None,
+            }))
+        })
+    });
+
+    g.bench_function("range_flop_600", |b| {
+        b.iter(|| {
+            equity(black_box(EquityInput {
+                hero: aa(),
+                board: flop_board(),
+                opponents: OpponentSpec::Range(vec![RangeBucket {
+                    hand_key: "KQs".into(),
+                    weight: 1.0,
+                }]),
                 trials: 600,
                 seed: 0xC0FFEE,
                 early_stop: None,

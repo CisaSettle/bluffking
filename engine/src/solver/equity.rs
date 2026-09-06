@@ -1,16 +1,15 @@
 //! Equity estimation by Monte Carlo + exact-enumeration showdown.
 //!
 //! Public API uses engine types (`HoleCards`, `BoardCards`) — no `rs_poker`
-//! leaks (ADR-012). Showdown comparisons reuse `engine::eval::rank_players`.
+//! leaks (ADR-012). Showdown comparisons reuse the board bitset across opponents.
 //!
 //! Determinism: all randomness is sourced from a caller-supplied seed
 //! (`u64`); the same `(hero, board, opponents, trials, seed)` always produces
 //! the same `EquityResult` byte-for-byte (ADR-043 §6).
 
 use crate::card::{Card, Rank, Suit};
-use crate::eval::{board_eval, rank_players, rank_with_board};
+use crate::eval::{board_eval, rank_with_board};
 use crate::hand::{BoardCards, HoleCards};
-use crate::player::PlayerId;
 use crate::rng::PokerRng;
 
 use super::{
@@ -278,30 +277,28 @@ fn equity_inner(input: EquityInput) -> (EquityResult, u32) {
         // sampled villain's two cards so a board card can never collide with it.
         // This low-frequency path keeps the engine's seeded ChaCha RNG.
         let mut rng = PokerRng::from_seed(input.seed);
+        let total_weight: f32 = pool.iter().map(|(_, weight)| *weight).sum();
+        let mut available = Vec::with_capacity(remaining_deck.len());
         for _ in 0..trials {
-            let v = sample_weighted(pool, &mut rng);
-            let mut available: Vec<Card> = remaining_deck
-                .iter()
-                .copied()
-                .filter(|c| *c != v.card1 && *c != v.card2)
-                .collect();
+            let v = sample_weighted(pool, total_weight, &mut rng);
+            // Restore the same deck order before every shuffle to preserve the
+            // seeded draw sequence while reusing the allocation.
+            available.clear();
+            available.extend(
+                remaining_deck
+                    .iter()
+                    .copied()
+                    .filter(|c| *c != v.card1 && *c != v.card2),
+            );
             shuffle_in_place(&mut available, &mut rng);
             let mut sim_board = input.board.clone();
             let mut cursor = 0usize;
             fill_board(&mut sim_board, &mut available, &mut cursor);
-            // `Range` is always exactly ONE villain (n_opp == 1), so a tie is
-            // always a 2-way chop worth SHARE_SCALE/2.
-            match hero_outcome(input.hero, &sim_board, std::slice::from_ref(&v)) {
-                HeroOutcome::Win => {
-                    wins += 1;
-                    share_sum += SHARE_SCALE;
-                }
-                HeroOutcome::Tie => {
-                    ties += 1;
-                    share_sum += SHARE_SCALE / 2;
-                }
-                HeroOutcome::Loss => {}
-            }
+            let (win, tie, share) =
+                showdown_share(&input.hero, &sim_board, std::slice::from_ref(&v));
+            wins += win as u32;
+            ties += tie as u32;
+            share_sum += share;
         }
     } else {
         // `Known` opponents reaching the MC loop are PREFLOP only (postflop
@@ -510,39 +507,6 @@ pub(crate) fn equity_vs_random_full(
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Outcome of a single showdown from hero's perspective.
-enum HeroOutcome {
-    Win,
-    Tie,
-    Loss,
-}
-
-/// Run one showdown of hero (seated at `PlayerId(0)`) plus `opponents` on
-/// `board`, returning hero's outcome. Shared by the MC loop and the exact
-/// river path so the win/tie/loss classification lives in one place.
-fn hero_outcome(hero: HoleCards, board: &BoardCards, opponents: &[HoleCards]) -> HeroOutcome {
-    let mut players: Vec<(PlayerId, HoleCards)> = Vec::with_capacity(1 + opponents.len());
-    players.push((PlayerId::new(0), hero));
-    for (i, h) in opponents.iter().enumerate() {
-        players.push((PlayerId::new((i + 1) as u64), *h));
-    }
-    let ranked = rank_players(&players, board);
-    let top_rank = ranked[0].1;
-    let hero_rank = ranked
-        .iter()
-        .find(|(pid, _)| pid.inner() == 0)
-        .map(|(_, r)| *r)
-        .unwrap_or(top_rank);
-    let winners_at_top: usize = ranked.iter().take_while(|(_, r)| *r == top_rank).count();
-    if hero_rank != top_rank {
-        HeroOutcome::Loss
-    } else if winners_at_top == 1 {
-        HeroOutcome::Win
-    } else {
-        HeroOutcome::Tie
-    }
-}
-
 /// Hero's outcome in one deterministic showdown, as
 /// `(win, tie, share)` where `win`/`tie` are 0/1 flags and `share` is hero's
 /// exact pot share in [`SHARE_SCALE`] units: loss → `(0, 0, 0)`; sole win →
@@ -554,27 +518,21 @@ fn showdown_share(
     board: &BoardCards,
     opponents: &[HoleCards],
 ) -> (u64, u64, u64) {
-    let mut players: Vec<(PlayerId, HoleCards)> = Vec::with_capacity(1 + opponents.len());
-    players.push((PlayerId::new(0), *hero));
-    for (i, h) in opponents.iter().enumerate() {
-        players.push((PlayerId::new((i + 1) as u64), *h));
+    let board = board_eval(board);
+    let hero_rank = rank_with_board(&board, hero);
+    let mut winners = 1u64;
+    for opponent in opponents {
+        match rank_with_board(&board, opponent).cmp(&hero_rank) {
+            std::cmp::Ordering::Greater => return (0, 0, 0),
+            std::cmp::Ordering::Equal => winners += 1,
+            std::cmp::Ordering::Less => {}
+        }
     }
-    let ranked = rank_players(&players, board);
-    let top_rank = ranked[0].1;
-    let hero_rank = ranked
-        .iter()
-        .find(|(pid, _)| pid.inner() == 0)
-        .map(|(_, r)| *r)
-        .unwrap_or(top_rank);
-    if hero_rank != top_rank {
-        return (0, 0, 0);
-    }
-    let winners_at_top = ranked.iter().take_while(|(_, r)| *r == top_rank).count() as u64;
-    if winners_at_top <= 1 {
+    if winners == 1 {
         (1, 0, SHARE_SCALE)
     } else {
-        // `winners_at_top` ≤ 6 (6-max) divides SHARE_SCALE exactly.
-        (0, 1, SHARE_SCALE / winners_at_top)
+        // At most six players; each possible tie divides SHARE_SCALE exactly.
+        (0, 1, SHARE_SCALE / winners)
     }
 }
 
@@ -763,8 +721,7 @@ pub fn range_legal_combos(buckets: &[RangeBucket], used: &[Card]) -> usize {
 /// Weighted-sample one villain hand from the pool. Determinism comes from the
 /// caller's `PokerRng`. The pool is assumed non-empty (the empty case falls
 /// back to `Random(1)` before the MC loop).
-fn sample_weighted(pool: &[(HoleCards, f32)], rng: &mut PokerRng) -> HoleCards {
-    let total: f32 = pool.iter().map(|(_, w)| *w).sum();
+fn sample_weighted(pool: &[(HoleCards, f32)], total: f32, rng: &mut PokerRng) -> HoleCards {
     if total <= 0.0 {
         return pool[0].0;
     }

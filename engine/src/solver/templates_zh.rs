@@ -295,12 +295,7 @@ pub fn strength_zh(hs: HandStrength) -> &'static str {
 
 /// Truncate to `max` Unicode scalar values (NOT bytes).
 fn truncate_chars(s: &str, max: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= max {
-        s.to_string()
-    } else {
-        chars[..max].iter().collect()
-    }
+    s.chars().take(max).collect()
 }
 
 #[cfg(test)]

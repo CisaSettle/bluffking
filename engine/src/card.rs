@@ -128,7 +128,7 @@ impl fmt::Display for Card {
 
 impl Serialize for Card {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.to_string())
+        serializer.collect_str(self)
     }
 }
 

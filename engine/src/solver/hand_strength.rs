@@ -68,10 +68,8 @@ impl HandStrength {
 /// unpaired hand. Templates can still reference these; advisor uses preflop
 /// charts as the primary signal.
 pub fn classify(hole: HoleCards, board: &BoardCards) -> HandStrength {
-    let board_cards = board.all_cards();
-
     // Preflop coarse classification.
-    if board_cards.is_empty() {
+    if board.count() == 0 {
         if hole.card1.rank == hole.card2.rank {
             let r = hole.card1.rank;
             return if r >= Rank::Jack {
@@ -85,6 +83,7 @@ pub fn classify(hole: HoleCards, board: &BoardCards) -> HandStrength {
         return HandStrength::PairWeak;
     }
 
+    let board_cards = board.all_cards();
     let hole_cards = [hole.card1, hole.card2];
     let all_cards: Vec<Card> = hole_cards
         .iter()
@@ -312,8 +311,8 @@ fn is_two_pair(cards: &[Card]) -> bool {
 /// board alone tells us whether hero's cards strengthen the two pair or merely
 /// play the board's (OSS dual-AI review 2026-07-01, finding C1).
 fn top_two_pair_ranks(counts: &[u8; 13]) -> Option<(usize, usize)> {
-    let pairs: Vec<usize> = (0..13).rev().filter(|&r| counts[r] >= 2).collect();
-    (pairs.len() >= 2).then(|| (pairs[0], pairs[1]))
+    let mut pairs = (0..13).rev().filter(|&r| counts[r] >= 2);
+    Some((pairs.next()?, pairs.next()?))
 }
 
 /// The `(trips_rank, pair_rank)` of the best full house makeable from `counts`
@@ -346,9 +345,8 @@ fn classify_pair(hole: HoleCards, board: &[Card]) -> Option<HandStrength> {
         // A pocket pair below the top board card but ABOVE the second board rank
         // plays like middle pair — it beats every board pair except the top one
         // (U36, dual-AI OSS review). Only a pair at/below the second rank is weak.
-        let mut sorted: Vec<Rank> = board_ranks.clone();
-        sorted.sort_by(|a, b| b.cmp(a));
-        if board.len() >= 2 && pair_rank > sorted[1] {
+        board_ranks.sort_by(|a, b| b.cmp(a));
+        if board.len() >= 2 && pair_rank > board_ranks[1] {
             return Some(HandStrength::PairMiddle);
         }
         return Some(HandStrength::PairWeak);

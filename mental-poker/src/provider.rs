@@ -31,8 +31,8 @@ pub struct DealRequest {
 #[derive(Debug, Clone)]
 pub struct DealtHand {
     /// The 52 cards in final deal order. The engine consumes this via
-    /// `engine::Deck::from_cards`; deck index → role layout is documented in
-    /// `docs/mental-poker-dealing-refactor.md` §2.3.
+    /// `engine::Deck::from_cards`; [`crate::state::ProtocolState`] tracks each
+    /// deck index's reveal role.
     pub deck: Vec<Card>,
     /// A 256-bit reproducibility seed recorded on the `hands` row
     /// (`deck_seed_b` BYTEA — ADR-062 §2).

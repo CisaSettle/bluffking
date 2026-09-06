@@ -2,8 +2,8 @@
 //!
 //! Mirrors the spec's "generate a real hand, then verify it" requirement: we
 //! deal a genuine `engine` hand from a derived `deck_seed` (the exact path the
-//! server's `pf_dealing` uses), serialize a `HandRecord` shaped like the
-//! `dump_hand_detail` fixture, then assert `pf::verify_hand` accepts it and
+//! server's `pf_dealing` uses), serialize a `HandRecord`, then assert
+//! `pf::verify_hand` accepts it and
 //! rejects mutated variants. Fixtures are generated from real engine output,
 //! never hand-authored (per [[lock-interface-spec-first]]).
 
@@ -14,7 +14,7 @@ use mental_poker::hash::ds_hash;
 use mental_poker::pf::{derive_deck_seed, verify_hand, HandRecord, DS_SEED_COMMIT};
 
 /// Deal a real hand from `(server_seed, client_seeds, hand_id)` and build the
-/// JSON-shaped record a verifier would receive from `dump_hand_detail`.
+/// JSON-shaped record consumed by `pf_verify`.
 fn record_for(
     server_seed: [u8; 32],
     client_seeds: BTreeMap<u8, [u8; 32]>,

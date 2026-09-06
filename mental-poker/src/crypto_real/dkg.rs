@@ -324,13 +324,6 @@ pub struct DkgShare {
     pub pok: SchnorrPok,
 }
 
-/// The coordinator-authored joint-key event (verifier recomputes the sum).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct JointKeyCommitted {
-    /// `Q = Σ Q_i` as 64-hex point.
-    pub joint_pubkey: String,
-}
-
 /// Errors from DKG verification (all are clean rejects, never panics).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DkgError {

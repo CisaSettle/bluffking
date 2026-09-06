@@ -48,15 +48,7 @@ impl SolverAction {
         }
     }
 
-    /// True iff this is an aggressive line (Raise or AllIn).
-    pub fn is_aggressive(self) -> bool {
-        matches!(self, SolverAction::Raise | SolverAction::AllIn)
-    }
 
-    /// True iff this is a passive continuing line (Check or Call).
-    pub fn is_passive_continue(self) -> bool {
-        matches!(self, SolverAction::Check | SolverAction::Call)
-    }
 }
 
 /// Verdict (mirrors ADR-029 §4.3 `verdict`).
@@ -311,7 +303,7 @@ fn analyze_preflop(
     let cell_freq = lookup(pos, bucket, &key)
         .map(|c| c.frequency)
         .unwrap_or(0.0);
-    let continue_action = preflop_continue_action(pos, bucket, &key);
+    let continue_action = preflop_continue_action(bucket);
     let verdict = preflop_verdict(
         input.hero_action_taken,
         gto_action,
@@ -353,33 +345,7 @@ pub(crate) fn recommend_preflop(
     key: &str,
 ) -> SolverAction {
     match lookup(pos, bucket, key) {
-        Some(c) if c.frequency >= 0.5 => {
-            // Aggressive action: vs_4bet=AllIn (5-bet jam), others=Raise.
-            match bucket {
-                // F2 (2026-06-25): the v3 CFR model's vs_4bet continue is a 5-bet
-                // JAM (all-in), NOT a flat-call — see `preflop_cfr::pot_model`
-                // (`hero_cont = STACK`, `hero_allin = true`) and the JSON `_doc`
-                // ("'Continue' means … jam for vs_4bet"). The headline previously
-                // said Call, telling premiums (freq 1.0) to FLAT a 4-bet at 100bb
-                // — directly contradicting the model the chart was solved from.
-                // The recommendation MUST match the modelled action: jam = AllIn.
-                ActionBucket::Vs4bet => SolverAction::AllIn,
-                // `facing_open` is a 3-BET range in the v3 CFR model: the bucket's
-                // `pot_model` continue is a 3-bet (`hero_cont = threebet`,
-                // `hero_aggressor = true`, see `preflop_cfr::pot_model`), so the
-                // grid paints every freq≥0.5 facing_open cell as RAISE. The
-                // recommendation MUST match the grid — a hand with facing_open
-                // freq≥0.5 is a 3-bet (Raise), NOT a flat-call. (F2, 2026-06-25:
-                // the pre-v3 "union of value-3bet + flat-call defense" split below
-                // is stale — it returned Call for dozens of REACHABLE cells the
-                // v3 grid paints Raise, e.g. MP/SB/BB KQo,QJo,A9s and CO/BTN
-                // 76s,A9s,J8s, so the user saw Raise on the grid but Call in the
-                // headline. The model no longer has a separate flat-call defense
-                // bucket; facing_open IS the 3-bet bucket.)
-                ActionBucket::FacingOpen => SolverAction::Raise,
-                _ => SolverAction::Raise,
-            }
-        }
+        Some(c) if c.frequency >= 0.5 => preflop_continue_action(bucket),
         // Chart says fold OR chart missing — fold safe.
         Some(_) | None => SolverAction::Fold,
     }
@@ -433,26 +399,11 @@ pub(crate) fn recommend_preflop_spot(
     }
 }
 
-/// The NON-fold (continue) action for a preflop bucket, INDEPENDENT of the cell's
-/// frequency. This is the "other branch" of a mixed cell — exactly the action
-/// `recommend_preflop` would name if the cell's frequency were ≥ 0.5. Used by the
-/// mixed-cell verdict (F6) so the equilibrium's continue branch is recognized even
-/// when the headline collapses the cell to Fold (freq < 0.5). Mirrors the
-/// action-selection in `recommend_preflop`: vs_4bet = AllIn (5-bet jam),
-/// facing_open = Raise (v3 facing_open is a 3-bet bucket — see `recommend_preflop`
-/// F2 note), else Raise.
-pub(crate) fn preflop_continue_action(
-    _pos: super::preflop_charts::PositionBucket,
-    bucket: ActionBucket,
-    _key: &str,
-) -> SolverAction {
+/// The chart's continue branch: a 5-bet jam against a 4-bet, otherwise a
+/// raise. Both the recommendation and mixed-cell verdict use this mapping.
+pub(crate) fn preflop_continue_action(bucket: ActionBucket) -> SolverAction {
     match bucket {
-        // F2: vs_4bet continue is a 5-bet JAM, not a flat-call (see
-        // `recommend_preflop` F2 note + `preflop_cfr::pot_model`).
         ActionBucket::Vs4bet => SolverAction::AllIn,
-        // v3: facing_open IS the 3-bet bucket, so its continue branch is Raise
-        // (matches the grid + `recommend_preflop`). See the F2 note there.
-        ActionBucket::FacingOpen => SolverAction::Raise,
         _ => SolverAction::Raise,
     }
 }
@@ -639,13 +590,6 @@ pub(crate) fn verdict_from_actions(
         return SolverVerdict::Mistake;
     }
     // Both aggressive ↔ both aggressive (Raise vs AllIn): Ok.
-    if hero.is_aggressive() && gto.is_aggressive() {
-        return SolverVerdict::Ok;
-    }
-    // Both passive-continue (Check vs Call when both are valid): Ok.
-    if hero.is_passive_continue() && gto.is_passive_continue() {
-        return SolverVerdict::Ok;
-    }
     SolverVerdict::Ok
 }
 
