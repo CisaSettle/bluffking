@@ -2915,7 +2915,10 @@ fn odd_chip_recipients(
     let mut sorted = ids.to_vec();
     sorted.sort_by_key(|pid| {
         (
-            button_order.get(&pid.inner()).copied().unwrap_or(usize::MAX),
+            button_order
+                .get(&pid.inner())
+                .copied()
+                .unwrap_or(usize::MAX),
             pid.inner(),
         )
     });

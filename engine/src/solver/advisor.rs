@@ -47,8 +47,6 @@ impl SolverAction {
             SolverAction::AllIn => "all_in",
         }
     }
-
-
 }
 
 /// Verdict (mirrors ADR-029 §4.3 `verdict`).

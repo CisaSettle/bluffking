@@ -533,8 +533,7 @@ fn flat_defend_range(vpos: PositionBucket) -> Vec<(HandKey, f32)> {
         preflop_charts::range_entries(vpos, ActionBucket::FacingOpen)
             .into_iter()
             .collect();
-    rfi
-        .into_iter()
+    rfi.into_iter()
         .filter_map(|(key, rfi_f)| {
             let tb = threebet.get(&key).copied().unwrap_or(0.0);
             let flat = (rfi_f - tb).clamp(0.0, 1.0);
@@ -592,7 +591,11 @@ fn villain_range(req: &SpotRequest) -> (OpponentSpec, RangeSummary) {
             };
             (
                 preflop_charts::range_entries(vpos, vbucket),
-                format!("{}_{}", vpos.key().to_ascii_lowercase(), vbucket.key().to_ascii_lowercase()),
+                format!(
+                    "{}_{}",
+                    vpos.key().to_ascii_lowercase(),
+                    vbucket.key().to_ascii_lowercase()
+                ),
             )
         }
     };
@@ -823,8 +826,6 @@ fn bb_to_units(bb: f32) -> u32 {
 fn round2(v: f32) -> f32 {
     (v * 100.0).round() / 100.0
 }
-
-
 
 #[cfg(test)]
 mod tests {

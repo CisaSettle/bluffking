@@ -876,8 +876,10 @@ fn verify_reenc(
     //   and Σ f_j·D_in[j].c1 + R·G = Lhs1 (the homomorphic identity, c1 coord),
     //   so LHS-A1 = Tf1 + T1 + c·Lhs1 = RHS-A1. A cheating output deck breaks
     //   the homomorphic identity, so Eq-A holds only for a genuine shuffle.
-    let zf_din_c1: RistrettoPoint = RistrettoPoint::multiscalar_mul(&z_f, d_in.iter().map(|c| c.c1));
-    let zf_din_c2: RistrettoPoint = RistrettoPoint::multiscalar_mul(&z_f, d_in.iter().map(|c| c.c2));
+    let zf_din_c1: RistrettoPoint =
+        RistrettoPoint::multiscalar_mul(&z_f, d_in.iter().map(|c| c.c1));
+    let zf_din_c2: RistrettoPoint =
+        RistrettoPoint::multiscalar_mul(&z_f, d_in.iter().map(|c| c.c2));
 
     let eq_a1 = (zf_din_c1 + z_r * G) == (tf1 + t1 + c * lhs1);
     let eq_a2 = (zf_din_c2 + z_r * q) == (tf2 + t2 + c * lhs2);

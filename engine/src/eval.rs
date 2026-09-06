@@ -211,7 +211,11 @@ pub fn board_eval(board: &BoardCards) -> BoardEval {
     if let Some(r) = board.river {
         hand.insert(card_to_rs(r));
     }
-    debug_assert_eq!(hand.count(), board.count(), "board contains duplicate cards");
+    debug_assert_eq!(
+        hand.count(),
+        board.count(),
+        "board contains duplicate cards"
+    );
     BoardEval { hand }
 }
 

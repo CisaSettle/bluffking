@@ -607,8 +607,6 @@ fn continue_reach(b: &SolvedBucket) -> VillainRange {
     (0..N_CLASSES).map(|c| prior[c] * b.freq[c]).collect()
 }
 
-
-
 /// Number of players still to act BEHIND hero when hero open-raises (RFI / iso).
 /// This is the position lever: UTG (5 behind) opens far tighter than BTN (2). An
 /// open is contested if ANY of the `n` defenders wakes up, and the showdown is
@@ -1277,9 +1275,6 @@ fn bucket_exploitability(sol: &BucketSolution, matrix: &EquityMatrix) -> Exploit
         hero_cont_mass: cont_mass,
     }
 }
-
-/// Combo count for a 169 key (pair=6, suited=4, offsuit=12).
-
 
 // --------------------------------------------------------------------------
 // Convenience: the canonical key order (re-exported for the generator/tests).

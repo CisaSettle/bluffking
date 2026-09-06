@@ -80,7 +80,9 @@ impl WasmParty {
     #[wasm_bindgen(constructor)]
     pub fn new(party_id: String) -> WasmParty {
         let mut rng = OsRng;
-        WasmParty { inner: DkgParty::generate(party_id, &mut rng) }
+        WasmParty {
+            inner: DkgParty::generate(party_id, &mut rng),
+        }
     }
 
     #[wasm_bindgen(getter)]
@@ -91,7 +93,12 @@ impl WasmParty {
     /// DKG registration message `{party_id, q_i, pok}` — public material only.
     pub fn register(&self) -> String {
         let mut rng = OsRng;
-        let pok = schnorr_prove(&self.inner.party_id, &self.inner.x_i, &self.inner.q_i, &mut rng);
+        let pok = schnorr_prove(
+            &self.inner.party_id,
+            &self.inner.x_i,
+            &self.inner.q_i,
+            &mut rng,
+        );
         serde_json::json!({
             "party_id": self.inner.party_id,
             "q_i": point_to_hex(&self.inner.q_i),
@@ -113,7 +120,10 @@ impl WasmParty {
         // deck is O(n) needless work. The shuffle only ever operates on the full
         // 52-card deck, so require exactly that.
         if wires.len() != DECK_SIZE {
-            return Err(format!("deck must have {DECK_SIZE} cards, got {}", wires.len()));
+            return Err(format!(
+                "deck must have {DECK_SIZE} cards, got {}",
+                wires.len()
+            ));
         }
         let input = wires_to_deck(&wires)?;
         let sh = Shuffle::perform(input, &q, &mut rng);
@@ -341,7 +351,14 @@ pub fn coord_verify_shuffle(
         Err(_) => return false,
     };
     let v = RealShuffleProofProvider::verifier_with_expected_key(q_hex);
-    v.verify_shuffle(&party_id, round, &deck_hash(&indeck), &deck_hash(&outdeck), None, &proof)
+    v.verify_shuffle(
+        &party_id,
+        round,
+        &deck_hash(&indeck),
+        &deck_hash(&outdeck),
+        None,
+        &proof,
+    )
 }
 
 /// Coordinator's server-blindness self-check: how many cards a KEYLESS coordinator
@@ -386,7 +403,10 @@ pub fn owner_open(idx: u32, ct_json: String, pks_json: String, shares_json: Stri
         Ok(s) => s,
         Err(_) => return -1,
     };
-    let proof = ThresholdDecryptionProof { scheme: SCHEME.to_string(), shares };
+    let proof = ThresholdDecryptionProof {
+        scheme: SCHEME.to_string(),
+        shares,
+    };
     match verify_and_open(idx, &ct, &pks, &proof) {
         Ok(id) => id as i32,
         Err(_) => -1,
@@ -441,15 +461,22 @@ pub fn selftest_roundtrip() -> String {
         Ok(_) => return "ERR:dkg-key-mismatch".to_string(),
         Err(e) => return format!("ERR:dkg-verify:{e:?}"),
     }
-    let pks: Vec<(String, RistrettoPoint)> =
-        run.parties.iter().map(|p| (p.party_id.clone(), p.q_i)).collect();
+    let pks: Vec<(String, RistrettoPoint)> = run
+        .parties
+        .iter()
+        .map(|p| (p.party_id.clone(), p.q_i))
+        .collect();
 
     let card = 7u8;
     let r = Scalar::random(&mut rng);
     let ct = Ct::encrypt_card(card, &run.joint_key, &r);
     let proof = ThresholdDecryptionProof {
         scheme: SCHEME.to_string(),
-        shares: run.parties.iter().map(|p| partial_decrypt(p, 0, &ct, &mut rng)).collect(),
+        shares: run
+            .parties
+            .iter()
+            .map(|p| partial_decrypt(p, 0, &ct, &mut rng))
+            .collect(),
     };
     match verify_and_open(0, &ct, &pks, &proof) {
         Ok(id) if id == card => format!("ok:{id}"),
@@ -554,7 +581,11 @@ mod tests {
         );
 
         // Malformed inputs are a clean reject (no panic).
-        assert!(!ed25519_verify("not-hex".to_string(), msg.clone(), sig.clone()));
+        assert!(!ed25519_verify(
+            "not-hex".to_string(),
+            msg.clone(),
+            sig.clone()
+        ));
         assert!(!ed25519_verify(vk.clone(), msg.clone(), "00".to_string()));
         assert!(!ed25519_verify("ab".repeat(31), msg, sig));
     }

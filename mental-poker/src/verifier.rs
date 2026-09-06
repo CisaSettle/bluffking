@@ -23,8 +23,7 @@
 //! `shuffle_pubkey`) their client actually generated.
 
 use crate::crypto::{
-    DecryptionProvider, MockDecryptionProvider, MockShuffleProofProvider,
-    ShuffleProofProvider,
+    DecryptionProvider, MockDecryptionProvider, MockShuffleProofProvider, ShuffleProofProvider,
 };
 use crate::events::*;
 use crate::hash::{canonical_json, ds_hash, hex_hash, parse_hash, Hash, ZERO_HASH};
@@ -634,13 +633,12 @@ pub fn verify(transcript: &Transcript) -> Result<VerifyReport, VerifyError> {
         }
 
         // (8 / 12) cryptographic proof checks via the provider interfaces.
-        let expected_joint_key = if bind_shuffle_key
-            && event.event_type == event_type::SHUFFLE_CONTRIBUTION
-        {
-            joint_key_acc.map(|q| crate::crypto_real::ec::point_to_hex(&q))
-        } else {
-            None
-        };
+        let expected_joint_key =
+            if bind_shuffle_key && event.event_type == event_type::SHUFFLE_CONTRIBUTION {
+                joint_key_acc.map(|q| crate::crypto_real::ec::point_to_hex(&q))
+            } else {
+                None
+            };
         verify_proofs(
             seq,
             event,
@@ -1132,15 +1130,12 @@ fn final_ciphertext_deck(
 }
 
 fn parse<T: serde::de::DeserializeOwned>(seq: u64, payload: &Value) -> Result<T, VerifyError> {
-    T::deserialize(payload)
-        .map_err(|e| err(seq, VerifyErrorKind::MalformedPayload(e.to_string())))
+    T::deserialize(payload).map_err(|e| err(seq, VerifyErrorKind::MalformedPayload(e.to_string())))
 }
 
 fn malformed(what: &str) -> VerifyErrorKind {
     VerifyErrorKind::MalformedPayload(what.to_string())
 }
-
-
 
 // ---------------------------------------------------------------------------
 // Tests

@@ -723,8 +723,6 @@ fn parse<T: serde::de::DeserializeOwned>(payload: &Value) -> Result<T, StateErro
     T::deserialize(payload).map_err(|e| StateError::MalformedPayload(e.to_string()))
 }
 
-
-
 /// Extract the seat from a canonical `party:N` id.
 pub fn seat_of_party(party_id: &str) -> Option<u8> {
     party_id.strip_prefix("party:")?.parse().ok()
