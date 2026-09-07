@@ -85,17 +85,16 @@ use crate::app_state::AppState;
 use crate::auth::middleware::OptionalAuthUser;
 use crate::entitlement::{self, Tier};
 
-/// Hard wall-clock timeout for one solve. The design measured a 1-bet-size flop
-/// at single-digit seconds; 12 s leaves headroom for a busy box while bounding a
-/// pathological case (the iteration cap + memory gate already bound the common
-/// path).
-const SOLVE_TIMEOUT: Duration = Duration::from_secs(12);
+/// Bound solve time within the API's nine-second handler deadline, leaving
+/// room for authentication and admission. A timed-out solve retains its CPU
+/// permit until the non-cancellable worker exits.
+const SOLVE_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// Process-global timeout override in MILLISECONDS (F5 test hook). `0` (the
 /// default) means "use the `SOLVE_TIMEOUT` const". An integration test can set a
 /// tiny value via [`test_set_solve_timeout_ms`] so a real solve deterministically
 /// trips the wall-clock-timeout branch (`solve_timeout` 503) without waiting the
-/// full 12 s. F6 (codex LOW): this mutable global + its setter exist ONLY behind
+/// full production budget. F6 (codex LOW): this mutable global + its setter exist ONLY behind
 /// `cfg(any(test, feature = "test-support"))`, so a default/release `cargo build`
 /// of the binary carries NEITHER the override state NOR a way to set it — the
 /// handler reads it only through [`effective_solve_timeout`], which is the const
