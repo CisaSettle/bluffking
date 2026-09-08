@@ -157,6 +157,16 @@ pub fn equity(input: EquityInput) -> EquityResult {
 /// the public [`equity`] signature (ADR-012 keeps the public API on engine types
 /// only, and no caller needs the count).
 fn equity_inner(input: EquityInput) -> (EquityResult, u32) {
+    // Specialize before the MC loop: earlier streets must not pay for a
+    // per-trial cache branch when their board changes on every draw.
+    if input.board.count() == 5 {
+        equity_impl::<true>(input)
+    } else {
+        equity_impl::<false>(input)
+    }
+}
+
+fn equity_impl<const CACHE_RIVER: bool>(input: EquityInput) -> (EquityResult, u32) {
     // Defensive: validate cards are unique.
     let board_cards = input.board.all_cards();
     if board_cards.len() > 5 {
@@ -319,6 +329,17 @@ fn equity_inner(input: EquityInput) -> (EquityResult, u32) {
         // Hot path: estimation-only fast PRNG (see `EquityRng` — NOT a dealing RNG).
         let mut rng = EquityRng::new(input.seed);
 
+        // On the river the board and hero rank never change. Across 10k
+        // trials there are only C(45, 2) possible random opponent holdings.
+        // Memoize their ranks within THIS estimate, keeping all draws, trial
+        // counts and early-stop decisions unchanged. No cross-hand cache or
+        // retained private cards. Earlier streets keep the allocation-free path.
+        let mut river = (CACHE_RIVER && missing == 0).then(|| {
+            let be = board_eval(&base_board);
+            let hero_rank = rank_with_board(&be, &input.hero);
+            (be, hero_rank, vec![None; 52 * 51 / 2])
+        });
+
         // ADR-082 coach early-stop policy. `None` ⇒ run all `trials`, byte-identical
         // to pre-ADR-082. `Some(..)` ⇒ after `min_trials` (clamped to `trials` so a
         // degenerate `trials < min_trials` can never under-run), re-evaluate the
@@ -348,8 +369,13 @@ fn equity_inner(input: EquityInput) -> (EquityResult, u32) {
             // outranks hero; win if none tie; tie otherwise) but avoids
             // building+sorting a per-trial Vec and re-converting the board per
             // player (`board_eval` + `rank_with_board` are allocation-free).
-            let be = board_eval(&sim_board);
-            let hero_rank = rank_with_board(&be, &input.hero);
+            let (be, hero_rank) = river
+                .as_ref()
+                .map(|(be, hero_rank, _)| (*be, *hero_rank))
+                .unwrap_or_else(|| {
+                    let be = board_eval(&sim_board);
+                    (be, rank_with_board(&be, &input.hero))
+                });
             let mut tied: u32 = 0;
             let mut hero_lost = false;
             if let Some(opps) = known_opps {
@@ -368,7 +394,16 @@ fn equity_inner(input: EquityInput) -> (EquityResult, u32) {
                 while i < opp_cards.len() {
                     let opp = HoleCards::new(opp_cards[i], opp_cards[i + 1]);
                     i += 2;
-                    let r = rank_with_board(&be, &opp);
+                    let r = if let Some((_, _, ranks)) = river.as_mut() {
+                        let a = opp.card1.suit as usize * 13 + opp.card1.rank as usize;
+                        let b = opp.card2.suit as usize * 13 + opp.card2.rank as usize;
+                        // Dense index for an unordered pair of distinct cards.
+                        let (lo, hi) = (a.min(b), a.max(b));
+                        *ranks[hi * (hi - 1) / 2 + lo]
+                            .get_or_insert_with(|| rank_with_board(&be, &opp))
+                    } else {
+                        rank_with_board(&be, &opp)
+                    };
                     if r > hero_rank {
                         hero_lost = true;
                         break;
@@ -886,6 +921,82 @@ mod tests {
 
     fn c(r: Rank, s: Suit) -> Card {
         Card::new(r, s)
+    }
+
+    #[test]
+    fn river_rank_reuse_preserves_seeded_results_and_stop_counts() {
+        for seed in 0..6 {
+            let mut cards = deck_minus(&[]);
+            shuffle_in_place(&mut cards, &mut PokerRng::from_seed(seed));
+            let hero = HoleCards::new(cards[0], cards[1]);
+            let board = BoardCards {
+                flop: Some([cards[2], cards[3], cards[4]]),
+                turn: Some(cards[5]),
+                river: Some(cards[6]),
+            };
+            for opponents in [
+                OpponentSpec::Random(1),
+                OpponentSpec::Random(5),
+                OpponentSpec::Range(vec![]),
+            ] {
+                for trials in [1, 600, 10_000] {
+                    for early_stop in [
+                        None,
+                        Some(EarlyStop {
+                            min_trials: EARLY_STOP_MIN_TRIALS,
+                            half_width: EARLY_STOP_HALF_WIDTH,
+                        }),
+                    ] {
+                        let input = EquityInput {
+                            hero,
+                            board: board.clone(),
+                            opponents: opponents.clone(),
+                            trials,
+                            seed,
+                            early_stop,
+                        };
+                        // The uncached path runs the original evaluator on the
+                        // identical shuffled deck, including every tie/share
+                        // and early-stop check. Compare the actual stop count too.
+                        assert_eq!(
+                            equity_impl::<true>(input.clone()),
+                            equity_impl::<false>(input)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn river_rank_reuse_preserves_multiway_board_chops() {
+        let board = BoardCards {
+            flop: Some([
+                c(Rank::Ace, Suit::Hearts),
+                c(Rank::King, Suit::Hearts),
+                c(Rank::Queen, Suit::Hearts),
+            ]),
+            turn: Some(c(Rank::Jack, Suit::Hearts)),
+            river: Some(c(Rank::Ten, Suit::Hearts)),
+        };
+        for n in 1..=5 {
+            let input = EquityInput {
+                hero: HoleCards::new(c(Rank::Two, Suit::Clubs), c(Rank::Three, Suit::Clubs)),
+                board: board.clone(),
+                opponents: OpponentSpec::Random(n),
+                trials: 10_000,
+                seed: 72,
+                early_stop: None,
+            };
+            let actual = equity_impl::<true>(input.clone());
+            assert_eq!(actual, equity_impl::<false>(input));
+            assert_eq!(actual.0.win_pct, 0);
+            assert_eq!(actual.0.tie_pct, 100);
+            assert_eq!(
+                actual.0.combined_pct,
+                (100.0 / (n + 1) as f64).round() as u8
+            );
+        }
     }
 
     #[test]

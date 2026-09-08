@@ -62,6 +62,26 @@ fn bench_equity(crit: &mut Criterion) {
     let mut g = crit.benchmark_group("equity");
     g.sample_size(20);
 
+    // A fixed river repeats at most C(45, 2) distinct opponent holdings.
+    // Keep the trial count/seed identical when measuring rank reuse.
+    for opponents in [1, 5] {
+        g.bench_function(format!("river_{opponents}opp_10k"), |b| {
+            b.iter(|| {
+                let mut board = flop_board();
+                board.turn = Some(card(Rank::Five, Suit::Diamonds));
+                board.river = Some(card(Rank::Nine, Suit::Clubs));
+                equity(black_box(EquityInput {
+                    hero: aa(),
+                    board,
+                    opponents: OpponentSpec::Random(opponents),
+                    trials: 10_000,
+                    seed: 0xC0FFEE,
+                    early_stop: None,
+                }))
+            })
+        });
+    }
+
     // Coach solver heavy path: preflop, 1 opponent, 10k trials (advisor.rs).
     g.bench_function("preflop_1opp_10k", |b| {
         b.iter(|| {
