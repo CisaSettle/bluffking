@@ -15,6 +15,16 @@ publish = false
 # server only ever sees ciphertext). Detached from the parent workspace.
 [workspace]
 
+# Detached from the workspace, so the root `[profile.release]` does not apply:
+# without this block `wasm-pack build --release` shipped the browser-side
+# shuffle/open verifier with no LTO at codegen-units = 16 (review 2026-09-16).
+# Fat LTO is fine here: this is a single small cdylib, not the OOM-prone
+# whole-server link the root manifest documents.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 

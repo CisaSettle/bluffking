@@ -25,9 +25,13 @@
 //! production these run ONLY for engine-blind sessions (`resolve_mp_crypto_mode`).
 
 use crate::hash::ds_hash;
-use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT as G;
+// PERF: the `precomputed-tables` fixed-base table for G. `&s * GT` is a
+// constant-time fixed-base ladder (~4x a variable-base mult), so it is safe on
+// prover/secret-dependent paths too.
+use curve25519_dalek::constants::RISTRETTO_BASEPOINT_TABLE as GT;
 use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
 use curve25519_dalek::scalar::Scalar;
+use rand_core::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 use std::collections::HashMap;
@@ -144,6 +148,29 @@ pub fn hash_to_ristretto(domain: &str) -> RistrettoPoint {
     RistrettoPoint::from_uniform_bytes(&wide)
 }
 
+/// A fresh 128-bit verifier-side batching weight.
+///
+/// **Why batching is sound (the "small-exponent" test).** A family of group
+/// equations `LHS_j == RHS_j` (j = 0..m) is equivalent, up to a negligible
+/// error, to the SINGLE equation `Σ_j ρ_j·(LHS_j − RHS_j) == O` for weights
+/// `ρ_j` drawn uniformly and INDEPENDENTLY *after* the proof is fixed. If any
+/// individual equation fails, its difference `Δ_j` is a non-identity point, and
+/// the weighted sum vanishes only for weight vectors lying in one coset of a
+/// proper subgroup of the weight space — probability ≤ 2⁻¹²⁸ for 128-bit
+/// weights. Crucially the weights are **per index**, so per-index binding
+/// arguments survive: a prover who redistributes values across indices changes
+/// at least one `Δ_j` and is caught with the same probability.
+///
+/// The weights come from OS randomness (`rand::rngs::OsRng` → `getrandom`; on
+/// wasm32 that is the browser CSPRNG via the crate's `getrandom` "js" feature),
+/// NOT from the Fiat–Shamir transcript, so a malicious prover cannot grind
+/// them. They are verifier-local and never transmitted.
+pub(crate) fn batch_weight<R: RngCore>(rng: &mut R) -> Scalar {
+    let mut b = [0u8; 16];
+    rng.fill_bytes(&mut b);
+    Scalar::from(u128::from_le_bytes(b))
+}
+
 // ---------------------------------------------------------------------------
 // §1.5 — card-id ↔ message-point encoding + 52-entry DL recovery table
 // ---------------------------------------------------------------------------
@@ -156,7 +183,7 @@ pub fn card_scalar(id: u8) -> Scalar {
 
 /// The message point encoding a card id: `card_scalar(id) · G`.
 pub fn card_point(id: u8) -> RistrettoPoint {
-    card_scalar(id) * G
+    &card_scalar(id) * GT
 }
 
 /// Recover a card id from a decrypted message point via the 52-entry DL table.
@@ -203,7 +230,7 @@ impl Ct {
     /// Encrypt a message point `m` under joint key `q` with randomness `r`.
     pub fn encrypt(m: &RistrettoPoint, q: &RistrettoPoint, r: &Scalar) -> Self {
         Ct {
-            c1: r * G,
+            c1: r * GT,
             c2: m + r * q,
         }
     }
@@ -228,7 +255,7 @@ impl Ct {
     /// (spec §1.4 / §3.2).
     pub fn reencrypt(&self, q: &RistrettoPoint, r_prime: &Scalar) -> Self {
         Ct {
-            c1: self.c1 + r_prime * G,
+            c1: self.c1 + r_prime * GT,
             c2: self.c2 + r_prime * q,
         }
     }
@@ -311,6 +338,9 @@ pub fn canonical_starting_deck() -> EncDeck {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Tests keep the plain variable-base form for readability; production paths
+    // use the precomputed `GT` table above.
+    use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT as G;
     use curve25519_dalek::traits::Identity;
 
     // ---- KAT-1: the domain-separated Pedersen generator H is byte-pinned. ----

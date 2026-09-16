@@ -38,6 +38,8 @@ use crate::crypto_real::ec::{
     is_identity_pubkey, point_from_hex, point_to_hex, scalar_from_hex, scalar_to_hex,
 };
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT as G;
+// PERF: fixed-base precomputed table for G (constant-time; safe on prover paths).
+use curve25519_dalek::constants::RISTRETTO_BASEPOINT_TABLE as GT;
 use curve25519_dalek::ristretto::RistrettoPoint;
 use curve25519_dalek::scalar::Scalar;
 use merlin::Transcript;
@@ -95,7 +97,7 @@ pub fn schnorr_prove<R: RngCore + CryptoRng>(
     rng: &mut R,
 ) -> SchnorrPok {
     let k = Scalar::random(rng);
-    let r_commit = k * G;
+    let r_commit = &k * GT;
     let c = schnorr_challenge(party_id, q, &r_commit);
     let s = k + c * x;
     SchnorrPok {
@@ -118,7 +120,7 @@ pub fn schnorr_verify(party_id: &str, q: &RistrettoPoint, pok: &SchnorrPok) -> b
         None => return false,
     };
     let c = schnorr_challenge(party_id, q, &r_commit);
-    s * G == r_commit + c * q
+    &s * GT == r_commit + c * q
 }
 
 // ---------------------------------------------------------------------------
@@ -169,7 +171,7 @@ pub fn schnorr_sign_bound<R: RngCore + CryptoRng>(
     rng: &mut R,
 ) -> SchnorrPok {
     let k = Scalar::random(rng);
-    let r_commit = k * G;
+    let r_commit = &k * GT;
     let c = schnorr_bind_challenge(party_id, q, &r_commit, message);
     let s = k + c * x;
     SchnorrPok {
@@ -202,7 +204,7 @@ pub fn schnorr_verify_bound(
         None => return false,
     };
     let c = schnorr_bind_challenge(party_id, q, &r_commit, message);
-    s * G == r_commit + c * q
+    &s * GT == r_commit + c * q
 }
 
 // ---------------------------------------------------------------------------
@@ -274,7 +276,7 @@ impl DkgParty {
     pub fn generate<R: RngCore + CryptoRng>(party_id: impl Into<String>, rng: &mut R) -> Self {
         let x_i = Scalar::random(rng);
         let blind = Scalar::random(rng);
-        let q_i = x_i * G;
+        let q_i = &x_i * GT;
         DkgParty {
             party_id: party_id.into(),
             x_i,

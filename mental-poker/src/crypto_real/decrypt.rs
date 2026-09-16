@@ -38,12 +38,15 @@
 use crate::crypto_real::dkg::challenge_scalar;
 use crate::crypto_real::dkg::DkgParty;
 use crate::crypto_real::ec::{
-    card_id_from_point, is_identity_pubkey, point_from_hex, point_to_hex, scalar_from_hex,
-    scalar_to_hex, Ct,
+    batch_weight, card_id_from_point, is_identity_pubkey, point_from_hex, point_to_hex,
+    scalar_from_hex, scalar_to_hex, Ct,
 };
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT as G;
+// PERF: fixed-base precomputed table for G (constant-time; safe on prover paths).
+use curve25519_dalek::constants::RISTRETTO_BASEPOINT_TABLE as GT;
 use curve25519_dalek::ristretto::RistrettoPoint;
 use curve25519_dalek::scalar::Scalar;
+use curve25519_dalek::traits::{Identity, VartimeMultiscalarMul};
 use merlin::Transcript;
 use rand_core::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
@@ -120,7 +123,7 @@ pub fn dleq_prove<R: RngCore + CryptoRng>(
     rng: &mut R,
 ) -> DleqProof {
     let k = Scalar::random(rng);
-    let a = k * G;
+    let a = &k * GT;
     let b = k * ct.c1;
     let c = dleq_challenge(party_id, deck_index, q_i, &ct.c1, &ct.c2, d_i, &a, &b);
     let s = k + c * x_i;
@@ -158,7 +161,7 @@ pub fn dleq_verify(
         None => return false,
     };
     let c = dleq_challenge(party_id, deck_index, q_i, &ct.c1, &ct.c2, d_i, &a, &b);
-    (s * G == a + c * q_i) && (s * ct.c1 == b + c * d_i)
+    (&s * GT == a + c * q_i) && (s * ct.c1 == b + c * d_i)
 }
 
 // ---------------------------------------------------------------------------
@@ -276,17 +279,89 @@ pub fn verify_and_open(
     if proof.shares.len() != party_pubkeys.len() {
         return Err(OpenError::QuorumMismatch);
     }
+    // PERF: the n DLEQ proofs are checked as ONE random-weighted batch instead of
+    // 2n separate double-base equalities. Per share i the two equations are
+    //     (1)  s_i·G  − A_i − c_i·Q_i == O        (2)  s_i·C1 − B_i − c_i·D_i == O
+    // and each gets its OWN fresh independent 128-bit weight (ρ_i, σ_i), so the
+    // batch rejects whenever ANY share's DLEQ is wrong except with probability
+    // ≈ 2⁻¹²⁸ (see `ec::batch_weight`). Per-share binding is untouched: each c_i
+    // is still squeezed over that share's own party id, deck index and points, so
+    // shares cannot be swapped between parties or ciphertexts. Weights are
+    // verifier-local OS randomness (a prover cannot grind them) and every batched
+    // input is public, so the variable-time multiscalar leaks nothing.
+    //
+    // Structural rejects (unknown / duplicate party, identity Q_i, malformed
+    // field) stay EAGER and in the same order as `verify_decryption_share`, so the
+    // returned error variants are unchanged. If only the batch fails we re-run the
+    // per-share verifier to name the offending party — an attack-only path.
     let mut sum_d = RistrettoPoint::default(); // identity
     let mut seen: Vec<&str> = Vec::with_capacity(proof.shares.len());
+    let mut rng = rand::rngs::OsRng;
+    let mut g_coeff = Scalar::ZERO; // coefficient of G
+    let mut c1_coeff = Scalar::ZERO; // coefficient of C1
+    let mut pts: Vec<RistrettoPoint> = Vec::with_capacity(4 * proof.shares.len());
+    let mut coeffs: Vec<Scalar> = Vec::with_capacity(4 * proof.shares.len());
     for share in &proof.shares {
         if seen.contains(&share.party_id.as_str()) {
             return Err(OpenError::QuorumMismatch); // duplicate party
         }
         seen.push(&share.party_id);
-        verify_decryption_share(deck_index, ct, party_pubkeys, share)?;
-        let d_i =
-            point_from_hex(&share.d_i).expect("verify_decryption_share accepted canonical d_i");
+        let q_i = party_pubkeys
+            .iter()
+            .find(|(id, _)| id == &share.party_id)
+            .map(|(_, q)| *q)
+            .ok_or(OpenError::QuorumMismatch)?;
+        // Same defense-in-depth identity-key rejection as `verify_decryption_share`.
+        if is_identity_pubkey(&q_i) {
+            return Err(OpenError::BadProof(share.party_id.clone()));
+        }
+        let d_i = point_from_hex(&share.d_i)
+            .ok_or_else(|| OpenError::Malformed(share.party_id.clone()))?;
+        // A malformed DLEQ field is a `false` from `dleq_verify`, i.e. BadProof.
+        let a = point_from_hex(&share.dleq.a)
+            .ok_or_else(|| OpenError::BadProof(share.party_id.clone()))?;
+        let b = point_from_hex(&share.dleq.b)
+            .ok_or_else(|| OpenError::BadProof(share.party_id.clone()))?;
+        let s = scalar_from_hex(&share.dleq.s)
+            .ok_or_else(|| OpenError::BadProof(share.party_id.clone()))?;
+        let c = dleq_challenge(
+            &share.party_id,
+            deck_index,
+            &q_i,
+            &ct.c1,
+            &ct.c2,
+            &d_i,
+            &a,
+            &b,
+        );
+
+        let rho = batch_weight(&mut rng); // weights equation (1)
+        g_coeff += rho * s;
+        pts.push(a);
+        coeffs.push(-rho);
+        pts.push(q_i);
+        coeffs.push(-(rho * c));
+
+        let sigma = batch_weight(&mut rng); // weights equation (2)
+        c1_coeff += sigma * s;
+        pts.push(b);
+        coeffs.push(-sigma);
+        pts.push(d_i);
+        coeffs.push(-(sigma * c));
+
         sum_d += d_i;
+    }
+    let batch = RistrettoPoint::vartime_multiscalar_mul(
+        [g_coeff, c1_coeff].into_iter().chain(coeffs),
+        [G, ct.c1].into_iter().chain(pts),
+    );
+    if batch != RistrettoPoint::identity() {
+        // At least one DLEQ is bad; find which one so the error names the party.
+        for share in &proof.shares {
+            verify_decryption_share(deck_index, ct, party_pubkeys, share)?;
+        }
+        // Unreachable unless the batch and the per-share path disagree.
+        return Err(OpenError::BadProof("batch".into()));
     }
     let m = ct.c2 - sum_d;
     card_id_from_point(&m).ok_or(OpenError::NotACard)

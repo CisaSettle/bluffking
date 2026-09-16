@@ -361,9 +361,13 @@ pub async fn test_drain_global_permits() -> impl Send {
 /// per-hand strategy table the hero row is selected from.
 #[derive(Clone)]
 struct CachedSpot {
-    /// The hero-INDEPENDENT response body (everything but the hero row). Cloned
-    /// per request and the hero row is filled in cheaply on the way out.
-    response: SolveResponse,
+    /// The hero-INDEPENDENT response body (everything but the hero row).
+    ///
+    /// PERF (2026-09-16 review MED): `Arc` so a cache HIT bumps a refcount
+    /// instead of deep-cloning the body, and so the clone can happen while the
+    /// DashMap shard guard is still held without the guard having to survive
+    /// into response serialization (see the hit path in `solve`).
+    response: Arc<SolveResponse>,
     /// The solving player's full per-hand strategy table — the hero-independent
     /// source any specific hero's [`HandStrategyDto`] is derived from.
     hands: Vec<HandStrategy>,
@@ -407,9 +411,11 @@ fn cached_spot_bytes(spot: &CachedSpot) -> usize {
         total += h.hand.capacity();
         total += freq_vec_bytes(&h.frequencies);
     }
-    // The hero-independent response body: only its variable-length parts matter
-    // (the fixed scalar fields are already in `size_of::<CachedSpot>()` above).
-    let r = &spot.response;
+    // The hero-independent response body. It hangs off an `Arc` now, so its
+    // fixed scalar fields are NOT inside `size_of::<CachedSpot>()` — count the
+    // struct itself, then its variable-length parts.
+    total += std::mem::size_of::<SolveResponse>();
+    let r = &*spot.response;
     total += r.method.capacity()
         + r.solving_player.capacity()
         + r.bet_sizes.capacity()
@@ -1003,21 +1009,61 @@ fn to_response_no_hero(
     }
 }
 
-/// Build the per-request `SolveResponse` from a [`CachedSpot`] and the optional
-/// hero hand (F3). The hero-independent body is cloned from the cache and the
-/// hero row (if any) is derived CHEAPLY from the cached per-hand table via
-/// [`hero_strategy`] — no re-solve. `cached` flags whether this was a cache hit.
-fn response_from_cached_spot(
+/// The hero row (if any) this request wants out of a cached spot, derived
+/// CHEAPLY from the cached per-hand table via [`hero_strategy`] — no re-solve.
+fn hero_row_from_cached_spot(
     spot: &CachedSpot,
     hero: Option<HoleCards>,
+) -> Option<HandStrategyDto> {
+    hero.and_then(|h| hero_strategy(&spot.hands, h))
+        .map(hand_strategy_to_dto)
+}
+
+/// The per-request response body, serialized BY REFERENCE from the cached
+/// hero-independent body plus this request's `hero` row and `cached` flag.
+///
+/// PERF (2026-09-16 review MED): the old shape deep-cloned the whole stored
+/// `SolveResponse` on every cache hit and did it while still holding the
+/// DashMap shard guard. This borrows the Arc'd body instead and only the two
+/// per-request fields are owned.
+///
+/// The field list MIRRORS [`SolveResponse`] exactly — `cached_view_is_wire_
+/// identical_to_solve_response` fails if the two ever drift.
+#[derive(Serialize)]
+struct CachedSolveView<'a> {
+    method: &'a str,
+    solving_player: &'a str,
+    exploitability: f32,
+    exploitability_pct_of_pot: f32,
+    actions: &'a [ActionFreqDto],
+    range_equity: f32,
+    range_ev: f32,
+    hero: Option<HandStrategyDto>,
+    bet_sizes: &'a str,
+    raise_sizes: &'a str,
+    max_iterations: u32,
     cached: bool,
-) -> SolveResponse {
-    let mut resp = spot.response.clone();
-    resp.cached = cached;
-    resp.hero = hero
-        .and_then(|h| hero_strategy(&spot.hands, h))
-        .map(hand_strategy_to_dto);
-    resp
+    source_url: &'a Option<String>,
+}
+
+impl<'a> CachedSolveView<'a> {
+    fn new(body: &'a SolveResponse, hero: Option<HandStrategyDto>, cached: bool) -> Self {
+        Self {
+            method: &body.method,
+            solving_player: &body.solving_player,
+            exploitability: body.exploitability,
+            exploitability_pct_of_pot: body.exploitability_pct_of_pot,
+            actions: &body.actions,
+            range_equity: body.range_equity,
+            range_ev: body.range_ev,
+            hero,
+            bet_sizes: &body.bet_sizes,
+            raise_sizes: &body.raise_sizes,
+            max_iterations: body.max_iterations,
+            cached,
+            source_url: &body.source_url,
+        }
+    }
 }
 
 /// Map a `gto_solver::SolveError` to the right HTTP response. All variants are
@@ -1332,14 +1378,24 @@ pub async fn solve_handler(
     // Whitespace/case/token-order range variants already collapse via
     // `canonical_range` inside `spot_key`.
     let key = spot_key(&req);
-    if let Some(cached) = solve_cache().get(&key) {
+    // PERF (2026-09-16 review MED): take everything this request needs out of
+    // the entry and DROP the DashMap `Ref` (a shard read guard) before building
+    // and serializing the response — the old shape held that guard for the whole
+    // `Json(...).into_response()`, blocking every insert/eviction on that shard
+    // behind JSON serialization. The body comes out as an `Arc` clone.
+    let hit = solve_cache().get(&key).and_then(|cached| {
         // U11: verify the stored canonical spot matches before serving — a u64
         // hash collision otherwise serves a different spot's equilibrium. On
         // mismatch, fall through and solve this spot fresh.
-        if cached.key_repr == spot_repr(&req) {
-            let resp = response_from_cached_spot(&cached, req.hero, true);
-            return Json(resp).into_response();
-        }
+        (cached.key_repr == spot_repr(&req)).then(|| {
+            (
+                Arc::clone(&cached.response),
+                hero_row_from_cached_spot(&cached, req.hero),
+            )
+        })
+    });
+    if let Some((body, hero_row)) = hit {
+        return Json(CachedSolveView::new(&body, hero_row, true)).into_response();
     }
 
     // --- per-IP in-flight guard (F1) — BEFORE the global permit so one source
@@ -1435,21 +1491,23 @@ pub async fn solve_handler(
     // differs ONLY in the hero hand re-derives its row from the cache instead of
     // re-solving the GB-scale equilibrium.
     let spot = CachedSpot {
-        response: to_response_no_hero(&out, &bet_sizes, &raise_sizes, false),
+        response: Arc::new(to_response_no_hero(&out, &bet_sizes, &raise_sizes, false)),
         hands: out.hands,
         // Filled in by `cache_insert` from `cached_spot_bytes`; 0 until then.
         bytes: 0,
         key_repr: spot_repr(&req),
     };
-    let resp = response_from_cached_spot(&spot, req.hero, false);
+    let body = Arc::clone(&spot.response);
+    let resp = CachedSolveView::new(&body, hero_row_from_cached_spot(&spot, req.hero), false);
 
     // Cache the solved spot under a BYTE budget (F7): `cache_insert` estimates the
     // entry's footprint and evicts oldest entries (FIFO) so total tracked memory
     // stays under `MAX_CACHE_BYTES` regardless of per-entry size — a wide spot's
     // ~135 KB per-hand table can no longer let a 2048-entry cap reach ~275 MB.
+    let response = Json(resp).into_response();
     cache_insert(key, spot);
 
-    Json(resp).into_response()
+    response
 }
 
 /// `GET /api/tools/poker/solve/source` — the AGPL §13 network-user offer (F4).
@@ -1723,6 +1781,41 @@ mod tests {
         );
     }
 
+    /// PERF guard (2026-09-16 MED): `CachedSolveView` serializes the cached body
+    /// BY REFERENCE instead of deep-cloning it, so it restates `SolveResponse`'s
+    /// field list. If the two ever drift — a field added, renamed or reordered
+    /// on one side only — the cache-hit response would silently differ from the
+    /// fresh-solve response. Assert they are wire-identical.
+    #[test]
+    fn cached_view_is_wire_identical_to_solve_response() {
+        let spot = synthetic_spot(3, 2);
+        let hero = HandStrategyDto {
+            hand: "AhKh".to_string(),
+            frequencies: vec![0.4, 0.6],
+            equity: 0.55,
+            ev: 3.25,
+        };
+        for cached in [true, false] {
+            let mut expected = (*spot.response).clone();
+            expected.cached = cached;
+            expected.hero = Some(hero.clone());
+            let view = CachedSolveView::new(&spot.response, Some(hero.clone()), cached);
+            assert_eq!(
+                serde_json::to_value(&view).expect("view"),
+                serde_json::to_value(&expected).expect("response"),
+                "CachedSolveView drifted from SolveResponse (cached={cached})"
+            );
+        }
+        // …and with no hero row.
+        let mut expected = (*spot.response).clone();
+        expected.cached = true;
+        let view = CachedSolveView::new(&spot.response, None, true);
+        assert_eq!(
+            serde_json::to_value(&view).expect("view"),
+            serde_json::to_value(&expected).expect("response")
+        );
+    }
+
     #[test]
     fn dto_deserializes_with_optional_fields_defaulted() {
         let dto: SolveRequestDto = serde_json::from_value(serde_json::json!({
@@ -1754,7 +1847,7 @@ mod tests {
             });
         }
         CachedSpot {
-            response: SolveResponse {
+            response: Arc::new(SolveResponse {
                 method: "cfr_equilibrium".into(),
                 solving_player: "oop".into(),
                 exploitability: 0.1,
@@ -1768,7 +1861,7 @@ mod tests {
                 max_iterations: PUBLIC_MAX_ITERATIONS,
                 cached: false,
                 source_url: None,
-            },
+            }),
             hands: table,
             bytes: 0,
             key_repr: String::new(),

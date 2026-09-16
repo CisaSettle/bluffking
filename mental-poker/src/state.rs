@@ -244,10 +244,14 @@ impl ProtocolState {
     /// Atomic: on any [`StateError`] the state is left **unchanged**, so a
     /// failing event never partially mutates `opened_indices` and friends.
     pub fn apply(&mut self, event_type: &str, payload: &Value) -> Result<(), StateError> {
-        let mut next = self.clone();
-        next.apply_inner(event_type, payload)?;
-        *self = next;
-        Ok(())
+        // Atomicity is a property of the handlers, not of a defensive
+        // full-state clone: the old `let mut next = self.clone()` copied
+        // `final_deck_commits` (52 heap `String`s) on EVERY event, in both the
+        // builder and the verifier hot loop. Every `apply_*` below validates
+        // completely before it mutates; the one handler that mutates inside a
+        // loop (`apply_community`) does its own scoped rollback of the three
+        // fields it touches. The `*_rejected` / atomicity tests pin this.
+        self.apply_inner(event_type, payload)
     }
 
     fn apply_inner(&mut self, event_type: &str, payload: &Value) -> Result<(), StateError> {
@@ -311,7 +315,6 @@ impl ProtocolState {
                 "seats not dense 0..n-1".into(),
             ));
         }
-        self.num_players = n as u8;
         // ADR-041 §5.1 Round-0 input rule (+ mp-phase4 F1 reenc seed):
         // - REAL re-encryption shuffle (`deck_repr == "reenc"`): seed with the
         //   `ec::deck_hash` **v2** of `canonical_starting_deck()` — the ciphertext
@@ -320,16 +323,18 @@ impl ProtocolState {
         //   commit `final_deck_hash` (see `apply_final_deck`).
         // - Interactive mock path (`deck_repr == "wire"`): seed with wire_deck_hash([0..51]).
         // - Phase-1 simulated path (absent / None): seed with canonical_initial_deck_hash().
-        match p.deck_repr.as_deref() {
-            Some("reenc") => {
-                self.reenc_shuffle = true;
-                self.last_deck_hash = hex_hash(&crate::crypto_real::ec::deck_hash(
+        //
+        // Resolved into locals FIRST: an unknown repr must not leave
+        // `num_players` mutated behind a rejected event (`apply` no longer
+        // rolls back via a full-state clone).
+        let (reenc_shuffle, seed_deck_hash) = match p.deck_repr.as_deref() {
+            Some("reenc") => (
+                true,
+                hex_hash(&crate::crypto_real::ec::deck_hash(
                     &crate::crypto_real::ec::canonical_starting_deck(),
-                ));
-            }
-            Some("wire") => {
-                self.last_deck_hash = hex_hash(&canonical_wire_deck_hash());
-            }
+                )),
+            ),
+            Some("wire") => (false, hex_hash(&canonical_wire_deck_hash())),
             // U37 (dual-AI OSS review): an unrecognized deck_repr must be
             // rejected loudly, not silently fall through to the legacy Phase-1
             // seeding path — a typo'd repr would otherwise replay under the
@@ -337,10 +342,14 @@ impl ProtocolState {
             Some(other) => {
                 return Err(StateError::UnknownDeckRepr(other.to_string()));
             }
-            None => {
-                self.last_deck_hash = hex_hash(&canonical_initial_deck_hash());
-            }
+            None => (false, hex_hash(&canonical_initial_deck_hash())),
+        };
+        // Every check passed — mutate.
+        self.num_players = n as u8;
+        if reenc_shuffle {
+            self.reenc_shuffle = true;
         }
+        self.last_deck_hash = seed_deck_hash;
         self.phase = Phase::KeyReg;
         Ok(())
     }
@@ -612,14 +621,29 @@ impl ProtocolState {
                 p.cards.len()
             )));
         }
+        // The only handler that mutates inside a loop: a mid-loop rejection
+        // must not leave 1 of 3 flop cards opened. Snapshot ONLY the three
+        // open-card fields (<= 52 u32 + <= 52 u8 + a u32) and restore them on
+        // error, instead of cloning the whole state (52 commit `String`s) for
+        // every event in the transcript.
+        let saved_indices = self.opened_indices.clone();
+        let saved_card_ids = self.opened_card_ids.clone();
+        let saved_revealed = self.revealed_count;
         for (card, expected_idx) in p.cards.iter().zip(indices) {
-            if card.deck_index != expected_idx {
-                return Err(StateError::BadDeckIndex(format!(
+            let step = if card.deck_index != expected_idx {
+                Err(StateError::BadDeckIndex(format!(
                     "stage '{}' expected index {expected_idx}, got {}",
                     p.stage, card.deck_index
-                )));
+                )))
+            } else {
+                self.open_card(card)
+            };
+            if let Err(e) = step {
+                self.opened_indices = saved_indices;
+                self.opened_card_ids = saved_card_ids;
+                self.revealed_count = saved_revealed;
+                return Err(e);
             }
-            self.open_card(card)?;
         }
         self.phase = next_phase;
         Ok(())
@@ -752,6 +776,82 @@ mod tests {
         .expect("hand_init applies");
         assert_eq!(s.phase, Phase::KeyReg);
         s
+    }
+
+    /// HARD INVARIANT (wire value): `state_hash()` feeds every transcript's
+    /// `state_hash_before` / `state_hash_after`, so changing its byte encoding
+    /// would invalidate every stored transcript AND the wasm verifier. The hex
+    /// below was captured from the pre-optimization implementation
+    /// (2026-09-16, before the `apply`/memoization work) — a diff here means
+    /// the hash DEFINITION moved and is a protocol break, not a test to update.
+    #[test]
+    fn state_hash_of_a_fixed_state_is_byte_stable() {
+        let state = ProtocolState {
+            phase: Phase::Dealing,
+            num_players: 3,
+            registered_seats: vec![0, 1, 2],
+            shuffle_rounds_done: 3,
+            last_deck_hash: "a".repeat(64),
+            final_deck_hash: Some("b".repeat(64)),
+            final_deck_commits: (0..4).map(|i| format!("{i:064x}")).collect(),
+            acked_seats: vec![0, 1, 2],
+            opened_indices: vec![0, 1, 2, 3],
+            opened_card_ids: vec![7, 8, 9, 10],
+            holes_opened: 4,
+            revealed_count: 4,
+            // `#[serde(skip)]` — deliberately flipped to prove it stays OUT of
+            // the hash (HARD INVARIANT 2 in the field docs).
+            reenc_shuffle: true,
+        };
+        assert_eq!(
+            hex_hash(&state.state_hash()),
+            "eacecf3173bbf7127cc58469ac5ca8f9534ad27b6acd00cfed47104019568536"
+        );
+        let mut mock = state.clone();
+        mock.reenc_shuffle = false;
+        assert_eq!(
+            hex_hash(&mock.state_hash()),
+            hex_hash(&state.state_hash()),
+            "reenc_shuffle must stay out of state_hash"
+        );
+    }
+
+    /// `apply` no longer clones the whole state, so each handler must be
+    /// atomic on its own: a rejected event leaves the state byte-identical.
+    #[test]
+    fn rejected_events_leave_the_state_untouched() {
+        // Unknown deck_repr: rejected AFTER `num_players` used to be written.
+        let mut s = ProtocolState::new();
+        let before = hex_hash(&s.state_hash());
+        let bad_init = json!({
+            "players": [
+                { "seat": 0, "party_id": "party:0" },
+                { "seat": 1, "party_id": "party:1" }
+            ],
+            "button_seat": 0,
+            "big_blind": 2,
+            "small_blind": 1,
+            "deck_repr": "wirex"
+        });
+        assert!(s.apply(event_type::HAND_INIT, &bad_init).is_err());
+        assert_eq!(hex_hash(&s.state_hash()), before);
+        assert_eq!(s.num_players, 0);
+
+        // Partially-valid community reveal: the first card is fine, the second
+        // carries the wrong deck index — neither may be opened.
+        let mut s = two_player_state();
+        let before = hex_hash(&s.state_hash());
+        let bad_flop = json!({
+            "stage": "flop",
+            "cards": [
+                { "deck_index": 4, "card_id": 1, "salt": "00".repeat(32) },
+                { "deck_index": 99, "card_id": 2, "salt": "00".repeat(32) }
+            ]
+        });
+        assert!(s.apply(event_type::COMMUNITY_REVEALED, &bad_flop).is_err());
+        assert_eq!(hex_hash(&s.state_hash()), before);
+        assert!(s.opened_indices.is_empty());
+        assert_eq!(s.revealed_count, 0);
     }
 
     #[test]

@@ -83,13 +83,29 @@ pub fn classify(hole: HoleCards, board: &BoardCards) -> HandStrength {
         return HandStrength::PairWeak;
     }
 
-    let board_cards = board.all_cards();
-    let hole_cards = [hole.card1, hole.card2];
-    let all_cards: Vec<Card> = hole_cards
-        .iter()
-        .chain(board_cards.iter())
-        .copied()
-        .collect();
+    // Hole + board live in stack buffers (max 2 + 5 = 7 cards): this function
+    // is called per decision by the advisor, and the old `Vec` per board /
+    // per union / per suit showed up as pure allocator traffic.
+    debug_assert!(board.count() <= 5);
+    let mut board_buf = [hole.card1; 5];
+    let mut board_n = 0usize;
+    if let Some(flop) = board.flop {
+        board_buf[..3].copy_from_slice(&flop);
+        board_n = 3;
+    }
+    if let Some(turn) = board.turn {
+        board_buf[board_n] = turn;
+        board_n += 1;
+    }
+    if let Some(river) = board.river {
+        board_buf[board_n] = river;
+        board_n += 1;
+    }
+    let board_cards: &[Card] = &board_buf[..board_n];
+    let mut all_buf = [hole.card1; 7];
+    all_buf[1] = hole.card2;
+    all_buf[2..2 + board_n].copy_from_slice(board_cards);
+    let all_cards: &[Card] = &all_buf[..2 + board_n];
 
     // ---- Detect made hands top-down ----
 
@@ -105,16 +121,21 @@ pub fn classify(hole: HoleCards, board: &BoardCards) -> HandStrength {
     // (weak dominated made hand, still has chop value, so not a pure bluff).
     // `is_set` / `classify_pair` already require a hero contribution.
     // OSS dual-AI review 2026-07-01 (finding C1).
-    let combined_counts = rank_counts(&all_cards);
-    let board_counts = rank_counts(&board_cards);
-    if is_full_house_plus(&all_cards) {
+    //
+    // Rank counts / suit counts / rank bitmasks are computed ONCE here for the
+    // union and once for the board alone, then threaded through every test.
+    let combined = CardStats::new(all_cards);
+    let board_stats = CardStats::new(board_cards);
+    let combined_counts = combined.rank_counts;
+    let board_counts = board_stats.rank_counts;
+    if combined.is_full_house_plus() {
         // Quads and straight flushes are near-nut even when hero "plays the board":
         // unlike a plain full house (which any opponent card re-pairing the board
         // beats), they are not dominated, so they always keep the strong band —
         // this also covers hero MAKING quads on a full-house board (e.g. Kc7d on
         // KsKhKdQcQs). Otherwise it is a plain full house: credit hero only when
         // hero's boat is strictly better than the board's own boat.
-        let near_nut = is_straight_flush(&all_cards) || combined_counts.iter().any(|&n| n >= 4);
+        let near_nut = combined.is_straight_flush() || combined_counts.iter().any(|&n| n >= 4);
         let hero_improves = near_nut
             || match (
                 full_house_key(&combined_counts),
@@ -130,16 +151,16 @@ pub fn classify(hole: HoleCards, board: &BoardCards) -> HandStrength {
             HandStrength::PairWeak
         };
     }
-    if is_flush(&all_cards) {
+    if combined.is_flush() {
         return HandStrength::Flush;
     }
-    if is_straight(&all_cards) {
+    if combined.is_straight() {
         return HandStrength::Straight;
     }
-    if is_set(hole, &board_cards) {
+    if is_set(hole, board_cards) {
         return HandStrength::Set;
     }
-    if is_two_pair(&all_cards) {
+    if combined.is_two_pair() {
         let hero_improves = match (
             top_two_pair_ranks(&combined_counts),
             top_two_pair_ranks(&board_counts),
@@ -156,27 +177,26 @@ pub fn classify(hole: HoleCards, board: &BoardCards) -> HandStrength {
     }
 
     // Pair classification.
-    if let Some(pair_kind) = classify_pair(hole, &board_cards) {
+    if let Some(pair_kind) = classify_pair(hole, board_cards) {
         return pair_kind;
     }
 
     // ---- Draws (no made hand at least a pair) ----
-    let board_suits = board_cards.iter().map(|c| c.suit).collect::<Vec<_>>();
     let hole_suits = [hole.card1.suit, hole.card2.suit];
-    let flush_draw = has_flush_draw(&hole_suits, &board_suits);
+    let flush_draw = has_flush_draw(&hole_suits, &board_stats.suit_counts);
 
     // Hero must PARTICIPATE in a straight draw — a 4-run/gutshot window living
     // entirely on the board plays every hand equally and is not hero's draw
     // (mirrors the `hole_n >= 1` requirement in `has_flush_draw`). U19 (dual-AI
     // OSS review): Ac2d on 5h6s7d8c must not read as an OESD.
     let hole_bits = (1u16 << hole.card1.rank as u16) | (1u16 << hole.card2.rank as u16);
-    let oesd = has_open_ended_straight_draw(&all_cards, hole_bits);
-    let gutshot = !oesd && has_gutshot(&all_cards, hole_bits);
+    let oesd = has_open_ended_straight_draw(combined.rank_bits, hole_bits);
+    let gutshot = !oesd && has_gutshot(combined.rank_bits, hole_bits);
 
     if flush_draw || oesd {
         return HandStrength::DrawStrong;
     }
-    if gutshot || has_backdoor_flush(&hole_suits, &board_suits) {
+    if gutshot || has_backdoor_flush(&hole_suits, &board_stats.suit_counts, board_n) {
         return HandStrength::DrawWeak;
     }
 
@@ -187,85 +207,103 @@ pub fn classify(hole: HoleCards, board: &BoardCards) -> HandStrength {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn rank_counts(cards: &[Card]) -> [u8; 13] {
-    let mut counts = [0u8; 13];
-    for c in cards {
-        counts[c.rank as usize] += 1;
-    }
-    counts
+/// One pass over a card set, shared by every made-hand test below: rank
+/// multiplicities, per-suit card counts, the union rank bitmask, and a rank
+/// bitmask per suit (which makes the straight-flush test a bit-shift instead of
+/// four filtered `Vec<Card>` allocations). Built once per `classify` for the
+/// hole+board union and once for the board alone, replacing the three separate
+/// `rank_counts` passes the classifier used to make.
+#[derive(Clone, Copy)]
+struct CardStats {
+    rank_counts: [u8; 13],
+    suit_counts: [u8; 4],
+    /// Union of `1 << rank` over all cards.
+    rank_bits: u16,
+    /// Per suit, the union of `1 << rank` over that suit's cards.
+    suit_rank_bits: [u16; 4],
 }
 
-fn suit_counts(cards: &[Card]) -> [u8; 4] {
-    let mut counts = [0u8; 4];
-    for c in cards {
-        let i = match c.suit {
-            Suit::Spades => 0,
-            Suit::Hearts => 1,
-            Suit::Diamonds => 2,
-            Suit::Clubs => 3,
+impl CardStats {
+    fn new(cards: &[Card]) -> Self {
+        let mut stats = Self {
+            rank_counts: [0; 13],
+            suit_counts: [0; 4],
+            rank_bits: 0,
+            suit_rank_bits: [0; 4],
         };
-        counts[i] += 1;
+        for card in cards {
+            let suit = suit_index(card.suit);
+            let bit = 1u16 << (card.rank as u16);
+            stats.rank_counts[card.rank as usize] += 1;
+            stats.suit_counts[suit] += 1;
+            stats.rank_bits |= bit;
+            stats.suit_rank_bits[suit] |= bit;
+        }
+        stats
     }
-    counts
-}
 
-fn is_full_house_plus(cards: &[Card]) -> bool {
-    let counts = rank_counts(cards);
-    let mut four = false;
-    let mut three_count = 0u8;
-    let mut pair_count = 0u8;
-    for c in counts.iter() {
-        if *c >= 4 {
-            four = true;
-        }
-        if *c >= 3 {
-            three_count += 1;
-        }
-        if *c >= 2 {
-            pair_count += 1;
-        }
+    fn is_flush(&self) -> bool {
+        self.suit_counts.iter().any(|c| *c >= 5)
     }
-    if four {
-        return true;
-    }
-    if three_count >= 1 && pair_count >= 2 {
-        return true;
-    }
-    if three_count >= 2 {
-        // two trips ⇒ full house (use higher trip as trips, lower as pair).
-        return true;
-    }
-    // Straight-flush detection delegated — handled holistically with rs_poker
-    // in eval.rs. For HandStrength we only need FullHousePlus to cover boats,
-    // quads, straight flushes; we approximate by also testing the combination.
-    is_straight_flush(cards)
-}
 
-fn is_straight_flush(cards: &[Card]) -> bool {
-    // Group by suit and check straight within each suited subset.
-    for suit_label in Suit::ALL {
-        let subset: Vec<Card> = cards
-            .iter()
-            .copied()
-            .filter(|c| c.suit == suit_label)
-            .collect();
-        if subset.len() >= 5 && is_straight(&subset) {
+    fn is_straight(&self) -> bool {
+        straight_in_bits(self.rank_bits)
+    }
+
+    /// A straight inside one suit. `straight_in_bits` already requires five
+    /// distinct consecutive ranks of that suit, which implies the old
+    /// "subset.len() >= 5" precondition.
+    fn is_straight_flush(&self) -> bool {
+        self.suit_rank_bits.iter().copied().any(straight_in_bits)
+    }
+
+    fn is_two_pair(&self) -> bool {
+        self.rank_counts.iter().filter(|c| **c >= 2).count() >= 2
+    }
+
+    fn is_full_house_plus(&self) -> bool {
+        let mut four = false;
+        let mut three_count = 0u8;
+        let mut pair_count = 0u8;
+        for c in self.rank_counts.iter() {
+            if *c >= 4 {
+                four = true;
+            }
+            if *c >= 3 {
+                three_count += 1;
+            }
+            if *c >= 2 {
+                pair_count += 1;
+            }
+        }
+        if four {
             return true;
         }
+        if three_count >= 1 && pair_count >= 2 {
+            return true;
+        }
+        if three_count >= 2 {
+            // two trips ⇒ full house (use higher trip as trips, lower as pair).
+            return true;
+        }
+        // Straight-flush detection delegated — handled holistically with rs_poker
+        // in eval.rs. For HandStrength we only need FullHousePlus to cover boats,
+        // quads, straight flushes; we approximate by also testing the combination.
+        self.is_straight_flush()
     }
-    false
 }
 
-fn is_flush(cards: &[Card]) -> bool {
-    suit_counts(cards).iter().any(|c| *c >= 5)
+fn suit_index(suit: Suit) -> usize {
+    match suit {
+        Suit::Spades => 0,
+        Suit::Hearts => 1,
+        Suit::Diamonds => 2,
+        Suit::Clubs => 3,
+    }
 }
 
-fn is_straight(cards: &[Card]) -> bool {
-    // Build a bitmask of ranks present.
-    let mut bits: u16 = 0;
-    for c in cards {
-        bits |= 1u16 << (c.rank as u16);
-    }
+/// Five consecutive ranks (or the wheel) inside a rank bitmask.
+fn straight_in_bits(bits: u16) -> bool {
     // Wheel: A,2,3,4,5 — treat Ace as low.
     let wheel_mask: u16 = (1 << (Rank::Ace as u16))
         | (1 << (Rank::Two as u16))
@@ -301,11 +339,6 @@ fn is_set(hole: HoleCards, board: &[Card]) -> bool {
     false
 }
 
-fn is_two_pair(cards: &[Card]) -> bool {
-    let counts = rank_counts(cards);
-    counts.iter().filter(|c| **c >= 2).count() >= 2
-}
-
 /// The two highest paired ranks (count ≥ 2), highest first, if at least two
 /// exist — i.e. the two-pair a hand makes. Comparing this for hole+board vs the
 /// board alone tells us whether hero's cards strengthen the two pair or merely
@@ -333,7 +366,13 @@ fn top_board_rank(board: &[Card]) -> Rank {
 fn classify_pair(hole: HoleCards, board: &[Card]) -> Option<HandStrength> {
     // Find any pair involving hero (pocket pair or pair with board).
     let hole_ranks = [hole.card1.rank, hole.card2.rank];
-    let mut board_ranks: Vec<Rank> = board.iter().map(|c| c.rank).collect();
+    debug_assert!(board.len() <= 5);
+    let mut board_ranks_buf = [Rank::Two; 5];
+    let board_len = board.len().min(5);
+    for (slot, card) in board_ranks_buf.iter_mut().zip(board.iter()) {
+        *slot = card.rank;
+    }
+    let board_ranks = &mut board_ranks_buf[..board_len];
     let top = top_board_rank(board);
 
     // Pocket pair.
@@ -384,10 +423,10 @@ fn classify_pair(hole: HoleCards, board: &[Card]) -> Option<HandStrength> {
     Some(HandStrength::PairWeak)
 }
 
-fn has_flush_draw(hole_suits: &[Suit; 2], board_suits: &[Suit]) -> bool {
+fn has_flush_draw(hole_suits: &[Suit; 2], board_suit_counts: &[u8; 4]) -> bool {
     for suit in Suit::ALL {
         let hole_n = hole_suits.iter().filter(|s| **s == suit).count();
-        let board_n = board_suits.iter().filter(|s| **s == suit).count();
+        let board_n = board_suit_counts[suit_index(suit)] as usize;
         // Flush draw = exactly 4 of one suit, of which at least 1 is in hero's hole.
         if hole_n + board_n == 4 && hole_n >= 1 {
             return true;
@@ -396,14 +435,18 @@ fn has_flush_draw(hole_suits: &[Suit; 2], board_suits: &[Suit]) -> bool {
     false
 }
 
-fn has_backdoor_flush(hole_suits: &[Suit; 2], board_suits: &[Suit]) -> bool {
+fn has_backdoor_flush(
+    hole_suits: &[Suit; 2],
+    board_suit_counts: &[u8; 4],
+    board_len: usize,
+) -> bool {
     // Backdoor flush = exactly 3 of one suit on flop, hero holds at least one.
-    if board_suits.len() != 3 {
+    if board_len != 3 {
         return false;
     }
     for suit in Suit::ALL {
         let hole_n = hole_suits.iter().filter(|s| **s == suit).count();
-        let board_n = board_suits.iter().filter(|s| **s == suit).count();
+        let board_n = board_suit_counts[suit_index(suit)] as usize;
         if hole_n + board_n == 3 && hole_n >= 1 {
             return true;
         }
@@ -411,11 +454,8 @@ fn has_backdoor_flush(hole_suits: &[Suit; 2], board_suits: &[Suit]) -> bool {
     false
 }
 
-fn has_open_ended_straight_draw(cards: &[Card], hole_bits: u16) -> bool {
-    let mut bits: u16 = 0;
-    for c in cards {
-        bits |= 1u16 << (c.rank as u16);
-    }
+/// `bits` is the union rank bitmask of hole+board (see [`CardStats`]).
+fn has_open_ended_straight_draw(bits: u16, hole_bits: u16) -> bool {
     // OESD = 4 consecutive ranks with potential to extend on both ends
     // (so not at the very top or bottom). We scan ranks 2..=K for a 4-run
     // and ensure both endpoints have room to extend.
@@ -446,11 +486,8 @@ fn has_open_ended_straight_draw(cards: &[Card], hole_bits: u16) -> bool {
     false
 }
 
-fn has_gutshot(cards: &[Card], hole_bits: u16) -> bool {
-    let mut bits: u16 = 0;
-    for c in cards {
-        bits |= 1u16 << (c.rank as u16);
-    }
+/// `bits` is the union rank bitmask of hole+board (see [`CardStats`]).
+fn has_gutshot(bits: u16, hole_bits: u16) -> bool {
     let low_idx = Rank::Two as u16;
     let high_idx = Rank::Ace as u16;
     // Any 5-rank window with exactly 4 bits set is a gutshot, PROVIDED hero holds
@@ -872,5 +909,65 @@ mod tests {
         // Q♦Q♥ makes quad Queens (beats the board's KKKQQ full house).
         let quad_queens = h(c(Rank::Queen, Suit::Diamonds), c(Rank::Queen, Suit::Hearts));
         assert_eq!(classify(quad_queens, &board), HandStrength::FullHousePlus);
+    }
+
+    fn lcg(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        *state >> 33
+    }
+
+    /// Fix (3) guard: the single-pass / stack-array classifier must return
+    /// EXACTLY what the old allocating implementation returned. The digest is a
+    /// captured fingerprint of 60,000 classifications (20,000 deterministic
+    /// 7-card deals x flop / turn / river boards) taken from the
+    /// pre-optimization code (2026-09-16). A change here is a behaviour change,
+    /// not a test to refresh.
+    #[test]
+    fn classify_is_unchanged_over_random_deals() {
+        let mut state = 0x2026_0916_u64;
+        let mut digest: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut counts = [0usize; 13];
+        for _ in 0..20_000 {
+            let mut idx = [0u8; 7];
+            let mut n = 0usize;
+            while n < 7 {
+                let candidate = (lcg(&mut state) % 52) as u8;
+                if idx[..n].contains(&candidate) {
+                    continue;
+                }
+                idx[n] = candidate;
+                n += 1;
+            }
+            let cards: Vec<Card> = idx
+                .iter()
+                .map(|i| Card::new(Rank::ALL[(*i / 4) as usize], Suit::ALL[(*i % 4) as usize]))
+                .collect();
+            let hole = h(cards[0], cards[1]);
+            let boards = [
+                b3(cards[2], cards[3], cards[4]),
+                BoardCards {
+                    flop: Some([cards[2], cards[3], cards[4]]),
+                    turn: Some(cards[5]),
+                    river: None,
+                },
+                b5(cards[2], cards[3], cards[4], cards[5], cards[6]),
+            ];
+            for board in boards {
+                let strength = classify(hole, &board);
+                counts[strength as usize] += 1;
+                digest ^= strength as u64 + 1;
+                digest = digest.wrapping_mul(0x100_0000_01b3);
+            }
+        }
+        assert!(
+            counts.iter().filter(|c| **c > 0).count() >= 12,
+            "coverage too narrow to pin anything: {counts:?}"
+        );
+        assert_eq!(
+            digest, 0x7ef8_df1a_9153_5475,
+            "classify output changed vs the pre-optimization implementation"
+        );
     }
 }

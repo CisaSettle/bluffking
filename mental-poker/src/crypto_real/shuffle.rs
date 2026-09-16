@@ -113,14 +113,18 @@ use crate::crypto_real::ec::{
 };
 use crate::hash::{hex_hash, Hash};
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT as G;
+// PERF: fixed-base precomputed table for G. `&s * GT` is a constant-time
+// fixed-base ladder (~4x faster than the generic variable-base one), so it is
+// safe on the prover's secret-dependent paths as well as the verifier's.
+use curve25519_dalek::constants::RISTRETTO_BASEPOINT_TABLE as GT;
 use curve25519_dalek::ristretto::RistrettoPoint;
 use curve25519_dalek::scalar::Scalar;
-use curve25519_dalek::traits::{Identity, MultiscalarMul};
+use curve25519_dalek::traits::{Identity, MultiscalarMul, VartimeMultiscalarMul};
 use merlin::Transcript;
 use rand_core::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
 
-use super::ec::pedersen_h;
+use super::ec::{batch_weight, pedersen_h};
 
 /// Scheme identifier for the (sound, sigma-based interim) re-encryption shuffle
 /// (spec §3.6). The full Bayer–Groth `"bg-shuffle-ristretto-v1"` is a later
@@ -435,7 +439,7 @@ impl Shuffle {
 
             // Pedersen-commit to f: Cf_j = f_j·G + b_j·H.
             let b: Vec<Scalar> = (0..n).map(|_| Scalar::random(rng)).collect();
-            let cf: Vec<RistrettoPoint> = (0..n).map(|j| f[j] * G + b[j] * h).collect();
+            let cf: Vec<RistrettoPoint> = (0..n).map(|j| &f[j] * GT + b[j] * h).collect();
 
             // R = Σ_k e_k · ρ_k  (the aggregate re-encryption randomness).
             let r_agg: Scalar = (0..n).map(|k| e[k] * self.rho[k]).sum();
@@ -503,7 +507,7 @@ fn prove_reenc<R: RngCore + CryptoRng>(
     let v: Vec<Scalar> = (0..n).map(|_| Scalar::random(rng)).collect(); // blinders for f_j
     let u: Vec<Scalar> = (0..n).map(|_| Scalar::random(rng)).collect(); // blinders for b_j
 
-    let t1 = w * G;
+    let t1 = &w * GT;
     let t2 = w * q;
     // Tf = Σ_j v_j·D_in[j]  (a ciphertext: bind blinders to the input deck).
     let tf1: RistrettoPoint = (0..n).map(|j| v[j] * input[j].c1).sum();
@@ -511,7 +515,7 @@ fn prove_reenc<R: RngCore + CryptoRng>(
     // Tb_j = v_j·G + u_j·H — PER-ELEMENT, binding the same v_j to each f
     // commitment's opening (so Part A's f_j and the committed Cf_j are
     // index-matched, not just equal in aggregate).
-    let tb_pts: Vec<RistrettoPoint> = (0..n).map(|j| v[j] * G + u[j] * h).collect();
+    let tb_pts: Vec<RistrettoPoint> = (0..n).map(|j| &v[j] * GT + u[j] * h).collect();
 
     t.append_message(b"A_T1", t1.compress().as_bytes());
     t.append_message(b"A_T2", t2.compress().as_bytes());
@@ -599,7 +603,7 @@ fn prove_permutation<R: RngCore + CryptoRng>(
         prod.push(acc);
         prod_blind.push(Scalar::random(rng));
     }
-    let cp: Vec<RistrettoPoint> = (0..n).map(|i| prod[i] * G + prod_blind[i] * h).collect();
+    let cp: Vec<RistrettoPoint> = (0..n).map(|i| &prod[i] * GT + prod_blind[i] * h).collect();
     for cp_t in &cp {
         t.append_message(b"Cp", cp_t.compress().as_bytes());
     }
@@ -615,13 +619,13 @@ fn prove_permutation<R: RngCore + CryptoRng>(
         };
         let r_y = factor_blind[tdx];
         let r_z = prod_blind[tdx];
-        let c_y = x * G - (f[tdx] * G + b[tdx] * h); // = Cfac_t
+        let c_y = x * GT - (&f[tdx] * GT + b[tdx] * h); // = Cfac_t
 
         // Sound multiplication proof for z = x·y (Schnorr form).
         let bb = Scalar::random(rng);
         let r_b = Scalar::random(rng);
         let r_zb = Scalar::random(rng);
-        let b_pt = bb * G + r_b * h; // B
+        let b_pt = &bb * GT + r_b * h; // B
         let b_prime = bb * c_y + r_zb * h; // B'
         t.append_message(b"M_B", b_pt.compress().as_bytes());
         t.append_message(b"M_Bp", b_prime.compress().as_bytes());
@@ -881,7 +885,7 @@ fn verify_reenc(
     let zf_din_c2: RistrettoPoint =
         RistrettoPoint::multiscalar_mul(&z_f, d_in.iter().map(|c| c.c2));
 
-    let eq_a1 = (zf_din_c1 + z_r * G) == (tf1 + t1 + c * lhs1);
+    let eq_a1 = (zf_din_c1 + &z_r * GT) == (tf1 + t1 + c * lhs1);
     let eq_a2 = (zf_din_c2 + z_r * q) == (tf2 + t2 + c * lhs2);
 
     // (3) PER-ELEMENT binding of z_f_j / z_b_j to each f commitment
@@ -891,10 +895,41 @@ fn verify_reenc(
     //   the homomorphic sum are index-matched to the committed Cf_j (which Part B
     //   proves is a permutation of e). This closes the "redistribute f_j across
     //   indices keeping the sum" gap that a single aggregate check would leave.
+    //
+    //   PERF: the n equations are checked as ONE random-weighted batch
+    //       Σ_j ρ_j·( z_f_j·G + z_b_j·H − Tb_j − c·Cf_j )  ==  O
+    //   evaluated with a single multiscalar multiplication. The per-index binding
+    //   argument above is PRESERVED because each index j carries its OWN fresh
+    //   independent weight ρ_j (see [`batch_weight`]): this is not a single
+    //   aggregate check, which is exactly the gap the comment above warns about.
+    //   A proof that breaks any one index passes the batch with probability
+    //   ≈ 2⁻¹²⁸. `vartime_` is sound here: every input (z_f, z_b, Tb, Cf, c) is
+    //   PUBLIC proof data, and the weights are the verifier's own randomness —
+    //   no secret is exponent-dependent.
+    let mut rng = rand::rngs::OsRng;
+    let mut g_coeff = Scalar::ZERO;
+    let mut h_coeff = Scalar::ZERO;
+    let mut tb_coeff = Vec::with_capacity(n);
+    let mut cf_coeff = Vec::with_capacity(n);
     for j in 0..n {
-        if (z_f[j] * G + z_b[j] * h) != (tb[j] + c * cf[j]) {
-            return false;
-        }
+        let rho = batch_weight(&mut rng);
+        g_coeff += rho * z_f[j];
+        h_coeff += rho * z_b[j];
+        tb_coeff.push(-rho);
+        cf_coeff.push(-(rho * c));
+    }
+    let batch = RistrettoPoint::vartime_multiscalar_mul(
+        [g_coeff, h_coeff]
+            .into_iter()
+            .chain(tb_coeff)
+            .chain(cf_coeff),
+        [G, *h]
+            .into_iter()
+            .chain(tb.iter().copied())
+            .chain(cf.iter().copied()),
+    );
+    if batch != RistrettoPoint::identity() {
+        return false;
     }
 
     eq_a1 && eq_a2
@@ -933,13 +968,31 @@ fn verify_permutation(
 
     // C_y for step t = factor commitment Cfac_t = x·G − Cf_t (committed value
     // x − f_t, blind −b_t), reconstructed from public x and the committed Cf_t.
+    //
+    // PERF: the 2n per-step equalities plus the final opening are accumulated
+    // into ONE random-weighted batch (see [`batch_weight`]) instead of 2n+1
+    // separate multi-base equalities. Each equality gets its OWN fresh
+    // independent 128-bit weight, so every per-step/per-index binding is
+    // preserved and a proof that breaks any one of them passes with probability
+    // ≈ 2⁻¹²⁸ per equality. Everything fed into the batch is PUBLIC proof data
+    // plus the verifier's own randomness, so the variable-time multiscalar leaks
+    // nothing secret. Malformed-field early returns are unchanged; only the
+    // *equality* verdict moves to the end (the accept/reject outcome is the
+    // same, and the transcript is verifier-local so the extra absorbs after a
+    // would-be failure are harmless).
+    let mut rng = rand::rngs::OsRng;
+    let mut g_coeff = Scalar::ZERO; // coefficient of G
+    let mut h_coeff = Scalar::ZERO; // coefficient of H
+    let mut cp_coeff = vec![Scalar::ZERO; n]; // coefficients of Cp_0..Cp_{n-1}
+    let mut cf_coeff = vec![Scalar::ZERO; n]; // coefficients of Cf_0..Cf_{n-1}
+    let mut b_pts: Vec<RistrettoPoint> = Vec::with_capacity(n);
+    let mut b_pt_coeff: Vec<Scalar> = Vec::with_capacity(n);
+    let mut b_primes: Vec<RistrettoPoint> = Vec::with_capacity(n);
+    let mut b_prime_coeff: Vec<Scalar> = Vec::with_capacity(n);
+
     for tdx in 0..n {
         let step = &p.steps[tdx];
-        // C_x = Cp_{t-1} (or 1·G for t == 0), C_y = Cfac_t, C_z = Cp_t.
-        let c_x = if tdx == 0 { G } else { cp[tdx - 1] };
-        let c_y = x * G - cf[tdx];
-        let c_z = cp[tdx];
-
+        // C_x = Cp_{t-1} (or 1·G for t == 0), C_y = Cfac_t = x·G − Cf_t, C_z = Cp_t.
         let b_pt = match point_from_hex(&step.b_pt) {
             Some(v) => v,
             None => return false,
@@ -966,27 +1019,60 @@ fn verify_permutation(
         };
 
         // (1) knowledge of x_val (the previous product) opening C_x:
-        //       z_x·G + z_rx·H == B + c·C_x
-        if (z_x * G + z_rx * h) != (b_pt + c * c_x) {
-            return false;
+        //       z_x·G + z_rx·H − B − c·C_x  ==  O
+        let rho = batch_weight(&mut rng);
+        g_coeff += rho * z_x;
+        h_coeff += rho * z_rx;
+        b_pts.push(b_pt);
+        b_pt_coeff.push(-rho);
+        if tdx == 0 {
+            g_coeff -= rho * c; // C_x = 1·G
+        } else {
+            cp_coeff[tdx - 1] -= rho * c;
         }
+
         // (2) the multiplication relation z = x·y, i.e. P_t == P_{t-1}·(x − f_t):
-        //       z_x·C_y + z_rz·H == B' + c·C_z
+        //       z_x·C_y + z_rz·H − B' − c·C_z  ==  O ,  C_y = x·G − Cf_t
         //   (sound: LHS − RHS = c·(x_val·y_val − z_val)·G, zero iff the product holds)
-        if (z_x * c_y + z_rz * h) != (b_prime + c * c_z) {
-            return false;
-        }
+        let sigma = batch_weight(&mut rng);
+        let sz = sigma * z_x;
+        g_coeff += sz * x; // sz·(x·G)
+        cf_coeff[tdx] -= sz; // sz·(−Cf_t)
+        h_coeff += sigma * z_rz;
+        b_primes.push(b_prime);
+        b_prime_coeff.push(-sigma);
+        cp_coeff[tdx] -= sigma * c;
     }
 
     // Final: the top running product must equal the public target ∏_k (x − e_k).
     // The prover reveals the final blind; we check Cp_{n-1} == target·G + s·H.
     // (target is public, so revealing s leaks nothing about the permutation.)
+    // Folded into the same batch under its own independent weight τ.
     let target: Scalar = e.iter().fold(Scalar::ONE, |acc, ek| acc * (x - ek));
     let final_blind = match scalar_from_hex(&p.final_blind) {
         Some(v) => v,
         None => return false,
     };
-    cp[n - 1] == (target * G + final_blind * h)
+    let tau = batch_weight(&mut rng);
+    cp_coeff[n - 1] += tau;
+    g_coeff -= tau * target;
+    h_coeff -= tau * final_blind;
+
+    let batch = RistrettoPoint::vartime_multiscalar_mul(
+        [g_coeff, h_coeff]
+            .into_iter()
+            .chain(cp_coeff)
+            .chain(cf_coeff)
+            .chain(b_pt_coeff)
+            .chain(b_prime_coeff),
+        [G, *h]
+            .into_iter()
+            .chain(cp.iter().copied())
+            .chain(cf.iter().copied())
+            .chain(b_pts)
+            .chain(b_primes),
+    );
+    batch == RistrettoPoint::identity()
 }
 
 // ===========================================================================

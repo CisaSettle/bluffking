@@ -11,6 +11,8 @@
 use wasm_bindgen::prelude::*;
 
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT as G;
+// PERF: precomputed fixed-base table for G (constant-time; `&s * GT`).
+use curve25519_dalek::constants::RISTRETTO_BASEPOINT_TABLE as GT;
 use curve25519_dalek::ristretto::RistrettoPoint;
 use curve25519_dalek::scalar::Scalar;
 use rand::rngs::OsRng;
@@ -375,7 +377,7 @@ pub fn coord_blind_check(deck_json: String, pks_json: String) -> Result<usize, S
             let s = Scalar::from(k);
             cands.push(ct.c2 - s * qsum);
             cands.push(ct.c2 - s * ct.c1);
-            cands.push(ct.c2 - s * G);
+            cands.push(ct.c2 - (&s * GT));
         }
         cands.iter().any(|m| card_id_from_point(m).is_some())
     };
@@ -410,6 +412,71 @@ pub fn owner_open(idx: u32, ct_json: String, pks_json: String, shares_json: Stri
     match verify_and_open(idx, &ct, &pks, &proof) {
         Ok(id) => id as i32,
         Err(_) => -1,
+    }
+}
+
+/// Batched [`owner_open`]: open SEVERAL cards under ONE parse of the party
+/// pubkey list. `owner_open` re-parses `pks_json` (n hex points → Ristretto
+/// decompressions) on every call, so opening k cards paid that cost k times;
+/// here it is paid once.
+///
+/// * `deck_json`  — `[{"idx":<deck index>,"ct":{"c1":"..","c2":".."}}, ...]`
+/// * `pks_json`   — the same party directory `owner_open` takes
+/// * `shares_json` — `[[share,...], ...]`, ALIGNED BY POSITION with `deck_json`
+///
+/// Returns a JSON array of card ids (`-1` for a card whose quorum/proof check
+/// fails — same per-card verdict as `owner_open`, so one bad card never
+/// invalidates the others), or `"ERR:<reason>"` on a structural problem
+/// (malformed JSON, length mismatch, bad pubkey/ciphertext) — the same
+/// `ERR:` convention as [`coord_joint_key`].
+///
+/// Verification is UNCHANGED: each card still goes through `verify_and_open`
+/// with its own deck index bound into the transcript. `owner_open` is kept for
+/// single-card callers and for compatibility with existing embedders.
+#[wasm_bindgen]
+pub fn owner_open_all(deck_json: String, pks_json: String, shares_json: String) -> String {
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        idx: u32,
+        ct: CtWire,
+    }
+
+    let err = |reason: &str| format!("ERR:{reason}");
+
+    let entries: Vec<Entry> = match serde_json::from_str(&deck_json) {
+        Ok(v) => v,
+        Err(e) => return err(&format!("bad deck json: {e}")),
+    };
+    let share_sets: Vec<Vec<DecryptionShare>> = match serde_json::from_str(&shares_json) {
+        Ok(v) => v,
+        Err(e) => return err(&format!("bad shares json: {e}")),
+    };
+    if entries.len() != share_sets.len() {
+        return err("deck/shares length mismatch");
+    }
+    // Parsed ONCE for the whole batch — the point of this entry point.
+    let pks = match parse_pks(&pks_json) {
+        Ok(p) => p,
+        Err(e) => return err(&e),
+    };
+
+    let mut ids: Vec<i32> = Vec::with_capacity(entries.len());
+    for (entry, shares) in entries.iter().zip(share_sets) {
+        let Some(ct) = Ct::from_wire(&entry.ct) else {
+            return err("bad ciphertext");
+        };
+        let proof = ThresholdDecryptionProof {
+            scheme: SCHEME.to_string(),
+            shares,
+        };
+        ids.push(match verify_and_open(entry.idx, &ct, &pks, &proof) {
+            Ok(id) => id as i32,
+            Err(_) => -1,
+        });
+    }
+    match serde_json::to_string(&ids) {
+        Ok(json) => json,
+        Err(e) => err(&e.to_string()),
     }
 }
 
@@ -489,6 +556,90 @@ pub fn selftest_roundtrip() -> String {
 mod tests {
     use super::*;
     use curve25519_dalek::traits::Identity;
+
+    /// `owner_open_all` is a BATCHING optimization only — it must return exactly
+    /// what per-card `owner_open` returns, including the `-1` verdict for a card
+    /// whose share set is short of the n-of-n quorum, and the `-1` must stay
+    /// local to that card (one bad open never poisons its neighbours).
+    #[test]
+    fn owner_open_all_matches_per_card_owner_open() {
+        let mut rng = OsRng;
+        let run = DkgRun::simulate(3, &mut rng);
+        let pks: Vec<serde_json::Value> = run
+            .parties
+            .iter()
+            .map(|p| serde_json::json!({"party_id": p.party_id, "q_i": point_to_hex(&p.q_i)}))
+            .collect();
+        let pks_json = serde_json::to_string(&pks).unwrap();
+
+        // Three cards at three DIFFERENT deck indices: the index is bound into
+        // each DLEQ transcript, so a batch that mixed them up would fail.
+        let cards: [(u32, u8); 3] = [(0, 7), (17, 33), (51, 12)];
+        let cts: Vec<Ct> = cards
+            .iter()
+            .map(|(idx, id)| Ct::encrypt_card(*id, &run.joint_key, &Scalar::from(*idx as u64 + 1)))
+            .collect();
+
+        let share_sets: Vec<Vec<DecryptionShare>> = cards
+            .iter()
+            .zip(&cts)
+            .enumerate()
+            .map(|(i, ((idx, _), ct))| {
+                // Card #1 deliberately gets only 2 of the 3 shares.
+                let quorum = if i == 1 { 2 } else { run.parties.len() };
+                run.parties[..quorum]
+                    .iter()
+                    .map(|p| partial_decrypt(p, *idx, ct, &mut OsRng))
+                    .collect()
+            })
+            .collect();
+
+        let per_card: Vec<i32> = cards
+            .iter()
+            .zip(&cts)
+            .zip(&share_sets)
+            .map(|(((idx, _), ct), shares)| {
+                owner_open(
+                    *idx,
+                    serde_json::to_string(&ct.to_wire()).unwrap(),
+                    pks_json.clone(),
+                    serde_json::to_string(shares).unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            per_card,
+            vec![7, -1, 12],
+            "baseline: owner_open opens the full-quorum cards and rejects the short one"
+        );
+
+        let deck_json = serde_json::to_string(
+            &cards
+                .iter()
+                .zip(&cts)
+                .map(|((idx, _), ct)| serde_json::json!({"idx": idx, "ct": ct.to_wire()}))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let batched = owner_open_all(
+            deck_json.clone(),
+            pks_json.clone(),
+            serde_json::to_string(&share_sets).unwrap(),
+        );
+        assert_eq!(
+            serde_json::from_str::<Vec<i32>>(&batched).unwrap(),
+            per_card,
+            "batched open must agree card-for-card with owner_open"
+        );
+
+        // Structural problems are reported as ERR:, never as a silent short array.
+        assert!(
+            owner_open_all(deck_json.clone(), pks_json.clone(), "[[]]".to_string())
+                .starts_with("ERR:"),
+            "a deck/shares length mismatch must be an ERR:, not a partial result"
+        );
+        assert!(owner_open_all(deck_json, "[]".to_string(), "[]".to_string()).starts_with("ERR:"));
+    }
 
     /// F2 / F-CRYPTO-15: the coordinator-side register verifier must reject an
     /// IDENTITY (x_i = 0) party key, even when the accompanying Schnorr PoK is

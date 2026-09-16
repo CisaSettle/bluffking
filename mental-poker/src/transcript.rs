@@ -120,6 +120,11 @@ pub struct TranscriptBuilder<'a> {
     decryption_scheme: String,
     key_directory: KeyDirectory,
     state: ProtocolState,
+    /// Hex `state.state_hash()` of `state` as it stands RIGHT NOW — i.e. the
+    /// `state_hash_after` of the last appended event, which is by definition
+    /// the `state_hash_before` of the next one. Memoized so each event hashes
+    /// the (52-commit) state once instead of twice.
+    state_hash_hex: String,
     events: Vec<TranscriptEvent>,
     prev_hash: Hash,
     seq: u64,
@@ -146,6 +151,7 @@ impl<'a> TranscriptBuilder<'a> {
             decryption_scheme: decryption.scheme().to_string(),
             key_directory,
             state: ProtocolState::new(),
+            state_hash_hex: hex_hash(&ProtocolState::new().state_hash()),
             events: Vec::new(),
             prev_hash: ZERO_HASH,
             seq: 0,
@@ -209,10 +215,14 @@ impl<'a> TranscriptBuilder<'a> {
             }
         }
 
-        let state_hash_before = hex_hash(&self.state.state_hash());
+        // The previous event's `state_hash_after` IS this event's
+        // `state_hash_before` — the state cannot change between appends — so we
+        // hash the state once per event instead of twice.
+        let state_hash_before = self.state_hash_hex.clone();
         // Best-effort apply; an invalid event leaves the state untouched.
         let _ = self.state.apply(event_type, &payload);
         let state_hash_after = hex_hash(&self.state.state_hash());
+        self.state_hash_hex = state_hash_after.clone();
 
         // ADR-041 §4: envelope signer is always `coordinator`.
         let envelope_signer = crate::events::COORDINATOR;

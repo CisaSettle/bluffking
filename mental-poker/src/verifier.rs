@@ -410,6 +410,11 @@ pub fn verify(transcript: &Transcript) -> Result<VerifyReport, VerifyError> {
     };
 
     let mut state = ProtocolState::new();
+    // Memoized hex `state.state_hash()` for the CURRENT `state`. Every event's
+    // verified `state_hash_after` is, by definition, the next event's
+    // `state_hash_before`, so the state is hashed once per event instead of
+    // twice (the state carries 52 per-card commit `String`s).
+    let mut state_hash_hex = hex_hash(&state.state_hash());
     let mut prev_hash: Hash = ZERO_HASH;
 
     // F2 (shuffle key binding): for the real re-encryption-shuffle scheme the
@@ -555,8 +560,9 @@ pub fn verify(transcript: &Transcript) -> Result<VerifyReport, VerifyError> {
             }
         }
 
-        // (6) state hash before.
-        if hex_hash(&state.state_hash()) != event.state_hash_before {
+        // (6) state hash before (memoized from the previous event's verified
+        // `state_hash_after`; identical value, one hash fewer).
+        if state_hash_hex != event.state_hash_before {
             return Err(err(seq, VerifyErrorKind::StateHashBefore));
         }
 
@@ -566,7 +572,8 @@ pub fn verify(transcript: &Transcript) -> Result<VerifyReport, VerifyError> {
             .map_err(|e| err(seq, VerifyErrorKind::State(e)))?;
 
         // (6) state hash after.
-        if hex_hash(&state.state_hash()) != event.state_hash_after {
+        state_hash_hex = hex_hash(&state.state_hash());
+        if state_hash_hex != event.state_hash_after {
             return Err(err(seq, VerifyErrorKind::StateHashAfter));
         }
 

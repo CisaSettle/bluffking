@@ -395,7 +395,8 @@ pub struct RankDescription {
 }
 
 fn rank_str(r: Rank) -> String {
-    r.char().to_string()
+    // One `char` -> one-char `String`: the wire shape (see `RankDescription`).
+    String::from(r.char())
 }
 
 /// Derive a [`RankDescription`] for a player's hole cards against the board.
@@ -409,71 +410,87 @@ fn rank_str(r: Rank) -> String {
 /// best hand possible with the cards currently dealt.
 pub fn describe_hand(hole: &HoleCards, board: &BoardCards) -> RankDescription {
     let rank = rank_hand(hole, board);
-    let mut cards: Vec<Card> = Vec::with_capacity(7);
-    cards.push(hole.card1);
-    cards.push(hole.card2);
-    for c in board.all_cards() {
-        cards.push(c);
+    // At most 7 cards — kept in a stack buffer. This runs once per viewer per
+    // broadcast snapshot (hero hand-strength banner), so the intermediate
+    // `Vec`s it used to build were pure allocator traffic; only the `String`s
+    // that go on the wire are heap-allocated now.
+    let mut card_buf = [hole.card1; 7];
+    card_buf[1] = hole.card2;
+    let mut n = 2usize;
+    if let Some(flop) = board.flop {
+        card_buf[n..n + 3].copy_from_slice(&flop);
+        n += 3;
     }
-    // Descending by rank, suits arbitrary.
+    if let Some(turn) = board.turn {
+        card_buf[n] = turn;
+        n += 1;
+    }
+    if let Some(river) = board.river {
+        card_buf[n] = river;
+        n += 1;
+    }
+    let cards: &mut [Card] = &mut card_buf[..n];
+    // Descending by rank, suits arbitrary. Stable, so cards of equal rank keep
+    // the hole-then-board order the old `Vec` push order produced.
     cards.sort_by_key(|c| Reverse(c.rank));
 
-    // Count occurrences of each rank.
-    let mut rank_counts: Vec<(Rank, usize)> = Vec::new();
-    for r in Rank::ALL.iter().rev() {
-        let n = cards.iter().filter(|c| c.rank == *r).count();
-        if n > 0 {
-            rank_counts.push((*r, n));
-        }
+    // Count occurrences of each rank once (indexed by rank, not a Vec of pairs).
+    let mut counts = [0u8; 13];
+    for c in cards.iter() {
+        counts[c.rank as usize] += 1;
     }
+    // Highest rank (descending, as the old `rank_counts` vec was ordered) with
+    // at least `min` occurrences, optionally skipping one already-used rank.
+    let highest_with = |min: u8, exclude: Option<Rank>| -> Option<Rank> {
+        Rank::ALL
+            .iter()
+            .rev()
+            .copied()
+            .find(|r| counts[*r as usize] >= min && Some(*r) != exclude)
+    };
+    // Distinct ranks in `cards` order (descending), skipping `exclude`.
+    let distinct_ranks_except = |exclude: Option<Rank>| -> ([Rank; 7], usize) {
+        let mut out = [Rank::Two; 7];
+        let mut len = 0usize;
+        for c in cards.iter() {
+            if Some(c.rank) == exclude || out[..len].contains(&c.rank) {
+                continue;
+            }
+            out[len] = c.rank;
+            len += 1;
+        }
+        (out, len)
+    };
 
     let category = rank.name().to_string();
     match rank {
         HandRank::HighCard(_) => {
             // Top 5 distinct ranks descending.
-            let mut ranks_desc: Vec<Rank> = cards.iter().map(|c| c.rank).collect();
-            ranks_desc.dedup();
-            let take: Vec<Rank> = ranks_desc.into_iter().take(5).collect();
-            let primary = take.first().copied().map(rank_str);
-            let kicker = take.get(1).copied().map(rank_str);
-            let board = take.into_iter().map(rank_str).collect();
+            let (ranks, len) = distinct_ranks_except(None);
+            let take = &ranks[..len.min(5)];
             RankDescription {
                 category,
-                primary,
+                primary: take.first().copied().map(rank_str),
                 secondary: None,
-                kicker,
-                board,
+                kicker: take.get(1).copied().map(rank_str),
+                board: take.iter().copied().map(rank_str).collect(),
             }
         }
         HandRank::OnePair(_) => {
-            let pair = rank_counts.iter().find(|(_, n)| *n >= 2).map(|(r, _)| *r);
-            let kickers: Vec<Rank> = cards
-                .iter()
-                .map(|c| c.rank)
-                .filter(|r| Some(*r) != pair)
-                .fold(Vec::new(), |mut acc, r| {
-                    if !acc.contains(&r) {
-                        acc.push(r);
-                    }
-                    acc
-                });
-            let board: Vec<String> = kickers.iter().take(3).map(|r| rank_str(*r)).collect();
+            let pair = highest_with(2, None);
+            let (kickers, len) = distinct_ranks_except(pair);
+            let kickers = &kickers[..len];
             RankDescription {
                 category,
                 primary: pair.map(rank_str),
                 secondary: None,
                 kicker: kickers.first().copied().map(rank_str),
-                board,
+                board: kickers.iter().take(3).copied().map(rank_str).collect(),
             }
         }
         HandRank::TwoPair(_) => {
-            let pairs: Vec<Rank> = rank_counts
-                .iter()
-                .filter(|(_, n)| *n >= 2)
-                .map(|(r, _)| *r)
-                .collect();
-            let high = pairs.first().copied();
-            let low = pairs.get(1).copied();
+            let high = highest_with(2, None);
+            let low = highest_with(2, high);
             let kicker = cards
                 .iter()
                 .map(|c| c.rank)
@@ -487,28 +504,19 @@ pub fn describe_hand(hole: &HoleCards, board: &BoardCards) -> RankDescription {
             }
         }
         HandRank::ThreeOfAKind(_) => {
-            let trip = rank_counts.iter().find(|(_, n)| *n >= 3).map(|(r, _)| *r);
-            let kickers: Vec<Rank> = cards
-                .iter()
-                .map(|c| c.rank)
-                .filter(|r| Some(*r) != trip)
-                .fold(Vec::new(), |mut acc, r| {
-                    if !acc.contains(&r) {
-                        acc.push(r);
-                    }
-                    acc
-                });
-            let board: Vec<String> = kickers.iter().take(2).map(|r| rank_str(*r)).collect();
+            let trip = highest_with(3, None);
+            let (kickers, len) = distinct_ranks_except(trip);
+            let kickers = &kickers[..len];
             RankDescription {
                 category,
                 primary: trip.map(rank_str),
                 secondary: None,
                 kicker: kickers.first().copied().map(rank_str),
-                board,
+                board: kickers.iter().take(2).copied().map(rank_str).collect(),
             }
         }
         HandRank::Straight(_) => {
-            let high = straight_high_card(&cards);
+            let high = straight_high_card(cards);
             let low = high.map(straight_low_for);
             let board = match high {
                 Some(h) => five_straight_ranks(h)
@@ -526,35 +534,34 @@ pub fn describe_hand(hole: &HoleCards, board: &BoardCards) -> RankDescription {
             }
         }
         HandRank::Flush(_) => {
-            let suit = flush_suit(&cards);
-            let top_5: Vec<Rank> = match suit {
-                Some(s) => {
-                    let mut rs: Vec<Rank> = cards
-                        .iter()
-                        .filter(|c| c.suit == s)
-                        .map(|c| c.rank)
-                        .collect();
-                    rs.sort_by_key(|r| Reverse(*r));
-                    rs.into_iter().take(5).collect()
+            // `cards` is already sorted descending, so the flush ranks come out
+            // descending without a second sort.
+            let suit = flush_suit(cards);
+            let mut top_5 = [Rank::Two; 5];
+            let mut len = 0usize;
+            if let Some(s) = suit {
+                for c in cards.iter().filter(|c| c.suit == s) {
+                    if len == 5 {
+                        break;
+                    }
+                    top_5[len] = c.rank;
+                    len += 1;
                 }
-                None => Vec::new(),
-            };
+            }
+            let top_5 = &top_5[..len];
             RankDescription {
                 category,
                 primary: top_5.first().copied().map(rank_str),
                 secondary: None,
                 kicker: None,
-                board: top_5.into_iter().map(rank_str).collect(),
+                board: top_5.iter().copied().map(rank_str).collect(),
             }
         }
         HandRank::FullHouse(_) => {
             // The trip rank is the highest count-3-or-4 rank.
             // The pair rank is the highest count-2-or-3 rank that is not the trip.
-            let trip = rank_counts.iter().find(|(_, n)| *n >= 3).map(|(r, _)| *r);
-            let pair = rank_counts
-                .iter()
-                .find(|(r, n)| *n >= 2 && Some(*r) != trip)
-                .map(|(r, _)| *r);
+            let trip = highest_with(3, None);
+            let pair = highest_with(2, trip);
             RankDescription {
                 category,
                 primary: trip.map(rank_str),
@@ -564,7 +571,7 @@ pub fn describe_hand(hole: &HoleCards, board: &BoardCards) -> RankDescription {
             }
         }
         HandRank::FourOfAKind(_) => {
-            let quad = rank_counts.iter().find(|(_, n)| *n >= 4).map(|(r, _)| *r);
+            let quad = highest_with(4, None);
             let kicker = cards.iter().map(|c| c.rank).find(|r| Some(*r) != quad);
             RankDescription {
                 category,
@@ -575,12 +582,16 @@ pub fn describe_hand(hole: &HoleCards, board: &BoardCards) -> RankDescription {
             }
         }
         HandRank::StraightFlush(_) => {
-            let suit = flush_suit(&cards);
-            let flush_cards: Vec<Card> = match suit {
-                Some(s) => cards.iter().copied().filter(|c| c.suit == s).collect(),
-                None => Vec::new(),
-            };
-            let high = straight_high_card(&flush_cards);
+            let suit = flush_suit(cards);
+            let mut flush_buf = [hole.card1; 7];
+            let mut len = 0usize;
+            if let Some(s) = suit {
+                for c in cards.iter().filter(|c| c.suit == s) {
+                    flush_buf[len] = *c;
+                    len += 1;
+                }
+            }
+            let high = straight_high_card(&flush_buf[..len]);
             let board = match high {
                 Some(h) => five_straight_ranks(h)
                     .iter()
@@ -1291,5 +1302,78 @@ mod tests {
         // secondary is None and board is empty → omitted from JSON.
         assert!(!json.contains("\"secondary\""), "{json}");
         assert!(!json.contains("\"board\""), "{json}");
+    }
+
+    fn lcg_eval(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        *state >> 33
+    }
+
+    /// Fix (4) guard: the stack-array `describe_hand` must emit EXACTLY the
+    /// same wire shape as the old allocating implementation. The digest is a
+    /// fingerprint of the serialized `RankDescription` for 60,000 deals
+    /// (20,000 deterministic 7-card sets x flop / turn / river boards),
+    /// captured from the pre-optimization code (2026-09-16). A change here is
+    /// a WIRE change (see the `RankDescription` doc table), not a stale test.
+    #[test]
+    fn describe_hand_is_unchanged_over_random_deals() {
+        let mut state = 0x2026_0916_u64;
+        let mut digest: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut categories: Vec<String> = Vec::new();
+        for _ in 0..20_000 {
+            let mut idx = [0u8; 7];
+            let mut n = 0usize;
+            while n < 7 {
+                let candidate = (lcg_eval(&mut state) % 52) as u8;
+                if idx[..n].contains(&candidate) {
+                    continue;
+                }
+                idx[n] = candidate;
+                n += 1;
+            }
+            let cards: Vec<Card> = idx
+                .iter()
+                .map(|i| card(Rank::ALL[(*i / 4) as usize], Suit::ALL[(*i % 4) as usize]))
+                .collect();
+            let h = hole(cards[0], cards[1]);
+            let boards = [
+                BoardCards {
+                    flop: Some([cards[2], cards[3], cards[4]]),
+                    turn: None,
+                    river: None,
+                },
+                BoardCards {
+                    flop: Some([cards[2], cards[3], cards[4]]),
+                    turn: Some(cards[5]),
+                    river: None,
+                },
+                BoardCards {
+                    flop: Some([cards[2], cards[3], cards[4]]),
+                    turn: Some(cards[5]),
+                    river: Some(cards[6]),
+                },
+            ];
+            for board in boards {
+                let desc = describe_hand(&h, &board);
+                if !categories.contains(&desc.category) {
+                    categories.push(desc.category.clone());
+                }
+                let json = serde_json::to_string(&desc).expect("description serializes");
+                for byte in json.as_bytes() {
+                    digest ^= *byte as u64;
+                    digest = digest.wrapping_mul(0x100_0000_01b3);
+                }
+            }
+        }
+        assert!(
+            categories.len() >= 9,
+            "coverage too narrow to pin anything: {categories:?}"
+        );
+        assert_eq!(
+            digest, 0x7804_48c5_4ce8_591c,
+            "describe_hand wire output changed vs the pre-optimization implementation"
+        );
     }
 }
