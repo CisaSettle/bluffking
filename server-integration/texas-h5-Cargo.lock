@@ -2914,6 +2914,7 @@ dependencies = [
  "idna",
  "jsonwebtoken",
  "libc",
+ "md-5",
  "mental-poker",
  "openssl",
  "proptest",
