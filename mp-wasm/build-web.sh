@@ -3,7 +3,7 @@
 # into client-game so `npm ci` worktrees / CI never need the Rust toolchain.
 #
 #   target:  --target web  → an ES module with an explicit async `init()`,
-#            the proven browser path (browser_demo.html). Vite consumes it
+#            the proven browser path. Vite consumes it
 #            natively (no vite-plugin-wasm, no optimizeDeps, no fs.allow entry):
 #            MpRealClient does `import init` + a `?url` asset import of the .wasm.
 #
@@ -28,7 +28,7 @@ echo "[build-web] wasm-pack build --target web --out-dir pkg-web --release"
 # was given); otherwise the browser-ready artifacts stay in pkg-web/.
 if [ -z "${MP_WASM_VENDOR_DIR:-}" ] && [ ! -d "$here/../client-game" ]; then
   echo "[build-web] client-game/ not found (public OSS clone?) — skipping vendor step."
-  echo "[build-web] artifacts ready in $here/pkg-web (browser_demo.html imports ./pkg-web/);"
+  echo "[build-web] artifacts ready in $here/pkg-web;"
   echo "[build-web] set MP_WASM_VENDOR_DIR=<dir> to vendor them elsewhere."
   exit 0
 fi
