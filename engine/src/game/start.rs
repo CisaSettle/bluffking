@@ -68,6 +68,7 @@ impl GameHand {
             big_blind,
             small_blind,
             forced_straddle: None,
+            ante: Chips::ZERO,
             preflop_bring_in: big_blind,
             mode: HandMode::Plaintext,
             deck,
@@ -133,6 +134,7 @@ impl GameHand {
             big_blind,
             small_blind,
             forced_straddle: None,
+            ante: Chips::ZERO,
             preflop_bring_in: big_blind,
             mode: HandMode::Blind,
             // Empty deck: blind mode never deals from it. Any accidental
@@ -163,6 +165,14 @@ impl GameHand {
         self
     }
 
+    /// Enable a per-seat ante for this hand. Every dealt seat posts
+    /// `min(amount, stack)` as dead money before the blinds; a zero amount
+    /// disables it. Antes are not part of the preflop bet level.
+    pub fn with_ante(mut self, amount: Chips) -> Self {
+        self.ante = amount;
+        self
+    }
+
     /// Start the hand: post blinds, deal hole cards, begin preflop betting.
     pub fn start(&mut self) -> Result<GameSnapshot, ActionError> {
         if self.phase != Phase::NotStarted {
@@ -182,6 +192,29 @@ impl GameHand {
         let n = self.seats.len();
         if n < 2 {
             return Err(ActionError::NotInHand);
+        }
+
+        // Post antes first: dead money that goes straight into the completed
+        // pot. A stack that cannot cover the ante posts what it has and is
+        // all-in before the blinds (settlement reads each seat's total
+        // contribution, so the ante layer is contested like any side pot).
+        let mut ante_total = 0u32;
+        if self.ante.0 > 0 {
+            for seat in &mut self.seats {
+                let posted = self.ante.0.min(seat.stack.0);
+                seat.stack.0 -= posted;
+                ante_total += posted;
+                if seat.stack.0 == 0 {
+                    seat.all_in = true;
+                }
+            }
+            self.completed_pot.0 += ante_total;
+            self.cumulative_side_pots.push(SidePot {
+                cap: self.ante,
+                amount: Chips(ante_total),
+                eligible: self.seats.iter().map(|s| s.player_id).collect(),
+                refund_to: Vec::new(),
+            });
         }
 
         // Determine blind positions.
@@ -212,6 +245,7 @@ impl GameHand {
                 small_blind: self.small_blind.0 as u64,
                 straddle_seat: straddle_idx.map(|idx| self.seats[idx].seat),
                 straddle_amount: self.forced_straddle.filter(|_| n >= 3).map(|v| v.0 as u64),
+                ante: self.ante.0 as u64,
                 deck_seed: self.deck_seed,
             });
         }
@@ -238,8 +272,8 @@ impl GameHand {
             amount: Chips(sb_blind_amount),
             stack_before: sb_stack_start,
             stack_after: Chips(sb_stack_start.0 - sb_blind_amount),
-            pot_before: Chips::ZERO,
-            pot_after: Chips(sb_blind_amount),
+            pot_before: Chips(ante_total),
+            pot_after: Chips(ante_total + sb_blind_amount),
         });
         self.last_action.insert(
             sb_id.inner(),
@@ -263,8 +297,8 @@ impl GameHand {
             amount: Chips(bb_blind_amount),
             stack_before: bb_stack_start,
             stack_after: Chips(bb_stack_start.0 - bb_blind_amount),
-            pot_before: Chips(sb_blind_amount),
-            pot_after: Chips(sb_blind_amount + bb_blind_amount),
+            pot_before: Chips(ante_total + sb_blind_amount),
+            pot_after: Chips(ante_total + sb_blind_amount + bb_blind_amount),
         });
         self.last_action.insert(
             bb_id.inner(),
@@ -284,7 +318,9 @@ impl GameHand {
             let stack_start = self.seats[idx].stack;
             let posted = requested.0.min(stack_start.0);
             let seq = self.action_seq;
-            let pot_before = sb_blind_amount.saturating_add(bb_blind_amount);
+            let pot_before = ante_total
+                .saturating_add(sb_blind_amount)
+                .saturating_add(bb_blind_amount);
             self.actions.push(ActionRecord {
                 seq,
                 street: Street::Preflop,
@@ -447,7 +483,8 @@ impl GameHand {
 
         // Emit PotUpdated after all forced posts are made.
         // Blinds are never all-in for normal stacks; compute accurately anyway.
-        let total_blind_pot = sb_blind_amount as u64
+        let total_blind_pot = ante_total as u64
+            + sb_blind_amount as u64
             + bb_blind_amount as u64
             + straddle_record
                 .map(|(_, _, posted, _, _)| posted as u64)

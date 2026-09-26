@@ -191,6 +191,13 @@ impl BettingRound {
             }
         }
 
+        // A seat emptied before the blinds (e.g. by an ante) is all-in.
+        for ps in &mut player_states {
+            if ps.stack.0 == 0 {
+                ps.all_in = true;
+            }
+        }
+
         let current_bet = Chips(current_bet.0.max(big_blind.0));
         let n_can_act = player_states
             .iter()

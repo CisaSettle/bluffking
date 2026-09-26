@@ -69,6 +69,9 @@ pub enum EngineEvent {
         /// Requested straddle amount in chips, if enabled for this hand.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         straddle_amount: Option<u64>,
+        /// Per-seat ante in chips (0 when the table has no ante).
+        #[serde(default, skip_serializing_if = "is_zero")]
+        ante: u64,
         /// Deck seed (for per-bot RNG derivation — ADR-024 §6, ADR-062 §2).
         /// 256-bit; the server projects it to a `u64` for the bot RNG.
         ///
@@ -187,4 +190,8 @@ pub enum EngineEvent {
         /// The complete hand result.
         result: HandResult,
     },
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
 }

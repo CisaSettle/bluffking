@@ -1710,3 +1710,107 @@ fn three_player_full_hand_no_panic() {
     let total: u32 = result.chips_awarded.values().sum();
     assert_eq!(total, 60); // 3 * 20
 }
+
+#[test]
+fn ante_posts_dead_money_before_blinds() {
+    let mut hand = GameHand::new_with_rng(
+        vec![
+            (pid(1), c(1000), 0),
+            (pid(2), c(1000), 1),
+            (pid(3), c(1000), 2),
+        ],
+        0,
+        c(20),
+        c(10),
+        PokerRng::from_seed(7),
+    )
+    .with_ante(c(5));
+
+    let snap = hand.start().expect("ante hand starts");
+    assert_eq!(snap.pot, c(45), "3 antes + SB + BB");
+    assert_eq!(snap.current_bet, c(20), "antes do not raise the bet level");
+    assert_eq!(snap.min_raise_to, Some(c(40)));
+    assert_eq!(snap.current_actor, Some(pid(1)));
+    assert_eq!(hand.actions.len(), 2, "antes are not action records");
+    assert_eq!(hand.actions[0].seq, 0);
+    assert_eq!(hand.actions[0].pot_before, c(15));
+    assert_eq!(hand.actions[1].pot_after, c(45));
+
+    let events = hand.drain_events();
+    assert!(matches!(
+        events.first(),
+        Some(EngineEvent::HandStarted { ante: 5, .. })
+    ));
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, EngineEvent::PotUpdated { pot: 45, .. })));
+
+    hand.apply_action(pid(1), PlayerAction::Fold).unwrap();
+    hand.apply_action(pid(2), PlayerAction::Fold).unwrap();
+    assert!(hand.is_done());
+    let result = hand.finish();
+    assert_eq!(result.final_stacks[&1], 995);
+    assert_eq!(result.final_stacks[&2], 985);
+    assert_eq!(result.final_stacks[&3], 1020);
+    assert_eq!(result.final_stacks.values().sum::<u32>(), 3000);
+}
+
+#[test]
+fn ante_short_stack_is_all_in_and_only_contests_the_ante_layer() {
+    let mut hand = GameHand::new_with_rng(
+        vec![
+            (pid(1), c(3), 0),
+            (pid(2), c(1000), 1),
+            (pid(3), c(1000), 2),
+        ],
+        0,
+        c(20),
+        c(10),
+        PokerRng::from_seed(11),
+    )
+    .with_ante(c(5));
+
+    let snap = hand.start().expect("ante hand starts");
+    assert_eq!(snap.pot, c(3 + 5 + 5 + 10 + 20));
+    assert_ne!(
+        snap.current_actor,
+        Some(pid(1)),
+        "a seat emptied by the ante never acts"
+    );
+    while !hand.is_done() {
+        let Some(actor) = hand.snapshot().current_actor else {
+            break;
+        };
+        if hand.apply_action(actor, PlayerAction::Call).is_err() {
+            hand.apply_action(actor, PlayerAction::Check).unwrap();
+        }
+    }
+    let result = hand.finish();
+    assert_eq!(result.final_stacks.values().sum::<u32>(), 2003);
+    assert!(
+        result.final_stacks[&1] <= 9,
+        "the all-in short stack can win at most 3 x its 3-chip ante"
+    );
+}
+
+#[test]
+fn zero_ante_is_the_unchanged_blind_only_hand() {
+    let mut hand = GameHand::new_with_rng(
+        vec![
+            (pid(1), c(1000), 0),
+            (pid(2), c(1000), 1),
+            (pid(3), c(1000), 2),
+        ],
+        0,
+        c(20),
+        c(10),
+        PokerRng::from_seed(7),
+    )
+    .with_ante(c(0));
+    let snap = hand.start().unwrap();
+    assert_eq!(snap.pot, c(30));
+    assert!(matches!(
+        hand.drain_events().first(),
+        Some(EngineEvent::HandStarted { ante: 0, .. })
+    ));
+}

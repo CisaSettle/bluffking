@@ -392,6 +392,8 @@ pub struct GameHand {
     /// action opens to that seat's left, and a fully-funded straddle becomes
     /// the preflop bring-in / minimum raise increment.
     forced_straddle: Option<Chips>,
+    /// Per-seat ante posted as dead money before the blinds (zero = none).
+    ante: Chips,
     /// The preflop opening wager / minimum raise increment ACTUALLY handed to
     /// [`BettingRound::new_preflop`] when the hand started: the big blind
     /// normally, the straddle when a live straddle was fully funded (a SHORT
@@ -561,6 +563,11 @@ impl GameHand {
         let (_, bb_idx) = blind_positions(self.dealer_idx, n);
         let idx = (bb_idx + 1) % n;
         Some((self.seats[idx].seat, amount))
+    }
+
+    /// Configured per-seat ante for this hand (zero when disabled).
+    pub fn ante(&self) -> Chips {
+        self.ante
     }
 
     /// Drain all events accumulated since the last call.
