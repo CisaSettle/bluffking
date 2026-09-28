@@ -5,7 +5,7 @@
 //! server's `pf_dealing` uses), serialize a `HandRecord`, then assert
 //! `pf::verify_hand` accepts it and
 //! rejects mutated variants. Fixtures are generated from real engine output,
-//! never hand-authored (per [[lock-interface-spec-first]]).
+//! never hand-authored; they are derived from the locked wire interface.
 
 use std::collections::BTreeMap;
 

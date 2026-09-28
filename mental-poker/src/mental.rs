@@ -11,7 +11,7 @@
 //! - **Mock crypto.** Shuffle and decryption proofs come from
 //!   [`crate::crypto::MockShuffleProofProvider`] / [`MockDecryptionProvider`];
 //!   signatures from [`crate::signing::MockSignatureProvider`]. None are
-//!   production-safe — see those modules and `docs/...refactor.md` §7.
+//!   production-safe; see those modules for the exact boundaries.
 //! - **Coordinator-simulated parties.** All `n` parties are simulated locally
 //!   from one master seed. There is not yet a real distributed key-exchange /
 //!   shuffle choreography over WebSocket (rollout §8 phase 3).

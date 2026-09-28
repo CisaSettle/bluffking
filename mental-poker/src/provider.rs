@@ -54,7 +54,7 @@ pub trait DealingProvider {
     fn deal(&self, request: &DealRequest) -> DealtHand;
 }
 
-/// The `DEALING_PROVIDER` feature-flag values (see `docs/...refactor.md` §9).
+/// Runtime values accepted by the `DEALING_PROVIDER` configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DealingProviderKind {
     /// Legacy trusted-server shuffle. Not a Mental Poker provider.
