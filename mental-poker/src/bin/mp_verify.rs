@@ -110,7 +110,7 @@ fn report(transcript: &Transcript) -> i32 {
     match verify(transcript) {
         Ok(r) => {
             // BUG-108: a `verify()` Ok on a DEV-ONLY MOCK transcript (the
-            // production `mental_poker_prefer` path: mock-shuffle-v1 /
+            // offline mock fixture: mock-shuffle-v1 /
             // mock-decrypt-v1 / mock signing) means only that the transcript
             // REPLAYS consistently — the mock proofs do NOT prove a true shuffle
             // or honest decryption, so it is NOT a provable-fairness guarantee.

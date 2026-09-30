@@ -54,18 +54,11 @@ pub trait DealingProvider {
     fn deal(&self, request: &DealRequest) -> DealtHand;
 }
 
-/// Runtime values accepted by the `DEALING_PROVIDER` configuration.
+/// Runtime values accepted by the offline provider selector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DealingProviderKind {
     /// Legacy trusted-server shuffle. Not a Mental Poker provider.
     ExistingServer,
-    /// Prefer the current interactive Mental Poker transcript mode on eligible
-    /// all-human tables, falling back per hand to [`ExistingServer`].
-    ///
-    /// This is an operational (mock-transcript) policy — NOT the cross-vendor-AI-audited
-    /// engine-blind path. Successful hands still produce the current
-    /// `mental_poker_mock` transcript/provider string.
-    PreferMentalPoker,
     /// Mental Poker protocol with **mock** crypto. Dev only.
     MentalPokerMock,
     /// Mental Poker protocol with **generic, UNAUDITED** real crypto. Rejected
@@ -83,21 +76,20 @@ pub enum DealingProviderKind {
     /// This variant exists so [`crate::guard_provider_allowed`] can record, as a
     /// reviewable distinction, that the cross-vendor-AI-audited engine-blind composition is
     /// prod-permitted while the generic [`Self::MentalPokerProduction`] stays
-    /// caged. It is intentionally NOT parseable from `DEALING_PROVIDER`.
+    /// caged. It is intentionally NOT parseable from a provider name.
     MentalPokerEngineBlind,
 }
 
 impl DealingProviderKind {
-    /// Parse the `DEALING_PROVIDER` env value. Unknown values map to `None`.
+    /// Parse the provider name. Unknown values map to `None`.
     ///
     /// `MentalPokerEngineBlind` is intentionally **NOT** parseable here: the live
     /// engine-blind path is routed by the per-session `engine_blind` flag, never
-    /// by a startup `DEALING_PROVIDER=...` selection, so it must never be
+    /// by a startup provider-name selection, so it must never be
     /// reachable through the env-var startup path.
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim() {
             "existing_server" => Some(Self::ExistingServer),
-            "mental_poker_prefer" => Some(Self::PreferMentalPoker),
             "mental_poker_mock" => Some(Self::MentalPokerMock),
             "mental_poker_production" => Some(Self::MentalPokerProduction),
             _ => None,
@@ -108,19 +100,9 @@ impl DealingProviderKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ExistingServer => "existing_server",
-            Self::PreferMentalPoker => "mental_poker_prefer",
             Self::MentalPokerMock => "mental_poker_mock",
             Self::MentalPokerProduction => "mental_poker_production",
             Self::MentalPokerEngineBlind => "mental_poker_engine_blind",
-        }
-    }
-
-    /// The persisted provider for a completed transcript, if this kind uses
-    /// the current interactive Mental Poker implementation.
-    pub fn transcript_provider_kind(self) -> Self {
-        match self {
-            Self::PreferMentalPoker => Self::MentalPokerMock,
-            other => other,
         }
     }
 }

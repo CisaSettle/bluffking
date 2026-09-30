@@ -7,10 +7,6 @@
 //!   server-side RNG/shuffle directly;
 //! - [`ExistingServerDealingProvider`] — the legacy trusted-server shuffle,
 //!   retained for rollback;
-//! - `mental_poker_prefer` — the production policy that first tries the current
-//!   interactive transcript mode on eligible all-human hands and falls back to
-//!   [`ExistingServerDealingProvider`] when the table is ineligible or the
-//!   choreography aborts;
 //! - [`MentalPokerDealingProvider`] — the untrusted-dealer protocol
 //!   (encrypted deck, re-encryption shuffle, final deck commitment, owner-only
 //!   reveal, staged community reveal) producing a signed [`Transcript`];
@@ -28,8 +24,6 @@
 //! guard [`guard_provider_allowed`] keeps the explicit mock provider out of
 //! production and rejects the generic `mental_poker_production` provider
 //! (engine-blind selects real crypto via `resolve_mp_crypto_mode`).
-//! `mental_poker_prefer` may run in production as a best-effort transcript mode,
-//! but it must not be described as server-blind cryptographic Mental Poker.
 //!
 //! Pure crate: no async, no IO, no DB — `cargo test -p mental-poker` needs no
 //! database.
@@ -77,9 +71,6 @@ pub use verifier::{
 /// environment. The server calls this at startup and **panics** on `Err`.
 ///
 /// - `existing_server` — always allowed.
-/// - `mental_poker_prefer` — allowed in all environments. It is a production
-///   policy that attempts the current interactive transcript mode first and
-///   falls back per hand to `existing_server`; it is not server-blind crypto.
 /// - `mental_poker_mock` — allowed only in an explicitly-listed non-production
 ///   env (dev/CI/staging/test/local; its crypto is dev-only mock). FAIL-CLOSED:
 ///   an unset/empty/unrecognised `APP_ENV` is treated as production and rejected
@@ -96,7 +87,7 @@ pub use verifier::{
 ///   `server::mp_dealing::resolve_mp_crypto_mode` (which only returns `Real` in
 ///   prod for an `engine_blind` session) plus the Mock-void safety net
 ///   (`mp_engine_blind_live.rs` — a `Mock` engine-blind hand still VOIDS). This
-///   guard validates the **startup `DEALING_PROVIDER`** value, and this variant
+///   guard validates the **provider-selection** value, and this variant
 ///   is intentionally NOT parseable from that env var (`DealingProviderKind::parse`),
 ///   so it can never be selected at startup. Permitting it here keeps the
 ///   cross-vendor-AI-audited-vs-generic distinction reviewable and future-proofs an explicit
@@ -116,14 +107,11 @@ pub fn guard_provider_allowed(kind: DealingProviderKind, app_env: &str) -> Resul
     );
     match kind {
         DealingProviderKind::ExistingServer => Ok(()),
-        DealingProviderKind::PreferMentalPoker => Ok(()),
         DealingProviderKind::MentalPokerMock => {
             if is_production {
-                Err(
-                    "DEALING_PROVIDER=mental_poker_mock relies on dev-only mock \
+                Err("mental_poker_mock relies on dev-only mock \
                      crypto and must not run when APP_ENV=production"
-                        .to_string(),
-                )
+                    .to_string())
             } else {
                 Ok(())
             }
@@ -131,15 +119,15 @@ pub fn guard_provider_allowed(kind: DealingProviderKind, app_env: &str) -> Resul
         // The generic real-crypto provider is rejected in every environment.
         // Only the engine-blind composition below is allowed, under ADR-101's
         // trusted-single-operator scope.
-        DealingProviderKind::MentalPokerProduction => Err(
-            "DEALING_PROVIDER=mental_poker_production is the generic UNAUDITED \
+        DealingProviderKind::MentalPokerProduction => {
+            Err("mental_poker_production is the generic UNAUDITED \
              real-crypto path and stays rejected everywhere; ONLY the \
              engine-blind composition is allowed under the trusted-single-operator \
              scope (see docs/architecture/adr/ADR-101-engine-blind-honest-operator-scope.html)"
-                .to_string(),
-        ),
+                .to_string())
+        }
         // ADR-070 P5 — the cross-vendor-AI-audited engine-blind n-of-n composition is
-        // prod-permitted. (Not reachable from the startup DEALING_PROVIDER env;
+        // prod-permitted. (Not reachable from the provider name;
         // see the doc-comment — the live gate is resolve_mp_crypto_mode + the
         // per-session engine_blind routing flag + the Mock-void safety net.)
         DealingProviderKind::MentalPokerEngineBlind => Ok(()),
@@ -149,16 +137,14 @@ pub fn guard_provider_allowed(kind: DealingProviderKind, app_env: &str) -> Resul
 /// Construct the configured dealing provider after [`guard_provider_allowed`]
 /// has approved it. `entropy` is OS randomness the server supplies for the
 /// Mental Poker master seed. Returns `None` for `mental_poker_production`
-/// (no implementation yet). `mental_poker_prefer` uses the same current
-/// transcript implementation as `mental_poker_mock`; callers decide eligibility
-/// and fallback before invoking it.
+/// (no implementation yet). Mock providers are used by offline fixtures only.
 pub fn select_provider(
     kind: DealingProviderKind,
     entropy: Vec<u8>,
 ) -> Option<Box<dyn DealingProvider>> {
     match kind {
         DealingProviderKind::ExistingServer => Some(Box::new(ExistingServerDealingProvider::new())),
-        DealingProviderKind::PreferMentalPoker | DealingProviderKind::MentalPokerMock => {
+        DealingProviderKind::MentalPokerMock => {
             Some(Box::new(MentalPokerDealingProvider::new(entropy)))
         }
         // `MentalPokerProduction` has no `DealingProvider` impl. The cross-vendor-AI-audited
@@ -189,15 +175,6 @@ mod guard_tests {
         assert!(
             guard_provider_allowed(DealingProviderKind::MentalPokerMock, "PRODUCTION").is_err()
         );
-    }
-
-    #[test]
-    fn prefer_allowed_in_production() {
-        assert!(
-            guard_provider_allowed(DealingProviderKind::PreferMentalPoker, "production").is_ok()
-        );
-        assert!(guard_provider_allowed(DealingProviderKind::PreferMentalPoker, "prod").is_ok());
-        assert!(guard_provider_allowed(DealingProviderKind::PreferMentalPoker, "dev").is_ok());
     }
 
     #[test]
@@ -233,7 +210,7 @@ mod guard_tests {
         assert!(
             guard_provider_allowed(DealingProviderKind::MentalPokerProduction, "prod").is_err()
         );
-        // And it must NOT be reachable from the startup DEALING_PROVIDER env at all
+        // And it must NOT be reachable from the provider name at all
         // for the engine-blind variant (that is routed per-session, not via env).
         assert_eq!(
             DealingProviderKind::parse("mental_poker_engine_blind"),
@@ -276,13 +253,5 @@ mod guard_tests {
             select_provider(DealingProviderKind::MentalPokerEngineBlind, vec![0u8; 32]).is_none(),
             "engine-blind must not fall back to a mock DealingProvider"
         );
-    }
-
-    #[test]
-    fn prefer_selects_current_transcript_provider() {
-        let provider = select_provider(DealingProviderKind::PreferMentalPoker, vec![0u8; 32])
-            .expect("prefer mode uses current transcript provider");
-        assert_eq!(provider.name(), "mental_poker_mock");
-        assert!(provider.is_verifiable());
     }
 }

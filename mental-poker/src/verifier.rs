@@ -38,8 +38,7 @@ use thiserror::Error;
 /// (cryptographically sound, up to the interim shuffle's stated ~2⁻²⁶ soundness
 /// bound — see `crypto_real::shuffle`) schemes or dev-only **mocks**.
 ///
-/// This is the crux of BUG-108: the production `mental_poker_prefer` policy deals
-/// eligible all-human hands with the **mock** crypto suite (`mock-shuffle-v1` +
+/// This is the crux of BUG-108: offline test fixtures use the **mock** crypto suite (`mock-shuffle-v1` +
 /// `mock-decrypt-v1`, mock signing envelope — see `crypto.rs` module docs). Those
 /// proofs are *not* cryptographically sound: a malicious shuffler that replaces a
 /// card still produces a "valid" mock proof. A `verify()` `Ok` on such a
@@ -69,7 +68,7 @@ pub enum SchemeSoundness {
 /// the signing key directory is the mock (symmetric HMAC) kind.
 ///
 /// FAIL-CLOSED: anything other than the full real composition is [`DevMock`], so
-/// the mock production path (`mental_poker_prefer`) can never be reported as a
+/// a mock fixture can never be reported as a
 /// sound fairness guarantee.
 ///
 /// [`Sound`]: SchemeSoundness::Sound
@@ -710,8 +709,7 @@ pub enum VerifyFairnessError {
 /// BUG-108 (fail-closed fairness gate) — the strict counterpart to [`verify`].
 ///
 /// [`verify`] returns `Ok` for ANY transcript that **replays consistently**,
-/// including the dev-only mock-crypto suite ([`SchemeSoundness::DevMock`]) the
-/// production `mental_poker_prefer` policy deals. That `Ok` is the right answer
+/// including the dev-only mock-crypto suite ([`SchemeSoundness::DevMock`]) used in offline fixtures. That `Ok` is the right answer
 /// for an internal replay *self-check* (e.g. the server validating a transcript
 /// it just built — `mp_dealing.rs`), but it is the WRONG answer for any consumer
 /// asking the *fairness* question "may I present this to a real player as
@@ -1203,7 +1201,7 @@ mod soundness_tests {
 
     #[test]
     fn mock_dealt_transcript_verifies_but_reports_devmock() {
-        // This is exactly the production `mental_poker_prefer` deal: the mock
+        // This is exactly an offline mock deal: the mock
         // Mental Poker provider. It MUST verify (consistent replay) yet be flagged
         // DevMock so the `mp-verify` CLI / any UI never claims it is provably fair.
         let request = DealRequest {
