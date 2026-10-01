@@ -23,11 +23,9 @@
 //! an abstract pot-share %; EV is in pot units (the tree's chip scale). NO money
 //! / wager / cash / chips-won wording.
 //!
-//! ## Auth + rate limit
-//! PUBLIC (no `AuthUser`). Per-IP rate-limited at the router layer via
-//! `RateLimitKind::PostflopSolve` (15/window — far TIGHTER than the 120/window
-//! `PokerTool` MC tools, because each solve is hundreds of MB → ~1.5 GB + seconds
-//! of CPU).
+//! ## Auth
+//! PUBLIC (no `AuthUser`). Each solve is hundreds of MB → ~1.5 GB + seconds of
+//! CPU, so the defenses below bound memory and concurrency.
 //!
 //! ## DoS / OOM defenses (layered)
 //! 1. **Pre-allocation memory gate** (`gto-solver` `SolveLimits::max_memory_bytes`
@@ -553,14 +551,6 @@ fn source_url() -> Option<String> {
     source_url_cell().get().cloned()
 }
 
-/// The configured §13 source URL, exposed for the rate-limit layer (F2). The
-/// `PostflopSolve` 429 is produced by `RateLimitLayer` BEFORE `solve_handler`
-/// runs, so the layer cannot reuse `error_body`; it reads the offer through this
-/// accessor instead, keeping the single `OnceLock` as the source of truth.
-pub fn configured_source_url() -> Option<String> {
-    source_url()
-}
-
 /// Max characters in EITHER range string (F2). The upstream range grammar parses
 /// comma-separated tokens; a near-body-limit (2 MB) comma-heavy string would burn
 /// worker CPU in `validate_request` (parsed SYNCHRONOUSLY on the async worker,
@@ -944,7 +934,7 @@ fn player_str(p: Player) -> &'static str {
 /// The source IP for the per-IP in-flight guard (F1). Uses the TCP peer from
 /// axum's `ConnectInfo`. We deliberately key on the DIRECT peer (not
 /// `X-Forwarded-For`): the per-IP guard is a self-DoS / capacity-fairness control
-/// layered UNDER the `PostflopSolve` rate limit (which already does the
+/// layered UNDER the server-wide request budget (which already does the
 /// proxy-aware client-IP extraction). Behind a trusted proxy every request shares
 /// the edge peer, which only makes this guard STRICTER (more conservative), never
 /// looser, so it cannot be bypassed by forging headers. A missing `ConnectInfo`
