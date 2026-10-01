@@ -11,6 +11,19 @@ just the library.
   deployed (rate-limit / memory-gate / concurrency / cache / §13 source-offer
   logic). It is the endpoint that reaches the AGPL `gto-solver` crate over the
   network.
+- `sealed_dealer.rs` — the **sealed dealer** as deployed: the separate process
+  that deals every default (non-mental-poker) Hold'em hand. It is published for
+  transparency so anyone can read exactly what it does: it shuffles with the
+  open-source `engine` deck, commits to the deck before the hand, sends each
+  human player's hole cards straight to that player's browser over its own
+  WebSocket (they never pass through the game-server process), releases board
+  and contested showdown cards only when the game reaches those stages, and
+  hands the completed deck to the game server after settlement for the owner's
+  private hand review. It is a single trusted dealer, **not** mental poker: the
+  dealer process itself holds the deck. For dealing that no server can read, see
+  `mental-poker/` (`crypto_real`). Like `gto_solve.rs` it is a source offer, not a
+  build target: it references closed server modules (`protocol`,
+  `session_registry`, `runtime_checkpoint`, `outbound`).
 - `texas-h5-Cargo.lock` (U47) — the **deployed server binary's exact dependency
   resolution**, i.e. the §13 reproduce artifact. It pins every version — including
   the git-pinned `postflop-solver` commit — as actually built and deployed. Use
@@ -41,5 +54,6 @@ To compile the exact deployed handler, a downstream would drop `gto_solve.rs`
 into a server crate that supplies those sibling modules and resolve it against
 `texas-h5-Cargo.lock` (which pins `gto-solver` + `postflop-solver` at the deployed
 versions). We intentionally do **not** vendor a synthetic wrapper crate around it
-here — that would ship a fork of the closed server's private module surface. The
-rest of the BluffKing server, clients, and website remain closed.
+here — that would ship a fork of the closed server's private module surface. Apart from
+`sealed_dealer.rs`, the rest of the BluffKing server, clients, and website remain
+closed.

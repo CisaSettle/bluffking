@@ -17,7 +17,7 @@ English · [中文](#中文)
 ## English
 
 > [!NOTE]
-> **This is the open-source subset of [BluffKing](https://bluffking.ai)** — the free, **no-real-money** Texas Hold'em study product. These crates are the poker **engine**, the **verifiable ("mental poker") dealing**, and the **postflop CFR solver** behind it; the game server, web/mobile clients, and website stay closed-source. Running at **[bluffking.ai](https://bluffking.ai)**, which offers this repo as the AGPL §13 Corresponding Source for the solver it serves. Its real server-blind cryptography (`crypto_real`) is **live in production for opt-in all-human "engine-blind" tables** (the server can't see your folded or pre-showdown cards) — cross-vendor AI-audited (Claude + OpenAI Codex — the audit consensus is public) and open-source: read the code and run the offline verifier yourself. (A separate, experimental *co-shuffle* toggle uses mock crypto and is disabled in production.)
+> **This is the open-source subset of [BluffKing](https://bluffking.ai)** — the free, **no-real-money** Texas Hold'em study product. These crates are the poker **engine**, the **verifiable ("mental poker") dealing**, and the **postflop CFR solver** behind it; the game server (except its sealed dealer, published as [`server-integration/sealed_dealer.rs`](server-integration/sealed_dealer.rs)), web/mobile clients, and website stay closed-source. Running at **[bluffking.ai](https://bluffking.ai)**, which offers this repo as the AGPL §13 Corresponding Source for the solver it serves. Its real server-blind cryptography (`crypto_real`) is **live in production for opt-in all-human "engine-blind" tables** (the server can't see your folded or pre-showdown cards) — cross-vendor AI-audited (Claude + OpenAI Codex — the audit consensus is public) and open-source: read the code and run the offline verifier yourself. (A separate, experimental *co-shuffle* toggle uses mock crypto and is disabled in production.)
 
 ### What's here
 
@@ -90,7 +90,7 @@ section) and [`SECURITY.md`](SECURITY.md).
 ## 中文
 
 > [!NOTE]
-> **这是 [BluffKing](https://bluffking.ai) 的开源子集** —— 免费、**不涉及真钱** 的德州扑克学习产品。这些 crate 是它背后的扑克 **引擎**、**可验证("mental poker")发牌** 与 **翻后 CFR 求解器**;游戏服务器、Web/移动客户端与官网保持闭源。线上运行于 **[bluffking.ai](https://bluffking.ai)**,该站将本仓库作为其求解器的 AGPL §13 对应源码对外提供。它的真实服务端盲发密码学(`crypto_real`)已在生产环境 **为可选的全真人「engine-blind」牌桌启用**(服务器看不到你已弃牌或摊牌前的底牌)——经 AI 跨厂商独立审计(Claude + OpenAI Codex,审计共识已公开)、开源可复核:代码你能读、离线验证器你能自己跑。(另有一个独立的实验性 *co-shuffle* 开关使用 mock 加密,生产环境已禁用。)
+> **这是 [BluffKing](https://bluffking.ai) 的开源子集** —— 免费、**不涉及真钱** 的德州扑克学习产品。这些 crate 是它背后的扑克 **引擎**、**可验证("mental poker")发牌** 与 **翻后 CFR 求解器**;游戏服务器(其中的密封发牌进程除外,已作为 [`server-integration/sealed_dealer.rs`](server-integration/sealed_dealer.rs) 公开)、Web/移动客户端与官网保持闭源。线上运行于 **[bluffking.ai](https://bluffking.ai)**,该站将本仓库作为其求解器的 AGPL §13 对应源码对外提供。它的真实服务端盲发密码学(`crypto_real`)已在生产环境 **为可选的全真人「engine-blind」牌桌启用**(服务器看不到你已弃牌或摊牌前的底牌)——经 AI 跨厂商独立审计(Claude + OpenAI Codex,审计共识已公开)、开源可复核:代码你能读、离线验证器你能自己跑。(另有一个独立的实验性 *co-shuffle* 开关使用 mock 加密,生产环境已禁用。)
 
 ### 仓库内容
 
