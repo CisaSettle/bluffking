@@ -1,6 +1,6 @@
 //! Phase 6 H5 rebuild — variable-seat regression for HU through 9-max.
 //!
-//! The Phase 3 client felt is drawn for 2-9 seats and the SetupView wizard
+//! The Phase 3 client felt is drawn for 2-9 seats and the PokerSetupForm wizard
 //! exposes a 2-9 picker. The engine already supports the full range via
 //! `Position::for_seat` + `blind_positions`, but this test pins the contract:
 //!
