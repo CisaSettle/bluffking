@@ -317,7 +317,20 @@ fn internal_authorized(headers: &HeaderMap, state: &WorkerState) -> bool {
     headers
         .get(INTERNAL_TOKEN_HEADER)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.as_bytes() == state.internal_token.as_bytes())
+        .is_some_and(|value| constant_time_eq(value.as_bytes(), state.internal_token.as_bytes()))
+}
+
+/// Constant-time byte comparison so response timing can't recover the
+/// internal token byte-by-byte.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 async fn internal_ready(State(state): State<WorkerState>, headers: HeaderMap) -> StatusCode {
@@ -1143,6 +1156,7 @@ mod tests {
             bot_hand_id,
             &hand,
             &std::collections::HashSet::from([3]),
+            &HashMap::new(),
             client.clone(),
             format!("ws://{addr}/ws"),
             Some(3),
@@ -1171,6 +1185,83 @@ mod tests {
 
         worker.abort();
     }
+
+    /// A mid-hand joiner can bind a seat a fill bot is playing, or a seat a dealt
+    /// human vacated. Neither seat's ticket may reach them: redeeming it would
+    /// expose a live opponent's hole cards.
+    #[tokio::test]
+    async fn tickets_go_only_to_users_dealt_into_the_hand() {
+        let mut hand = engine::GameHand::new_blind(
+            vec![
+                (engine::PlayerId(1), engine::Chips(100), 0),
+                (engine::PlayerId(2), engine::Chips(100), 1),
+                (engine::PlayerId(104), engine::Chips(100), 3),
+            ],
+            0,
+            engine::Chips(20),
+            engine::Chips(10),
+            [0; 32],
+        );
+        hand.start().unwrap();
+        let (alice, bob, carol, mallory) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        let active = ActiveHand::create(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            &hand,
+            &std::collections::HashSet::from([3]),
+            &HashMap::from([(alice, 0), (bob, 1)]),
+        )
+        .await
+        .expect("sealed hand");
+
+        // Bob left mid-hand; Carol took his seat and Mallory took the bot seat.
+        let live = HashMap::from([(alice, 0), (carol, 1), (mallory, 3)]);
+        let mut receivers = HashMap::new();
+        let mut senders = HashMap::new();
+        for (conn_id, uid) in [alice, carol, mallory].into_iter().enumerate() {
+            let (tx, rx) = tokio::sync::mpsc::channel(4);
+            senders.insert(
+                uid,
+                crate::session_registry::WsSender {
+                    conn_id: conn_id as u64,
+                    tx,
+                },
+            );
+            receivers.insert(uid, rx);
+        }
+        let conns = tokio::sync::Mutex::new(senders);
+        active.sync_tickets(&live, &conns).await;
+
+        let mut tickets_for = |uid: Uuid| {
+            let rx = receivers.get_mut(&uid).unwrap();
+            let mut seats = Vec::new();
+            while let Ok(frame) = rx.try_recv() {
+                let crate::outbound::Outbound::Text(json) = frame else {
+                    continue;
+                };
+                let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+                if value["kind"] == "sealed_deal_ticket" {
+                    seats.push(value["data"]["seat"].as_u64().unwrap());
+                }
+            }
+            seats
+        };
+        assert_eq!(tickets_for(alice), vec![0]);
+        assert!(
+            tickets_for(carol).is_empty(),
+            "replacement got Bob's ticket"
+        );
+        assert!(
+            tickets_for(mallory).is_empty(),
+            "joiner got the bot's ticket"
+        );
+        active.delete().await;
+    }
 }
 
 /// Per-hand capabilities. This never contains the undealt deck or human holes.
@@ -1181,6 +1272,10 @@ pub struct ActiveHand {
     pub hand_id: Uuid,
     sent_connections: tokio::sync::Mutex<HashMap<Uuid, u64>>,
     seats: Vec<u8>,
+    /// Human user -> seat for the users actually dealt into this hand, taken
+    /// when the hand is created. A mid-hand joiner who binds a bot-filled or
+    /// vacated seat is absent here, so it never receives that seat's ticket.
+    dealt_users: HashMap<Uuid, u8>,
     client: SealedDealerClient,
 }
 
@@ -1190,6 +1285,7 @@ impl ActiveHand {
         hand_id: Uuid,
         hand: &engine::GameHand,
         bots: &std::collections::HashSet<u8>,
+        users: &HashMap<Uuid, u8>,
     ) -> Result<Self, String> {
         #[cfg(any(test, feature = "test-support"))]
         ensure_test_worker().await?;
@@ -1204,6 +1300,7 @@ impl ActiveHand {
             hand_id,
             hand,
             bots,
+            users,
             client()?.clone(),
             public_ws_endpoint()?.to_string(),
             test_seed,
@@ -1215,12 +1312,18 @@ impl ActiveHand {
         hand_id: Uuid,
         hand: &engine::GameHand,
         bots: &std::collections::HashSet<u8>,
+        users: &HashMap<Uuid, u8>,
         client: SealedDealerClient,
         endpoint: String,
         _test_seed: Option<u64>,
     ) -> Result<Self, String> {
         let mut seats: Vec<u8> = hand.seats().iter().map(|s| s.seat).collect();
         seats.sort_unstable();
+        let dealt_users = users
+            .iter()
+            .filter(|(_, seat)| seats.contains(seat) && !bots.contains(seat))
+            .map(|(&uid, &seat)| (uid, seat))
+            .collect();
         let deal = client
             .create_hand(&CreateHandRequest {
                 hand_id,
@@ -1247,6 +1350,7 @@ impl ActiveHand {
             endpoint,
             hand_id,
             seats,
+            dealt_users,
             client,
             sent_connections: Default::default(),
         })
@@ -1268,9 +1372,15 @@ impl ActiveHand {
             if sent.get(&uid) == Some(&conn_id) {
                 continue;
             }
-            let Some(&seat) = users.get(&uid) else {
+            // Only a user dealt into this hand who still holds that seat gets a
+            // ticket. The live map also holds mid-hand joiners bound to a
+            // bot-filled or vacated seat; that seat's cards are not theirs.
+            let Some(&seat) = self.dealt_users.get(&uid) else {
                 continue;
             };
+            if users.get(&uid) != Some(&seat) {
+                continue;
+            }
             let Some(ticket) = self.deal.tickets.iter().find(|t| t.seat == seat) else {
                 continue;
             };
