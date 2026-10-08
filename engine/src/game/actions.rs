@@ -63,6 +63,7 @@ impl GameHand {
             events: Vec::new(),
             pending_board_street: self.pending_board_street,
             finished_street: self.finished_street,
+            dead_small_blind: self.dead_small_blind,
         }
     }
 

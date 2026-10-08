@@ -84,6 +84,7 @@ impl GameHand {
             events: vec![],
             pending_board_street: None,
             finished_street: None,
+            dead_small_blind: false,
         }
     }
 
@@ -153,6 +154,7 @@ impl GameHand {
             events: vec![],
             pending_board_street: None,
             finished_street: None,
+            dead_small_blind: false,
         }
     }
 
@@ -170,6 +172,16 @@ impl GameHand {
     /// disables it. Antes are not part of the preflop bet level.
     pub fn with_ante(mut self, amount: Chips) -> Self {
         self.ante = amount;
+        self
+    }
+
+    /// Tournament dead-button rule: post no small blind this hand. With three
+    /// or more players the big blind is the seat left of `dealer_idx`, preflop
+    /// action opens left of the big blind and postflop action still starts
+    /// left of the dealer. Ignored heads-up, where the dealer always posts the
+    /// small blind.
+    pub fn with_dead_small_blind(mut self) -> Self {
+        self.dead_small_blind = true;
         self
     }
 
@@ -218,8 +230,8 @@ impl GameHand {
         }
 
         // Determine blind positions.
-        let (sb_idx, bb_idx) = blind_positions(self.dealer_idx, n);
-        let sb_id = self.seats[sb_idx].player_id;
+        let (sb_idx, bb_idx) = self.forced_blind_positions(n);
+        let sb_id = sb_idx.map(|idx| self.seats[idx].player_id);
         let bb_id = self.seats[bb_idx].player_id;
         let straddle_idx = self
             .forced_straddle
@@ -235,8 +247,9 @@ impl GameHand {
             // of panicking with index-out-of-bounds (defensive hardening,
             // audit 2026-06-03).
             let dealer_seat = self.seats[self.dealer_idx % n].seat;
-            let sb_seat = self.seats[sb_idx].seat;
             let bb_seat = self.seats[bb_idx].seat;
+            // A dead small blind reports the big-blind seat: nobody posts it.
+            let sb_seat = sb_idx.map_or(bb_seat, |idx| self.seats[idx].seat);
             self.events.push(EngineEvent::HandStarted {
                 dealer_seat,
                 sb_seat,
@@ -251,9 +264,13 @@ impl GameHand {
         }
 
         // Record blind action metadata (using starting stacks).
-        let sb_stack_start = self.seats[sb_idx].stack;
+        let sb_stack_start = sb_idx.map_or(Chips::ZERO, |idx| self.seats[idx].stack);
         let bb_stack_start = self.seats[bb_idx].stack;
-        let sb_blind_amount = self.small_blind.0.min(sb_stack_start.0);
+        let sb_blind_amount = if sb_idx.is_some() {
+            self.small_blind.0.min(sb_stack_start.0)
+        } else {
+            0
+        };
         let bb_blind_amount = self.big_blind.0.min(bb_stack_start.0);
 
         // Record SB action.
@@ -261,28 +278,30 @@ impl GameHand {
         // carry the same engine-authoritative seq as the recorded ActionRecord
         // (SB = 0, BB = 1; first voluntary action = 2).
         let sb_action_seq = self.action_seq;
-        self.actions.push(ActionRecord {
-            seq: self.action_seq,
-            street: Street::Preflop,
-            player_id: sb_id,
-            action: PlayerAction::Blind {
-                kind: BlindKind::Small,
+        if let Some(sb_id) = sb_id {
+            self.actions.push(ActionRecord {
+                seq: self.action_seq,
+                street: Street::Preflop,
+                player_id: sb_id,
+                action: PlayerAction::Blind {
+                    kind: BlindKind::Small,
+                    amount: Chips(sb_blind_amount),
+                },
                 amount: Chips(sb_blind_amount),
-            },
-            amount: Chips(sb_blind_amount),
-            stack_before: sb_stack_start,
-            stack_after: Chips(sb_stack_start.0 - sb_blind_amount),
-            pot_before: Chips(ante_total),
-            pot_after: Chips(ante_total + sb_blind_amount),
-        });
-        self.last_action.insert(
-            sb_id.inner(),
-            PlayerAction::Blind {
-                kind: BlindKind::Small,
-                amount: Chips(sb_blind_amount),
-            },
-        );
-        self.action_seq = self.action_seq.saturating_add(1); // SB seq=0 before BB seq=1; saturating (U33)
+                stack_before: sb_stack_start,
+                stack_after: Chips(sb_stack_start.0 - sb_blind_amount),
+                pot_before: Chips(ante_total),
+                pot_after: Chips(ante_total + sb_blind_amount),
+            });
+            self.last_action.insert(
+                sb_id.inner(),
+                PlayerAction::Blind {
+                    kind: BlindKind::Small,
+                    amount: Chips(sb_blind_amount),
+                },
+            );
+            self.action_seq = self.action_seq.saturating_add(1); // SB seq=0 before BB seq=1; saturating (U33)
+        }
 
         // Record BB action.
         let bb_action_seq = self.action_seq;
@@ -380,10 +399,11 @@ impl GameHand {
             .map(|(idx, _, _, _, _)| (idx + 1) % n)
             .unwrap_or((bb_idx + 1) % n);
 
-        let mut blinds = vec![
-            (sb_id, Chips(sb_blind_amount)),
-            (bb_id, Chips(bb_blind_amount)),
-        ];
+        let mut blinds = Vec::with_capacity(3);
+        if let Some(sb_id) = sb_id {
+            blinds.push((sb_id, Chips(sb_blind_amount)));
+        }
+        blinds.push((bb_id, Chips(bb_blind_amount)));
         if let Some((_, id, posted, _, _)) = straddle_record {
             blinds.push((id, Chips(posted)));
         }
@@ -434,20 +454,22 @@ impl GameHand {
             })
         });
 
-        // Emit SB blind event.
-        let sb_seat = self.seats[sb_idx].seat;
-        self.events.push(EngineEvent::ActionApplied {
-            seat: sb_seat,
-            action: PlayerAction::Blind {
-                kind: BlindKind::Small,
-                amount: Chips(sb_blind_amount),
-            },
-            contributed: sb_blind_amount as u64,
-            current_bet: post_blind_current_bet,
-            min_raise_to: post_blind_min_raise_to,
-            next_actor_seat: post_blind_next_actor_seat,
-            action_seq: sb_action_seq,
-        });
+        // Emit SB blind event (none when the small blind is dead).
+        if let Some(sb_idx) = sb_idx {
+            let sb_seat = self.seats[sb_idx].seat;
+            self.events.push(EngineEvent::ActionApplied {
+                seat: sb_seat,
+                action: PlayerAction::Blind {
+                    kind: BlindKind::Small,
+                    amount: Chips(sb_blind_amount),
+                },
+                contributed: sb_blind_amount as u64,
+                current_bet: post_blind_current_bet,
+                min_raise_to: post_blind_min_raise_to,
+                next_actor_seat: post_blind_next_actor_seat,
+                action_seq: sb_action_seq,
+            });
+        }
 
         // Emit BB blind event.
         let bb_seat = self.seats[bb_idx].seat;

@@ -432,6 +432,10 @@ pub struct GameHand {
     /// `Done`. Lets `current_street()` report the real final street instead of a
     /// `Preflop` sentinel for completed hands (U34, dual-AI OSS review).
     finished_street: Option<Street>,
+    /// Tournament dead-button rule: no small blind is posted this hand (the
+    /// seat that owed it is empty). Only honoured with three or more players;
+    /// the big blind is then the seat left of `dealer_idx`. Default `false`.
+    dead_small_blind: bool,
 }
 
 /// Why a blind-mode `finish_blind` / `inject_*` call could not complete.
@@ -560,7 +564,7 @@ impl GameHand {
         if n < 3 {
             return None;
         }
-        let (_, bb_idx) = blind_positions(self.dealer_idx, n);
+        let (_, bb_idx) = self.forced_blind_positions(n);
         let idx = (bb_idx + 1) % n;
         Some((self.seats[idx].seat, amount))
     }
@@ -703,6 +707,19 @@ impl GameHand {
 /// blind assignment and returns `(0, 0)` rather than dividing by zero (U35,
 /// dual-AI OSS review — the public API must not panic on a degenerate seat
 /// count).
+impl GameHand {
+    /// Small/big blind indices for this hand: [`blind_positions`] unless the
+    /// small blind is dead, in which case nobody posts it and the big blind is
+    /// the seat immediately left of the dealer.
+    pub(crate) fn forced_blind_positions(&self, n: usize) -> (Option<usize>, usize) {
+        if self.dead_small_blind && n >= 3 {
+            return (None, (self.dealer_idx % n + 1) % n);
+        }
+        let (sb, bb) = blind_positions(self.dealer_idx, n);
+        (Some(sb), bb)
+    }
+}
+
 pub fn blind_positions(dealer_idx: usize, n: usize) -> (usize, usize) {
     if n < 2 {
         return (0, 0);

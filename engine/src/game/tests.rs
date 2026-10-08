@@ -1814,3 +1814,70 @@ fn zero_ante_is_the_unchanged_blind_only_hand() {
         Some(EngineEvent::HandStarted { ante: 0, .. })
     ));
 }
+
+/// Tournament dead-button rule: with a dead small blind nobody posts it, the
+/// big blind is left of the dealer, preflop opens left of the big blind and
+/// postflop action still starts left of the dealer.
+#[test]
+fn dead_small_blind_posts_only_the_big_blind() {
+    let mut hand = GameHand::new_with_rng(
+        vec![
+            (pid(1), c(1000), 0),
+            (pid(2), c(1000), 3),
+            (pid(3), c(1000), 5),
+            (pid(4), c(1000), 7),
+        ],
+        0,
+        c(20),
+        c(10),
+        PokerRng::from_seed(11),
+    )
+    .with_dead_small_blind();
+    let snap = hand.start().unwrap();
+    let stack = |snap: &GameSnapshot, id: u64| {
+        snap.players.iter().find(|p| p.player_id == pid(id)).unwrap().stack.0
+    };
+    assert_eq!(stack(&snap, 1), 1000, "dealer posts nothing");
+    assert_eq!(stack(&snap, 2), 980, "seat left of the dealer posts the big blind");
+    assert_eq!(stack(&snap, 3), 1000, "no small blind is posted");
+    assert_eq!(snap.pot.0, 20);
+    assert_eq!(snap.current_actor, Some(pid(3)), "preflop opens left of the big blind");
+    // The validation dry run (preview clone) must keep the dead-blind layout.
+    hand.validate_action(pid(3), &PlayerAction::Call).unwrap();
+    for id in [3, 4, 1] {
+        hand.apply_action(pid(id), PlayerAction::Call).unwrap();
+    }
+    let snap = hand.apply_action(pid(2), PlayerAction::Check).unwrap();
+    assert_eq!(snap.street, Street::Flop);
+    assert_eq!(snap.current_actor, Some(pid(2)), "postflop starts left of the dealer");
+    assert_eq!(snap.pot.0, 80);
+    for street in 0..3 {
+        for id in [2, 3, 4, 1] {
+            if hand.is_done() {
+                break;
+            }
+            hand.apply_action(pid(id), PlayerAction::Check).unwrap();
+        }
+        let _ = street;
+    }
+    assert!(hand.is_done());
+    let result = hand.finish();
+    assert_eq!(result.final_stacks.values().map(|v| *v as u64).sum::<u64>(), 4000);
+}
+
+/// Heads-up ignores the dead-small-blind flag: the dealer always posts it.
+#[test]
+fn dead_small_blind_is_ignored_heads_up() {
+    let mut hand = GameHand::new_with_rng(
+        vec![(pid(1), c(1000), 0), (pid(2), c(1000), 4)],
+        0,
+        c(20),
+        c(10),
+        PokerRng::from_seed(12),
+    )
+    .with_dead_small_blind();
+    let snap = hand.start().unwrap();
+    let dealer = snap.players.iter().find(|p| p.player_id == pid(1)).unwrap();
+    assert_eq!(dealer.stack.0, 990);
+    assert_eq!(snap.current_actor, Some(pid(1)));
+}
