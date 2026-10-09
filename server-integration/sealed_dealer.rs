@@ -1378,7 +1378,7 @@ impl ActiveHand {
             let Some(&seat) = self.dealt_users.get(&uid) else {
                 continue;
             };
-            if users.get(&uid) != Some(&seat) {
+            if users.get(&uid) != Some(&seat) || crate::runtime_checkpoint::replaced_during_hand(seat) {
                 continue;
             }
             let Some(ticket) = self.deal.tickets.iter().find(|t| t.seat == seat) else {
