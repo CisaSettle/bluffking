@@ -873,6 +873,335 @@ pub async fn configure_or_launch() -> Result<Option<tokio::process::Child>, Stri
     Ok(Some(child))
 }
 
+/// Per-hand capabilities. This never contains the undealt deck or human holes.
+pub struct ActiveHand {
+    pub deal: CreateHandResponse,
+    pub bot_holes: HashMap<u8, engine::HoleCards>,
+    pub endpoint: String,
+    pub hand_id: Uuid,
+    sent_connections: tokio::sync::Mutex<HashMap<Uuid, u64>>,
+    seats: Vec<u8>,
+    /// Human user -> seat for the users actually dealt into this hand, taken
+    /// when the hand is created. A mid-hand joiner who binds a bot-filled or
+    /// vacated seat is absent here, so it never receives that seat's ticket.
+    dealt_users: HashMap<Uuid, u8>,
+    client: SealedDealerClient,
+}
+
+impl ActiveHand {
+    pub async fn create(
+        session_id: Uuid,
+        hand_id: Uuid,
+        hand: &engine::GameHand,
+        bots: &std::collections::HashSet<u8>,
+        users: &HashMap<Uuid, u8>,
+    ) -> Result<Self, String> {
+        #[cfg(any(test, feature = "test-support"))]
+        ensure_test_worker().await?;
+        #[cfg(any(test, feature = "test-support"))]
+        let test_seed = take_test_seed(session_id);
+        #[cfg(not(any(test, feature = "test-support")))]
+        let test_seed = {
+            let _ = session_id;
+            None
+        };
+        Self::create_with(
+            hand_id,
+            hand,
+            bots,
+            users,
+            client()?.clone(),
+            public_ws_endpoint()?.to_string(),
+            test_seed,
+        )
+        .await
+    }
+
+    async fn create_with(
+        hand_id: Uuid,
+        hand: &engine::GameHand,
+        bots: &std::collections::HashSet<u8>,
+        users: &HashMap<Uuid, u8>,
+        client: SealedDealerClient,
+        endpoint: String,
+        _test_seed: Option<u64>,
+    ) -> Result<Self, String> {
+        let mut seats: Vec<u8> = hand.seats().iter().map(|s| s.seat).collect();
+        seats.sort_unstable();
+        let dealt_users = users
+            .iter()
+            .filter(|(_, seat)| seats.contains(seat) && !bots.contains(seat))
+            .map(|(&uid, &seat)| (uid, seat))
+            .collect();
+        let deal = client
+            .create_hand(&CreateHandRequest {
+                hand_id,
+                seats: seats.clone(),
+                #[cfg(any(test, feature = "test-support"))]
+                test_seed: _test_seed,
+                bot_seats: bots.iter().copied().filter(|s| seats.contains(s)).collect(),
+            })
+            .await?;
+        let mut bot_holes = HashMap::new();
+        for seat in bots.iter().filter(|s| seats.contains(s)) {
+            let cards = match client.bot_hole(hand_id, *seat).await.and_then(decode_hole) {
+                Ok(cards) => cards,
+                Err(e) => {
+                    client.delete_hand(hand_id).await;
+                    return Err(e);
+                }
+            };
+            bot_holes.insert(*seat, cards);
+        }
+        Ok(Self {
+            deal,
+            bot_holes,
+            endpoint,
+            hand_id,
+            seats,
+            dealt_users,
+            client,
+            sent_connections: Default::default(),
+        })
+    }
+
+    pub async fn sync_tickets(
+        &self,
+        users: &HashMap<Uuid, u8>,
+        conns: &tokio::sync::Mutex<HashMap<Uuid, crate::session_registry::WsSender>>,
+    ) {
+        let recipients: Vec<_> = conns
+            .lock()
+            .await
+            .iter()
+            .map(|(&uid, c)| (uid, c.conn_id, c.tx.clone()))
+            .collect();
+        let mut sent = self.sent_connections.lock().await;
+        for (uid, conn_id, tx) in recipients {
+            if sent.get(&uid) == Some(&conn_id) {
+                continue;
+            }
+            // Only a user dealt into this hand who still holds that seat gets a
+            // ticket. The live map also holds mid-hand joiners bound to a
+            // bot-filled or vacated seat; that seat's cards are not theirs.
+            let Some(&seat) = self.dealt_users.get(&uid) else {
+                continue;
+            };
+            if users.get(&uid) != Some(&seat) || crate::runtime_checkpoint::replaced_during_hand(seat) {
+                continue;
+            }
+            let Some(ticket) = self.deal.tickets.iter().find(|t| t.seat == seat) else {
+                continue;
+            };
+            let msg = crate::protocol::ServerMsg::SealedDealTicket {
+                hand_id: self.hand_id,
+                seat,
+                ticket: ticket.ticket.clone(),
+                endpoint: self.endpoint.clone(),
+                commitment: self.deal.commitment.clone(),
+            };
+            if let Ok(json) = serde_json::to_string(&msg) {
+                if crate::runtime_checkpoint::try_send(&tx, crate::outbound::Outbound::Text(json))
+                    .is_ok()
+                {
+                    sent.insert(uid, conn_id);
+                }
+            }
+        }
+    }
+
+    pub async fn can_void_delivery(&self, seat: u8) -> bool {
+        self.seats.contains(&seat)
+            && !self.bot_holes.contains_key(&seat)
+            && self.client.delivery_received(self.hand_id, seat).await.ok() == Some(false)
+    }
+
+    pub async fn sync_solo_ticket(
+        &self,
+        seat: u8,
+        slot: &tokio::sync::Mutex<Option<crate::session_registry::WsSender>>,
+    ) {
+        let Some((conn_id, tx)) = slot
+            .lock()
+            .await
+            .as_ref()
+            .map(|c| (c.conn_id, c.tx.clone()))
+        else {
+            return;
+        };
+        let mut sent = self.sent_connections.lock().await;
+        if sent.get(&Uuid::nil()) == Some(&conn_id) {
+            return;
+        }
+        let Some(ticket) = self.deal.tickets.iter().find(|t| t.seat == seat) else {
+            return;
+        };
+        let msg = crate::protocol::ServerMsg::SealedDealTicket {
+            hand_id: self.hand_id,
+            seat,
+            ticket: ticket.ticket.clone(),
+            endpoint: self.endpoint.clone(),
+            commitment: self.deal.commitment.clone(),
+        };
+        if let Ok(json) = serde_json::to_string(&msg) {
+            if crate::runtime_checkpoint::try_send(&tx, crate::outbound::Outbound::Text(json))
+                .is_ok()
+            {
+                sent.insert(Uuid::nil(), conn_id);
+            }
+        }
+    }
+
+    pub async fn advance(&self, hand: &mut engine::GameHand) -> Result<(), String> {
+        while let Some(street) = hand.pending_board_street() {
+            let ids = self.client.reveal_board(self.hand_id, street).await?;
+            let cards: Option<Vec<_>> = ids
+                .into_iter()
+                .map(mental_poker::card_id::id_to_card)
+                .collect();
+            let cards = cards.ok_or("invalid sealed board")?;
+            hand.inject_board_for_street(&cards)
+                .map_err(|e| format!("{e:?}"))?;
+        }
+        Ok(())
+    }
+
+    pub async fn finish(
+        &self,
+        hand: &mut engine::GameHand,
+    ) -> Result<engine::game::HandResult, String> {
+        let contenders: Vec<_> = hand
+            .seats()
+            .iter()
+            .filter(|s| !s.folded)
+            .map(|s| (s.player_id, s.seat))
+            .collect();
+        if contenders.len() >= 2 {
+            let reveals = self
+                .client
+                .reveal_showdown(self.hand_id, contenders.iter().map(|(_, s)| *s).collect())
+                .await?;
+            for reveal in reveals {
+                let pid = contenders
+                    .iter()
+                    .find(|(_, s)| *s == reveal.seat)
+                    .ok_or("invalid showdown seat")?
+                    .0;
+                hand.inject_showdown_reveal(pid, decode_hole(reveal.cards)?)
+                    .map_err(|e| format!("{e:?}"))?;
+            }
+        }
+        let mut result = hand.finish_blind().map_err(|e| format!("{e:?}"))?;
+        // The hand is over. Only now may private review obtain the completed deck.
+        let deck = self.client.settle(self.hand_id).await?;
+        validate_final_deck(self.hand_id, &self.deal.commitment, &deck)?;
+        result.deck_seed = deck.seed;
+        for seat in hand.seats() {
+            if result
+                .showdown
+                .iter()
+                .any(|s| s.player_id == seat.player_id)
+            {
+                continue;
+            }
+            let i = self
+                .seats
+                .iter()
+                .position(|s| *s == seat.seat)
+                .ok_or("missing dealt seat")?;
+            result.folded_hole_cards.insert(
+                seat.player_id.inner(),
+                decode_hole([deck.cards[i], deck.cards[i + self.seats.len()]])?,
+            );
+        }
+        Ok(result)
+    }
+
+    pub async fn delete(&self) {
+        self.client.delete_hand(self.hand_id).await;
+    }
+}
+
+fn decode_hole(ids: [u8; 2]) -> Result<engine::HoleCards, String> {
+    if ids[0] == ids[1] {
+        return Err("duplicate hole card".into());
+    }
+    let a = mental_poker::card_id::id_to_card(ids[0]).ok_or("invalid hole card")?;
+    let b = mental_poker::card_id::id_to_card(ids[1]).ok_or("invalid hole card")?;
+    Ok(engine::HoleCards::new(a, b))
+}
+
+/// Private review material is assembled only after the hand finishes.
+pub fn completed_holes(result: &engine::game::HandResult) -> HashMap<u64, [engine::Card; 2]> {
+    let mut holes: HashMap<_, _> = result
+        .folded_hole_cards
+        .iter()
+        .map(|(&pid, h)| (pid, h.as_array()))
+        .collect();
+    holes.extend(
+        result
+            .showdown
+            .iter()
+            .map(|s| (s.player_id.inner(), s.hole_cards.as_array())),
+    );
+    holes
+}
+
+#[cfg(any(test, feature = "test-support"))]
+static TEST_HAND_SEEDS: OnceLock<std::sync::Mutex<HashMap<Uuid, u64>>> = OnceLock::new();
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_next_hand_seed_for_test(session_id: Uuid, seed: u64) {
+    TEST_HAND_SEEDS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .insert(session_id, seed);
+}
+#[cfg(any(test, feature = "test-support"))]
+fn take_test_seed(session_id: Uuid) -> Option<u64> {
+    TEST_HAND_SEEDS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .remove(&session_id)
+}
+
+/// Actor fixtures still exercise a real isolated dealer; no plaintext fallback.
+#[cfg(any(test, feature = "test-support"))]
+pub async fn ensure_test_worker() -> Result<(), String> {
+    let client = CLIENT.get_or_init(|| {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("test dealer port");
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let token = Uuid::new_v4().to_string();
+        let worker_token = token.clone();
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(run_worker(addr, worker_token))
+                .unwrap();
+        });
+        let _ = PUBLIC_WS_ENDPOINT.set(Arc::from(format!("ws://{addr}/ws")));
+        SealedDealerClient::new(format!("http://{addr}"), token)
+    });
+    for _ in 0..50 {
+        if client
+            .http
+            .get(format!("{}/healthz", client.base_url))
+            .send()
+            .await
+            .is_ok_and(|r| r.status().is_success())
+        {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Err("test sealed dealer did not start".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1262,333 +1591,4 @@ mod tests {
         );
         active.delete().await;
     }
-}
-
-/// Per-hand capabilities. This never contains the undealt deck or human holes.
-pub struct ActiveHand {
-    pub deal: CreateHandResponse,
-    pub bot_holes: HashMap<u8, engine::HoleCards>,
-    pub endpoint: String,
-    pub hand_id: Uuid,
-    sent_connections: tokio::sync::Mutex<HashMap<Uuid, u64>>,
-    seats: Vec<u8>,
-    /// Human user -> seat for the users actually dealt into this hand, taken
-    /// when the hand is created. A mid-hand joiner who binds a bot-filled or
-    /// vacated seat is absent here, so it never receives that seat's ticket.
-    dealt_users: HashMap<Uuid, u8>,
-    client: SealedDealerClient,
-}
-
-impl ActiveHand {
-    pub async fn create(
-        session_id: Uuid,
-        hand_id: Uuid,
-        hand: &engine::GameHand,
-        bots: &std::collections::HashSet<u8>,
-        users: &HashMap<Uuid, u8>,
-    ) -> Result<Self, String> {
-        #[cfg(any(test, feature = "test-support"))]
-        ensure_test_worker().await?;
-        #[cfg(any(test, feature = "test-support"))]
-        let test_seed = take_test_seed(session_id);
-        #[cfg(not(any(test, feature = "test-support")))]
-        let test_seed = {
-            let _ = session_id;
-            None
-        };
-        Self::create_with(
-            hand_id,
-            hand,
-            bots,
-            users,
-            client()?.clone(),
-            public_ws_endpoint()?.to_string(),
-            test_seed,
-        )
-        .await
-    }
-
-    async fn create_with(
-        hand_id: Uuid,
-        hand: &engine::GameHand,
-        bots: &std::collections::HashSet<u8>,
-        users: &HashMap<Uuid, u8>,
-        client: SealedDealerClient,
-        endpoint: String,
-        _test_seed: Option<u64>,
-    ) -> Result<Self, String> {
-        let mut seats: Vec<u8> = hand.seats().iter().map(|s| s.seat).collect();
-        seats.sort_unstable();
-        let dealt_users = users
-            .iter()
-            .filter(|(_, seat)| seats.contains(seat) && !bots.contains(seat))
-            .map(|(&uid, &seat)| (uid, seat))
-            .collect();
-        let deal = client
-            .create_hand(&CreateHandRequest {
-                hand_id,
-                seats: seats.clone(),
-                #[cfg(any(test, feature = "test-support"))]
-                test_seed: _test_seed,
-                bot_seats: bots.iter().copied().filter(|s| seats.contains(s)).collect(),
-            })
-            .await?;
-        let mut bot_holes = HashMap::new();
-        for seat in bots.iter().filter(|s| seats.contains(s)) {
-            let cards = match client.bot_hole(hand_id, *seat).await.and_then(decode_hole) {
-                Ok(cards) => cards,
-                Err(e) => {
-                    client.delete_hand(hand_id).await;
-                    return Err(e);
-                }
-            };
-            bot_holes.insert(*seat, cards);
-        }
-        Ok(Self {
-            deal,
-            bot_holes,
-            endpoint,
-            hand_id,
-            seats,
-            dealt_users,
-            client,
-            sent_connections: Default::default(),
-        })
-    }
-
-    pub async fn sync_tickets(
-        &self,
-        users: &HashMap<Uuid, u8>,
-        conns: &tokio::sync::Mutex<HashMap<Uuid, crate::session_registry::WsSender>>,
-    ) {
-        let recipients: Vec<_> = conns
-            .lock()
-            .await
-            .iter()
-            .map(|(&uid, c)| (uid, c.conn_id, c.tx.clone()))
-            .collect();
-        let mut sent = self.sent_connections.lock().await;
-        for (uid, conn_id, tx) in recipients {
-            if sent.get(&uid) == Some(&conn_id) {
-                continue;
-            }
-            // Only a user dealt into this hand who still holds that seat gets a
-            // ticket. The live map also holds mid-hand joiners bound to a
-            // bot-filled or vacated seat; that seat's cards are not theirs.
-            let Some(&seat) = self.dealt_users.get(&uid) else {
-                continue;
-            };
-            if users.get(&uid) != Some(&seat) || crate::runtime_checkpoint::replaced_during_hand(seat) {
-                continue;
-            }
-            let Some(ticket) = self.deal.tickets.iter().find(|t| t.seat == seat) else {
-                continue;
-            };
-            let msg = crate::protocol::ServerMsg::SealedDealTicket {
-                hand_id: self.hand_id,
-                seat,
-                ticket: ticket.ticket.clone(),
-                endpoint: self.endpoint.clone(),
-                commitment: self.deal.commitment.clone(),
-            };
-            if let Ok(json) = serde_json::to_string(&msg) {
-                if crate::runtime_checkpoint::try_send(&tx, crate::outbound::Outbound::Text(json))
-                    .is_ok()
-                {
-                    sent.insert(uid, conn_id);
-                }
-            }
-        }
-    }
-
-    pub async fn can_void_delivery(&self, seat: u8) -> bool {
-        self.seats.contains(&seat)
-            && !self.bot_holes.contains_key(&seat)
-            && self.client.delivery_received(self.hand_id, seat).await.ok() == Some(false)
-    }
-
-    pub async fn sync_solo_ticket(
-        &self,
-        seat: u8,
-        slot: &tokio::sync::Mutex<Option<crate::session_registry::WsSender>>,
-    ) {
-        let Some((conn_id, tx)) = slot
-            .lock()
-            .await
-            .as_ref()
-            .map(|c| (c.conn_id, c.tx.clone()))
-        else {
-            return;
-        };
-        let mut sent = self.sent_connections.lock().await;
-        if sent.get(&Uuid::nil()) == Some(&conn_id) {
-            return;
-        }
-        let Some(ticket) = self.deal.tickets.iter().find(|t| t.seat == seat) else {
-            return;
-        };
-        let msg = crate::protocol::ServerMsg::SealedDealTicket {
-            hand_id: self.hand_id,
-            seat,
-            ticket: ticket.ticket.clone(),
-            endpoint: self.endpoint.clone(),
-            commitment: self.deal.commitment.clone(),
-        };
-        if let Ok(json) = serde_json::to_string(&msg) {
-            if crate::runtime_checkpoint::try_send(&tx, crate::outbound::Outbound::Text(json))
-                .is_ok()
-            {
-                sent.insert(Uuid::nil(), conn_id);
-            }
-        }
-    }
-
-    pub async fn advance(&self, hand: &mut engine::GameHand) -> Result<(), String> {
-        while let Some(street) = hand.pending_board_street() {
-            let ids = self.client.reveal_board(self.hand_id, street).await?;
-            let cards: Option<Vec<_>> = ids
-                .into_iter()
-                .map(mental_poker::card_id::id_to_card)
-                .collect();
-            let cards = cards.ok_or("invalid sealed board")?;
-            hand.inject_board_for_street(&cards)
-                .map_err(|e| format!("{e:?}"))?;
-        }
-        Ok(())
-    }
-
-    pub async fn finish(
-        &self,
-        hand: &mut engine::GameHand,
-    ) -> Result<engine::game::HandResult, String> {
-        let contenders: Vec<_> = hand
-            .seats()
-            .iter()
-            .filter(|s| !s.folded)
-            .map(|s| (s.player_id, s.seat))
-            .collect();
-        if contenders.len() >= 2 {
-            let reveals = self
-                .client
-                .reveal_showdown(self.hand_id, contenders.iter().map(|(_, s)| *s).collect())
-                .await?;
-            for reveal in reveals {
-                let pid = contenders
-                    .iter()
-                    .find(|(_, s)| *s == reveal.seat)
-                    .ok_or("invalid showdown seat")?
-                    .0;
-                hand.inject_showdown_reveal(pid, decode_hole(reveal.cards)?)
-                    .map_err(|e| format!("{e:?}"))?;
-            }
-        }
-        let mut result = hand.finish_blind().map_err(|e| format!("{e:?}"))?;
-        // The hand is over. Only now may private review obtain the completed deck.
-        let deck = self.client.settle(self.hand_id).await?;
-        validate_final_deck(self.hand_id, &self.deal.commitment, &deck)?;
-        result.deck_seed = deck.seed;
-        for seat in hand.seats() {
-            if result
-                .showdown
-                .iter()
-                .any(|s| s.player_id == seat.player_id)
-            {
-                continue;
-            }
-            let i = self
-                .seats
-                .iter()
-                .position(|s| *s == seat.seat)
-                .ok_or("missing dealt seat")?;
-            result.folded_hole_cards.insert(
-                seat.player_id.inner(),
-                decode_hole([deck.cards[i], deck.cards[i + self.seats.len()]])?,
-            );
-        }
-        Ok(result)
-    }
-
-    pub async fn delete(&self) {
-        self.client.delete_hand(self.hand_id).await;
-    }
-}
-
-fn decode_hole(ids: [u8; 2]) -> Result<engine::HoleCards, String> {
-    if ids[0] == ids[1] {
-        return Err("duplicate hole card".into());
-    }
-    let a = mental_poker::card_id::id_to_card(ids[0]).ok_or("invalid hole card")?;
-    let b = mental_poker::card_id::id_to_card(ids[1]).ok_or("invalid hole card")?;
-    Ok(engine::HoleCards::new(a, b))
-}
-
-/// Private review material is assembled only after the hand finishes.
-pub fn completed_holes(result: &engine::game::HandResult) -> HashMap<u64, [engine::Card; 2]> {
-    let mut holes: HashMap<_, _> = result
-        .folded_hole_cards
-        .iter()
-        .map(|(&pid, h)| (pid, h.as_array()))
-        .collect();
-    holes.extend(
-        result
-            .showdown
-            .iter()
-            .map(|s| (s.player_id.inner(), s.hole_cards.as_array())),
-    );
-    holes
-}
-
-#[cfg(any(test, feature = "test-support"))]
-static TEST_HAND_SEEDS: OnceLock<std::sync::Mutex<HashMap<Uuid, u64>>> = OnceLock::new();
-
-#[cfg(any(test, feature = "test-support"))]
-pub fn set_next_hand_seed_for_test(session_id: Uuid, seed: u64) {
-    TEST_HAND_SEEDS
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap()
-        .insert(session_id, seed);
-}
-#[cfg(any(test, feature = "test-support"))]
-fn take_test_seed(session_id: Uuid) -> Option<u64> {
-    TEST_HAND_SEEDS
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap()
-        .remove(&session_id)
-}
-
-/// Actor fixtures still exercise a real isolated dealer; no plaintext fallback.
-#[cfg(any(test, feature = "test-support"))]
-pub async fn ensure_test_worker() -> Result<(), String> {
-    let client = CLIENT.get_or_init(|| {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("test dealer port");
-        let addr = probe.local_addr().unwrap();
-        drop(probe);
-        let token = Uuid::new_v4().to_string();
-        let worker_token = token.clone();
-        std::thread::spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(run_worker(addr, worker_token))
-                .unwrap();
-        });
-        let _ = PUBLIC_WS_ENDPOINT.set(Arc::from(format!("ws://{addr}/ws")));
-        SealedDealerClient::new(format!("http://{addr}"), token)
-    });
-    for _ in 0..50 {
-        if client
-            .http
-            .get(format!("{}/healthz", client.base_url))
-            .send()
-            .await
-            .is_ok_and(|r| r.status().is_success())
-        {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    Err("test sealed dealer did not start".into())
 }
