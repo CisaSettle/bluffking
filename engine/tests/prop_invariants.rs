@@ -1143,7 +1143,7 @@ proptest! {
 //
 // Why this section exists
 // -----------------------
-// 2026-06-16 bug-free visual+poker review-gap diagnosis (RC-1 / RC-4): the
+// 2026-06-16 release-loop visual+poker review-gap diagnosis (RC-1 / RC-4): the
 // release loop's verdict is exit-code math, so a hand-evaluator or pot-award
 // regression that pays the pot to the WRONG made hand ships GREEN — chips still
 // conserve (`prop_chip_conservation`), Σnet still equals 0 (server standings),

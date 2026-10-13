@@ -11,6 +11,7 @@
 //! This is intentionally a single trusted dealer, not Mental Poker: players do
 //! not shuffle, exchange key shares or participate in threshold decryption.
 
+use crate::auth::constant_time::constant_time_eq;
 use std::{
     collections::HashMap,
     net::SocketAddr,
@@ -318,19 +319,6 @@ fn internal_authorized(headers: &HeaderMap, state: &WorkerState) -> bool {
         .get(INTERNAL_TOKEN_HEADER)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| constant_time_eq(value.as_bytes(), state.internal_token.as_bytes()))
-}
-
-/// Constant-time byte comparison so response timing can't recover the
-/// internal token byte-by-byte.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 async fn internal_ready(State(state): State<WorkerState>, headers: HeaderMap) -> StatusCode {
@@ -987,7 +975,9 @@ impl ActiveHand {
             let Some(&seat) = self.dealt_users.get(&uid) else {
                 continue;
             };
-            if users.get(&uid) != Some(&seat) || crate::runtime_checkpoint::replaced_during_hand(seat) {
+            if users.get(&uid) != Some(&seat)
+                || crate::runtime_checkpoint::replaced_during_hand(seat)
+            {
                 continue;
             }
             let Some(ticket) = self.deal.tickets.iter().find(|t| t.seat == seat) else {

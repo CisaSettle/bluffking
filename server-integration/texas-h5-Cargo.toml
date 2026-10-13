@@ -18,7 +18,7 @@ uuid = { version = "1", features = ["v4", "v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 
 # Rust review standard (L0/L1): in-repo Clippy policy so a bare `cargo clippy`
-# is strict in local and bug-free verification. Main-push CI is intentionally a
+# is strict in local verification. Main-push CI is intentionally a
 # build-only deploy gate and does not run Clippy. Crates opt in with
 # `[lints] workspace = true`.
 # NOTE: do NOT add `pedantic`/`nursery`/`restriction` here: local
