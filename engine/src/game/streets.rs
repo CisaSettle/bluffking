@@ -441,6 +441,11 @@ impl GameHand {
                 }
 
                 self.phase = Phase::Betting(street);
+                // `last_action` is per-street (live clients clear their action
+                // pills at each street boundary). Without this a mid-hand
+                // snapshot replays a preflop raise as a flop 下注 for a seat
+                // that has not acted yet on the new street.
+                self.last_action.clear();
 
                 // Determine first actor post-flop: first non-folded/all-in seat
                 // strictly LEFT OF the button (WSOP/TDA standard).

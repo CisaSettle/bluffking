@@ -13,7 +13,7 @@
 
 use crate::auth::constant_time::constant_time_eq;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     net::SocketAddr,
     sync::{Arc, OnceLock},
     time::Duration,
@@ -44,9 +44,13 @@ const DEALER_REQUEST_ATTEMPTS: usize = 3;
 const MAX_HOLE_CONNECTIONS: usize = 8192;
 /// A new socket must present its first ticket within this.
 const HOLE_DELIVERY_TIMEOUT: Duration = Duration::from_secs(5);
-/// A socket with no ticket for this long closes; the client reopens it on the
-/// next hand.
-const HOLE_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// A socket with no VALID ticket for this long closes; the client reopens it
+/// on the next hand. Long enough to span a typical wait between hands: a fresh
+/// cross-border handshake is the fragile step (prod 2026-10-14), not an
+/// established socket.
+const HOLE_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// Keeps NAT/proxy state of an idle socket alive. Never extends the deadline.
+const HOLE_KEEPALIVE: Duration = Duration::from_secs(30);
 /// Unknown tickets tolerated per socket before it is closed.
 const HOLE_MAX_MISSES: u8 = 3;
 
@@ -56,12 +60,30 @@ pub struct SeatTicket {
     pub ticket: String,
 }
 
+/// Phase one of a verifiable deal (ADR-064 on the sealed dealer): the worker
+/// draws `server_seed` and publishes only its hash before any player entropy
+/// exists, so it cannot pick a deck after seeing the client seeds.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommitHandRequest {
+    pub hand_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommitHandResponse {
+    pub seed_commit: [u8; 32],
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CreateHandRequest {
     pub hand_id: Uuid,
     pub seats: Vec<u8>,
     #[serde(default)]
     pub bot_seats: Vec<u8>,
+    /// Fresh per-hand player seeds collected after the commit, by seat. When a
+    /// commit exists the deck is `Deck::new(from_seed_bytes(derive_deck_seed(
+    /// server_seed, client_seeds, hand_id)))`, reproducible by players.
+    #[serde(default)]
+    pub client_seeds: BTreeMap<u8, [u8; 32]>,
     #[cfg(any(test, feature = "test-support"))]
     #[serde(default)]
     pub test_seed: Option<u64>,
@@ -105,6 +127,12 @@ pub struct FinalDeckResponse {
     pub cards: Vec<u8>,
     pub seed: [u8; 32],
     pub nonce: [u8; 32],
+    /// Committed seed, released only at settlement. `None` for an uncommitted
+    /// (test-pinned) deal.
+    #[serde(default)]
+    pub server_seed: Option<[u8; 32]>,
+    #[serde(default)]
+    pub client_seeds: BTreeMap<u8, [u8; 32]>,
 }
 
 fn final_deck(hand: &SealedHand) -> FinalDeckResponse {
@@ -112,7 +140,78 @@ fn final_deck(hand: &SealedHand) -> FinalDeckResponse {
         cards: hand.deck.clone(),
         seed: hand.seed,
         nonce: hand.nonce,
+        server_seed: hand.server_seed,
+        client_seeds: hand.client_seeds.clone(),
     }
+}
+
+/// Canonical card ids of the deck a seed shuffles to.
+pub fn deck_ids(seed: [u8; 32]) -> Vec<u8> {
+    Deck::new(&mut PokerRng::from_seed_bytes(seed))
+        .cards()
+        .iter()
+        .copied()
+        .map(mental_poker::card_id::card_to_id)
+        .collect()
+}
+
+/// Settlement guard: every card the engine settled with (board and showdown
+/// holes) must sit at its position in the final deck. `seats` is the sorted
+/// deal order. A worker that returned different cards during play than the
+/// deck it settles with fails here, before the result is accepted.
+pub fn check_settled_cards(
+    seats: &[u8],
+    deck: &[u8],
+    result: &engine::game::HandResult,
+    seat_of: impl Fn(engine::PlayerId) -> Option<u8>,
+) -> Result<(), String> {
+    let n = seats.len();
+    let id = mental_poker::card_id::card_to_id;
+    for (i, card) in result.board.all_cards().into_iter().enumerate() {
+        if deck.get(2 * n + i) != Some(&id(card)) {
+            return Err("settled board does not match the sealed deck".into());
+        }
+    }
+    for entry in &result.showdown {
+        let p = seat_of(entry.player_id)
+            .and_then(|seat| seats.iter().position(|s| *s == seat))
+            .ok_or("showdown seat was not dealt")?;
+        let mut want = [deck[p], deck[n + p]];
+        let mut got = entry.hole_cards.as_array().map(id);
+        want.sort_unstable();
+        got.sort_unstable();
+        if want != got {
+            return Err("settled showdown cards do not match the sealed deck".into());
+        }
+    }
+    Ok(())
+}
+
+/// The material players check after a verifiable hand. Validates the commit,
+/// the seed derivation and the deck before anything is revealed or persisted.
+pub fn verified_reveal(
+    hand_id: Uuid,
+    seed_commit: [u8; 32],
+    deck: &FinalDeckResponse,
+) -> Result<crate::pf_dealing::PfSecrets, String> {
+    use crate::pf_dealing::{derive_deck_seed, seed_commit as commit_of, PfSecrets};
+    let server_seed = deck.server_seed.ok_or("sealed deal was not committed")?;
+    if commit_of(&server_seed) != seed_commit {
+        return Err("sealed server seed does not match its commit".into());
+    }
+    let deck_seed = derive_deck_seed(&server_seed, &deck.client_seeds, hand_id);
+    if deck_seed != deck.seed || deck_ids(deck_seed) != deck.cards {
+        return Err("sealed deck does not follow from the revealed seeds".into());
+    }
+    Ok(PfSecrets {
+        hand_id,
+        server_seed,
+        seed_commit,
+        client_seeds: deck.client_seeds.clone(),
+        deck_seed,
+        dealt_seats: Vec::new(),
+        withheld_seats: Vec::new(),
+    })
 }
 
 pub fn validate_final_deck(
@@ -173,6 +272,8 @@ struct SealedHand {
     deck: Vec<u8>,
     seed: [u8; 32],
     nonce: [u8; 32],
+    server_seed: Option<[u8; 32]>,
+    client_seeds: BTreeMap<u8, [u8; 32]>,
     commitment: String,
     tickets: HashMap<String, u8>,
     bot_seats: Vec<u8>,
@@ -201,6 +302,20 @@ impl SealedHand {
 
     fn new(hand_id: Uuid, seats: Vec<u8>) -> Result<(Self, Vec<SeatTicket>), &'static str> {
         Self::new_with_rng(hand_id, seats, PokerRng::from_os())
+    }
+
+    fn new_committed(
+        hand_id: Uuid,
+        seats: Vec<u8>,
+        server_seed: [u8; 32],
+        client_seeds: BTreeMap<u8, [u8; 32]>,
+    ) -> Result<(Self, Vec<SeatTicket>), &'static str> {
+        let deck_seed = crate::pf_dealing::derive_deck_seed(&server_seed, &client_seeds, hand_id);
+        let (mut hand, tickets) =
+            Self::new_with_rng(hand_id, seats, PokerRng::from_seed_bytes(deck_seed))?;
+        hand.server_seed = Some(server_seed);
+        hand.client_seeds = client_seeds;
+        Ok((hand, tickets))
     }
     fn new_with_rng(
         hand_id: Uuid,
@@ -245,6 +360,8 @@ impl SealedHand {
                 deck,
                 seed,
                 nonce,
+                server_seed: None,
+                client_seeds: BTreeMap::new(),
                 commitment,
                 tickets,
                 bot_seats: Vec::new(),
@@ -307,10 +424,18 @@ impl SealedHand {
     }
 }
 
+/// A worker-held server seed and when it was drawn.
+type PendingCommit = ([u8; 32], tokio::time::Instant);
+
+/// Commits older than this without a deal are dropped (the game server voided
+/// or crashed between the two phases).
+const COMMIT_TTL: Duration = Duration::from_secs(120);
+
 #[derive(Clone)]
 struct WorkerState {
     internal_token: Arc<str>,
     hands: Arc<RwLock<HashMap<Uuid, SealedHand>>>,
+    commits: Arc<RwLock<HashMap<Uuid, PendingCommit>>>,
     hole_connections: Arc<Semaphore>,
 }
 
@@ -356,7 +481,10 @@ async fn create_hand(
     // Keep lookup and insertion atomic, including concurrent retries.
     let mut hands = state.hands.write().await;
     if let Some(existing) = hands.get(&request.hand_id) {
-        if existing.seats != seats || existing.bot_seats != bot_seats {
+        if existing.seats != seats
+            || existing.bot_seats != bot_seats
+            || existing.client_seeds != request.client_seeds
+        {
             return (
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({"error":"hand_config_mismatch"})),
@@ -373,13 +501,45 @@ async fn create_hand(
         return (StatusCode::OK, Json(existing.create_response())).into_response();
     }
 
+    // A committed hand must be dealt from its committed seed. Without a commit
+    // there is no player entropy to mix, so seeds are refused rather than
+    // silently ignored.
+    let committed = state
+        .commits
+        .write()
+        .await
+        .remove(&request.hand_id)
+        .map(|(seed, _)| seed);
+    if committed.is_none() && !request.client_seeds.is_empty() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error":"hand_not_committed"})),
+        )
+            .into_response();
+    }
+    if request
+        .client_seeds
+        .keys()
+        .any(|seat| !seats.contains(seat) || bot_seats.contains(seat))
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let fresh = |seats| match committed {
+        Some(server_seed) => SealedHand::new_committed(
+            request.hand_id,
+            seats,
+            server_seed,
+            request.client_seeds.clone(),
+        ),
+        None => SealedHand::new(request.hand_id, seats),
+    };
     #[cfg(any(test, feature = "test-support"))]
     let created = match request.test_seed {
         Some(seed) => SealedHand::new_with_rng(request.hand_id, seats, PokerRng::from_seed(seed)),
-        None => SealedHand::new(request.hand_id, seats),
+        None => fresh(seats),
     };
     #[cfg(not(any(test, feature = "test-support")))]
-    let created = SealedHand::new(request.hand_id, seats);
+    let created = fresh(seats);
     let Ok((mut hand, _)) = created else {
         return StatusCode::BAD_REQUEST.into_response();
     };
@@ -387,6 +547,34 @@ async fn create_hand(
     let response = hand.create_response();
     hands.insert(request.hand_id, hand);
     (StatusCode::CREATED, Json(response)).into_response()
+}
+
+async fn commit_hand(
+    State(state): State<WorkerState>,
+    headers: HeaderMap,
+    Json(request): Json<CommitHandRequest>,
+) -> impl IntoResponse {
+    if !internal_authorized(&headers, &state) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if state.hands.read().await.contains_key(&request.hand_id) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error":"hand_exists"})),
+        )
+            .into_response();
+    }
+    let now = tokio::time::Instant::now();
+    let mut commits = state.commits.write().await;
+    commits.retain(|_, (_, at)| now.duration_since(*at) < COMMIT_TTL);
+    // A lost response is replayed with the same commit, never a new seed.
+    let (server_seed, _) = *commits
+        .entry(request.hand_id)
+        .or_insert_with(|| (crate::pf_dealing::os_random_32(), now));
+    Json(CommitHandResponse {
+        seed_commit: crate::pf_dealing::seed_commit(&server_seed),
+    })
+    .into_response()
 }
 
 async fn reveal_board(
@@ -465,6 +653,7 @@ async fn delete_hand(
         return StatusCode::UNAUTHORIZED;
     }
     state.hands.write().await.remove(&hand_id);
+    state.commits.write().await.remove(&hand_id);
     StatusCode::NO_CONTENT
 }
 
@@ -487,15 +676,33 @@ async fn hole_ws(State(state): State<WorkerState>, ws: WebSocketUpgrade) -> impl
 /// every deal.
 async fn deliver_holes(mut socket: WebSocket, state: WorkerState) {
     let mut misses = 0u8;
-    // Absolute deadlines: only a ticket extends them, never control frames.
+    // Absolute deadline: only a valid ticket extends it, never control frames,
+    // unknown tickets or keepalives. A frame that was already buffered is not
+    // processed after expiry, and every write is bounded by it too.
     let mut deadline = tokio::time::Instant::now() + HOLE_DELIVERY_TIMEOUT;
+    let mut keepalive =
+        tokio::time::interval_at(tokio::time::Instant::now() + HOLE_KEEPALIVE, HOLE_KEEPALIVE);
+    let expired = |deadline| tokio::time::Instant::now() >= deadline;
     loop {
-        let raw = match tokio::time::timeout_at(deadline, socket.recv()).await {
-            Ok(Some(Ok(Message::Text(raw)))) => raw,
-            Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => continue,
-            _ => break,
+        let raw = tokio::select! {
+            _ = keepalive.tick() => {
+                if expired(deadline)
+                    || !matches!(
+                        tokio::time::timeout_at(deadline, socket.send(Message::Ping(Vec::new()))).await,
+                        Ok(Ok(()))
+                    )
+                {
+                    break;
+                }
+                continue;
+            }
+            frame = tokio::time::timeout_at(deadline, socket.recv()) => match frame {
+                _ if expired(deadline) => break,
+                Ok(Some(Ok(Message::Text(raw)))) => raw,
+                Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => continue,
+                _ => break,
+            },
         };
-        deadline = tokio::time::Instant::now() + HOLE_IDLE_TIMEOUT;
         let Ok(auth) = serde_json::from_str::<TicketAuth>(&raw) else {
             break;
         };
@@ -515,27 +722,36 @@ async fn deliver_holes(mut socket: WebSocket, state: WorkerState) {
         let Some(delivery) = delivery else {
             misses += 1;
             if misses >= HOLE_MAX_MISSES
-                || socket
-                    .send(Message::Text(r#"{"error":"unknown_ticket"}"#.into()))
-                    .await
-                    .is_err()
+                || expired(deadline)
+                || !matches!(
+                    tokio::time::timeout_at(
+                        deadline,
+                        socket.send(Message::Text(r#"{"error":"unknown_ticket"}"#.into())),
+                    )
+                    .await,
+                    Ok(Ok(()))
+                )
             {
                 break;
             }
             continue;
         };
         misses = 0;
+        deadline = tokio::time::Instant::now() + HOLE_IDLE_TIMEOUT;
         let Ok(json) = serde_json::to_string(&delivery) else {
             break;
         };
-        if socket.send(Message::Text(json)).await.is_err() {
+        if !matches!(
+            tokio::time::timeout_at(deadline, socket.send(Message::Text(json))).await,
+            Ok(Ok(()))
+        ) {
             break;
         }
         if let Some(hand) = state.hands.write().await.get_mut(&delivery.hand_id) {
             hand.delivered_seats.insert(delivery.seat);
         }
     }
-    let _ = socket.close().await;
+    let _ = tokio::time::timeout(Duration::from_secs(1), socket.close()).await;
 }
 
 async fn delivery_received(
@@ -582,11 +798,13 @@ pub async fn run_worker(addr: SocketAddr, internal_token: String) -> std::io::Re
     let state = WorkerState {
         internal_token: Arc::from(internal_token),
         hands: Arc::new(RwLock::new(HashMap::new())),
+        commits: Arc::new(RwLock::new(HashMap::new())),
         hole_connections: Arc::new(Semaphore::new(MAX_HOLE_CONNECTIONS)),
     };
     let app = Router::new()
         .route("/internal/readyz", get(internal_ready))
         .route("/internal/hands", post(create_hand))
+        .route("/internal/commits", post(commit_hand))
         .route("/internal/hands/:hand_id/bots/:seat", post(bot_hole))
         .route(
             "/internal/hands/:hand_id/deliveries/:seat",
@@ -666,6 +884,22 @@ impl SealedDealerClient {
         .json()
         .await
         .map_err(|e| e.to_string())
+    }
+
+    pub async fn commit_hand(&self, hand_id: Uuid) -> Result<[u8; 32], String> {
+        let response: CommitHandResponse = self
+            .send_with_retry(
+                self.request(
+                    self.http
+                        .post(format!("{}/internal/commits", self.base_url)),
+                )
+                .json(&CommitHandRequest { hand_id }),
+            )
+            .await?
+            .json()
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(response.seed_commit)
     }
 
     pub async fn delivery_received(&self, hand_id: Uuid, seat: u8) -> Result<bool, String> {
@@ -861,9 +1095,20 @@ pub async fn configure_or_launch() -> Result<Option<tokio::process::Child>, Stri
     Ok(Some(child))
 }
 
+/// The outcome of the pre-deal seed exchange for a committed hand.
+#[derive(Debug, Clone)]
+pub struct SeedCommitInput {
+    pub seed_commit: [u8; 32],
+    pub client_seeds: BTreeMap<u8, [u8; 32]>,
+    pub withheld_seats: Vec<u8>,
+}
+
 /// Per-hand capabilities. This never contains the undealt deck or human holes.
 pub struct ActiveHand {
     pub deal: CreateHandResponse,
+    /// The commit players saw and the exchange outcome; `None` for a pinned
+    /// test deck, which is never revealed.
+    commit: Option<SeedCommitInput>,
     pub bot_holes: HashMap<u8, engine::HoleCards>,
     pub endpoint: String,
     pub hand_id: Uuid,
@@ -883,6 +1128,7 @@ impl ActiveHand {
         hand: &engine::GameHand,
         bots: &std::collections::HashSet<u8>,
         users: &HashMap<Uuid, u8>,
+        commit: Option<SeedCommitInput>,
     ) -> Result<Self, String> {
         #[cfg(any(test, feature = "test-support"))]
         ensure_test_worker().await?;
@@ -901,10 +1147,19 @@ impl ActiveHand {
             client()?.clone(),
             public_ws_endpoint()?.to_string(),
             test_seed,
+            commit,
         )
         .await
     }
 
+    /// Phase one: obtain the dealer's seed commitment for `hand_id`.
+    pub async fn commit(hand_id: Uuid) -> Result<[u8; 32], String> {
+        #[cfg(any(test, feature = "test-support"))]
+        ensure_test_worker().await?;
+        client()?.commit_hand(hand_id).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn create_with(
         hand_id: Uuid,
         hand: &engine::GameHand,
@@ -913,7 +1168,17 @@ impl ActiveHand {
         client: SealedDealerClient,
         endpoint: String,
         _test_seed: Option<u64>,
+        commit: Option<SeedCommitInput>,
     ) -> Result<Self, String> {
+        #[cfg(any(test, feature = "test-support"))]
+        let pinned = _test_seed.is_some();
+        #[cfg(not(any(test, feature = "test-support")))]
+        let pinned = false;
+        let commit = commit.filter(|_| !pinned);
+        let client_seeds = commit
+            .as_ref()
+            .map(|c| c.client_seeds.clone())
+            .unwrap_or_default();
         let mut seats: Vec<u8> = hand.seats().iter().map(|s| s.seat).collect();
         seats.sort_unstable();
         let dealt_users = users
@@ -928,6 +1193,7 @@ impl ActiveHand {
                 #[cfg(any(test, feature = "test-support"))]
                 test_seed: _test_seed,
                 bot_seats: bots.iter().copied().filter(|s| seats.contains(s)).collect(),
+                client_seeds,
             })
             .await?;
         let mut bot_holes = HashMap::new();
@@ -943,6 +1209,7 @@ impl ActiveHand {
         }
         Ok(Self {
             deal,
+            commit,
             bot_holes,
             endpoint,
             hand_id,
@@ -1056,10 +1323,18 @@ impl ActiveHand {
         Ok(())
     }
 
+    /// Settle the hand. Also returns the verified commit-reveal secrets that
+    /// players use to recompute the deck (`None` for a pinned test deck).
     pub async fn finish(
         &self,
         hand: &mut engine::GameHand,
-    ) -> Result<engine::game::HandResult, String> {
+    ) -> Result<
+        (
+            engine::game::HandResult,
+            Option<crate::pf_dealing::PfSecrets>,
+        ),
+        String,
+    > {
         let contenders: Vec<_> = hand
             .seats()
             .iter()
@@ -1085,6 +1360,24 @@ impl ActiveHand {
         // The hand is over. Only now may private review obtain the completed deck.
         let deck = self.client.settle(self.hand_id).await?;
         validate_final_deck(self.hand_id, &self.deal.commitment, &deck)?;
+        check_settled_cards(&self.seats, &deck.cards, &result, |pid| {
+            hand.seats()
+                .iter()
+                .find(|s| s.player_id == pid)
+                .map(|s| s.seat)
+        })?;
+        let pf = match &self.commit {
+            Some(commit) => {
+                let mut pf = verified_reveal(self.hand_id, commit.seed_commit, &deck)?;
+                if pf.client_seeds != commit.client_seeds {
+                    return Err("sealed dealer mixed different player seeds".into());
+                }
+                pf.dealt_seats = self.seats.clone();
+                pf.withheld_seats = commit.withheld_seats.clone();
+                Some(pf)
+            }
+            None => None,
+        };
         result.deck_seed = deck.seed;
         for seat in hand.seats() {
             if result
@@ -1104,7 +1397,7 @@ impl ActiveHand {
                 decode_hole([deck.cards[i], deck.cards[i + self.seats.len()]])?,
             );
         }
-        Ok(result)
+        Ok((result, pf))
     }
 
     pub async fn delete(&self) {
@@ -1148,6 +1441,22 @@ pub fn set_next_hand_seed_for_test(session_id: Uuid, seed: u64) {
         .unwrap()
         .insert(session_id, seed);
 }
+/// A fixture pinned this session's next deck: it is dealt without the
+/// commit-reveal exchange and never revealed.
+#[cfg(any(test, feature = "test-support"))]
+pub fn next_deck_is_pinned(session_id: Uuid) -> bool {
+    TEST_HAND_SEEDS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .contains_key(&session_id)
+}
+
+#[cfg(not(any(test, feature = "test-support")))]
+pub fn next_deck_is_pinned(_session_id: Uuid) -> bool {
+    false
+}
+
 #[cfg(any(test, feature = "test-support"))]
 fn take_test_seed(session_id: Uuid) -> Option<u64> {
     TEST_HAND_SEEDS
@@ -1238,6 +1547,152 @@ mod tests {
         assert!(SealedHand::new(id, vec![0, 0]).is_err());
     }
 
+    async fn spawn_worker() -> (
+        SealedDealerClient,
+        tokio::task::JoinHandle<std::io::Result<()>>,
+    ) {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
+        let addr = probe.local_addr().expect("local addr");
+        drop(probe);
+        let token = "test-internal-token".to_string();
+        let worker = tokio::spawn(run_worker(addr, token.clone()));
+        let http = reqwest::Client::new();
+        for _ in 0..50 {
+            if http
+                .get(format!("http://{addr}/healthz"))
+                .send()
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        (
+            SealedDealerClient::new(format!("http://{addr}"), token),
+            worker,
+        )
+    }
+
+    /// ADR-064 on the sealed dealer: the deck is fixed by the commit plus the
+    /// players' seeds, players can reproduce it from the settlement reveal,
+    /// and the worker refuses to deal from seeds it never committed against.
+    #[tokio::test]
+    async fn committed_deal_is_reproducible_from_the_reveal() {
+        let (client, worker) = spawn_worker().await;
+        let hand_id = Uuid::new_v4();
+        let seed_commit = client.commit_hand(hand_id).await.unwrap();
+        assert_eq!(
+            client.commit_hand(hand_id).await.unwrap(),
+            seed_commit,
+            "replay keeps the commit"
+        );
+        let seeds = BTreeMap::from([(0u8, [0xA1; 32]), (3u8, [0xB2; 32])]);
+        let request = CreateHandRequest {
+            hand_id,
+            seats: vec![0, 3, 5],
+            bot_seats: Vec::new(),
+            client_seeds: seeds.clone(),
+            test_seed: None,
+        };
+        let deal = client.create_hand(&request).await.unwrap();
+        assert_eq!(
+            client.create_hand(&request).await.unwrap(),
+            deal,
+            "replay keeps the deal"
+        );
+        let mut other = request.clone();
+        other.client_seeds.insert(5, [0xC3; 32]);
+        assert!(
+            client.create_hand(&other).await.is_err(),
+            "seeds cannot change after the deal"
+        );
+
+        let deck = client.settle(hand_id).await.unwrap();
+        validate_final_deck(hand_id, &deal.commitment, &deck).unwrap();
+        let pf = verified_reveal(hand_id, seed_commit, &deck).unwrap();
+        assert_eq!(pf.client_seeds, seeds);
+        // An independent verifier reproduces the deal from the revealed seeds.
+        let card = |id: u8| mental_poker::card_id::id_to_card(id).unwrap();
+        let record = mental_poker::pf::HandRecord {
+            hand_id: hand_id.to_string(),
+            server_seed: hex::encode(pf.server_seed),
+            seed_commit: hex::encode(seed_commit),
+            client_seeds: seeds
+                .iter()
+                .map(|(s, v)| (s.to_string(), hex::encode(v)))
+                .collect(),
+            num_players: 3,
+            dealt_seats: vec![0, 3, 5],
+            hole_cards: BTreeMap::from([(
+                "3".to_string(),
+                vec![card(deck.cards[1]), card(deck.cards[4])],
+            )]),
+            community: deck.cards[6..11].iter().map(|id| card(*id)).collect(),
+        };
+        mental_poker::pf::verify_hand(&record).expect("revealed deal verifies");
+
+        // A revealed seed set that differs from the dealt one fails closed.
+        let mut forged = deck.clone();
+        forged.client_seeds.remove(&3);
+        assert!(verified_reveal(hand_id, seed_commit, &forged).is_err());
+        assert!(verified_reveal(hand_id, [0; 32], &deck).is_err());
+
+        // Seeds without a prior commit are refused rather than ignored.
+        let uncommitted = CreateHandRequest {
+            hand_id: Uuid::new_v4(),
+            ..request
+        };
+        assert!(client.create_hand(&uncommitted).await.is_err());
+        worker.abort();
+    }
+
+    #[test]
+    fn settlement_guard_rejects_cards_not_at_their_deck_positions() {
+        let mut hand = engine::GameHand::new_blind(
+            vec![
+                (engine::PlayerId(1), engine::Chips(100), 0),
+                (engine::PlayerId(2), engine::Chips(100), 3),
+            ],
+            0,
+            engine::Chips(20),
+            engine::Chips(10),
+            [0; 32],
+        );
+        hand.start().unwrap();
+        let deck = deck_ids([7; 32]);
+        let card = |id: u8| mental_poker::card_id::id_to_card(id).unwrap();
+        hand.apply_action(engine::PlayerId(1), engine::PlayerAction::AllIn)
+            .unwrap();
+        hand.apply_action(engine::PlayerId(2), engine::PlayerAction::Call)
+            .unwrap();
+        while let Some(street) = hand.pending_board_street() {
+            let range = match street {
+                engine::Street::Flop => 4..7,
+                engine::Street::Turn => 7..8,
+                _ => 8..9,
+            };
+            let cards: Vec<_> = deck[range].iter().map(|id| card(*id)).collect();
+            hand.inject_board_for_street(&cards).unwrap();
+        }
+        for (pid, p) in [(1, 0usize), (2, 1)] {
+            hand.inject_showdown_reveal(
+                engine::PlayerId(pid),
+                engine::HoleCards::new(card(deck[p + 2]), card(deck[p])),
+            )
+            .unwrap();
+        }
+        let result = hand.finish_blind().unwrap();
+        let seat_of = |pid: engine::PlayerId| Some(if pid.0 == 1 { 0 } else { 3 });
+        check_settled_cards(&[0, 3], &deck, &result, seat_of).unwrap();
+        let mut swapped = deck.clone();
+        swapped.swap(4, 9);
+        assert!(check_settled_cards(&[0, 3], &swapped, &result, seat_of).is_err());
+        swapped = deck.clone();
+        swapped.swap(1, 20);
+        assert!(check_settled_cards(&[0, 3], &swapped, &result, seat_of).is_err());
+    }
+
     #[tokio::test]
     async fn worker_delivers_holes_directly_and_opens_deck_only_at_settlement() {
         let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
@@ -1310,6 +1765,7 @@ mod tests {
                 hand_id,
                 seats: vec![0, 3],
                 bot_seats: Vec::new(),
+                client_seeds: Default::default(),
                 #[cfg(any(test, feature = "test-support"))]
                 test_seed: None,
             })
@@ -1319,6 +1775,7 @@ mod tests {
             hand_id,
             seats: vec![3, 0], // Request ordering does not change seat ownership.
             bot_seats: Vec::new(),
+            client_seeds: Default::default(),
             #[cfg(any(test, feature = "test-support"))]
             test_seed: None,
         };
@@ -1380,6 +1837,7 @@ mod tests {
                 hand_id: next_hand,
                 seats: vec![0, 3],
                 bot_seats: Vec::new(),
+                client_seeds: Default::default(),
                 #[cfg(any(test, feature = "test-support"))]
                 test_seed: None,
             })
@@ -1479,6 +1937,7 @@ mod tests {
             client.clone(),
             format!("ws://{addr}/ws"),
             Some(3),
+            None,
         )
         .await
         .unwrap();
@@ -1496,7 +1955,8 @@ mod tests {
         hand.apply_action(engine::PlayerId(2), engine::PlayerAction::Call)
             .unwrap();
         active.advance(&mut hand).await.unwrap();
-        let result = active.finish(&mut hand).await.unwrap();
+        let (result, pf) = active.finish(&mut hand).await.unwrap();
+        assert!(pf.is_none(), "a pinned test deck is never revealed");
         assert_eq!(result.final_stacks.values().sum::<u32>(), 200);
         assert_eq!(result.board.count(), 5);
         assert_eq!(completed_holes(&result).len(), 2);
@@ -1508,6 +1968,95 @@ mod tests {
     /// A mid-hand joiner can bind a seat a fill bot is playing, or a seat a dealt
     /// human vacated. Neither seat's ticket may reach them: redeeming it would
     /// expose a live opponent's hole cards.
+    /// Prod 2026-10-14: idle hole sockets outlive a wait between hands, so only
+    /// a VALID ticket may extend a socket's lifetime.
+    #[tokio::test]
+    async fn hole_socket_lifetime_is_extended_only_by_valid_tickets() {
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
+        let addr = probe.local_addr().expect("local addr");
+        drop(probe);
+        let token = "test-internal-token".to_string();
+        let worker = tokio::spawn(run_worker(addr, token.clone()));
+        let http = reqwest::Client::new();
+        for _ in 0..50 {
+            if http
+                .get(format!("http://{addr}/healthz"))
+                .send()
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let client = SealedDealerClient::new(format!("http://{addr}"), token);
+        let hand_id = Uuid::new_v4();
+        let deal = client
+            .create_hand(&CreateHandRequest {
+                hand_id,
+                seats: vec![0, 3],
+                bot_seats: Vec::new(),
+                client_seeds: Default::default(),
+                #[cfg(any(test, feature = "test-support"))]
+                test_seed: None,
+            })
+            .await
+            .expect("create sealed hand");
+        let ticket = deal
+            .tickets
+            .iter()
+            .find(|t| t.seat == 3)
+            .unwrap()
+            .ticket
+            .clone();
+        let redeem = serde_json::json!({ "ticket": ticket }).to_string();
+
+        // An unknown ticket is answered but does not extend the first-ticket
+        // deadline: the socket still closes within HOLE_DELIVERY_TIMEOUT.
+        let (mut stranger, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .expect("connect");
+        let started = tokio::time::Instant::now();
+        tokio::time::sleep(HOLE_DELIVERY_TIMEOUT / 2).await;
+        stranger
+            .send(WsMessage::Text(r#"{"ticket":"nope"}"#.into()))
+            .await
+            .expect("send unknown ticket");
+        let reply = stranger.next().await.unwrap().unwrap().into_text().unwrap();
+        assert!(reply.contains("unknown_ticket"));
+        let closed = tokio::time::timeout(HOLE_DELIVERY_TIMEOUT, async {
+            loop {
+                match stranger.next().await {
+                    Some(Ok(WsMessage::Text(_))) => panic!("no further frames expected"),
+                    Some(Ok(_)) => continue,
+                    _ => break,
+                }
+            }
+        })
+        .await;
+        assert!(closed.is_ok(), "unknown ticket must not extend the socket");
+        assert!(started.elapsed() < HOLE_DELIVERY_TIMEOUT + Duration::from_secs(1));
+
+        // A valid ticket keeps the socket past the first-ticket window, so the
+        // next hand is served without a fresh handshake.
+        let (mut kept, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .expect("connect kept socket");
+        for round in 0..2 {
+            if round == 1 {
+                tokio::time::sleep(HOLE_DELIVERY_TIMEOUT + Duration::from_secs(1)).await;
+            }
+            kept.send(WsMessage::Text(redeem.clone())).await.unwrap();
+            let delivery: HoleDelivery =
+                serde_json::from_str(&kept.next().await.unwrap().unwrap().into_text().unwrap())
+                    .expect("delivery on the kept socket");
+            assert_eq!((delivery.hand_id, delivery.seat), (hand_id, 3));
+        }
+        client.delete_hand(hand_id).await;
+        worker.abort();
+    }
+
     #[tokio::test]
     async fn tickets_go_only_to_users_dealt_into_the_hand() {
         let mut hand = engine::GameHand::new_blind(
@@ -1534,6 +2083,7 @@ mod tests {
             &hand,
             &std::collections::HashSet::from([3]),
             &HashMap::from([(alice, 0), (bob, 1)]),
+            None,
         )
         .await
         .expect("sealed hand");

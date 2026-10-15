@@ -1199,13 +1199,41 @@ fn zero_chip_call_recorded_as_check() {
         snap_after.pot, pot_before,
         "zero-chip action must not change the pot"
     );
+}
 
-    // The relabelled Check must also appear as the last_action for BB.
-    assert_eq!(
-        hand.last_action.get(&bb.inner()),
-        Some(&PlayerAction::Check),
-        "last_action must reflect the relabelled Check"
+#[test]
+fn last_action_resets_at_each_street() {
+    let mut hand = GameHand::new_with_rng(
+        vec![(pid(1), c(1000), 0), (pid(2), c(1000), 1)],
+        0,
+        c(20),
+        c(10),
+        PokerRng::from_seed(9),
     );
+    hand.start().unwrap();
+
+    // Preflop: SB raises, BB calls → flop.
+    let sb = hand.snapshot().current_actor.unwrap();
+    hand.apply_action(sb, PlayerAction::Raise { amount: c(60) })
+        .unwrap();
+    let bb = hand.snapshot().current_actor.unwrap();
+    hand.apply_action(bb, PlayerAction::Call).unwrap();
+
+    let flop = hand.snapshot();
+    assert_eq!(flop.street, Street::Flop);
+    assert!(
+        flop.players.iter().all(|p| p.last_action.is_none()),
+        "a preflop action must not survive into the flop snapshot"
+    );
+
+    // A flop action shows only for the seat that took it.
+    let first = flop.current_actor.unwrap();
+    hand.apply_action(first, PlayerAction::Check).unwrap();
+    let snap = hand.snapshot();
+    for p in &snap.players {
+        let expected = (p.player_id == first).then_some(PlayerAction::Check);
+        assert_eq!(p.last_action, expected);
+    }
 }
 
 /// A-002: In heads-up (n=2) the dealer is the SB and the non-dealer is the BB.
