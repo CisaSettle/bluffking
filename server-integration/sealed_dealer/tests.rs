@@ -88,6 +88,7 @@ async fn committed_deal_is_reproducible_from_the_reveal() {
         seats: vec![0, 3, 5],
         bot_seats: Vec::new(),
         client_seeds: seeds.clone(),
+        seed_commit: Some(seed_commit),
         test_seed: None,
     };
     let deal = client.create_hand(&request).await.unwrap();
@@ -136,9 +137,66 @@ async fn committed_deal_is_reproducible_from_the_reveal() {
     // Seeds without a prior commit are refused rather than ignored.
     let uncommitted = CreateHandRequest {
         hand_id: Uuid::new_v4(),
-        ..request
+        ..request.clone()
     };
     assert!(client.create_hand(&uncommitted).await.is_err());
+    // A replay that names a different commitment than the dealt hand's is a
+    // config mismatch, not a replay.
+    let other_commit = CreateHandRequest {
+        seed_commit: Some([0x5A; 32]),
+        ..request
+    };
+    assert!(client.create_hand(&other_commit).await.is_err());
+    worker.abort();
+}
+
+/// A worker restarted between the commit and the deal has lost the pending
+/// commit. The game server names the commitment it announced, so the deal is
+/// refused before any card exists instead of being voided at settlement.
+#[tokio::test]
+async fn deal_is_refused_when_the_announced_commit_is_not_pending() {
+    let (client, worker) = spawn_worker().await;
+    // No commit at all (the restart case): refused even without player seeds.
+    let hand_id = Uuid::new_v4();
+    let request = CreateHandRequest {
+        hand_id,
+        seats: vec![0, 3],
+        bot_seats: Vec::new(),
+        client_seeds: Default::default(),
+        seed_commit: Some([0x11; 32]),
+        test_seed: None,
+    };
+    let refused = client.create_hand(&request).await;
+    assert!(refused.is_err(), "lost commit must refuse the deal");
+    assert!(
+        refused.unwrap_err().contains("409"),
+        "the refusal is a conflict, not a transport error"
+    );
+    // A pending commit for the hand that is not the announced one is refused
+    // too, and the mismatch consumed it: the next attempt still fails.
+    let committed = Uuid::new_v4();
+    let seed_commit = client.commit_hand(committed).await.unwrap();
+    let wrong = CreateHandRequest {
+        hand_id: committed,
+        seed_commit: Some([0x22; 32]),
+        ..request.clone()
+    };
+    assert!(client.create_hand(&wrong).await.is_err());
+    // The announced commit deals as before.
+    let again = Uuid::new_v4();
+    let seed_commit_again = client.commit_hand(again).await.unwrap();
+    assert_ne!(seed_commit, seed_commit_again);
+    let ok = CreateHandRequest {
+        hand_id: again,
+        seed_commit: Some(seed_commit_again),
+        ..request
+    };
+    let deal = client.create_hand(&ok).await.unwrap();
+    assert_eq!(
+        client.create_hand(&ok).await.unwrap(),
+        deal,
+        "replay keeps the deal"
+    );
     worker.abort();
 }
 
@@ -246,10 +304,9 @@ async fn worker_delivers_holes_directly_and_opens_deck_only_at_settlement() {
     let (mut idle, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
         .await
         .expect("connect idle unauthenticated socket");
-    let closed =
-        tokio::time::timeout(HOLE_DELIVERY_TIMEOUT + Duration::from_secs(1), idle.next())
-            .await
-            .expect("idle connection must release its admission slot");
+    let closed = tokio::time::timeout(HOLE_DELIVERY_TIMEOUT + Duration::from_secs(1), idle.next())
+        .await
+        .expect("idle connection must release its admission slot");
     assert!(!matches!(
         closed,
         Some(Ok(tokio_tungstenite::tungstenite::Message::Text(_)))
@@ -261,6 +318,7 @@ async fn worker_delivers_holes_directly_and_opens_deck_only_at_settlement() {
             seats: vec![0, 3],
             bot_seats: Vec::new(),
             client_seeds: Default::default(),
+            seed_commit: None,
             #[cfg(any(test, feature = "test-support"))]
             test_seed: None,
         })
@@ -271,6 +329,7 @@ async fn worker_delivers_holes_directly_and_opens_deck_only_at_settlement() {
         seats: vec![3, 0], // Request ordering does not change seat ownership.
         bot_seats: Vec::new(),
         client_seeds: Default::default(),
+        seed_commit: None,
         #[cfg(any(test, feature = "test-support"))]
         test_seed: None,
     };
@@ -333,6 +392,7 @@ async fn worker_delivers_holes_directly_and_opens_deck_only_at_settlement() {
             seats: vec![0, 3],
             bot_seats: Vec::new(),
             client_seeds: Default::default(),
+            seed_commit: None,
             #[cfg(any(test, feature = "test-support"))]
             test_seed: None,
         })
@@ -493,6 +553,7 @@ async fn hole_socket_lifetime_is_extended_only_by_valid_tickets() {
             seats: vec![0, 3],
             bot_seats: Vec::new(),
             client_seeds: Default::default(),
+            seed_commit: None,
             #[cfg(any(test, feature = "test-support"))]
             test_seed: None,
         })

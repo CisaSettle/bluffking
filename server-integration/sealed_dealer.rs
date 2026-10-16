@@ -84,6 +84,13 @@ pub struct CreateHandRequest {
     /// server_seed, client_seeds, hand_id)))`, reproducible by players.
     #[serde(default)]
     pub client_seeds: BTreeMap<u8, [u8; 32]>,
+    /// The commitment the game server obtained for this hand. When set, the
+    /// worker must still hold that exact pending commit: a worker restarted
+    /// between commit and deal has lost it and refuses the deal up front
+    /// (`hand_not_committed`) instead of dealing an uncommitted deck that
+    /// only fails verification at settlement, after a whole hand was played.
+    #[serde(default)]
+    pub seed_commit: Option<[u8; 32]>,
     #[cfg(any(test, feature = "test-support"))]
     #[serde(default)]
     pub test_seed: Option<u64>,
@@ -484,6 +491,11 @@ async fn create_hand(
         if existing.seats != seats
             || existing.bot_seats != bot_seats
             || existing.client_seeds != request.client_seeds
+            || request.seed_commit.is_some_and(|expected| {
+                existing
+                    .server_seed
+                    .is_none_or(|seed| crate::pf_dealing::seed_commit(&seed) != expected)
+            })
         {
             return (
                 StatusCode::CONFLICT,
@@ -516,6 +528,18 @@ async fn create_hand(
             Json(serde_json::json!({"error":"hand_not_committed"})),
         )
             .into_response();
+    }
+    // The game server expects a committed deal: the pending commit must be the
+    // one it announced to the players, not missing (worker restarted after the
+    // commit) and not another hand's.
+    if let Some(expected) = request.seed_commit {
+        if committed.is_none_or(|seed| crate::pf_dealing::seed_commit(&seed) != expected) {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error":"hand_not_committed"})),
+            )
+                .into_response();
+        }
     }
     if request
         .client_seeds
@@ -1194,6 +1218,7 @@ impl ActiveHand {
                 test_seed: _test_seed,
                 bot_seats: bots.iter().copied().filter(|s| seats.contains(s)).collect(),
                 client_seeds,
+                seed_commit: commit.as_ref().map(|c| c.seed_commit),
             })
             .await?;
         let mut bot_holes = HashMap::new();
