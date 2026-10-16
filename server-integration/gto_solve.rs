@@ -49,6 +49,10 @@
 //!    repeated canonical spots are served from memory (the GB solve is a one-time
 //!    cost).
 //! 6. **Per-IP rate limit** (above) bounds request volume from one source.
+//! 7. **CPU bound** (`SOLVER_THREADS`, default 1): every solve runs in one
+//!    dedicated rayon pool (nice 10 on Linux, best-effort) instead of the
+//!    all-core global pool, so with the default size solving leaves a vCPU of
+//!    the 2-vCPU host free for requests.
 //!
 //! ## Errors
 //! Invalid input (bad cards / board / ranges / sizing / pot) → 400 in the
@@ -209,6 +213,57 @@ const MAX_TIER_TURN_RIVER_SIZES: usize = 8;
 
 /// Stop once exploitability reaches this fraction of the pot (0.5%).
 const PUBLIC_TARGET_EXPLOIT_PCT: f32 = 0.005;
+
+/// Default size of the solver's dedicated rayon pool (`SOLVER_THREADS`).
+///
+/// The upstream CFR loop is rayon-parallel. Left on rayon's GLOBAL pool it fans
+/// out to one thread per core, so a single fresh solve occupied BOTH vCPUs of
+/// the production host for seconds. The tokio workers are not blocked (the
+/// solve runs under `spawn_blocking`), but they wait in the run queue: on the
+/// 2-vCPU rig (2026-10-16) a 25 qps `/api/auth/me` probe went from 3–5 ms to
+/// 26 ms p99 while solves ran. One thread, shared by every concurrent solve,
+/// keeps a core free for live play and the API.
+const DEFAULT_SOLVER_THREADS: usize = 1;
+
+/// Size of the solver pool (cached first-read). `SOLVER_THREADS` overrides the
+/// default; values are clamped to ≥1.
+fn solver_threads() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("SOLVER_THREADS")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .map(|n| n.max(1))
+            .unwrap_or(DEFAULT_SOLVER_THREADS)
+    })
+}
+
+/// The dedicated rayon pool every solve runs in (lazy). `install` routes the
+/// upstream crate's `par_iter` calls here instead of the global pool, and the
+/// pool threads run at nice 10 like the hand-enrichment worker, so the
+/// scheduler prefers request-serving threads when both are runnable.
+fn solver_pool() -> &'static rayon::ThreadPool {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(solver_threads())
+            .thread_name(|i| format!("gto-solver-{i}"))
+            .start_handler(|_| {
+                // Linux nice is per-thread; these threads belong to this pool only.
+                #[cfg(target_os = "linux")]
+                {
+                    // SAFETY: PRIO_PROCESS with who=0 targets the calling Linux
+                    // thread; the syscall takes only scalar arguments.
+                    let result = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 10) };
+                    if result != 0 {
+                        tracing::warn!(error = %std::io::Error::last_os_error(), "gto_solver_priority_failed");
+                    }
+                }
+            })
+            .build()
+            .expect("build the bounded gto-solver thread pool")
+    })
+}
 
 /// Global concurrency semaphore (lazy). `Arc` so a clone can be moved into the
 /// async permit-acquire without borrowing a `'static` reference awkwardly.
@@ -1435,7 +1490,7 @@ pub async fn solve_handler(
         // in-flight cap until it truly completes, exactly like the global permit.
         let _permit = permit;
         let _ip_guard = ip_guard;
-        solve_spot(&req_for_solve)
+        solver_pool().install(|| solve_spot(&req_for_solve))
     });
 
     let timeout = effective_solve_timeout();

@@ -578,41 +578,26 @@ impl GameHand {
             return Vec::new();
         }
 
-        // Did anyone bet/raise on the river?
-        // Walk river actions in order; track each player's contribution before
-        // their action and flag aggression when the action moved current_bet up
-        // (Raise / AllIn that exceeded the running bet) — `actions` carries
-        // pot_before/pot_after but not current_bet, so use action-shape +
-        // amount > 0 to identify aggression.
-        let mut river_current_bet: u32 = 0;
-        let mut river_committed: std::collections::HashMap<u64, u32> =
-            std::collections::HashMap::new();
-        let mut last_river_aggressor: Option<PlayerId> = None;
-        for a in &self.actions {
-            if a.street != Street::River {
-                continue;
-            }
-            let pid_key = a.player_id.inner();
-            let prior = *river_committed.get(&pid_key).unwrap_or(&0);
-            let new_total = prior + a.amount.0;
-            river_committed.insert(pid_key, new_total);
-            match a.action {
-                PlayerAction::Raise { .. } | PlayerAction::AllIn
-                    if new_total > river_current_bet =>
-                {
-                    river_current_bet = new_total;
-                    last_river_aggressor = Some(a.player_id);
-                }
-                _ => {}
-            }
-        }
+        // Auto-runout streets have no actions. Use the last street actually
+        // played, so a called pre-river shove retains first-show priority.
+        // A played, checked-through river still starts left of the button.
+        let last_betting_street = [Street::River, Street::Turn, Street::Flop, Street::Preflop]
+            .into_iter()
+            .find(|street| self.actions.iter().any(|action| action.street == *street));
+        // Reuse authoritative wager semantics: blind commitments count toward
+        // preflop totals, but blinds and all-in calls are never aggression.
+        let last_aggressor = last_betting_street.and_then(|street| {
+            self.street_action_facts(street)
+                .into_iter()
+                .rev()
+                .find(|fact| fact.increased_bet)
+                .map(|fact| fact.player_id)
+        });
 
-        // Pick the start seat:
-        //   * river aggressor exists → their seat
-        //   * else → first non-folded seat clockwise from button (dealer + 1)
+        // Last played street's aggressor first; otherwise left of the button.
         let n = self.seats.len();
         let first_left_of_button = (self.dealer_idx % n + 1) % n;
-        let start_idx = if let Some(pid) = last_river_aggressor {
+        let start_idx = if let Some(pid) = last_aggressor {
             self.seats
                 .iter()
                 .position(|s| s.player_id == pid)

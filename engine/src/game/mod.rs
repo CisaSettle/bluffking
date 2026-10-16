@@ -208,8 +208,9 @@ pub struct HandResult {
     /// Rules (2026-05-28 BUG-D):
     /// - If any bet/raise occurred on the river → the **last river aggressor**
     ///   shows first, then turn-order from the next non-folded seat clockwise.
-    /// - If the river checked through (or there was no river because all
-    ///   remaining players were all-in pre-river) → the first non-folded
+    /// - If pre-river all-in betting caused an automatic runout → the last
+    ///   aggressor on the last street actually played shows first.
+    /// - If the last played street checked through → the first non-folded
     ///   player clockwise from the button shows first, then turn-order.
     /// - Empty `Vec` when there was no showdown (fold-around).
     ///
@@ -392,6 +393,8 @@ pub struct GameHand {
     /// action opens to that seat's left, and a fully-funded straddle becomes
     /// the preflop bring-in / minimum raise increment.
     forced_straddle: Option<Chips>,
+    /// Per-seat bomb-pot contribution; replaces blinds and skips preflop.
+    bomb_pot: Option<Chips>,
     /// Per-seat ante posted as dead money before the blinds (zero = none).
     ante: Chips,
     /// The preflop opening wager / minimum raise increment ACTUALLY handed to
@@ -559,6 +562,9 @@ impl GameHand {
     /// and the hand has at least three players. This is public table topology;
     /// reconnect snapshots may expose it without revealing card state.
     pub fn straddle_position(&self) -> Option<(u8, Chips)> {
+        if self.bomb_pot.is_some() {
+            return None;
+        }
         let amount = self.forced_straddle?;
         let n = self.seats.len();
         if n < 3 {
@@ -571,7 +577,12 @@ impl GameHand {
 
     /// Configured per-seat ante for this hand (zero when disabled).
     pub fn ante(&self) -> Chips {
-        self.ante
+        self.bomb_pot.unwrap_or(self.ante)
+    }
+
+    /// Configured bomb-pot contribution, absent for ordinary hands.
+    pub fn bomb_pot_amount(&self) -> Option<Chips> {
+        self.bomb_pot
     }
 
     /// Drain all events accumulated since the last call.

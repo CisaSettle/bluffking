@@ -68,6 +68,7 @@ impl GameHand {
             big_blind,
             small_blind,
             forced_straddle: None,
+            bomb_pot: None,
             ante: Chips::ZERO,
             preflop_bring_in: big_blind,
             mode: HandMode::Plaintext,
@@ -135,6 +136,7 @@ impl GameHand {
             big_blind,
             small_blind,
             forced_straddle: None,
+            bomb_pot: None,
             ante: Chips::ZERO,
             preflop_bring_in: big_blind,
             mode: HandMode::Blind,
@@ -164,6 +166,14 @@ impl GameHand {
     /// straddle, even when the table-level setting remains enabled.
     pub fn with_forced_straddle(mut self, amount: Chips) -> Self {
         self.forced_straddle = (amount.0 > 0).then_some(amount);
+        self
+    }
+
+    /// Start directly on a single flop after every player posts this amount
+    /// (capped by their stack). Replaces normal antes, blinds and straddles;
+    /// the configured big blind remains the postflop minimum bet. Zero disables.
+    pub fn with_bomb_pot(mut self, amount: Chips) -> Self {
+        self.bomb_pot = (amount.0 > 0).then_some(amount);
         self
     }
 
@@ -211,9 +221,10 @@ impl GameHand {
         // all-in before the blinds (settlement reads each seat's total
         // contribution, so the ante layer is contested like any side pot).
         let mut ante_total = 0u32;
-        if self.ante.0 > 0 {
+        let ante = self.ante();
+        if ante.0 > 0 {
             for seat in &mut self.seats {
-                let posted = self.ante.0.min(seat.stack.0);
+                let posted = ante.0.min(seat.stack.0);
                 seat.stack.0 -= posted;
                 ante_total += posted;
                 if seat.stack.0 == 0 {
@@ -222,11 +233,15 @@ impl GameHand {
             }
             self.completed_pot.0 += ante_total;
             self.cumulative_side_pots.push(SidePot {
-                cap: self.ante,
+                cap: ante,
                 amount: Chips(ante_total),
                 eligible: self.seats.iter().map(|s| s.player_id).collect(),
                 refund_to: Vec::new(),
             });
+        }
+
+        if self.bomb_pot.is_some() {
+            return self.start_bomb_pot();
         }
 
         // Determine blind positions.
@@ -372,20 +387,7 @@ impl GameHand {
         // plaintext hole value before a verified showdown reveal. (Skipping this
         // block is what makes "no plaintext before showdown" structural: there
         // is no blind code path that writes `Plain`.)
-        if self.mode == HandMode::Plaintext {
-            let n_seats = self.seats.len();
-            let mut first_cards: Vec<crate::card::Card> = Vec::with_capacity(n_seats);
-            let mut second_cards: Vec<crate::card::Card> = Vec::with_capacity(n_seats);
-            for _ in 0..n_seats {
-                first_cards.push(self.deck.deal().map_err(|_| ActionError::HandFinished)?);
-            }
-            for _ in 0..n_seats {
-                second_cards.push(self.deck.deal().map_err(|_| ActionError::HandFinished)?);
-            }
-            for (i, seat) in self.seats.iter_mut().enumerate() {
-                seat.hole = HoleSlot::Plain(HoleCards::new(first_cards[i], second_cards[i]));
-            }
-        }
+        self.deal_hole_cards()?;
 
         // Build the preflop betting round BEFORE emitting blind events so that
         // the post-blind current_bet / min_raise_to / next_actor are accurate.
@@ -528,16 +530,7 @@ impl GameHand {
         // do NOT introduce a redacted event variant (the contract allows "or
         // none") so the not-yet-blind-aware server needs no changes. A client
         // learns its own cards out-of-band via the threshold-decrypt protocol.
-        if self.mode == HandMode::Plaintext {
-            for seat in &self.seats {
-                if let Some(hole) = seat.hole_cards() {
-                    self.events.push(EngineEvent::HoleCardsDealt {
-                        seat: seat.seat,
-                        cards: hole.as_array(),
-                    });
-                }
-            }
-        }
+        self.emit_hole_cards();
 
         if self
             .betting_round
@@ -549,5 +542,64 @@ impl GameHand {
         }
 
         Ok(self.snapshot())
+    }
+
+    fn deal_hole_cards(&mut self) -> Result<(), ActionError> {
+        if self.mode == HandMode::Plaintext {
+            let n_seats = self.seats.len();
+            let mut first_cards: Vec<crate::card::Card> = Vec::with_capacity(n_seats);
+            let mut second_cards: Vec<crate::card::Card> = Vec::with_capacity(n_seats);
+            for _ in 0..n_seats {
+                first_cards.push(self.deck.deal().map_err(|_| ActionError::HandFinished)?);
+            }
+            for _ in 0..n_seats {
+                second_cards.push(self.deck.deal().map_err(|_| ActionError::HandFinished)?);
+            }
+            for (i, seat) in self.seats.iter_mut().enumerate() {
+                seat.hole = HoleSlot::Plain(HoleCards::new(first_cards[i], second_cards[i]));
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_hole_cards(&mut self) {
+        if self.mode == HandMode::Plaintext {
+            for seat in &self.seats {
+                if let Some(hole) = seat.hole_cards() {
+                    self.events.push(EngineEvent::HoleCardsDealt {
+                        seat: seat.seat,
+                        cards: hole.as_array(),
+                    });
+                }
+            }
+        }
+    }
+
+    fn start_bomb_pot(&mut self) -> Result<GameSnapshot, ActionError> {
+        let n = self.seats.len();
+        let (sb_idx, bb_idx) = self.forced_blind_positions(n);
+        let bb_seat = self.seats[bb_idx].seat;
+        self.events.push(EngineEvent::HandStarted {
+            dealer_seat: self.seats[self.dealer_idx % n].seat,
+            sb_seat: sb_idx.map_or(bb_seat, |idx| self.seats[idx].seat),
+            bb_seat,
+            big_blind: self.big_blind.0 as u64,
+            small_blind: self.small_blind.0 as u64,
+            straddle_seat: None,
+            straddle_amount: None,
+            ante: self.ante().0 as u64,
+            deck_seed: self.deck_seed,
+        });
+        self.deal_hole_cards()?;
+        self.events.push(EngineEvent::PotUpdated {
+            pot: self.completed_pot.0 as u64,
+            side_pots: vec![],
+            has_all_in: self.seats.iter().any(|seat| seat.all_in),
+        });
+        self.emit_hole_cards();
+        // No preflop betting round exists. Reuse the ordinary street transition
+        // so postflop order, all-in runout and sealed board injection stay shared.
+        self.phase = Phase::Betting(Street::Preflop);
+        self.close_street_and_advance()
     }
 }

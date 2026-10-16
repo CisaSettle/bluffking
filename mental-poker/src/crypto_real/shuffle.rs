@@ -108,18 +108,19 @@
 use crate::crypto::{ShuffleProof, ShuffleProofProvider};
 use crate::crypto_real::dkg::challenge_scalar;
 use crate::crypto_real::ec::{
-    deck_hash, is_identity_pubkey, point_from_hex, point_to_hex, scalar_from_hex, scalar_to_hex,
-    Ct, CtWire,
+    deck_hash, is_identity_pubkey, point_from_hex, point_to_bytes, point_to_hex, scalar_from_hex,
+    scalar_to_hex, Ct, CtWire,
 };
-use crate::hash::{hex_hash, Hash};
+use crate::hash::{ds_hash, hex_hash, Hash};
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT as G;
 // PERF: fixed-base precomputed table for G. `&s * GT` is a constant-time
 // fixed-base ladder (~4x faster than the generic variable-base one), so it is
 // safe on the prover's secret-dependent paths as well as the verifier's.
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_TABLE as GT;
+use curve25519_dalek::ristretto::CompressedRistretto;
 use curve25519_dalek::ristretto::RistrettoPoint;
 use curve25519_dalek::scalar::Scalar;
-use curve25519_dalek::traits::{Identity, MultiscalarMul, VartimeMultiscalarMul};
+use curve25519_dalek::traits::{Identity, VartimeMultiscalarMul};
 use merlin::Transcript;
 use rand_core::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
@@ -301,22 +302,97 @@ fn statement_transcript(
     d_in: &[Ct],
     d_out: &[Ct],
 ) -> Transcript {
+    let in_bytes = deck_bytes(d_in);
+    let out_bytes = deck_bytes(d_out);
+    statement_transcript_bytes(
+        party,
+        round,
+        &point_to_bytes(q),
+        &in_bytes,
+        &out_bytes,
+        &deck_hash(d_in),
+        &deck_hash(d_out),
+    )
+}
+
+/// The byte-level core of [`statement_transcript`]: the same absorb sequence over
+/// the canonical encodings (`c1, c2` per ciphertext, deck order). The verifier
+/// feeds it the encodings it just decoded, so it never re-compresses a point.
+fn statement_transcript_bytes(
+    party: &str,
+    round: u32,
+    q: &[u8; 32],
+    d_in: &[[u8; 32]],
+    d_out: &[[u8; 32]],
+    in_hash: &Hash,
+    out_hash: &Hash,
+) -> Transcript {
     let mut t = Transcript::new(b"mp:shuffle:reenc:v1");
     t.append_message(b"party", party.as_bytes());
     t.append_u64(b"round", round as u64);
-    t.append_message(b"Q", q.compress().as_bytes());
-    t.append_message(b"in_hash", &deck_hash(d_in));
-    t.append_message(b"out_hash", &deck_hash(d_out));
-    t.append_u64(b"n", d_in.len() as u64);
-    for ct in d_in {
-        t.append_message(b"in_c1", ct.c1.compress().as_bytes());
-        t.append_message(b"in_c2", ct.c2.compress().as_bytes());
+    t.append_message(b"Q", q);
+    t.append_message(b"in_hash", in_hash);
+    t.append_message(b"out_hash", out_hash);
+    t.append_u64(b"n", (d_in.len() / 2) as u64);
+    for ct in d_in.as_chunks::<2>().0 {
+        t.append_message(b"in_c1", &ct[0]);
+        t.append_message(b"in_c2", &ct[1]);
     }
-    for ct in d_out {
-        t.append_message(b"out_c1", ct.c1.compress().as_bytes());
-        t.append_message(b"out_c2", ct.c2.compress().as_bytes());
+    for ct in d_out.as_chunks::<2>().0 {
+        t.append_message(b"out_c1", &ct[0]);
+        t.append_message(b"out_c2", &ct[1]);
     }
     t
+}
+
+/// Canonical encodings of a deck, `c1, c2` per ciphertext in deck order.
+fn deck_bytes(deck: &[Ct]) -> Vec<[u8; 32]> {
+    deck.iter()
+        .flat_map(|ct| [point_to_bytes(&ct.c1), point_to_bytes(&ct.c2)])
+        .collect()
+}
+
+/// [`deck_hash`] over already-canonical encodings (`c1, c2` per ciphertext).
+fn deck_hash_bytes(bytes: &[[u8; 32]]) -> Hash {
+    let refs: Vec<&[u8]> = bytes.iter().map(|p| p.as_slice()).collect();
+    ds_hash("mp:deck-hash:v2", &refs)
+}
+
+/// Decode a point from hex and keep its 32-byte encoding. Ristretto decoding
+/// accepts only the canonical encoding, so the kept bytes are exactly
+/// `point.compress()` and can be absorbed into the transcript as-is.
+fn point_and_bytes_from_hex(s: &str) -> Option<(RistrettoPoint, [u8; 32])> {
+    let mut bytes = [0u8; 32];
+    hex::decode_to_slice(s, &mut bytes).ok()?;
+    let point = CompressedRistretto(bytes).decompress()?;
+    Some((point, bytes))
+}
+
+/// Decode a list of hex points, keeping each canonical encoding.
+fn points_and_bytes_from_hex(list: &[String]) -> Option<(Vec<RistrettoPoint>, Vec<[u8; 32]>)> {
+    let mut points = Vec::with_capacity(list.len());
+    let mut bytes = Vec::with_capacity(list.len());
+    for s in list {
+        let (p, b) = point_and_bytes_from_hex(s)?;
+        points.push(p);
+        bytes.push(b);
+    }
+    Some((points, bytes))
+}
+
+/// [`decode_deck`] that also returns the canonical encodings (`c1, c2` per
+/// ciphertext, deck order).
+fn decode_deck_with_bytes(wire: &[CtWire]) -> Option<(Vec<Ct>, Vec<[u8; 32]>)> {
+    let mut deck = Vec::with_capacity(wire.len());
+    let mut bytes = Vec::with_capacity(wire.len() * 2);
+    for w in wire {
+        let (c1, b1) = point_and_bytes_from_hex(&w.c1)?;
+        let (c2, b2) = point_and_bytes_from_hex(&w.c2)?;
+        deck.push(Ct { c1, c2 });
+        bytes.push(b1);
+        bytes.push(b2);
+    }
+    Some((deck, bytes))
 }
 
 /// Squeeze the public per-element challenge weight vector `e = (e_0..e_{N-1})`.
@@ -673,15 +749,15 @@ fn verify_argument(
         None => return false,
     };
     // Decode the decks + joint key (T8/T9 clean rejects).
-    let d_in = match decode_deck(&arg.input_deck) {
+    let (d_in, d_in_bytes) = match decode_deck_with_bytes(&arg.input_deck) {
         Some(d) => d,
         None => return false,
     };
-    let d_out = match decode_deck(&arg.output_deck) {
+    let (d_out, d_out_bytes) = match decode_deck_with_bytes(&arg.output_deck) {
         Some(d) => d,
         None => return false,
     };
-    let q = match point_from_hex(&arg.joint_key) {
+    let (q, q_bytes) = match point_and_bytes_from_hex(&arg.joint_key) {
         Some(p) => p,
         None => return false,
     };
@@ -717,7 +793,9 @@ fn verify_argument(
     // The proof must be ABOUT the decks bound by the trait's hashes (T6 — the
     // verifier never trusts the embedded decks blindly; they must hash to the
     // committed input/output hashes, which the caller binds to the transcript).
-    if deck_hash(&d_in) != *input_hash || deck_hash(&d_out) != *output_hash {
+    let in_hash = deck_hash_bytes(&d_in_bytes);
+    let out_hash = deck_hash_bytes(&d_out_bytes);
+    if in_hash != *input_hash || out_hash != *output_hash {
         return false;
     }
     if proof.input_deck_hash != hex_hash(input_hash)
@@ -729,7 +807,15 @@ fn verify_argument(
     let h = *pedersen_h();
 
     // Re-derive the public challenges from the SAME transcript binding (T6).
-    let mut t = statement_transcript(party, round, &q, &d_in, &d_out);
+    let mut t = statement_transcript_bytes(
+        party,
+        round,
+        &q_bytes,
+        &d_in_bytes,
+        &d_out_bytes,
+        &in_hash,
+        &out_hash,
+    );
 
     // SOUNDNESS-CRITICAL (BUG-125): a valid proof MUST carry exactly CHAL_REPS
     // independent card-integrity rounds. Accepting fewer (e.g. a single-round
@@ -749,17 +835,12 @@ fn verify_argument(
         if rr.f_commitments.len() != n {
             return false;
         }
-        let cf: Vec<RistrettoPoint> = match rr
-            .f_commitments
-            .iter()
-            .map(|s| point_from_hex(s))
-            .collect::<Option<Vec<_>>>()
-        {
+        let (cf, cf_bytes) = match points_and_bytes_from_hex(&rr.f_commitments) {
             Some(v) => v,
             None => return false,
         };
-        for cf_j in &cf {
-            t.append_message(b"Cf", cf_j.compress().as_bytes());
+        for cf_j in &cf_bytes {
+            t.append_message(b"Cf", cf_j);
         }
 
         if !verify_reenc(&mut t, &rr.reenc, &d_in, &d_out, &cf, &e, &q, &h, n) {
@@ -777,19 +858,24 @@ fn verify_argument(
     // SZ term O(N·CHAL_REPS/ℓ)), not the N! per round that CHAL_REPS *independent*
     // arguments would each admit. ----
     let beta = challenge_scalar(&mut t, b"beta");
-    let mut cg = vec![RistrettoPoint::identity(); n]; // Σ_i β^i·Cf^(i)_j
+    // The combined commitment Cg_j = Σ_i β^i·Cf^(i)_j enters only the final
+    // linear batch of `verify_permutation`, so it is never materialised: that
+    // batch takes each Cf^(i)_j with coefficient β^i·(its Cg_j coefficient).
+    let mut beta_pows = Vec::with_capacity(CHAL_REPS);
+    let mut pw = Scalar::ONE;
+    for _ in 0..CHAL_REPS {
+        beta_pows.push(pw);
+        pw *= beta;
+    }
     let mut hh = vec![Scalar::ZERO; n]; // Σ_i β^i·e^(i)_k (public combined weights)
-    for j in 0..n {
-        let mut pw = Scalar::ONE;
-        for i in 0..CHAL_REPS {
-            cg[j] += pw * cf_all[i][j];
-            hh[j] += pw * e_all[i][j];
-            pw *= beta;
+    for (j, hh_j) in hh.iter_mut().enumerate() {
+        for (i, pw) in beta_pows.iter().enumerate() {
+            *hh_j += pw * e_all[i][j];
         }
     }
     // squeeze the polynomial challenge AFTER the combined weights are bound.
     let x = challenge_scalar(&mut t, b"x");
-    verify_permutation(&mut t, &arg.perm, &cg, &hh, &x, &h, n)
+    verify_permutation(&mut t, &arg.perm, &cf_all, &beta_pows, &hh, &x, &h, n)
 }
 
 /// Verify Part A: the homomorphic difference is `(R·G, R·Q)` and the `f`
@@ -809,26 +895,26 @@ fn verify_reenc(
     if p.z_f.len() != n || p.z_b.len() != n {
         return false;
     }
-    let t1 = match point_from_hex(&p.t1) {
+    let (t1, t1_bytes) = match point_and_bytes_from_hex(&p.t1) {
         Some(v) => v,
         None => return false,
     };
-    let t2 = match point_from_hex(&p.t2) {
+    let (t2, t2_bytes) = match point_and_bytes_from_hex(&p.t2) {
         Some(v) => v,
         None => return false,
     };
-    let tf1 = match point_from_hex(&p.tf1) {
+    let (tf1, tf1_bytes) = match point_and_bytes_from_hex(&p.tf1) {
         Some(v) => v,
         None => return false,
     };
-    let tf2 = match point_from_hex(&p.tf2) {
+    let (tf2, tf2_bytes) = match point_and_bytes_from_hex(&p.tf2) {
         Some(v) => v,
         None => return false,
     };
     if p.tb.len() != n {
         return false;
     }
-    let tb: Vec<RistrettoPoint> = match p.tb.iter().map(|s| point_from_hex(s)).collect() {
+    let (tb, tb_bytes) = match points_and_bytes_from_hex(&p.tb) {
         Some(v) => v,
         None => return false,
     };
@@ -845,12 +931,12 @@ fn verify_reenc(
         None => return false,
     };
 
-    t.append_message(b"A_T1", t1.compress().as_bytes());
-    t.append_message(b"A_T2", t2.compress().as_bytes());
-    t.append_message(b"A_Tf1", tf1.compress().as_bytes());
-    t.append_message(b"A_Tf2", tf2.compress().as_bytes());
-    for tb_j in &tb {
-        t.append_message(b"A_Tb", tb_j.compress().as_bytes());
+    t.append_message(b"A_T1", &t1_bytes);
+    t.append_message(b"A_T2", &t2_bytes);
+    t.append_message(b"A_Tf1", &tf1_bytes);
+    t.append_message(b"A_Tf2", &tf2_bytes);
+    for tb_j in &tb_bytes {
+        t.append_message(b"A_Tb", tb_j);
     }
     let c = challenge_scalar(t, b"c_a");
 
@@ -859,8 +945,6 @@ fn verify_reenc(
     //
     // (1) The aggregate output combination (public, computable by verifier):
     //       Lhs1 = Σ_k e_k·D_out[k].c1 ;  Lhs2 = Σ_k e_k·D_out[k].c2
-    let lhs1: RistrettoPoint = RistrettoPoint::multiscalar_mul(e, d_out.iter().map(|c| c.c1));
-    let lhs2: RistrettoPoint = RistrettoPoint::multiscalar_mul(e, d_out.iter().map(|c| c.c2));
 
     // (2) f-knowledge over the input deck:  z_f·D_in == Tf + c·(Σ f_j·D_in[j]).
     //     We don't know Σ f_j·D_in[j] directly, but the homomorphic relation says
@@ -880,13 +964,30 @@ fn verify_reenc(
     //   and Σ f_j·D_in[j].c1 + R·G = Lhs1 (the homomorphic identity, c1 coord),
     //   so LHS-A1 = Tf1 + T1 + c·Lhs1 = RHS-A1. A cheating output deck breaks
     //   the homomorphic identity, so Eq-A holds only for a genuine shuffle.
-    let zf_din_c1: RistrettoPoint =
-        RistrettoPoint::multiscalar_mul(&z_f, d_in.iter().map(|c| c.c1));
-    let zf_din_c2: RistrettoPoint =
-        RistrettoPoint::multiscalar_mul(&z_f, d_in.iter().map(|c| c.c2));
-
-    let eq_a1 = (zf_din_c1 + &z_r * GT) == (tf1 + t1 + c * lhs1);
-    let eq_a2 = (zf_din_c2 + z_r * q) == (tf2 + t2 + c * lhs2);
+    //
+    //   PERF: each equation is evaluated as ONE variable-time multiscalar
+    //       Σ z_f_j·D_in[j].cX − Σ (c·e_k)·D_out[k].cX + z_r·B − TfX − TX  ==  O
+    //   (B = G for X = 1, Q for X = 2), an exact rearrangement of the equality
+    //   above, not a probabilistic batch. `vartime_` is sound: every input is
+    //   public proof/statement data.
+    let neg_ce: Vec<Scalar> = e.iter().map(|e_k| -(c * e_k)).collect();
+    let minus_one = -Scalar::ONE;
+    let eq_a = |base: RistrettoPoint,
+                tf: RistrettoPoint,
+                tt: RistrettoPoint,
+                coord: fn(&Ct) -> RistrettoPoint| {
+        RistrettoPoint::vartime_multiscalar_mul(
+            z_f.iter()
+                .chain(neg_ce.iter())
+                .chain([&z_r, &minus_one, &minus_one]),
+            d_in.iter()
+                .map(coord)
+                .chain(d_out.iter().map(coord))
+                .chain([base, tf, tt]),
+        ) == RistrettoPoint::identity()
+    };
+    let eq_a1 = eq_a(G, tf1, t1, |ct| ct.c1);
+    let eq_a2 = eq_a(*q, tf2, t2, |ct| ct.c2);
 
     // (3) PER-ELEMENT binding of z_f_j / z_b_j to each f commitment
     //     Cf_j = f_j·G + b_j·H:
@@ -941,10 +1042,12 @@ fn verify_reenc(
 /// Each step proves `P_t = P_{t-1}·(x − f_t)` with the sound Schnorr
 /// multiplication argument; the final running-product commitment is opened to the
 /// public `target = ∏_k (x − e_k)` via the revealed `final_blind`.
+#[allow(clippy::too_many_arguments)]
 fn verify_permutation(
     t: &mut Transcript,
     p: &PermProof,
-    cf: &[RistrettoPoint],
+    cf_all: &[Vec<RistrettoPoint>],
+    beta_pows: &[Scalar],
     e: &[Scalar],
     x: &Scalar,
     h: &RistrettoPoint,
@@ -953,17 +1056,15 @@ fn verify_permutation(
     if p.p_commitments.len() != n || p.steps.len() != n {
         return false;
     }
-    let cp: Vec<RistrettoPoint> = match p
-        .p_commitments
-        .iter()
-        .map(|s| point_from_hex(s))
-        .collect::<Option<Vec<_>>>()
-    {
+    if cf_all.len() != beta_pows.len() || cf_all.iter().any(|cf| cf.len() != n) {
+        return false;
+    }
+    let (cp, cp_bytes) = match points_and_bytes_from_hex(&p.p_commitments) {
         Some(v) => v,
         None => return false,
     };
-    for cp_t in &cp {
-        t.append_message(b"Cp", cp_t.compress().as_bytes());
+    for cp_t in &cp_bytes {
+        t.append_message(b"Cp", cp_t);
     }
 
     // C_y for step t = factor commitment Cfac_t = x·G − Cf_t (committed value
@@ -993,16 +1094,16 @@ fn verify_permutation(
     for tdx in 0..n {
         let step = &p.steps[tdx];
         // C_x = Cp_{t-1} (or 1·G for t == 0), C_y = Cfac_t = x·G − Cf_t, C_z = Cp_t.
-        let b_pt = match point_from_hex(&step.b_pt) {
+        let (b_pt, b_pt_bytes) = match point_and_bytes_from_hex(&step.b_pt) {
             Some(v) => v,
             None => return false,
         };
-        let b_prime = match point_from_hex(&step.b_prime) {
+        let (b_prime, b_prime_bytes) = match point_and_bytes_from_hex(&step.b_prime) {
             Some(v) => v,
             None => return false,
         };
-        t.append_message(b"M_B", b_pt.compress().as_bytes());
-        t.append_message(b"M_Bp", b_prime.compress().as_bytes());
+        t.append_message(b"M_B", &b_pt_bytes);
+        t.append_message(b"M_Bp", &b_prime_bytes);
         let c = challenge_scalar(t, b"c_mul");
 
         let z_x = match scalar_from_hex(&step.z_x) {
@@ -1058,17 +1159,24 @@ fn verify_permutation(
     g_coeff -= tau * target;
     h_coeff -= tau * final_blind;
 
+    // Cg_j = Σ_i β^i·Cf^(i)_j, so its coefficient spreads over every round's Cf.
+    // (Collected: the multiscalar needs exact-size iterators.)
+    let cf_terms: Vec<Scalar> = beta_pows
+        .iter()
+        .flat_map(|pw| cf_coeff.iter().map(move |k| pw * k))
+        .collect();
+    let cf_points: Vec<RistrettoPoint> = cf_all.iter().flatten().copied().collect();
     let batch = RistrettoPoint::vartime_multiscalar_mul(
         [g_coeff, h_coeff]
             .into_iter()
             .chain(cp_coeff)
-            .chain(cf_coeff)
+            .chain(cf_terms)
             .chain(b_pt_coeff)
             .chain(b_prime_coeff),
         [G, *h]
             .into_iter()
             .chain(cp.iter().copied())
-            .chain(cf.iter().copied())
+            .chain(cf_points)
             .chain(b_pts)
             .chain(b_primes),
     );

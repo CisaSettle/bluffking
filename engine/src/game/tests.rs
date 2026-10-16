@@ -24,3 +24,6 @@ mod previews;
 mod settlement;
 #[path = "tests/straddles.rs"]
 mod straddles;
+
+#[path = "tests/bomb_pots.rs"]
+mod bomb_pots;

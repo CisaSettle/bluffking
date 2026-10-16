@@ -342,9 +342,7 @@ fn hu_all_in_on_flop_auto_runs_out_turn_and_river() {
     );
 
     // 2026-05-28 BUG-D — show_order is populated for HU all-in.
-    // No river action means the "first non-folded clockwise from button"
-    // path runs: HU dealer=0 (button is pid 1's seat), so clockwise from
-    // dealer+1 means BB seat = pid 2 → pid 1.
+    // Auto-runout retains the last played street's aggressor priority.
     assert_eq!(
         result.show_order.len(),
         2,
@@ -452,6 +450,53 @@ fn show_order_river_aggressor_then_turn_order() {
     );
 }
 
+/// A called shove leads the reveal order, including pre-river runouts.
+/// A caller's AllIn token (including an under-call) must not steal priority.
+#[test]
+fn show_order_called_all_in_keeps_aggressor_on_each_street() {
+    use engine::hand::Street;
+
+    for street in [Street::Preflop, Street::Flop, Street::Turn, Street::River] {
+        for caller_stack in [700, 1000] {
+            for call_action in [PlayerAction::Call, PlayerAction::AllIn] {
+                let mut hand = GameHand::new_with_rng(
+                    vec![(pid(1), c(1000), 0), (pid(2), c(caller_stack), 1)],
+                    0,
+                    c(20),
+                    c(10),
+                    PokerRng::from_seed(2026101601),
+                );
+                hand.start().expect("start");
+                if street != Street::Preflop {
+                    hand.apply_action(pid(1), PlayerAction::Call)
+                        .expect("complete blind");
+                    hand.apply_action(pid(2), PlayerAction::Check)
+                        .expect("blind option");
+                    while hand.snapshot().street != street {
+                        hand.apply_action(pid(2), PlayerAction::Check)
+                            .expect("BB checks");
+                        hand.apply_action(pid(1), PlayerAction::Check)
+                            .expect("BTN checks");
+                    }
+                    hand.apply_action(pid(2), PlayerAction::Check)
+                        .expect("check to shover");
+                }
+                hand.apply_action(pid(1), PlayerAction::AllIn)
+                    .expect("button shoves");
+                hand.apply_action(pid(2), call_action)
+                    .expect("BB calls all-in");
+                assert!(hand.is_done(), "called shove must finish via runout");
+                let result = hand.finish();
+                assert_eq!(
+                    result.show_order,
+                    vec![pid(1), pid(2)],
+                    "last aggressor leads on {street:?}, caller stack {caller_stack}"
+                );
+            }
+        }
+    }
+}
+
 /// 2026-05-28 BUG-D — when the river checks through, show_order starts from
 /// the first non-folded player clockwise from the button.
 #[test]
@@ -465,12 +510,13 @@ fn show_order_river_checked_through_starts_from_left_of_button() {
         GameHand::new_with_rng(players, 0, c(20), c(10), PokerRng::from_seed(2026052802));
     hand.start().expect("start ok");
 
-    // Run through preflop check-call to flop.
+    // Earlier button aggression must not override a checked-through river.
     let actor = hand.snapshot().current_actor.expect("preflop actor");
-    hand.apply_action(actor, PlayerAction::Call).expect("call");
+    hand.apply_action(actor, PlayerAction::Raise { amount: c(60) })
+        .expect("button raises");
     let actor = hand.snapshot().current_actor.expect("bb option");
-    hand.apply_action(actor, PlayerAction::Check)
-        .expect("check");
+    hand.apply_action(actor, PlayerAction::Call)
+        .expect("BB calls");
 
     // Flop / turn / river all check through.
     for _ in 0..6 {

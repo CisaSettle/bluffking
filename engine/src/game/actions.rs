@@ -46,6 +46,7 @@ impl GameHand {
             big_blind: self.big_blind,
             small_blind: self.small_blind,
             forced_straddle: self.forced_straddle,
+            bomb_pot: self.bomb_pot,
             ante: self.ante,
             preflop_bring_in: self.preflop_bring_in,
             mode: self.mode,

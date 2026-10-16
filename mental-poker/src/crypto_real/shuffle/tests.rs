@@ -667,3 +667,37 @@ fn shuffle_bench_per_hand_deal() {
     }
     println!("(per-card threshold-open latency is benched in decrypt.rs / RT-2)\n");
 }
+
+// ---------------------------------------------------------------------------
+// The verifier absorbs the DECODED bytes into its transcript instead of
+// re-compressing each point. That is only equivalent if decoding accepts
+// exactly the canonical encoding, so the kept bytes always equal `compress()`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn decoded_point_bytes_are_the_canonical_encoding() {
+    let mut rng = OsRng;
+    for _ in 0..64 {
+        let p = RistrettoPoint::random(&mut rng);
+        let (back, bytes) = point_and_bytes_from_hex(&point_to_hex(&p)).unwrap();
+        assert_eq!(back, p);
+        assert_eq!(bytes, p.compress().to_bytes());
+        // Upper-case hex decodes to the same canonical bytes.
+        let (_, upper) = point_and_bytes_from_hex(&point_to_hex(&p).to_uppercase()).unwrap();
+        assert_eq!(upper, bytes);
+    }
+    // Non-canonical encodings are rejected, never re-encoded: a field element
+    // >= p, a "negative" (odd) s, and wrong lengths.
+    let p_plus = {
+        let mut b = [0xffu8; 32];
+        b[0] = 0xed;
+        b[31] = 0x7f;
+        b
+    };
+    assert!(point_and_bytes_from_hex(&hex::encode(p_plus)).is_none());
+    let mut odd = RistrettoPoint::random(&mut rng).compress().to_bytes();
+    odd[0] |= 1;
+    assert!(point_and_bytes_from_hex(&hex::encode(odd)).is_none());
+    assert!(point_and_bytes_from_hex(&"00".repeat(31)).is_none());
+    assert!(point_and_bytes_from_hex(&"00".repeat(33)).is_none());
+}

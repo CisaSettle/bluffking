@@ -600,6 +600,123 @@ fn range_equity_is_deterministic_on_seed() {
     );
 }
 
+/// Exact weighted-range equity (percent) by enumerating every villain combo and
+/// every run-out of the missing board cards with the same showdown rule.
+fn exact_range_equity_pct(hero: HoleCards, board: &BoardCards, buckets: &[RangeBucket]) -> f64 {
+    let mut used = vec![hero.card1, hero.card2];
+    used.extend(board.all_cards());
+    let pool = build_range_pool(buckets, &used);
+    let missing = 5 - board.count();
+    let (mut weighted, mut weight_sum) = (0.0f64, 0.0f64);
+    for (villain, w) in &pool {
+        let mut known = used.clone();
+        known.extend([villain.card1, villain.card2]);
+        let deck = deck_minus(&known);
+        let (mut share, mut runouts) = (0u64, 0u64);
+        let mut visit = |cards: &[Card]| {
+            let mut sim = board.clone();
+            let mut cursor = 0usize;
+            let mut cards = cards.to_vec();
+            fill_board(&mut sim, &mut cards, &mut cursor);
+            share += showdown_share(&hero, &sim, std::slice::from_ref(villain)).2;
+            runouts += 1;
+        };
+        match missing {
+            0 => visit(&[]),
+            1 => deck.iter().for_each(|a| visit(&[*a])),
+            _ => {
+                for i in 0..deck.len() {
+                    for j in (i + 1)..deck.len() {
+                        visit(&[deck[i], deck[j]]);
+                    }
+                }
+            }
+        }
+        weighted += f64::from(*w) * share as f64 / (runouts as f64 * SHARE_SCALE as f64);
+        weight_sum += f64::from(*w);
+    }
+    100.0 * weighted / weight_sum
+}
+
+/// The sampled range path is an unbiased estimate of the exact weighted range
+/// equity: within 2 points at the production 10k trials (standard error is
+/// <= 0.5 points), on flop, turn and river boards, with fractional weights.
+#[test]
+fn range_monte_carlo_matches_exact_weighted_enumeration() {
+    let weighted = |key: &str, weight: f32| RangeBucket {
+        hand_key: key.to_string(),
+        weight,
+    };
+    let flop = [
+        c(Rank::Queen, Suit::Hearts),
+        c(Rank::Nine, Suit::Hearts),
+        c(Rank::Four, Suit::Clubs),
+    ];
+    let boards = [
+        BoardCards {
+            flop: Some(flop),
+            turn: None,
+            river: None,
+        },
+        BoardCards {
+            flop: Some(flop),
+            turn: Some(c(Rank::Two, Suit::Spades)),
+            river: None,
+        },
+        BoardCards {
+            flop: Some(flop),
+            turn: Some(c(Rank::Two, Suit::Spades)),
+            river: Some(c(Rank::Jack, Suit::Diamonds)),
+        },
+    ];
+    let range = vec![
+        weighted("QQ", 1.0),
+        weighted("AQs", 1.0),
+        weighted("KQo", 0.5),
+        weighted("JTs", 0.75),
+        weighted("KK", 0.0),
+        weighted("99", 0.25),
+        weighted("A5s", 0.5),
+    ];
+    let hero = HoleCards::new(c(Rank::Ace, Suit::Hearts), c(Rank::Ten, Suit::Hearts));
+    // A zero-weight bucket must be inert: the same seed gives the identical
+    // estimate with or without it.
+    let without_zero: Vec<RangeBucket> = range.iter().filter(|b| b.weight > 0.0).cloned().collect();
+    let est = |r: &[RangeBucket]| {
+        equity(EquityInput {
+            hero,
+            board: boards[0].clone(),
+            opponents: OpponentSpec::Range(r.to_vec()),
+            trials: 2_000,
+            seed: 9,
+            early_stop: None,
+        })
+    };
+    assert_eq!(
+        est(&range),
+        est(&without_zero),
+        "a zero-weight bucket must not change the estimate"
+    );
+    for (k, board) in boards.iter().enumerate() {
+        let exact = exact_range_equity_pct(hero, board, &range);
+        for seed in [1u64, 2, 3] {
+            let mc = equity(EquityInput {
+                hero,
+                board: board.clone(),
+                opponents: OpponentSpec::Range(range.clone()),
+                trials: crate::solver::DEFAULT_MC_TRIALS,
+                seed,
+                early_stop: None,
+            })
+            .equity_pct();
+            assert!(
+                (f64::from(mc) - exact).abs() <= 2.0,
+                "board {k} seed {seed}: MC {mc}% vs exact {exact:.2}%"
+            );
+        }
+    }
+}
+
 #[test]
 fn fully_blocked_range_falls_back_without_panic() {
     // Hero holds As/Ah and board has Ad/Ac → the only AA combos are all

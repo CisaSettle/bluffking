@@ -10,6 +10,7 @@
 use crate::card::{Card, Rank, Suit};
 use crate::eval::{board_eval, rank_with_board};
 use crate::hand::{BoardCards, HoleCards};
+#[cfg(test)]
 use crate::rng::PokerRng;
 
 use super::{
@@ -262,8 +263,8 @@ fn equity_impl<const CACHE_RIVER: bool>(input: EquityInput) -> (EquityResult, u3
     }
 
     // MC loop. Two paths:
-    //  * Range (M1 weighted villain): per-trial filtered deck — correctness
-    //    first; this path is low-frequency (range_insight only).
+    //  * Range (M1 weighted villain): sampled villain + a partial draw that
+    //    skips the villain's cards (every spot with a villain position).
     //  * Random / Known-preflop (the HOT coach + live-snapshot path): reuse ONE
     //    scratch deck across all trials and draw only the cards we actually need
     //    via a partial Fisher–Yates. Measured baseline showed ~89% of equity()
@@ -283,27 +284,45 @@ fn equity_impl<const CACHE_RIVER: bool>(input: EquityInput) -> (EquityResult, u3
     let mut trials_run = trials;
 
     if let Some(pool) = range_pool.as_ref() {
-        // M1 §1a weighted single villain: deal the board from the deck MINUS the
+        // M1 §1a weighted single villain: sample a villain combo by weight, then
+        // deal the missing board cards from the hero/board-free deck, SKIPPING the
         // sampled villain's two cards so a board card can never collide with it.
-        // This low-frequency path keeps the engine's seeded ChaCha RNG.
-        let mut rng = PokerRng::from_seed(input.seed);
-        let total_weight: f32 = pool.iter().map(|(_, weight)| *weight).sum();
-        let mut available = Vec::with_capacity(remaining_deck.len());
+        //
+        // Every spot with a villain position runs this branch (the public spot
+        // analyzer and each replay street), so it uses the same estimation-only
+        // machinery as the Random path: `EquityRng` and a partial draw from one
+        // reused scratch deck, plus a binary search over cumulative weights.
+        // The former per-trial ChaCha full-deck shuffle and linear weight walk
+        // made a 10k-trial range estimate cost ~8 ms (2026-10-16 p99 audit).
+        let mut cumulative: Vec<f64> = Vec::with_capacity(pool.len());
+        let mut total_weight = 0.0f64;
+        for (_, weight) in pool {
+            total_weight += f64::from(*weight);
+            cumulative.push(total_weight);
+        }
+        let mut scratch = remaining_deck;
+        let mut rng = EquityRng::new(input.seed);
+        let mut runout = [scratch[0]; 5];
         for _ in 0..trials {
-            let v = sample_weighted(pool, total_weight, &mut rng);
-            // Restore the same deck order before every shuffle to preserve the
-            // seeded draw sequence while reusing the allocation.
-            available.clear();
-            available.extend(
-                remaining_deck
-                    .iter()
-                    .copied()
-                    .filter(|c| *c != v.card1 && *c != v.card2),
-            );
-            shuffle_in_place(&mut available, &mut rng);
+            let v = pool[sample_cumulative(&cumulative, total_weight, &mut rng)].0;
+            // Partial Fisher–Yates over the scratch deck; drawn villain cards are
+            // discarded, which leaves a uniform draw from the deck minus them.
+            // The deck holds at least 45 cards, so `missing + 2` draws always fit.
+            let mut drawn = 0usize;
+            let mut i = 0usize;
+            while drawn < missing {
+                let j = i + rng.index(scratch.len() - i);
+                scratch.swap(i, j);
+                let card = scratch[i];
+                i += 1;
+                if card != v.card1 && card != v.card2 {
+                    runout[drawn] = card;
+                    drawn += 1;
+                }
+            }
             let mut sim_board = input.board.clone();
             let mut cursor = 0usize;
-            fill_board(&mut sim_board, &mut available, &mut cursor);
+            fill_board(&mut sim_board, &mut runout[..missing], &mut cursor);
             let (win, tie, share) =
                 showdown_share(&input.hero, &sim_board, std::slice::from_ref(&v));
             wins += win as u32;
@@ -723,7 +742,7 @@ fn rank_from_char(ch: char) -> Option<Rank> {
 /// Each surviving combo carries its bucket weight (clamped to `[0, 1]`); zero-
 /// or negative-weight buckets contribute nothing. `used` is hero + board cards;
 /// any combo sharing a card with `used` is dropped. The returned pool is what
-/// `sample_weighted` draws one villain from each MC trial.
+/// `sample_cumulative` draws one villain from each MC trial.
 fn build_range_pool(buckets: &[RangeBucket], used: &[Card]) -> Vec<(HoleCards, f32)> {
     let mut pool: Vec<(HoleCards, f32)> = Vec::new();
     for bucket in buckets {
@@ -753,27 +772,20 @@ pub fn range_legal_combos(buckets: &[RangeBucket], used: &[Card]) -> usize {
     build_range_pool(buckets, used).len()
 }
 
-/// Weighted-sample one villain hand from the pool. Determinism comes from the
-/// caller's `PokerRng`. The pool is assumed non-empty (the empty case falls
-/// back to `Random(1)` before the MC loop).
-fn sample_weighted(pool: &[(HoleCards, f32)], total: f32, rng: &mut PokerRng) -> HoleCards {
+/// Weighted-sample the index of one villain hand from the pool's cumulative
+/// weights. Determinism comes from the caller's seeded `EquityRng`. The pool is
+/// assumed non-empty (the empty case falls back to `Random(1)` before the MC
+/// loop).
+fn sample_cumulative(cumulative: &[f64], total: f64, rng: &mut EquityRng) -> usize {
     if total <= 0.0 {
-        return pool[0].0;
+        return 0;
     }
-    // Draw a uniform value in [0, total) from 64 bits of RNG, then walk the
-    // cumulative weights. Mirrors the seed-driven determinism of the deck shuffle.
-    let mut buf = [0u8; 8];
-    rng.fill_bytes(&mut buf);
-    let frac = (u64::from_le_bytes(buf) as f64) / (u64::MAX as f64 + 1.0);
-    let mut target = (frac as f32) * total;
-    for (hand, w) in pool {
-        target -= *w;
-        if target < 0.0 {
-            return *hand;
-        }
-    }
-    // Floating-point edge: return the last combo.
-    pool[pool.len() - 1].0
+    // Uniform target in [0, total) from the top 53 bits, then the first combo
+    // whose cumulative weight exceeds it. Zero weights never match (strict >).
+    let target = (rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64 * total;
+    cumulative
+        .partition_point(|&c| c <= target)
+        .min(cumulative.len() - 1)
 }
 
 fn deck_minus(used: &[Card]) -> Vec<Card> {
@@ -789,6 +801,7 @@ fn deck_minus(used: &[Card]) -> Vec<Card> {
     out
 }
 
+#[cfg(test)]
 fn shuffle_in_place(cards: &mut [Card], rng: &mut PokerRng) {
     // Fisher–Yates, mirrors `Deck::new`.
     let n = cards.len();
@@ -823,7 +836,7 @@ fn draw_prefix(deck: &mut [Card], k: usize, rng: &mut EquityRng) {
 /// Fast, deterministic PRNG for equity **estimation** (Monte Carlo sampling).
 ///
 /// This is deliberately NOT a dealing / shuffle RNG. Provably-fair dealing uses
-/// [`PokerRng`]/ChaCha20 (ADR-062) and MUST stay there. Equity estimation has
+/// [`PokerRng`](crate::rng::PokerRng)/ChaCha20 (ADR-062) and MUST stay there. Equity estimation has
 /// no fairness or unpredictability requirement — it only needs good statistical
 /// uniformity and determinism from the caller's seed (ADR-043 §6). Once the
 /// per-trial allocation churn was removed, ChaCha `fill_bytes` per drawn card
@@ -863,6 +876,7 @@ impl EquityRng {
     }
 }
 
+#[cfg(test)]
 fn rng_range(rng: &mut PokerRng, n: usize) -> usize {
     if n <= 1 {
         return 0;
