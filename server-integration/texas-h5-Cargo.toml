@@ -33,6 +33,9 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
 
 [profile.dev]
 opt-level = 0
+# Match test dependency artifacts; full debug symbols made each server build
+# hundreds of MB. Opt in locally with CARGO_PROFILE_DEV_DEBUG when needed.
+debug = 0
 
 [profile.test]
 debug = 0
