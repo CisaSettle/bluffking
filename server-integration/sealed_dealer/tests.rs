@@ -400,13 +400,48 @@ async fn worker_delivers_holes_directly_and_opens_deck_only_at_settlement() {
         .expect("create second sealed hand");
     socket
         .send(tokio_tungstenite::tungstenite::Message::Text(
-            serde_json::json!({"ticket": next.tickets.iter().find(|t| t.seat == 3).unwrap().ticket}).to_string(),
+            serde_json::json!({
+                "ticket": next.tickets.iter().find(|t| t.seat == 3).unwrap().ticket,
+                "diagnostic_trace": "2cdbb614-2b4d-42c9-bfdc-e071f7d236a1"
+            })
+            .to_string(),
         ))
         .await
         .expect("send second ticket on the same socket");
     let raw = socket.next().await.unwrap().unwrap().into_text().unwrap();
     let second: HoleDelivery = serde_json::from_str(&raw).expect("second delivery");
     assert_eq!((second.hand_id, second.seat), (next_hand, 3));
+    let evidence: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(
+        evidence["diagnostic_trace"],
+        "2cdbb614-2b4d-42c9-bfdc-e071f7d236a1"
+    );
+    let work_ms = evidence["server_work_ms"].as_f64().unwrap();
+    let lookup_ms = evidence["server_lookup_ms"].as_f64().unwrap();
+    assert!(work_ms.is_finite() && work_ms >= lookup_ms && lookup_ms >= 0.0);
+    // Invalid optional correlation must neither reject an owner's bearer ticket
+    // nor reflect attacker-controlled strings/objects into the response.
+    for invalid in [
+        serde_json::json!("secret-not-a-trace"),
+        serde_json::json!({"nested": true}),
+    ] {
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                serde_json::json!({
+                    "ticket": next.tickets.iter().find(|t| t.seat == 3).unwrap().ticket,
+                    "diagnostic_trace": invalid,
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        let raw = socket.next().await.unwrap().unwrap().into_text().unwrap();
+        let delivery: HoleDelivery = serde_json::from_str(&raw).unwrap();
+        assert_eq!((delivery.hand_id, delivery.seat), (next_hand, 3));
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(value.get("diagnostic_trace").is_none());
+        assert!(!raw.contains("secret-not-a-trace"));
+    }
     for n in 0..HOLE_MAX_MISSES {
         socket
             .send(tokio_tungstenite::tungstenite::Message::Text(

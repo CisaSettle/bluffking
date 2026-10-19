@@ -11,6 +11,9 @@
 //! This is intentionally a single trusted dealer, not Mental Poker: players do
 //! not shuffle, exchange key shares or participate in threshold decryption.
 
+pub(crate) mod diagnostics;
+mod metrics;
+
 use crate::auth::constant_time::constant_time_eq;
 use std::{
     collections::{BTreeMap, HashMap},
@@ -22,7 +25,7 @@ use std::{
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Path, State,
+        Path, RawQuery, State,
     },
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
@@ -261,6 +264,21 @@ pub struct HoleDelivery {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TicketAuth {
     ticket: String,
+    // Malformed optional diagnostics never reject an otherwise valid ticket.
+    #[serde(default, deserialize_with = "diagnostics::deserialize_trace")]
+    diagnostic_trace: Option<Uuid>,
+}
+
+#[derive(Serialize)]
+struct ObservedHoleDelivery<'a> {
+    #[serde(flatten)]
+    delivery: &'a HoleDelivery,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostic_trace: Option<Uuid>,
+    /// Receipt of the text frame through lookup, before serialization/send.
+    /// Does not include the handshake, network, send/backpressure or receipt ack.
+    server_work_ms: f64,
+    server_lookup_ms: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -681,15 +699,27 @@ async fn delete_hand(
     StatusCode::NO_CONTENT
 }
 
-async fn hole_ws(State(state): State<WorkerState>, ws: WebSocketUpgrade) -> impl IntoResponse {
+async fn hole_ws(
+    State(state): State<WorkerState>,
+    RawQuery(query): RawQuery,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    let trace = diagnostics::query_trace(query.as_deref());
+    let connection = Uuid::new_v4();
+    diagnostics::record(connection, trace, "upgrade_requested", 0.0, 0.0);
     let Ok(permit) = state.hole_connections.clone().try_acquire_owned() else {
+        diagnostics::record(connection, trace, "capacity_rejected", 0.0, 0.0);
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     ws.max_message_size(512)
         .max_frame_size(512)
+        .on_failed_upgrade(move |_| {
+            diagnostics::record(connection, trace, "upgrade_failed", 0.0, 0.0);
+        })
         .on_upgrade(move |socket| async move {
             let _permit = permit;
-            deliver_holes(socket, state).await;
+            diagnostics::record(connection, trace, "upgraded", 0.0, 0.0);
+            deliver_holes(socket, state, connection, trace).await;
         })
         .into_response()
 }
@@ -698,8 +728,17 @@ async fn hole_ws(State(state): State<WorkerState>, ws: WebSocketUpgrade) -> impl
 /// ticket, answered with that seat's hole cards (or an error frame). Opening a
 /// fresh connection per hand cost a TCP + TLS + WebSocket handshake before
 /// every deal.
-async fn deliver_holes(mut socket: WebSocket, state: WorkerState) {
+async fn deliver_holes(
+    mut socket: WebSocket,
+    state: WorkerState,
+    connection: Uuid,
+    mut trace: Option<Uuid>,
+) {
+    let opened = std::time::Instant::now();
+    let mut close_reason = "peer_closed";
+    let mut tickets_seen = 0u64;
     let mut misses = 0u8;
+    let mut closing_timer = None;
     // Absolute deadline: only a valid ticket extends it, never control frames,
     // unknown tickets or keepalives. A frame that was already buffered is not
     // processed after expiry, and every write is bounded by it too.
@@ -716,20 +755,47 @@ async fn deliver_holes(mut socket: WebSocket, state: WorkerState) {
                         Ok(Ok(()))
                     )
                 {
+                    close_reason = "keepalive_write_failed";
                     break;
                 }
                 continue;
             }
             frame = tokio::time::timeout_at(deadline, socket.recv()) => match frame {
-                _ if expired(deadline) => break,
-                Ok(Some(Ok(Message::Text(raw)))) => raw,
+                Ok(Some(Ok(Message::Text(raw)))) => Some(raw),
+                Ok(Some(Ok(Message::Binary(_)))) => None,
+                Ok(Some(Err(_))) => { close_reason = "receive_error"; break; },
+                _ if expired(deadline) => { close_reason = "ticket_deadline"; break; },
                 Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => continue,
                 _ => break,
             },
         };
-        let Ok(auth) = serde_json::from_str::<TicketAuth>(&raw) else {
+        // No timer spans socket.recv(): client/keepalive waiting is excluded.
+        let received = std::time::Instant::now();
+        let (auth, timing) = ticket_observation(raw.as_deref(), expired(deadline), received);
+        let Some(auth) = auth else {
+            close_reason = "invalid_ticket_frame";
+            closing_timer = Some(timing);
             break;
         };
+        trace = auth.diagnostic_trace;
+        tickets_seen = tickets_seen.saturating_add(1);
+        if tickets_seen == 1 {
+            diagnostics::record(
+                connection,
+                trace,
+                "first_ticket_received",
+                elapsed_ms(opened),
+                0.0,
+            );
+        }
+        diagnostics::record(
+            connection,
+            trace,
+            "ticket_received",
+            elapsed_ms(received),
+            0.0,
+        );
+        let lookup_started = std::time::Instant::now();
         let delivery = {
             let hands = state.hands.read().await;
             hands.iter().find_map(|(hand_id, hand)| {
@@ -743,7 +809,15 @@ async fn deliver_holes(mut socket: WebSocket, state: WorkerState) {
                 })
             })
         };
+        let lookup_ms = elapsed_ms(lookup_started);
         let Some(delivery) = delivery else {
+            diagnostics::record(
+                connection,
+                trace,
+                "unknown_ticket",
+                elapsed_ms(received),
+                lookup_ms,
+            );
             misses += 1;
             if misses >= HOLE_MAX_MISSES
                 || expired(deadline)
@@ -756,26 +830,97 @@ async fn deliver_holes(mut socket: WebSocket, state: WorkerState) {
                     Ok(Ok(()))
                 )
             {
+                close_reason = "unknown_ticket_limit_or_write_failed";
+                closing_timer = Some(timing);
                 break;
             }
             continue;
         };
+        diagnostics::record(
+            connection,
+            trace,
+            "lookup_complete",
+            elapsed_ms(received),
+            lookup_ms,
+        );
         misses = 0;
         deadline = tokio::time::Instant::now() + HOLE_IDLE_TIMEOUT;
-        let Ok(json) = serde_json::to_string(&delivery) else {
+        let observed = ObservedHoleDelivery {
+            delivery: &delivery,
+            diagnostic_trace: trace,
+            server_work_ms: elapsed_ms(received),
+            server_lookup_ms: lookup_ms,
+        };
+        let Ok(json) = serde_json::to_string(&observed) else {
+            close_reason = "serialize_failed";
+            closing_timer = Some(timing);
             break;
         };
-        if !matches!(
-            tokio::time::timeout_at(deadline, socket.send(Message::Text(json))).await,
-            Ok(Ok(()))
-        ) {
+        let send_started = std::time::Instant::now();
+        let sent = tokio::time::timeout_at(deadline, socket.send(Message::Text(json))).await;
+        let outcome = match sent {
+            Ok(Ok(())) => "send_complete",
+            Ok(Err(_)) => "send_error",
+            Err(_) => "send_deadline",
+        };
+        diagnostics::record(
+            connection,
+            trace,
+            outcome,
+            elapsed_ms(received),
+            elapsed_ms(send_started),
+        );
+        if outcome != "send_complete" {
+            close_reason = outcome;
+            closing_timer = Some(timing);
             break;
         }
-        if let Some(hand) = state.hands.write().await.get_mut(&delivery.hand_id) {
-            hand.delivered_seats.insert(delivery.seat);
-        }
+        complete_delivery(&state, &delivery, timing).await;
     }
+    diagnostics::record(connection, trace, close_reason, elapsed_ms(opened), 0.0);
     let _ = tokio::time::timeout(Duration::from_secs(1), socket.close()).await;
+    drop(closing_timer);
+}
+
+fn elapsed_ms(started: std::time::Instant) -> f64 {
+    started.elapsed().as_secs_f64() * 1000.0
+}
+
+fn ticket_observation(
+    raw: Option<&str>,
+    expired: bool,
+    received: std::time::Instant,
+) -> (Option<TicketAuth>, crate::request_timing::WsTimer) {
+    let auth = if expired {
+        None
+    } else {
+        raw.and_then(|raw| serde_json::from_str(raw).ok())
+    };
+    let operation = if auth.is_some() {
+        crate::server_performance::WsOperation::Crypto
+    } else {
+        crate::server_performance::WsOperation::Rejected
+    };
+    (
+        auth,
+        crate::request_timing::WsTimer::with_operation(
+            Some(received),
+            "/sealed-dealer/ws",
+            operation,
+        ),
+    )
+}
+
+async fn complete_delivery(
+    state: &WorkerState,
+    delivery: &HoleDelivery,
+    _timing: crate::request_timing::WsTimer,
+) {
+    // This flag is the authoritative answer to delivery_received. Keep the
+    // same receipt timer through its lock wait and commit, also on cancellation.
+    if let Some(hand) = state.hands.write().await.get_mut(&delivery.hand_id) {
+        hand.delivered_seats.insert(delivery.seat);
+    }
 }
 
 async fn delivery_received(
@@ -819,14 +964,28 @@ async fn bot_hole(
 }
 
 pub async fn run_worker(addr: SocketAddr, internal_token: String) -> std::io::Result<()> {
+    // Initialize optional evidence infrastructure before accepting connections.
+    diagnostics::record(Uuid::nil(), None, "worker_ready", 0.0, 0.0);
     let state = WorkerState {
         internal_token: Arc::from(internal_token),
         hands: Arc::new(RwLock::new(HashMap::new())),
         commits: Arc::new(RwLock::new(HashMap::new())),
         hole_connections: Arc::new(Semaphore::new(MAX_HOLE_CONNECTIONS)),
     };
-    let app = Router::new()
+    if let Err(error) =
+        crate::server_performance::initialize(metrics::HTTP_ROUTES, &["/sealed-dealer/ws"])
+    {
+        tracing::error!(%error, "dealer performance catalog initialization failed");
+    }
+    let app = worker_router(state);
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await
+}
+
+fn worker_router(state: WorkerState) -> Router {
+    Router::new()
         .route("/internal/readyz", get(internal_ready))
+        .route("/internal/performance", get(metrics::snapshot))
         .route("/internal/hands", post(create_hand))
         .route("/internal/commits", post(commit_hand))
         .route("/internal/hands/:hand_id/bots/:seat", post(bot_hole))
@@ -840,9 +999,8 @@ pub async fn run_worker(addr: SocketAddr, internal_token: String) -> std::io::Re
         .route("/internal/hands/:hand_id", delete(delete_hand))
         .route("/healthz", get(|| async { StatusCode::NO_CONTENT }))
         .route("/ws", get(hole_ws))
-        .with_state(state);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await
+        .layer(axum::middleware::from_fn(metrics::measure))
+        .with_state(state)
 }
 
 #[derive(Clone)]
@@ -850,6 +1008,7 @@ pub struct SealedDealerClient {
     base_url: Arc<str>,
     internal_token: Arc<str>,
     http: reqwest::Client,
+    metrics_http: reqwest::Client,
 }
 
 impl SealedDealerClient {
@@ -861,7 +1020,51 @@ impl SealedDealerClient {
                 .timeout(Duration::from_secs(2))
                 .build()
                 .expect("sealed dealer HTTP client"),
+            metrics_http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(2))
+                .redirect(reqwest::redirect::Policy::none())
+                .no_proxy()
+                .build()
+                .expect("sealed dealer metrics client"),
         }
+    }
+
+    /// Optional admin read: one bounded request, no business retries or secret
+    /// payloads. Preserve the worker's PID/instance rather than merging counters.
+    pub(crate) async fn performance_snapshot(&self) -> Result<Vec<u8>, ()> {
+        let read = async {
+            let mut response = self
+                .request(
+                    self.metrics_http
+                        .get(format!("{}/internal/performance", self.base_url)),
+                )
+                .send()
+                .await
+                .map_err(|_| ())?;
+            if response.status() != reqwest::StatusCode::OK {
+                return Err(());
+            }
+            const LIMIT: usize = 512 * 1024;
+            let mut body = Vec::new();
+            while let Some(chunk) = response.chunk().await.map_err(|_| ())? {
+                if chunk.len() > LIMIT - body.len() {
+                    return Err(());
+                }
+                body.extend_from_slice(&chunk);
+            }
+            // Only the authenticated dealer endpoint can supply this schema.
+            let value: serde_json::Value = serde_json::from_slice(&body).map_err(|_| ())?;
+            if value["process_id"].as_u64().is_none()
+                || value["process_instance_id"].as_str().is_none()
+                || value["routes"].as_array().is_none()
+            {
+                return Err(());
+            }
+            Ok(body)
+        };
+        tokio::time::timeout(Duration::from_secs(2), read)
+            .await
+            .map_err(|_| ())?
     }
 
     fn request(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -1528,3 +1731,6 @@ pub async fn ensure_test_worker() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod metrics_tests;

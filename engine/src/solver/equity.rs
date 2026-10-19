@@ -303,8 +303,13 @@ fn equity_impl<const CACHE_RIVER: bool>(input: EquityInput) -> (EquityResult, u3
         let mut scratch = remaining_deck;
         let mut rng = EquityRng::new(input.seed);
         let mut runout = [scratch[0]; 5];
+        // A river range resamples the same concrete holdings on a fixed board.
+        // Reuse only this estimate's exact showdown result per pool entry;
+        // sampling, trial counts and integer pot-share accumulation stay intact.
+        let mut river = (CACHE_RIVER && missing == 0).then(|| vec![None; pool.len()]);
         for _ in 0..trials {
-            let v = pool[sample_cumulative(&cumulative, total_weight, &mut rng)].0;
+            let sampled = sample_cumulative(&cumulative, total_weight, &mut rng);
+            let v = pool[sampled].0;
             // Partial Fisher–Yates over the scratch deck; drawn villain cards are
             // discarded, which leaves a uniform draw from the deck minus them.
             // The deck holds at least 45 cards, so `missing + 2` draws always fit.
@@ -323,8 +328,13 @@ fn equity_impl<const CACHE_RIVER: bool>(input: EquityInput) -> (EquityResult, u3
             let mut sim_board = input.board.clone();
             let mut cursor = 0usize;
             fill_board(&mut sim_board, &mut runout[..missing], &mut cursor);
-            let (win, tie, share) =
-                showdown_share(&input.hero, &sim_board, std::slice::from_ref(&v));
+            let (win, tie, share) = if let Some(outcomes) = river.as_mut() {
+                *outcomes[sampled].get_or_insert_with(|| {
+                    showdown_share(&input.hero, &sim_board, std::slice::from_ref(&v))
+                })
+            } else {
+                showdown_share(&input.hero, &sim_board, std::slice::from_ref(&v))
+            };
             wins += win as u32;
             ties += tie as u32;
             share_sum += share;

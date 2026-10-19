@@ -24,6 +24,24 @@ fn river_rank_reuse_preserves_seeded_results_and_stop_counts() {
             OpponentSpec::Random(1),
             OpponentSpec::Random(5),
             OpponentSpec::Range(vec![]),
+            OpponentSpec::Range(vec![
+                RangeBucket {
+                    hand_key: "AA".into(),
+                    weight: 1.0,
+                },
+                RangeBucket {
+                    hand_key: "AKs".into(),
+                    weight: 0.25,
+                },
+                RangeBucket {
+                    hand_key: "76o".into(),
+                    weight: 0.7,
+                },
+                RangeBucket {
+                    hand_key: "22".into(),
+                    weight: 0.0,
+                },
+            ]),
         ] {
             for trials in [1, 600, 10_000] {
                 for early_stop in [
@@ -83,6 +101,32 @@ fn river_rank_reuse_preserves_multiway_board_chops() {
             (100.0 / (n + 1) as f64).round() as u8
         );
     }
+}
+
+#[test]
+fn river_range_reuse_preserves_board_chops_and_full_trial_count() {
+    let input = EquityInput {
+        hero: HoleCards::new(c(Rank::Two, Suit::Clubs), c(Rank::Three, Suit::Clubs)),
+        board: BoardCards {
+            flop: Some([
+                c(Rank::Ace, Suit::Hearts),
+                c(Rank::King, Suit::Hearts),
+                c(Rank::Queen, Suit::Hearts),
+            ]),
+            turn: Some(c(Rank::Jack, Suit::Hearts)),
+            river: Some(c(Rank::Ten, Suit::Hearts)),
+        },
+        opponents: OpponentSpec::Range(vec![bucket("AA"), bucket("76s"), bucket("54o")]),
+        trials: DEFAULT_MC_TRIALS,
+        seed: 72,
+        early_stop: None,
+    };
+    let actual = equity_impl::<true>(input.clone());
+    assert_eq!(actual, equity_impl::<false>(input));
+    assert_eq!(actual.1, DEFAULT_MC_TRIALS);
+    assert_eq!(actual.0.win_pct, 0);
+    assert_eq!(actual.0.tie_pct, 100);
+    assert_eq!(actual.0.combined_pct, 50);
 }
 
 #[test]
