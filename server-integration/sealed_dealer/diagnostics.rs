@@ -46,6 +46,8 @@ struct Event {
     phase: &'static str,
     elapsed_ms: f64,
     phase_ms: f64,
+    action_delivery_ms: Option<[f64; 11]>,
+    encode_cpu_ms: Option<f64>,
 }
 
 fn enqueue(sender: &SyncSender<Event>, event: Event) {
@@ -68,6 +70,8 @@ pub(super) fn record(
         phase,
         elapsed_ms,
         phase_ms,
+        action_delivery_ms: None,
+        encode_cpu_ms: None,
     });
 }
 
@@ -79,6 +83,44 @@ pub(crate) fn record_probe(trace: Uuid, phase: &'static str, elapsed_ms: f64) {
         phase,
         elapsed_ms,
         phase_ms: 0.0,
+        action_delivery_ms: None,
+        encode_cpu_ms: None,
+    });
+}
+
+/// Same-action evidence shares the bounded nonblocking collector, never probe
+/// semantics or an independent input's timing.
+pub(crate) fn record_action(trace: Uuid, phase: &'static str, elapsed_ms: f64) {
+    record_event(Event {
+        source: "ws_action",
+        connection: Uuid::nil(),
+        trace: Some(trace),
+        phase,
+        elapsed_ms,
+        phase_ms: 0.0,
+        action_delivery_ms: None,
+        encode_cpu_ms: None,
+    });
+}
+
+/// One bounded producer event holds fixed monotonic milestones; only the
+/// collector thread formats them. -1 means missing, never a measured zero.
+pub(crate) fn record_action_delivery(
+    trace: Uuid,
+    phase: &'static str,
+    elapsed_ms: f64,
+    milestones: [f64; 11],
+    encode_cpu_ms: Option<f64>,
+) {
+    record_event(Event {
+        source: "ws_action",
+        connection: Uuid::nil(),
+        trace: Some(trace),
+        phase,
+        elapsed_ms,
+        phase_ms: 0.0,
+        action_delivery_ms: Some(milestones),
+        encode_cpu_ms,
     });
 }
 
@@ -115,6 +157,8 @@ fn record_event(event: Event) {
                         phase = event.phase,
                         elapsed_ms = event.elapsed_ms,
                         phase_ms = event.phase_ms,
+                        action_delivery_ms = ?event.action_delivery_ms,
+                        encode_cpu_ms = ?event.encode_cpu_ms,
                         evidence_dropped = dropped,
                         "optional socket delivery evidence; flush completion is not a client acknowledgement"
                     );
@@ -164,6 +208,8 @@ mod tests {
             phase: "test",
             elapsed_ms: 0.0,
             phase_ms: 0.0,
+            action_delivery_ms: None,
+            encode_cpu_ms: None,
         };
         enqueue(&sender, event);
         enqueue(&sender, event);
