@@ -706,6 +706,7 @@ async fn hole_ws(
 ) -> impl IntoResponse {
     let trace = diagnostics::query_trace(query.as_deref());
     let connection = Uuid::new_v4();
+    let upgrade_started = std::time::Instant::now();
     diagnostics::record(connection, trace, "upgrade_requested", 0.0, 0.0);
     let Ok(permit) = state.hole_connections.clone().try_acquire_owned() else {
         diagnostics::record(connection, trace, "capacity_rejected", 0.0, 0.0);
@@ -714,11 +715,14 @@ async fn hole_ws(
     ws.max_message_size(512)
         .max_frame_size(512)
         .on_failed_upgrade(move |_| {
-            diagnostics::record(connection, trace, "upgrade_failed", 0.0, 0.0);
+            let elapsed = elapsed_ms(upgrade_started);
+            diagnostics::record(connection, trace, "upgrade_failed", elapsed, elapsed);
         })
         .on_upgrade(move |socket| async move {
             let _permit = permit;
-            diagnostics::record(connection, trace, "upgraded", 0.0, 0.0);
+            // Same-handler monotonic duration; excludes earlier proxy/TLS work.
+            let elapsed = elapsed_ms(upgrade_started);
+            diagnostics::record(connection, trace, "upgrade_complete", elapsed, elapsed);
             deliver_holes(socket, state, connection, trace).await;
         })
         .into_response()
