@@ -50,7 +50,11 @@ async fn spawn_worker() -> (
     let addr = probe.local_addr().expect("local addr");
     drop(probe);
     let token = "test-internal-token".to_string();
-    let worker = tokio::spawn(run_worker(addr, token.clone()));
+    let worker = tokio::spawn(run_worker(
+        addr,
+        token.clone(),
+        authorization::game_authority().public_key(),
+    ));
     let http = reqwest::Client::new();
     for _ in 0..50 {
         if http
@@ -104,7 +108,11 @@ async fn committed_deal_is_reproducible_from_the_reveal() {
         "seeds cannot change after the deal"
     );
 
-    let deck = client.settle(hand_id).await.unwrap();
+    let mut completed = folded_hand(&[0, 3, 5]);
+    let (_, deck) = client
+        .finish_and_settle(hand_id, &deal.commitment, &mut completed)
+        .await
+        .unwrap();
     validate_final_deck(hand_id, &deal.commitment, &deck).unwrap();
     let pf = verified_reveal(hand_id, seed_commit, &deck).unwrap();
     assert_eq!(pf.client_seeds, seeds);
@@ -252,7 +260,11 @@ async fn worker_delivers_holes_directly_and_opens_deck_only_at_settlement() {
     let addr = probe.local_addr().expect("local addr");
     drop(probe);
     let token = "test-internal-token".to_string();
-    let worker = tokio::spawn(run_worker(addr, token.clone()));
+    let worker = tokio::spawn(run_worker(
+        addr,
+        token.clone(),
+        authorization::game_authority().public_key(),
+    ));
     let http = reqwest::Client::new();
     let health = format!("http://{addr}/healthz");
     for _ in 0..50 {
@@ -274,13 +286,14 @@ async fn worker_delivers_holes_directly_and_opens_deck_only_at_settlement() {
             StatusCode::UNAUTHORIZED
         );
     }
+    let mut ready_request = http
+        .get(&ready)
+        .header(INTERNAL_TOKEN_HEADER, &token)
+        .build()
+        .unwrap();
+    authorization::sign(&mut ready_request).unwrap();
     assert_eq!(
-        http.get(&ready)
-            .header(INTERNAL_TOKEN_HEADER, &token)
-            .send()
-            .await
-            .unwrap()
-            .status(),
+        http.execute(ready_request).await.unwrap().status(),
         StatusCode::NO_CONTENT
     );
 
@@ -496,7 +509,11 @@ async fn worker_delivers_holes_directly_and_opens_deck_only_at_settlement() {
             .len(),
         2
     );
-    let opened = client.settle(hand_id).await.expect("settled deck");
+    let mut completed = folded_hand(&[0, 3]);
+    let (_, opened) = client
+        .finish_and_settle(hand_id, &deal.commitment, &mut completed)
+        .await
+        .expect("settled deck");
     assert_eq!(opened.cards.len(), 52);
     let mut commitment = Sha256::new();
     commitment.update(b"bluffking:sealed-deck:v1");
@@ -567,7 +584,11 @@ async fn hole_socket_lifetime_is_extended_only_by_valid_tickets() {
     let addr = probe.local_addr().expect("local addr");
     drop(probe);
     let token = "test-internal-token".to_string();
-    let worker = tokio::spawn(run_worker(addr, token.clone()));
+    let worker = tokio::spawn(run_worker(
+        addr,
+        token.clone(),
+        authorization::game_authority().public_key(),
+    ));
     let http = reqwest::Client::new();
     for _ in 0..50 {
         if http
@@ -721,4 +742,33 @@ async fn tickets_go_only_to_users_dealt_into_the_hand() {
         "joiner got the bot's ticket"
     );
     active.delete().await;
+}
+
+/// Finish through actual engine actions; settlement fixtures must never bypass
+/// the production completion guard merely to retrieve their verification deck.
+fn folded_hand(seats: &[u8]) -> engine::GameHand {
+    let mut hand = engine::GameHand::new_blind(
+        seats
+            .iter()
+            .enumerate()
+            .map(|(i, seat)| {
+                (
+                    engine::PlayerId::new(i as u64 + 1),
+                    engine::Chips(100),
+                    *seat,
+                )
+            })
+            .collect(),
+        0,
+        engine::Chips(20),
+        engine::Chips(10),
+        [0; 32],
+    );
+    hand.start().unwrap();
+    while !hand.is_done() {
+        let actor = hand.snapshot().current_actor.expect("preflop actor");
+        hand.apply_action(actor, engine::PlayerAction::Fold)
+            .unwrap();
+    }
+    hand
 }

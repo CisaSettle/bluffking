@@ -11,6 +11,8 @@
 //! This is intentionally a single trusted dealer, not Mental Poker: players do
 //! not shuffle, exchange key shares or participate in threshold decryption.
 
+mod authorization;
+pub use authorization::worker_verifying_key;
 pub(crate) mod diagnostics;
 mod metrics;
 
@@ -104,6 +106,11 @@ pub struct CreateHandResponse {
     pub commitment: String,
     pub deck_seed_tag: [u8; 32],
     pub tickets: Vec<SeatTicket>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct CompletedHandRequest {
+    commitment: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -458,6 +465,7 @@ const COMMIT_TTL: Duration = Duration::from_secs(120);
 
 #[derive(Clone)]
 struct WorkerState {
+    game_verifier: Arc<mental_poker::crypto_real::Ed25519SignatureProvider>,
     internal_token: Arc<str>,
     hands: Arc<RwLock<HashMap<Uuid, SealedHand>>>,
     commits: Arc<RwLock<HashMap<Uuid, PendingCommit>>>,
@@ -669,6 +677,7 @@ async fn settle_hand(
     State(state): State<WorkerState>,
     Path(hand_id): Path<Uuid>,
     headers: HeaderMap,
+    Json(request): Json<CompletedHandRequest>,
 ) -> impl IntoResponse {
     if !internal_authorized(&headers, &state) {
         return StatusCode::UNAUTHORIZED.into_response();
@@ -677,7 +686,10 @@ async fn settle_hand(
     let Some(hand) = hands.get_mut(&hand_id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    // This internal command is sent only after the authoritative game engine has
+    if request.commitment != hand.commitment {
+        return StatusCode::CONFLICT.into_response();
+    }
+    // This signed command is issued only after the authoritative game engine has
     // completed the hand.  It intentionally works for both showdowns and
     // fold-arounds: after settlement the game server may persist each owner's
     // cards for private review/coach use, matching a physical cardroom opening
@@ -967,10 +979,15 @@ async fn bot_hole(
     }
 }
 
-pub async fn run_worker(addr: SocketAddr, internal_token: String) -> std::io::Result<()> {
+pub async fn run_worker(
+    addr: SocketAddr,
+    internal_token: String,
+    verifying_key: [u8; 32],
+) -> std::io::Result<()> {
     // Initialize optional evidence infrastructure before accepting connections.
     diagnostics::record(Uuid::nil(), None, "worker_ready", 0.0, 0.0);
     let state = WorkerState {
+        game_verifier: Arc::new(authorization::verifier(&verifying_key)?),
         internal_token: Arc::from(internal_token),
         hands: Arc::new(RwLock::new(HashMap::new())),
         commits: Arc::new(RwLock::new(HashMap::new())),
@@ -1003,6 +1020,10 @@ fn worker_router(state: WorkerState) -> Router {
         .route("/internal/hands/:hand_id", delete(delete_hand))
         .route("/healthz", get(|| async { StatusCode::NO_CONTENT }))
         .route("/ws", get(hole_ws))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            authorization::guard,
+        ))
         .layer(axum::middleware::from_fn(metrics::measure))
         .with_state(state)
 }
@@ -1022,6 +1043,8 @@ impl SealedDealerClient {
             internal_token: Arc::from(internal_token.into()),
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(2))
+                .redirect(reqwest::redirect::Policy::none())
+                .no_proxy()
                 .build()
                 .expect("sealed dealer HTTP client"),
             metrics_http: reqwest::Client::builder()
@@ -1037,14 +1060,15 @@ impl SealedDealerClient {
     /// payloads. Preserve the worker's PID/instance rather than merging counters.
     pub(crate) async fn performance_snapshot(&self) -> Result<Vec<u8>, ()> {
         let read = async {
-            let mut response = self
+            let mut request = self
                 .request(
                     self.metrics_http
                         .get(format!("{}/internal/performance", self.base_url)),
                 )
-                .send()
-                .await
+                .build()
                 .map_err(|_| ())?;
+            authorization::sign(&mut request).map_err(|_| ())?;
+            let mut response = self.metrics_http.execute(request).await.map_err(|_| ())?;
             if response.status() != reqwest::StatusCode::OK {
                 return Err(());
             }
@@ -1084,7 +1108,9 @@ impl SealedDealerClient {
             let cloned = request
                 .try_clone()
                 .ok_or_else(|| "sealed dealer request is not replayable".to_string())?;
-            match cloned.send().await {
+            let mut signed = cloned.build().map_err(|e| e.to_string())?;
+            authorization::sign(&mut signed)?;
+            match self.http.execute(signed).await {
                 Ok(response) if response.status().is_success() => return Ok(response),
                 Ok(response)
                     if response.status().is_server_error()
@@ -1194,17 +1220,30 @@ impl SealedDealerClient {
         Ok(response.seats)
     }
 
-    pub async fn settle(&self, hand_id: Uuid) -> Result<FinalDeckResponse, String> {
-        self.send_with_retry(
-            self.request(
-                self.http
-                    .post(format!("{}/internal/hands/{hand_id}/settle", self.base_url)),
-            ),
-        )
-        .await?
-        .json()
-        .await
-        .map_err(|e| e.to_string())
+    pub async fn finish_and_settle(
+        &self,
+        hand_id: Uuid,
+        commitment: &str,
+        hand: &mut engine::GameHand,
+    ) -> Result<(engine::game::HandResult, FinalDeckResponse), String> {
+        // No HTTP request or completion signature is produced for a live hand,
+        // a non-blind hand, or an unresolved contested showdown.
+        let result = hand.finish_blind().map_err(|e| format!("{e:?}"))?;
+        let deck = self
+            .send_with_retry(
+                self.request(
+                    self.http
+                        .post(format!("{}/internal/hands/{hand_id}/settle", self.base_url)),
+                )
+                .json(&CompletedHandRequest {
+                    commitment: commitment.into(),
+                }),
+            )
+            .await?
+            .json()
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok((result, deck))
     }
 
     pub async fn delete_hand(&self, hand_id: Uuid) {
@@ -1250,6 +1289,7 @@ pub async fn configure_or_launch() -> Result<Option<tokio::process::Child>, Stri
         .unwrap_or_else(|_| "/sealed-dealer/ws".to_string());
 
     if let Ok(base_url) = std::env::var("SEALED_DEALER_URL") {
+        authorization::configure_external_authority()?;
         let token = std::env::var("SEALED_DEALER_INTERNAL_TOKEN")
             .map_err(|_| "SEALED_DEALER_INTERNAL_TOKEN is required with SEALED_DEALER_URL")?;
         CLIENT
@@ -1274,6 +1314,11 @@ pub async fn configure_or_launch() -> Result<Option<tokio::process::Child>, Stri
         .arg("--sealed-dealer-worker")
         .env("SEALED_DEALER_ADDR", addr.to_string())
         .env("SEALED_DEALER_INTERNAL_TOKEN", &worker_credential)
+        .env(
+            "SEALED_DEALER_GAME_VERIFY_KEY",
+            hex::encode(authorization::game_authority().public_key()),
+        )
+        .env_remove("SEALED_DEALER_GAME_SIGNING_KEY")
         .kill_on_drop(true);
     let mut child = command
         .spawn()
@@ -1298,13 +1343,17 @@ pub async fn configure_or_launch() -> Result<Option<tokio::process::Child>, Stri
                 "sealed dealer exited before becoming ready at {addr}: {status}"
             ));
         }
-        if http
-            .get(&health_url)
-            .header(INTERNAL_TOKEN_HEADER, &worker_credential)
-            .send()
-            .await
-            .is_ok_and(|response| response.status().is_success())
-        {
+        if {
+            let mut request = http
+                .get(&health_url)
+                .header(INTERNAL_TOKEN_HEADER, &worker_credential)
+                .build()
+                .map_err(|e| e.to_string())?;
+            authorization::sign(&mut request)?;
+            http.execute(request)
+                .await
+                .is_ok_and(|response| response.status().is_success())
+        } {
             if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
                 return Err(format!(
                     "sealed dealer exited before becoming ready at {addr}: {status}"
@@ -1588,9 +1637,10 @@ impl ActiveHand {
                     .map_err(|e| format!("{e:?}"))?;
             }
         }
-        let mut result = hand.finish_blind().map_err(|e| format!("{e:?}"))?;
-        // The hand is over. Only now may private review obtain the completed deck.
-        let deck = self.client.settle(self.hand_id).await?;
+        let (mut result, deck) = self
+            .client
+            .finish_and_settle(self.hand_id, &self.deal.commitment, hand)
+            .await?;
         validate_final_deck(self.hand_id, &self.deal.commitment, &deck)?;
         check_settled_cards(&self.seats, &deck.cards, &result, |pid| {
             hand.seats()
@@ -1712,7 +1762,11 @@ pub async fn ensure_test_worker() -> Result<(), String> {
                 .enable_all()
                 .build()
                 .unwrap()
-                .block_on(run_worker(addr, worker_token))
+                .block_on(run_worker(
+                    addr,
+                    worker_token,
+                    authorization::game_authority().public_key(),
+                ))
                 .unwrap();
         });
         let _ = PUBLIC_WS_ENDPOINT.set(Arc::from(format!("ws://{addr}/ws")));
@@ -1738,3 +1792,11 @@ mod tests;
 
 #[cfg(test)]
 mod metrics_tests;
+
+#[cfg(test)]
+pub(crate) fn game_verifying_key_for_test() -> [u8; 32] {
+    authorization::game_authority().public_key()
+}
+
+#[cfg(test)]
+mod authorization_tests;
