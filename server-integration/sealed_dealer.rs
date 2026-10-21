@@ -96,9 +96,6 @@ pub struct CreateHandRequest {
     /// only fails verification at settlement, after a whole hand was played.
     #[serde(default)]
     pub seed_commit: Option<[u8; 32]>,
-    #[cfg(any(test, feature = "test-support"))]
-    #[serde(default)]
-    pub test_seed: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -529,13 +526,6 @@ async fn create_hand(
             )
                 .into_response();
         }
-        #[cfg(any(test, feature = "test-support"))]
-        if request
-            .test_seed
-            .is_some_and(|seed| PokerRng::from_seed(seed).seed() != existing.seed)
-        {
-            return StatusCode::CONFLICT.into_response();
-        }
         return (StatusCode::OK, Json(existing.create_response())).into_response();
     }
 
@@ -583,12 +573,6 @@ async fn create_hand(
         ),
         None => SealedHand::new(request.hand_id, seats),
     };
-    #[cfg(any(test, feature = "test-support"))]
-    let created = match request.test_seed {
-        Some(seed) => SealedHand::new_with_rng(request.hand_id, seats, PokerRng::from_seed(seed)),
-        None => fresh(seats),
-    };
-    #[cfg(not(any(test, feature = "test-support")))]
     let created = fresh(seats);
     let Ok((mut hand, _)) = created else {
         return StatusCode::BAD_REQUEST.into_response();
@@ -1271,16 +1255,6 @@ pub fn public_ws_endpoint() -> Result<&'static str, &'static str> {
         .ok_or("sealed dealer public websocket is not configured")
 }
 
-#[cfg(test)]
-pub(crate) fn install_for_test(base_url: String, token: String, endpoint: String) {
-    CLIENT
-        .set(SealedDealerClient::new(base_url, token))
-        .unwrap_or_else(|_| panic!("sealed dealer test client installed once"));
-    PUBLIC_WS_ENDPOINT
-        .set(Arc::from(endpoint))
-        .expect("sealed dealer test endpoint installed once");
-}
-
 /// Configure an externally managed dealer, or launch the default sibling
 /// process on loopback. The returned child guard must live as long as the main
 /// server; dropping it kills only the worker launched by this process.
@@ -1410,11 +1384,6 @@ impl ActiveHand {
         users: &HashMap<Uuid, u8>,
         commit: Option<SeedCommitInput>,
     ) -> Result<Self, String> {
-        #[cfg(any(test, feature = "test-support"))]
-        ensure_test_worker().await?;
-        #[cfg(any(test, feature = "test-support"))]
-        let test_seed = take_test_seed(session_id);
-        #[cfg(not(any(test, feature = "test-support")))]
         let test_seed = {
             let _ = session_id;
             None
@@ -1434,8 +1403,6 @@ impl ActiveHand {
 
     /// Phase one: obtain the dealer's seed commitment for `hand_id`.
     pub async fn commit(hand_id: Uuid) -> Result<[u8; 32], String> {
-        #[cfg(any(test, feature = "test-support"))]
-        ensure_test_worker().await?;
         client()?.commit_hand(hand_id).await
     }
 
@@ -1450,9 +1417,6 @@ impl ActiveHand {
         _test_seed: Option<u64>,
         commit: Option<SeedCommitInput>,
     ) -> Result<Self, String> {
-        #[cfg(any(test, feature = "test-support"))]
-        let pinned = _test_seed.is_some();
-        #[cfg(not(any(test, feature = "test-support")))]
         let pinned = false;
         let commit = commit.filter(|_| !pinned);
         let client_seeds = commit
@@ -1470,8 +1434,6 @@ impl ActiveHand {
             .create_hand(&CreateHandRequest {
                 hand_id,
                 seats: seats.clone(),
-                #[cfg(any(test, feature = "test-support"))]
-                test_seed: _test_seed,
                 bot_seats: bots.iter().copied().filter(|s| seats.contains(s)).collect(),
                 client_seeds,
                 seed_commit: commit.as_ref().map(|c| c.seed_commit),
@@ -1712,91 +1674,6 @@ pub fn completed_holes(result: &engine::game::HandResult) -> HashMap<u64, [engin
     holes
 }
 
-#[cfg(any(test, feature = "test-support"))]
-static TEST_HAND_SEEDS: OnceLock<std::sync::Mutex<HashMap<Uuid, u64>>> = OnceLock::new();
-
-#[cfg(any(test, feature = "test-support"))]
-pub fn set_next_hand_seed_for_test(session_id: Uuid, seed: u64) {
-    TEST_HAND_SEEDS
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap()
-        .insert(session_id, seed);
-}
-/// A fixture pinned this session's next deck: it is dealt without the
-/// commit-reveal exchange and never revealed.
-#[cfg(any(test, feature = "test-support"))]
-pub fn next_deck_is_pinned(session_id: Uuid) -> bool {
-    TEST_HAND_SEEDS
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap()
-        .contains_key(&session_id)
-}
-
-#[cfg(not(any(test, feature = "test-support")))]
 pub fn next_deck_is_pinned(_session_id: Uuid) -> bool {
     false
 }
-
-#[cfg(any(test, feature = "test-support"))]
-fn take_test_seed(session_id: Uuid) -> Option<u64> {
-    TEST_HAND_SEEDS
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap()
-        .remove(&session_id)
-}
-
-/// Actor fixtures still exercise a real isolated dealer; no plaintext fallback.
-#[cfg(any(test, feature = "test-support"))]
-pub async fn ensure_test_worker() -> Result<(), String> {
-    let client = CLIENT.get_or_init(|| {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("test dealer port");
-        let addr = probe.local_addr().unwrap();
-        drop(probe);
-        let token = Uuid::new_v4().to_string();
-        let worker_token = token.clone();
-        std::thread::spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(run_worker(
-                    addr,
-                    worker_token,
-                    authorization::game_authority().public_key(),
-                ))
-                .unwrap();
-        });
-        let _ = PUBLIC_WS_ENDPOINT.set(Arc::from(format!("ws://{addr}/ws")));
-        SealedDealerClient::new(format!("http://{addr}"), token)
-    });
-    for _ in 0..50 {
-        if client
-            .http
-            .get(format!("{}/healthz", client.base_url))
-            .send()
-            .await
-            .is_ok_and(|r| r.status().is_success())
-        {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    Err("test sealed dealer did not start".into())
-}
-
-#[cfg(test)]
-mod tests;
-
-#[cfg(test)]
-mod metrics_tests;
-
-#[cfg(test)]
-pub(crate) fn game_verifying_key_for_test() -> [u8; 32] {
-    authorization::game_authority().public_key()
-}
-
-#[cfg(test)]
-mod authorization_tests;

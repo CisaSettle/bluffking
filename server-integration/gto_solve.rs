@@ -92,48 +92,9 @@ use crate::entitlement::{self, Tier};
 /// permit until the non-cancellable worker exits.
 const SOLVE_TIMEOUT: Duration = Duration::from_secs(6);
 
-/// Process-global timeout override in MILLISECONDS (F5 test hook). `0` (the
-/// default) means "use the `SOLVE_TIMEOUT` const". An integration test can set a
-/// tiny value via [`test_set_solve_timeout_ms`] so a real solve deterministically
-/// trips the wall-clock-timeout branch (`solve_timeout` 503) without waiting the
-/// full production budget. F6 (codex LOW): this mutable global + its setter exist ONLY behind
-/// `cfg(any(test, feature = "test-support"))`, so a default/release `cargo build`
-/// of the binary carries NEITHER the override state NOR a way to set it — the
-/// handler reads it only through [`effective_solve_timeout`], which is the const
-/// in a non-test build.
-#[cfg(any(test, feature = "test-support"))]
-static SOLVE_TIMEOUT_OVERRIDE_MS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// The wall-clock timeout the handler actually applies. In a test / `test-support`
-/// build it honours the [`SOLVE_TIMEOUT_OVERRIDE_MS`] override when non-zero (F5
-/// tests); in a default/release build (no override symbol exists) it is always the
-/// `SOLVE_TIMEOUT` const (F6).
-#[cfg(any(test, feature = "test-support"))]
-fn effective_solve_timeout() -> Duration {
-    let ms = SOLVE_TIMEOUT_OVERRIDE_MS.load(std::sync::atomic::Ordering::Relaxed);
-    if ms == 0 {
-        SOLVE_TIMEOUT
-    } else {
-        Duration::from_millis(ms)
-    }
-}
-
-/// Release/default build: no override exists, so the wall-clock timeout is always
-/// the `SOLVE_TIMEOUT` const (F6 — the mutable override is test-support-only).
-#[cfg(not(any(test, feature = "test-support")))]
+/// The wall-clock timeout the handler applies: always the `SOLVE_TIMEOUT` const.
 fn effective_solve_timeout() -> Duration {
     SOLVE_TIMEOUT
-}
-
-/// Set the per-solve wall-clock timeout override in ms (F5 test hook); `0`
-/// restores the `SOLVE_TIMEOUT` const. F6: gated behind
-/// `cfg(any(test, feature = "test-support"))` so it does NOT compile into the
-/// release binary; the integration tests enable the `test-support` feature (a
-/// separate-crate integration test can't reach a `#[cfg(test)]`-only item).
-#[cfg(any(test, feature = "test-support"))]
-pub fn test_set_solve_timeout_ms(ms: u64) {
-    SOLVE_TIMEOUT_OVERRIDE_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Box-wide max concurrent solves. Each flop solve can hold ~1.5 GB, so a small
@@ -334,73 +295,6 @@ fn acquire_ip_inflight(ip: IpAddr) -> Option<IpInflightGuard> {
         }),
         Err(_) => None,
     }
-}
-
-// ---------------------------------------------------------------------------
-// Test-only capacity hooks (F5) — F6: gated out of release builds
-// ---------------------------------------------------------------------------
-// The `solver_busy` 503 (global-pool-full and per-IP-full) and the permit-hold
-// semantics are otherwise only reachable by racing two real GB-scale solves,
-// which is flaky and slow. These hooks let an integration test DETERMINISTICALLY
-// drain the SAME process-global guards the handler uses, so it can assert the 503
-// paths against the live handler without timing races. They expose no new behavior
-// — only the ability to hold the existing guards.
-//
-// F6 (codex LOW): the whole block is gated behind
-// `cfg(any(test, feature = "test-support"))`, so a default/release `cargo build`
-// of the binary contains NONE of these `test_*` symbols. The integration tests
-// (a separate crate that can't reach `#[cfg(test)]`-only items) enable the
-// crate's `test-support` feature via the dev-dependency self-reference in
-// `Cargo.toml`. `#[doc(hidden)]` additionally keeps them out of docs.
-
-/// Drain the global solve semaphore to ZERO available permits and return them
-/// held in a guard (F5 test hook). While the returned guard is alive the handler's
-/// `try_acquire_owned()` on the global semaphore fails, so a fresh solve request
-/// hits the global-pool-full `solver_busy` 503 path. Acquires whatever is
-/// currently available (a leaked-but-still-running prior test solve may hold
-/// some), so the post-condition is "0 available", which is all the 503 path needs.
-/// Dropping the guard frees the acquired permits.
-#[cfg(any(test, feature = "test-support"))]
-#[doc(hidden)]
-pub fn test_hold_all_global_permits() -> impl Send {
-    let sem = solve_semaphore();
-    let mut held = Vec::with_capacity(max_concurrent_solves());
-    // Drain every currently-available permit; loop until none remain so the
-    // handler is guaranteed to see an empty pool regardless of any in-flight task.
-    while let Ok(p) = sem.clone().try_acquire_owned() {
-        held.push(p);
-    }
-    held
-}
-
-/// Reserve the per-IP in-flight slot for `ip` and return the guard (F5 test
-/// hook). While held, a solve request from the SAME `ip` hits the per-IP-full
-/// `solver_busy` 503 path. Returns `None` if the slot is already taken.
-#[cfg(any(test, feature = "test-support"))]
-#[doc(hidden)]
-pub fn test_hold_ip_inflight(ip: IpAddr) -> Option<impl Send> {
-    acquire_ip_inflight(ip)
-}
-
-/// ASYNC drain of the global solve semaphore (F5 test hook): acquire ALL
-/// `MAX_CONCURRENT_SOLVES` permits, AWAITING (not failing) if a solve is still
-/// in flight, so it blocks until every running solve has returned its permit.
-/// The timeout test uses this to wait out its leaked (non-cancellable) solve
-/// before releasing the serialization lock, so a following capacity test never
-/// inherits a busy permit. Dropping the returned guard frees the permits.
-#[cfg(any(test, feature = "test-support"))]
-#[doc(hidden)]
-pub async fn test_drain_global_permits() -> impl Send {
-    let sem = solve_semaphore();
-    let mut held = Vec::with_capacity(max_concurrent_solves());
-    for _ in 0..max_concurrent_solves() {
-        // `acquire_owned` awaits until a permit is free — this is what makes the
-        // drain BLOCK on any in-flight solve rather than skip it.
-        if let Ok(p) = sem.clone().acquire_owned().await {
-            held.push(p);
-        }
-    }
-    held
 }
 
 /// A cached SOLVED SPOT — the HERO-INDEPENDENT equilibrium (F3). Keyed by
@@ -950,32 +844,6 @@ fn spot_key(req: &SolveRequest) -> u64 {
     // ADR-085: partition the cache by the tier-dependent iteration cap (see
     // `spot_repr`), so different tiers never serve each other's convergence.
     h.write_u32(req.limits.max_iterations);
-    h.finish()
-}
-
-/// A hero-FOLDING cache key, retained only to document/verify the hero
-/// distinction (F3). The handler no longer caches by this: it caches the
-/// hero-INDEPENDENT [`spot_key`] and derives the hero row cheaply, so a hero-only
-/// change reuses the solved equilibrium. The tests still assert that folding in
-/// the hero would key responses apart (and that `spot_key` does NOT), proving the
-/// hero is the ONLY thing the per-request response adds over the cached spot.
-/// `#[cfg(test)]` because nothing in the production path keys by it anymore.
-#[cfg(test)]
-fn response_key(req: &SolveRequest) -> u64 {
-    let mut h = DefaultHasher::new();
-    h.write_u64(spot_key(req));
-    if let Some(hero) = req.hero {
-        h.write_u8(1);
-        // Order-independent: hash the sorted token pair.
-        let mut toks = [hero.card1.to_string(), hero.card2.to_string()];
-        toks.sort();
-        for t in &toks {
-            h.write(t.to_ascii_uppercase().as_bytes());
-            h.write_u8(0);
-        }
-    } else {
-        h.write_u8(0xFF);
-    }
     h.finish()
 }
 
@@ -1586,6 +1454,3 @@ pub async fn solve_source_handler() -> impl IntoResponse {
 // ===========================================================================
 // Tests (pure request/response shaping + helpers — no DB, no solve)
 // ===========================================================================
-
-#[cfg(test)]
-mod tests;

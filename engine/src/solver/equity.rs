@@ -10,8 +10,6 @@
 use crate::card::{Card, Rank, Suit};
 use crate::eval::{board_eval, rank_with_board};
 use crate::hand::{BoardCards, HoleCards};
-#[cfg(test)]
-use crate::rng::PokerRng;
 
 use super::{
     DEFAULT_MC_TRIALS, EARLY_STOP_CHECK_EVERY, EARLY_STOP_HALF_WIDTH, EARLY_STOP_MIN_TRIALS,
@@ -536,37 +534,6 @@ pub fn equity_vs_random(
     })
 }
 
-/// `#[cfg(test)]`-only sibling of [`equity`] that also returns the number of MC
-/// trials actually run (`t` at the early-stop break, or `trials` when the loop
-/// ran to completion). Lets the ADR-082 §5(c) tests assert that early-stop fires
-/// on dominant/clear-fold spots and runs full on marginal ones — WITHOUT leaking
-/// a `(EquityResult, u32)` shape into the ADR-012-public [`equity`] signature.
-#[cfg(test)]
-pub(crate) fn equity_with_trial_count(input: EquityInput) -> (EquityResult, u32) {
-    equity_inner(input)
-}
-
-/// `#[cfg(test)]`-only: the FULL-10k counterpart of [`equity_vs_random`] —
-/// identical inputs but `early_stop: None`. The ADR-082 §5(d) verdict-stability
-/// corpus runs the advisor pipeline once with the shipped early-stop path and
-/// once with this, and asserts `verdict` + `gto_action` are identical.
-#[cfg(test)]
-pub(crate) fn equity_vs_random_full(
-    hero: HoleCards,
-    board: BoardCards,
-    opp_count: u8,
-    seed: u64,
-) -> EquityResult {
-    equity(EquityInput {
-        hero,
-        board,
-        opponents: OpponentSpec::Random(opp_count),
-        trials: DEFAULT_MC_TRIALS,
-        seed,
-        early_stop: None,
-    })
-}
-
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -811,19 +778,6 @@ fn deck_minus(used: &[Card]) -> Vec<Card> {
     out
 }
 
-#[cfg(test)]
-fn shuffle_in_place(cards: &mut [Card], rng: &mut PokerRng) {
-    // Fisher–Yates, mirrors `Deck::new`.
-    let n = cards.len();
-    if n < 2 {
-        return;
-    }
-    for i in (1..n).rev() {
-        let j = rng_range(rng, i + 1);
-        cards.swap(i, j);
-    }
-}
-
 /// Partial Fisher–Yates: draw `k` cards without replacement into `deck[0..k]`.
 ///
 /// Permutes `deck` in place but leaves it a valid permutation of the same
@@ -886,22 +840,6 @@ impl EquityRng {
     }
 }
 
-#[cfg(test)]
-fn rng_range(rng: &mut PokerRng, n: usize) -> usize {
-    if n <= 1 {
-        return 0;
-    }
-    let mut buf = [0u8; 8];
-    loop {
-        rng.fill_bytes(&mut buf);
-        let v = u64::from_le_bytes(buf);
-        let threshold = u64::MAX - (u64::MAX % n as u64);
-        if v < threshold {
-            return (v % n as u64) as usize;
-        }
-    }
-}
-
 fn fill_board(board: &mut BoardCards, available: &mut [Card], cursor: &mut usize) {
     if board.flop.is_none() {
         let c1 = available[*cursor];
@@ -936,6 +874,3 @@ fn fill_board_from_runout(board: &mut BoardCards, runout: &[Card]) {
         board.river = Some(runout[cursor]);
     }
 }
-
-#[cfg(test)]
-mod tests;

@@ -10,7 +10,7 @@ This crate is the source of truth for poker rules in BluffKing. It drives the ga
 - No `rs_poker` types in any public signature — `rs_poker` stays an internal evaluation detail, swappable without breaking consumers
 - No `tokio`, `sqlx`, or `axum` dependencies (pure logic — no async, no IO, no DB)
 - Public data types (cards, actions, snapshots, results) derive `Debug + Clone` and usually `PartialEq`; stateful handles (`GameHand`, `PokerRng`) do not
-- `cargo test -p engine` runs without a live database
+- `cargo check -p engine` runs without a live database
 
 ## Key modules
 
@@ -25,14 +25,8 @@ This crate is the source of truth for poker rules in BluffKing. It drives the ga
 | `deck.rs` | Deck + shuffle |
 | `event.rs` | `EngineEvent` stream for downstream persistence |
 
-## Run tests
+## Verification
 
-```bash
-cargo test -p engine             # unit + integration, no DB needed
-```
-
-Integration tests live in `engine/tests/`: `full_hand.rs` plays a complete scripted hand end-to-end; `event_emission.rs` asserts the `EngineEvent` stream is well-formed.
-
-## Test-only API surface
-
-The `test-helpers` feature exposes `GameHand::override_hole_cards_for_test`, enabling downstream integration tests (e.g. the game server's) to inject specific hole cards. **Do not enable in production builds.** Consumers should enable it via `dev-dependencies` only.
+Only the repo-level E2E suite under `scripts/e2e` exercises this crate; there
+are no unit or integration tests in the crate (owner decision, 2026-10-21).
+`cargo check -p engine` / `cargo clippy -p engine` need no database.

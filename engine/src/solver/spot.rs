@@ -826,6 +826,3 @@ fn bb_to_units(bb: f32) -> u32 {
 fn round2(v: f32) -> f32 {
     (v * 100.0).round() / 100.0
 }
-
-#[cfg(test)]
-mod tests;

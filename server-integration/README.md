@@ -26,7 +26,7 @@ just the library.
   `session_registry`, `runtime_checkpoint`, `outbound`). Its submodules under
   `sealed_dealer/` are published with it: `authorization.rs` (the game-process signature
   every internal game-server-to-dealer request must carry),
-  `metrics.rs`, `diagnostics.rs` and their tests.
+  `metrics.rs` and `diagnostics.rs`.
 - `texas-h5-Cargo.lock` (U47) — the **deployed server binary's exact dependency
   resolution**, i.e. the §13 reproduce artifact. It pins every version — including
   the git-pinned `postflop-solver` commit — as actually built and deployed. Use

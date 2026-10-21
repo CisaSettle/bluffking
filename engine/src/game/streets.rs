@@ -289,45 +289,6 @@ impl GameHand {
     }
 
     // ---------------------------------------------------------------------------
-    // Test-only helpers
-    // ---------------------------------------------------------------------------
-
-    /// Override the hole cards for a specific player (by `PlayerId`).
-    ///
-    /// Intended exclusively for integration tests that need to control which
-    /// starting hand a player holds after `start()` has already dealt random cards.
-    /// Gated behind the `test-helpers` cargo feature so production builds cannot
-    /// call this method.
-    #[cfg(any(test, feature = "test-helpers"))]
-    pub fn override_hole_cards_for_test(&mut self, player_id: PlayerId, cards: HoleCards) {
-        let mut found = false;
-        for seat in &mut self.seats {
-            if seat.player_id == player_id {
-                seat.hole = HoleSlot::Plain(cards);
-                found = true;
-                break;
-            }
-        }
-        if !found {
-            return;
-        }
-        // Reserve the pinned cards out of the remaining deck so a later board
-        // deal cannot collide with them. Without this, the board (still dealt
-        // from the unshuffled remainder) can repeat a pinned hole card, and
-        // `rank_hand` then receives overlapping cards — a real-deck impossibility
-        // that its debug_assert (see eval.rs) correctly rejects. Test-only
-        // helper, so rebuilding the deck from its remaining cards is fine.
-        let remaining: Vec<crate::card::Card> = self
-            .deck
-            .cards()
-            .iter()
-            .copied()
-            .filter(|c| *c != cards.card1 && *c != cards.card2)
-            .collect();
-        self.deck = Deck::from_cards(remaining);
-    }
-
-    // ---------------------------------------------------------------------------
     // Private helpers
     // ---------------------------------------------------------------------------
 

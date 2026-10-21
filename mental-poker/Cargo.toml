@@ -15,8 +15,8 @@ workspace = true
 # Mental Poker card-dealing protocol: dealing abstraction, mock crypto,
 # signed hash-chain transcript, and an offline verifier.
 #
-# Pure crate — no async, no IO, no DB. `cargo test -p mental-poker` needs no
-# database. Depends on `engine` only for the `Card` type.
+# Pure crate — no async, no IO, no DB. Depends on `engine` only for the `Card`
+# type.
 
 [[bin]]
 name = "mp-verify"
@@ -31,13 +31,6 @@ path = "src/bin/pf_verify.rs"
 [[bin]]
 name = "pf_demo_hand"
 path = "src/bin/pf_demo_hand.rs"
-
-# Milestone-B server-blind per-hand deal latency bench (ADR-063 §8 / ADR-062
-# §4 Gate-B). Perf artifact — not a correctness gate, not wired into
-# production. `cargo bench -p mental-poker --bench phase4_deal`.
-[[bench]]
-name = "phase4_deal"
-harness = false
 
 [dependencies]
 engine = { path = "../engine" }
@@ -64,11 +57,6 @@ rand = "0.8"
 
 # WASM (Phase-4 web client, ADR-063): on wasm32-unknown-unknown the `rand 0.8 →
 # getrandom 0.2` chain needs the "js" backend (browser crypto.getRandomValues).
-# Target-gated — zero effect on the native server/test/bench builds.
+# Target-gated — zero effect on the native server builds.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }
-
-[dev-dependencies]
-# Criterion for the Phase-4 Gate-B latency bench (offline-cached). Dev/perf
-# tooling only — never a production dependency.
-criterion = "0.8"

@@ -56,13 +56,14 @@ generator + the JSON `_source`: open 2.5bb, 3-bet 3.2× open, 4-bet 2.2× 3-bet,
 position model + a minimum-defense-frequency floor; `R ∈ [0.70, 1.12]`. A
 different sizing/`R` model yields different ranges.
 
-### Poker-sanity invariants (enforced + guarded)
+### Poker-sanity invariants (expected of every regenerated chart)
 
-`engine/tests/preflop_chart_contract.rs` is a RED-first guard: AA/KK/AKs in every
-RFI, 72o nowhere, `vs_4bet ⊆ vs_3bet` per position, RFI widths widen
-UTG ⊆ MP ⊆ CO ⊆ BTN, AA in every non-empty bucket, and a clean-room/honest-label
-attestation (no third-party token; names the CFR + equity-realization method;
-never positively claims "GTO").
+AA/KK/AKs in every RFI, 72o nowhere, `vs_4bet ⊆ vs_3bet` per position, RFI
+widths widen UTG ⊆ MP ⊆ CO ⊆ BTN, AA in every non-empty bucket, and a
+clean-room/honest-label attestation (no third-party token; names the CFR +
+equity-realization method; never positively claims "GTO"). The former
+`engine/tests/preflop_chart_contract.rs` guard was removed with the unit-test
+suite (owner decision, 2026-10-21); re-check these by hand after regeneration.
 
 ### Reproducibility
 

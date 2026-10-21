@@ -1,5 +1,5 @@
 [workspace]
-members = ["engine", "mental-poker", "server", "gto-solver", "tools/bnb-hd-recovery", "tools/local-db-test"]
+members = ["engine", "mental-poker", "server", "gto-solver", "tools/bnb-hd-recovery"]
 resolver = "2"
 
 [workspace.package]
@@ -75,5 +75,5 @@ overflow-checks = true
 # justification is the small-and-acceptable delta, not perf-equivalence.) The
 # prod-parity guarantee holds because CI and the local gate build from the SAME
 # Dockerfile, so both get the identical ThinLTO binary. Regression-guarded by
-# scripts/tests/release-profile-memory-guard.sh — do NOT revert to `lto = true`.
+# scripts/guards/release-profile-memory-guard.sh — do NOT revert to `lto = true`.
 lto = "thin"

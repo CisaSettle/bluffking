@@ -537,11 +537,6 @@ mod pots;
 mod start;
 mod streets;
 
-#[cfg(test)]
-mod blind_tests;
-#[cfg(test)]
-mod tests;
-
 impl GameHand {
     /// Whether the hand is done.
     pub fn is_done(&self) -> bool {

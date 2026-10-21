@@ -40,36 +40,3 @@ pub fn id_to_card(id: CardId) -> Option<Card> {
 pub fn is_valid_card_id(id: u32) -> bool {
     id < DECK_SIZE as u32
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn round_trip_all_52() {
-        for id in 0..52u8 {
-            let card = id_to_card(id).expect("valid id");
-            assert_eq!(card_to_id(card), id, "round trip failed for id {id}");
-        }
-    }
-
-    #[test]
-    fn ids_are_unique_and_dense() {
-        let mut seen = [false; 52];
-        for id in 0..52u8 {
-            let card = id_to_card(id).unwrap();
-            let back = card_to_id(card) as usize;
-            assert!(!seen[back], "duplicate id {back}");
-            seen[back] = true;
-        }
-        assert!(seen.iter().all(|&b| b));
-    }
-
-    #[test]
-    fn out_of_range_rejected() {
-        assert!(id_to_card(52).is_none());
-        assert!(id_to_card(255).is_none());
-        assert!(!is_valid_card_id(52));
-        assert!(is_valid_card_id(51));
-    }
-}

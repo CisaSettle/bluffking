@@ -45,32 +45,3 @@ impl DealingProvider for ExistingServerDealingProvider {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashSet;
-
-    fn req() -> DealRequest {
-        DealRequest {
-            hand_id: "h".into(),
-            table_id: "t".into(),
-            num_players: 2,
-            button_seat: 0,
-            big_blind: 20,
-            small_blind: 10,
-        }
-    }
-
-    #[test]
-    fn deals_52_unique_cards_and_no_transcript() {
-        let dealt = ExistingServerDealingProvider::new().deal(&req());
-        assert_eq!(dealt.deck.len(), 52);
-        let unique: HashSet<_> = dealt.deck.iter().copied().collect();
-        assert_eq!(unique.len(), 52, "all 52 cards must be distinct");
-        assert!(
-            dealt.transcript.is_none(),
-            "legacy provider has no transcript"
-        );
-    }
-}

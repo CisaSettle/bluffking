@@ -850,9 +850,10 @@ fn solve_bucket(
 /// exactly `hero_freq` — `solve_bucket` is a thin wrapper, so adding this does NOT
 /// change any emitted frequency.
 ///
-/// Most fields are read only by the test-only `bucket_exploitability`; in a
-/// non-test build only `hero_freq` is consumed, so the rest are allowed dead.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Only `hero_freq` is consumed by the shipped solver; the remaining fields
+/// describe the model an exploitability measurement would need and are kept
+/// for that purpose, so they are allowed dead.
+#[allow(dead_code)]
 struct BucketSolution {
     hero_freq: [f64; N_CLASSES],
     /// Villain's converged average CALL frequency per class.
@@ -871,8 +872,8 @@ struct BucketSolution {
 /// equity `e`, hero's realization multiplier `r`, whether the terminal is ALL-IN,
 /// the `final_pot`, and hero's invested `cont`. ALL-IN ⇒ RAW equity (no `R`
 /// haircut); see-flop ⇒ `(e·r)` clamped to a probability. THE single definition
-/// of the hero terminal — both `solve_bucket_full_iters` and the (test-only)
-/// `bucket_exploitability` call THIS, so they can never drift apart (F7).
+/// of the hero terminal — `solve_bucket_full_iters` calls THIS so any
+/// exploitability measurement can never drift apart from it (F7).
 #[inline]
 fn hero_showdown_ev(e: f64, r: f64, allin: bool, final_pot: f64, cont: f64) -> f64 {
     let realized = if allin { e } else { (e * r).clamp(0.0, 1.0) };
@@ -1163,176 +1164,7 @@ fn solve_bucket_full_iters(
 }
 
 // --------------------------------------------------------------------------
-// Exploitability measurement (best response vs the converged average pair).
-// --------------------------------------------------------------------------
-
-/// Decomposed best-response gaps for one solved bucket, in bb, measured AGAINST
-/// THE SAME simplified model the solver optimized (NOT real poker — see the
-/// module docstring). Each gap is how much a player could win by switching to a
-/// best response while the OTHER player keeps its converged average strategy:
-///
-/// ```text
-/// hero_gap = BR_hero_value − hero_avg_value   (>= 0)
-/// vill_gap = BR_vill_value − vill_avg_value   (>= 0)
-/// ```
-///
-/// HONESTY — why the split matters: the PUBLISHED artifact is the HERO strategy,
-/// so `hero_gap` is the exploitability of what we actually ship. `vill_gap` is the
-/// opponent's best-response gap; in the tightest line (`vs_4bet`) hero continues
-/// only ~3.7% of the time, so the villain's call/fold node is almost OFF-PATH and
-/// its residual NashConv is concentrated on a node that is rarely reached — a
-/// well-known CFR property, not a defect of the published hero chart. We therefore
-/// report BOTH the raw `vill_gap` AND a REACH-WEIGHTED total (`vill_gap` scaled by
-/// hero's continue mass, i.e. the probability the villain node is actually
-/// reached), which honestly reflects on-path exploitability.
-#[cfg(test)]
-struct Exploitability {
-    /// Hero best-response gap (exploitability of the PUBLISHED strategy), bb.
-    hero_gap: f64,
-    /// Villain best-response gap, bb (raw, includes rarely-reached nodes).
-    vill_gap: f64,
-    /// Probability hero reaches the villain decision (hero's continue mass).
-    hero_cont_mass: f64,
-}
-
-#[cfg(test)]
-impl Exploitability {
-    /// Reach-weighted NashConv, bb: hero gap (always on-path) + villain gap scaled
-    /// by how often hero actually continues to the villain node.
-    fn reach_weighted(&self) -> f64 {
-        self.hero_gap + self.vill_gap * self.hero_cont_mass
-    }
-}
-
-/// Compute the decomposed exploitability of a solved bucket. Reuses the EXACT same
-/// fold / vill-fold / showdown terminal definitions as `solve_bucket_full` (incl.
-/// the F2 all-in symmetry and the best-of-N defender field model), so the numbers
-/// are the regrets the solver itself drove toward zero.
-#[cfg(test)]
-fn bucket_exploitability(sol: &BucketSolution, matrix: &EquityMatrix) -> Exploitability {
-    let n = N_CLASSES;
-    let pm = &sol.pm;
-    let prior = class_prior(&all_hand_keys());
-
-    let final_pot = pm.dead + pm.hero_cont + pm.vill_cont;
-    let hero_ev_fold = -pm.hero_in;
-    // U06: villain fold pays hero the whole pot; net = dead + vill_in (see solver).
-    let hero_ev_vill_fold = pm.dead + pm.vill_in;
-    let vill_ev_fold = -pm.vill_in;
-
-    // SAME shared terminal definitions the solver used (F7) — incl. the F2 all-in
-    // raw-equity symmetry — so the measured gaps are the regrets the solver itself
-    // drove toward zero, not a re-derived (and potentially divergent) copy.
-    let hero_ev_showdown = |h: usize, v: usize| -> f64 {
-        hero_showdown_ev(
-            matrix.get(h, v),
-            sol.hero_r[h],
-            pm.hero_allin,
-            final_pot,
-            pm.hero_cont,
-        )
-    };
-    let vill_ev_call = |h: usize, v: usize| -> f64 {
-        villain_call_ev(
-            1.0 - matrix.get(h, v),
-            sol.vill_r[v],
-            pm.hero_allin,
-            final_pot,
-            pm.vill_cont,
-        )
-    };
-
-    let nd = pm.n_defenders.max(1);
-
-    // ---- Field stats vs the villain AVERAGE strategy (mirrors the solver) ----
-    let mut p_fold_one = 0.0;
-    for v in 0..n {
-        let pv = sol.vrange[v];
-        if pv <= 0.0 {
-            continue;
-        }
-        p_fold_one += pv * (1.0 - sol.vill_call[v]);
-    }
-    if pm.mdf_applies && nd >= 1 {
-        p_fold_one = p_fold_one.min(1.0 - MDF_FLOOR);
-    }
-    let p_all_fold = p_fold_one.powi(nd as i32);
-    let call_mass: f64 = (0..n).map(|v| sol.vrange[v] * sol.vill_call[v]).sum();
-
-    // Hero's CONTINUE EV per class vs the villain average strategy.
-    let hero_cont_ev = |h: usize| -> f64 {
-        if call_mass <= 0.0 {
-            return hero_ev_vill_fold;
-        }
-        let mut sd = 0.0;
-        let mut wsum = 0.0;
-        for v in 0..n {
-            let pv = sol.vrange[v] * sol.vill_call[v];
-            if pv <= 0.0 {
-                continue;
-            }
-            let v_eq_vs_hero = 1.0 - matrix.get(h, v);
-            let w = pv * v_eq_vs_hero.powi((nd - 1) as i32);
-            sd += w * hero_ev_showdown(h, v);
-            wsum += w;
-        }
-        let contest_ev = if wsum > 0.0 {
-            sd / wsum
-        } else {
-            hero_ev_vill_fold
-        };
-        p_all_fold * hero_ev_vill_fold + (1.0 - p_all_fold) * contest_ev
-    };
-
-    // Hero: average value vs best-response value (prior-weighted).
-    let mut hero_avg = 0.0;
-    let mut hero_br = 0.0;
-    for (h, &f) in sol.hero_freq.iter().enumerate() {
-        let cont = hero_cont_ev(h);
-        hero_avg += prior[h] * (f * cont + (1.0 - f) * hero_ev_fold);
-        hero_br += prior[h] * cont.max(hero_ev_fold);
-    }
-
-    // Villain faces hero's CONTINUE reach (prior × hero continue freq).
-    let hero_cont_reach: Vec<f64> = (0..n).map(|h| prior[h] * sol.hero_freq[h]).collect();
-    let cont_mass: f64 = hero_cont_reach.iter().sum();
-    let vill_call_ev = |v: usize| -> f64 {
-        if cont_mass <= 0.0 {
-            return 0.0;
-        }
-        let mut ev = 0.0;
-        for (h, &rw) in hero_cont_reach.iter().enumerate() {
-            if rw <= 0.0 {
-                continue;
-            }
-            ev += rw * vill_ev_call(h, v);
-        }
-        ev / cont_mass
-    };
-
-    // Villain: average value vs best-response value (vrange-weighted).
-    let mut vill_avg = 0.0;
-    let mut vill_br = 0.0;
-    for v in 0..n {
-        let pv = sol.vrange[v];
-        if pv <= 0.0 {
-            continue;
-        }
-        let call = vill_call_ev(v);
-        let c = sol.vill_call[v];
-        vill_avg += pv * (c * call + (1.0 - c) * vill_ev_fold);
-        vill_br += pv * call.max(vill_ev_fold);
-    }
-
-    Exploitability {
-        hero_gap: hero_br - hero_avg,
-        vill_gap: vill_br - vill_avg,
-        hero_cont_mass: cont_mass,
-    }
-}
-
-// --------------------------------------------------------------------------
-// Convenience: the canonical key order (re-exported for the generator/tests).
+// Convenience: the canonical key order (re-exported for the generator).
 // --------------------------------------------------------------------------
 
 /// Canonical 169 hand-key order (pairs, suited, offsuit), from
@@ -1340,6 +1172,3 @@ fn bucket_exploitability(sol: &BucketSolution, matrix: &EquityMatrix) -> Exploit
 pub fn canonical_keys() -> Vec<String> {
     all_hand_keys()
 }
-
-#[cfg(test)]
-mod tests;

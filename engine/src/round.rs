@@ -838,6 +838,3 @@ impl BettingRound {
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

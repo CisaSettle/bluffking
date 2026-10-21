@@ -650,36 +650,3 @@ fn build_contributor_claim(
     let claim_sig = sig.sign(signer, &claim_hash);
     Some((signer.to_string(), claim_sig))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::provider::DealRequest;
-
-    fn request(num_players: u8) -> DealRequest {
-        DealRequest {
-            hand_id: "hand-test".into(),
-            table_id: "table-test".into(),
-            num_players,
-            button_seat: 0,
-            big_blind: 2,
-            small_blind: 1,
-        }
-    }
-
-    #[test]
-    fn deals_at_the_largest_size_that_fits_one_deck() {
-        // 23 players → 2*23 + 5 = 51 cards, the largest that fits a 52-card deck.
-        let dealt = MentalPokerDealingProvider::deterministic().deal(&request(23));
-        assert_eq!(dealt.deck.len(), DECK_SIZE);
-    }
-
-    #[test]
-    #[should_panic(expected = "players to fit one 52-card deck")]
-    fn rejects_too_many_players_with_a_clear_message() {
-        // 24 players would need 2*24 + 5 = 53 cards and previously panicked deep
-        // inside plan_events with an opaque slice-index error. The defensive
-        // guard now rejects it loudly at the provider boundary.
-        let _ = MentalPokerDealingProvider::deterministic().deal(&request(24));
-    }
-}
