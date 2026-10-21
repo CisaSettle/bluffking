@@ -1343,17 +1343,17 @@ pub async fn configure_or_launch() -> Result<Option<tokio::process::Child>, Stri
                 "sealed dealer exited before becoming ready at {addr}: {status}"
             ));
         }
-        if {
-            let mut request = http
-                .get(&health_url)
-                .header(INTERNAL_TOKEN_HEADER, &worker_credential)
-                .build()
-                .map_err(|e| e.to_string())?;
-            authorization::sign(&mut request)?;
-            http.execute(request)
-                .await
-                .is_ok_and(|response| response.status().is_success())
-        } {
+        let mut request = http
+            .get(&health_url)
+            .header(INTERNAL_TOKEN_HEADER, &worker_credential)
+            .build()
+            .map_err(|e| e.to_string())?;
+        authorization::sign(&mut request)?;
+        let healthy = http
+            .execute(request)
+            .await
+            .is_ok_and(|response| response.status().is_success());
+        if healthy {
             if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
                 return Err(format!(
                     "sealed dealer exited before becoming ready at {addr}: {status}"

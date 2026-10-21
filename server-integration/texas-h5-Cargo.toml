@@ -37,6 +37,15 @@ opt-level = 0
 # hundreds of MB. Opt in locally with CARGO_PROFILE_DEV_DEBUG when needed.
 debug = 0
 
+# Argon2id at the production parameters takes ~200 ms per hash unoptimized vs
+# ~11 ms optimized, so debug-server register/login crossed the 100 ms latency
+# alert. Optimize only the hashing crates; dev/test then match release cost.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
+
 [profile.test]
 debug = 0
 
