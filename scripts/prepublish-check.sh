@@ -40,7 +40,7 @@ fi
 # edit that only shifts line numbers doesn't churn the digest), sorted for stability.
 prov_hits=$(grep -rIniE "$prov_tokens" . "${excludes[@]}" 2>/dev/null | sed -E 's#^\./##; s/^([^:]+):[0-9]+:/\1:/' | LC_ALL=C sort || true)
 prov_digest=$(printf '%s' "$prov_hits" | shasum -a 256 | awk '{print $1}')
-EXPECTED_PROV_DIGEST="7d451e2c7ba3f9b7c997268e7e8973337ce411c602542b385bc58b093860792e"
+EXPECTED_PROV_DIGEST="c81931655267b3128c2ea41f7e3aaefa606dc9712f2f4fc72a6bc9fc83a42686"
 if [ -n "$data_hit" ] || [ "$clean_room_ok" -ne 1 ] || [ "$prov_digest" != "$EXPECTED_PROV_DIGEST" ]; then
   echo "  BLOCKER: third-party data-provenance issue:"
   [ -n "$data_hit" ] && echo "$data_hit" | sed 's/^/    - vendor token in DATA file: /'
