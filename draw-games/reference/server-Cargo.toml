@@ -66,10 +66,10 @@ rand = "0.8"
 futures = "0.3"
 
 # ADR-043 deleted the old hint SSE relay; ADR-107 uses one bounded JSON request
-# for conversational coach answers. `reqwest` also calls Google's tokeninfo
+# for conversational coach answers. `reqwest` also fetches Google's public keys
 # endpoint for the OAuth ID-token verification path. Default native-tls TLS
 # (matches sqlx's runtime-tokio-native-tls — do NOT add rustls and split the TLS
-# stack); the "json" feature gives us `.json()` decode of the tokeninfo response.
+# stack); the "json" feature decodes provider JSON responses.
 reqwest = { version = "0.12", features = ["json"] }
 # tokio-stream for ReceiverStream (SSE sender→stream bridge in coach handler).
 tokio-stream = "0.1"
@@ -105,8 +105,8 @@ url = "2"
 # domains so unicode/punycode variants collapse to ONE ownership key. Already
 # in the lockfile transitively via `url` — no new dependency tree.
 idna = "1"
-# Sign in with Apple (ADR-074 §4): verify the RS256-signed Apple identity token
-# locally against Apple's JWKS (RS256-only allowlist, aud/iss/exp pins). Default
+# Google and Apple sign-in: verify RS256 identity tokens locally against
+# cached provider JWKS (RS256-only allowlist, aud/iss/exp pins). Default
 # features include the `rsa` validator used by `DecodingKey::from_rsa_components`.
 jsonwebtoken = "9"
 # App Store Server Notifications V2: validate ES256 JWS signatures and the x5c
