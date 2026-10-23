@@ -1,8 +1,8 @@
 //! Shared plumbing for the dealer rooms, 百家乐 and 押大小.
 //!
 //! A room lives in this process's memory while it is open, like every other
-//! live table: polls, wagers and settlement change the in-memory state and
-//! answer at once, and an ordered per-room writer ([`crate::write_behind`])
+//! live table: polls, wagers and settlement change the in-memory state, and
+//! an ordered per-room writer ([`crate::write_behind`])
 //! commits each accepted change — a settled round's wallets, ledger, records
 //! and round row together with the room snapshot — in one transaction, in
 //! order, retrying until it lands. Seated players' wallets are the in-memory
@@ -12,6 +12,8 @@
 //! earlier writes have. The host table-owner lock (`crate::runtime_owner`)
 //! routes every room request to one process, which recovers all rooms from
 //! their rows before serving and drains its writers before exiting.
+//! Games with precommitted draws additionally require durable commitment and
+//! wager snapshots before acknowledging bets (`REQUIRE_DURABLE_BETS`).
 //!
 //! The games differ only in rules, wagers, views and round receipts, which
 //! implement [`DealerRoom`]; storage, membership, HTTP and the dealer loop
@@ -69,6 +71,9 @@ pub trait DealerRoom: Send + Sync + Sized + 'static {
     /// Seats per room, humans and AI co-bettors together.
     const MAX_MEMBERS: usize;
     const POLICY: wallet::Policy;
+    /// A committed draw must be durable before accepting a wager, and the
+    /// accepted wager must be durable before its HTTP acknowledgement.
+    const REQUIRE_DURABLE_BETS: bool = false;
     /// The `POST …/bet` body.
     type Bet: DeserializeOwned + Send;
     type State: Clone + Serialize + DeserializeOwned + Send + Sync + 'static;
@@ -1036,18 +1041,52 @@ pub async fn place_bet<R: DealerRoom>(
     let shared = R::registry()
         .room(code)
         .ok_or(Error::Code("room_not_found"))?;
+    let durable_round = if R::REQUIRE_DURABLE_BETS {
+        let (round, durable) = {
+            let room = shared.lock().await;
+            seated(&room, uid)?;
+            if room.members.get(&uid).is_some_and(|m| m.leaving) {
+                return Err(Error::Code("bet_closed"));
+            }
+            (R::round_id(&room.state), room.writer.durable())
+        };
+        // Waiting outside the room lock lets the dealer and other requests
+        // continue. A failed wait has not accepted or changed this wager.
+        tokio::time::timeout(Duration::from_secs(2), durable)
+            .await
+            .map_err(|_| Error::Unavailable)?
+            .map_err(|_| Error::Unavailable)?;
+        Some(round)
+    } else {
+        None
+    };
     let mut room = shared.lock().await;
     seated(&room, uid)?;
     if room.members.get(&uid).is_some_and(|m| m.leaving) {
         return Err(Error::Code("bet_closed"));
     }
+    if durable_round.is_some_and(|round| round != R::round_id(&room.state)) {
+        return Err(Error::Code("bet_closed"));
+    }
     room.touched = Instant::now();
     let mut next = room.state.as_ref().clone();
+    // Check the round and deadline again after the persistence wait.
     if R::bet(&mut next, uid, bet, balance::<R>(uid), now_ms())? {
         accept(code, &mut room, next, None)?;
         room.idle.activity();
     }
-    Ok(view(code, &room, uid))
+    let response = view(code, &room, uid);
+    let durable = R::REQUIRE_DURABLE_BETS.then(|| room.writer.durable());
+    drop(room);
+    if let Some(durable) = durable {
+        // Timeout is an unknown acknowledgement, not a rollback: the ordered
+        // writer retains the accepted snapshot, and an exact retry is safe.
+        tokio::time::timeout(Duration::from_secs(2), durable)
+            .await
+            .map_err(|_| Error::Unavailable)?
+            .map_err(|_| Error::Unavailable)?;
+    }
+    Ok(response)
 }
 
 /// Waits until everything the room's writer has accepted so far is durable.

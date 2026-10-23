@@ -4,14 +4,12 @@ use super::{
     store::{self, Purchase, TicketRow, TICKET_COLUMNS},
     Game, POLICY,
 };
-use crate::wallet;
+use crate::{draw_fairness, wallet};
 use chrono::Utc;
-use rand::{rngs::OsRng, Rng};
+use draw_games::scratch;
 use serde_json::{json, Value};
 use sqlx::{PgConnection, PgPool, Row};
 use uuid::Uuid;
-
-const PRIZES: [i64; 6] = [1, 1, 2, 2, 5, 10];
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -19,6 +17,8 @@ pub struct ScratchBuy {
     pub request_id: Uuid,
     pub cost: i64,
     pub count: usize,
+    #[serde(default)]
+    pub fairness: Option<draw_fairness::Challenge>,
 }
 
 pub fn project(out: &mut Value, ticket: &TicketRow) {
@@ -32,23 +32,47 @@ pub fn project(out: &mut Value, ticket: &TicketRow) {
             }
         })
         .collect();
-    // Replace both copies: never leave the persisted secret inside `entry`.
-    out["entry"] = json!({"cost": ticket.cost, "lucky": ticket.entry["lucky"], "numbers": numbers});
+    let all = (0..6).all(|i| revealed.get(i) == Some(&true));
+    let fairness = match ticket.entry.get("fairness") {
+        // Verify the card and award actually returned by storage, not a
+        // second, potentially divergent copy inside the stored proof.
+        Some(proof) if all => json!({
+            "kind": "scratch", "reveal": proof["reveal"],
+            "cost": ticket.cost, "count": proof["count"], "index": proof["index"],
+            "numbers": ticket.entry["numbers"], "lucky": ticket.entry["lucky"],
+            "prize": ticket.prize, "hits": ticket.tier,
+        }),
+        Some(proof) => json!({
+            "kind": "scratch",
+            "commitment": {
+                "protocol": proof["reveal"]["protocol"],
+                "game": proof["reveal"]["game"],
+                "draw_id": proof["reveal"]["draw_id"],
+                "commitment": proof["reveal"]["commitment"],
+            },
+            "client_seed": proof["reveal"]["client_seed"],
+            "cost": ticket.cost,
+            "count": proof["count"],
+            "index": proof["index"],
+            "verified": false,
+        }),
+        None => json!({"kind": "scratch", "verified": false, "reason": "legacy"}),
+    };
+    // Whitelist both copies: the persisted proof contains the server seed and
+    // complete card, neither of which may escape before all six spots open.
+    out["entry"] = json!({"cost": ticket.cost, "lucky": ticket.entry["lucky"], "numbers": numbers, "fairness": fairness});
     out["lucky"] = ticket.entry["lucky"].clone();
     out["numbers"] = json!(numbers);
     out["revealed"] = json!(revealed);
+    out["fairness"] = fairness;
 }
 
-fn prize(entry: &Value, cost: i64) -> (i64, i16) {
-    let mut total = 0;
-    let mut hits = 0;
-    for (i, factor) in PRIZES.iter().enumerate() {
-        if entry["numbers"][i] == entry["lucky"] {
-            total += cost * factor;
-            hits += 1;
-        }
-    }
-    (total, hits)
+fn prize(entry: &Value, cost: i64) -> Result<(i64, i16), Error> {
+    let numbers: [i16; 6] =
+        serde_json::from_value(entry["numbers"].clone()).map_err(|_| Error::InvalidEntry)?;
+    let lucky: i16 =
+        serde_json::from_value(entry["lucky"].clone()).map_err(|_| Error::InvalidEntry)?;
+    scratch::payout(cost, lucky, &numbers).map_err(|_| Error::InvalidEntry)
 }
 
 pub async fn buy(pool: &PgPool, user: Uuid, body: &ScratchBuy) -> Result<Purchase, Error> {
@@ -64,7 +88,15 @@ pub async fn buy(pool: &PgPool, user: Uuid, body: &ScratchBuy) -> Result<Purchas
     } else {
         super::purchase_id(user, body.request_id)
     };
-    let hash = store::body_sha256(&json!({"game":"scratch", "cost":body.cost, "count":body.count}));
+    let mut identity = json!({"game":"scratch", "cost":body.cost, "count":body.count});
+    if let Some(fairness) = &body.fairness {
+        identity["fairness"] = json!({
+            "offer_id": fairness.offer_id,
+            "commitment": fairness.commitment,
+            "client_seed": fairness.client_seed,
+        });
+    }
+    let hash = store::body_sha256(&identity);
     store::ensure_wallet(pool, user).await?;
     {
         let mut conn = pool.acquire().await?;
@@ -93,13 +125,31 @@ pub async fn buy(pool: &PgPool, user: Uuid, body: &ScratchBuy) -> Result<Purchas
     if charged > before {
         return Err(Error::InsufficientBalance);
     }
+    // Legacy purchases replay above without an offer. Every new purchase must
+    // consume the previously published commitment in this same transaction.
+    let challenge = body.fairness.as_ref().ok_or(Error::InvalidEntry)?;
+    let proof = draw_fairness::claim(&mut tx, user, "scratch", body.request_id, challenge)
+        .await
+        .map_err(|error| match error {
+            draw_fairness::ClaimError::Invalid => Error::InvalidEntry,
+            draw_fairness::ClaimError::Conflict => Error::RequestConflict,
+            draw_fairness::ClaimError::Db(error) => Error::Db(error),
+        })?;
+    let generated =
+        scratch::generate(&proof, body.cost, body.count).map_err(|_| Error::InvalidEntry)?;
     let now = Utc::now();
     let mut cards = Vec::with_capacity(body.count);
-    for _ in 0..body.count {
-        let numbers: Vec<i16> = (0..6).map(|_| OsRng.gen_range(1..=30)).collect();
-        let entry =
-            json!({"cost":body.cost, "lucky":OsRng.gen_range(1..=30i16), "numbers":numbers});
-        let (paid, tier) = prize(&entry, body.cost);
+    for (index, card) in generated.into_iter().enumerate() {
+        let fairness = json!({
+            "kind": "scratch", "reveal": proof,
+            "cost": body.cost, "count": body.count, "index": index,
+            "numbers": card.numbers, "lucky": card.lucky,
+            "prize": card.prize, "hits": card.hits,
+        });
+        let entry = json!({
+            "cost": body.cost, "lucky": card.lucky, "numbers": card.numbers,
+            "fairness": fairness,
+        });
         cards.push(TicketRow {
             id: Uuid::new_v4(),
             purchase_id: record_id,
@@ -110,9 +160,10 @@ pub async fn buy(pool: &PgPool, user: Uuid, body: &ScratchBuy) -> Result<Purchas
             multiplier: 1,
             cost: body.cost,
             revealed: Some(vec![batch; 6]),
-            prize: batch.then_some(paid),
-            tier: batch.then_some(tier),
+            prize: batch.then_some(card.prize),
+            tier: batch.then_some(card.hits),
             settled_at: batch.then_some(now),
+            proof_plan: None,
         });
     }
     let paid: i64 = cards.iter().filter_map(|t| t.prize).sum();
@@ -227,7 +278,7 @@ async fn reveal_inner(
     let mut paid = 0;
     if all {
         let (amount, tier) = if balance.is_some() {
-            prize(&card.entry, card.cost)
+            prize(&card.entry, card.cost)?
         } else {
             (0, 0)
         };

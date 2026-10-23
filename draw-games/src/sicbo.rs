@@ -8,7 +8,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use rand::{rngs::OsRng, Rng};
+pub use draw_games::sicbo::{wins, Side, MAX_STAKE, MIN_STAKE};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::{PgPool, Row};
@@ -18,15 +18,6 @@ pub const POLICY: wallet::Policy = wallet::Policy {
     game: crate::game_catalog::SICBO,
     grant: 1_000,
 };
-pub const MIN_STAKE: i64 = 10;
-pub const MAX_STAKE: i64 = 1_000;
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum Side {
-    Small,
-    Big,
-}
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Bet {
@@ -34,6 +25,9 @@ pub struct Bet {
     pub side: Side,
     pub stake: i64,
     pub session_id: Uuid,
+    /// Required only for a new roll; historical request retries stay readable.
+    #[serde(default)]
+    pub fairness: Option<crate::draw_fairness::Challenge>,
 }
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Receipt {
@@ -44,6 +38,9 @@ pub struct Receipt {
     pub total: u8,
     pub triple: bool,
     pub won: bool,
+    /// Existing ledger receipts never acquire a fabricated proof on readback.
+    #[serde(default)]
+    pub fairness: Option<serde_json::Value>,
 }
 #[derive(Debug, Serialize)]
 pub struct BetResult {
@@ -53,16 +50,6 @@ pub struct BetResult {
     pub delta: i64,
 }
 
-pub fn wins(dice: [u8; 3], side: Side) -> bool {
-    if dice[0] == dice[1] && dice[1] == dice[2] {
-        return false;
-    }
-    let total: u8 = dice.iter().sum();
-    match side {
-        Side::Small => (4..=10).contains(&total),
-        Side::Big => (11..=17).contains(&total),
-    }
-}
 #[derive(Debug)]
 pub enum Error {
     Invalid,
@@ -113,6 +100,15 @@ async fn saved(
     if receipt.side != bet.side || receipt.stake != bet.stake {
         return Err(Error::Conflict);
     }
+    if let (Some(challenge), Some(proof)) = (&bet.fairness, &receipt.fairness) {
+        let reveal = &proof["reveal"];
+        if reveal["draw_id"] != json!(challenge.offer_id)
+            || reveal["commitment"] != json!(challenge.commitment)
+            || reveal["client_seed"] != json!(challenge.client_seed)
+        {
+            return Err(Error::Conflict);
+        }
+    }
     Ok(Some(BetResult {
         receipt,
         balance,
@@ -158,9 +154,17 @@ pub async fn play(pool: &PgPool, user: Uuid, bet: &Bet) -> Result<BetResult, Err
     if bet.stake > balance {
         return Err(Error::Balance);
     }
-    let dice = std::array::from_fn(|_| OsRng.gen_range(1..=6));
+    let challenge = bet.fairness.as_ref().ok_or(Error::Invalid)?;
+    let reveal = crate::draw_fairness::claim(&mut tx, user, "sicbo", bet.request_id, challenge)
+        .await
+        .map_err(|error| match error {
+            crate::draw_fairness::ClaimError::Invalid => Error::Invalid,
+            crate::draw_fairness::ClaimError::Conflict => Error::Conflict,
+            crate::draw_fairness::ClaimError::Db(error) => Error::Db(error),
+        })?;
+    let dice = draw_games::sicbo::draw(&reveal).map_err(|_| Error::Invalid)?;
     let won = wins(dice, bet.side);
-    let delta = if won { bet.stake } else { -bet.stake };
+    let delta = draw_games::sicbo::delta(dice, bet.side, bet.stake);
     let receipt = Receipt {
         request_id: bet.request_id,
         side: bet.side,
@@ -169,6 +173,9 @@ pub async fn play(pool: &PgPool, user: Uuid, bet: &Bet) -> Result<BetResult, Err
         total: dice.iter().sum(),
         triple: dice[0] == dice[1] && dice[1] == dice[2],
         won,
+        fairness: Some(draw_games::sicbo::payout_proof(
+            &reveal, dice, bet.side, bet.stake,
+        )),
     };
     let play = wallet::Play {
         record_id: bet.request_id,
@@ -229,8 +236,10 @@ pub async fn profile(
     let wallet = wallet::ensure(&state.pool, POLICY, auth.user_id).await?;
     crate::casino_room::recover::<crate::sicbo_room::SicboRoom>(&state.pool).await?;
     let room = crate::sicbo_room::current_room(auth.user_id);
+    let fairness_offer = crate::draw_fairness::offer(&state.pool, auth.user_id, "sicbo").await?;
     Ok(Json(
-        json!({ "wallet":wallet, "room":room, "min_stake":MIN_STAKE, "max_stake":MAX_STAKE }),
+        json!({ "wallet":wallet, "room":room, "min_stake":MIN_STAKE, "max_stake":MAX_STAKE,
+            "fairness_offer":fairness_offer }),
     ))
 }
 pub async fn bet(

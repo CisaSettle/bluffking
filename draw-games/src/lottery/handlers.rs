@@ -22,6 +22,8 @@ pub enum Error {
     BeansInUse,
     TicketNotFound,
     AlreadySettled,
+    FairnessRequired,
+    Proof(String),
     Db(sqlx::Error),
 }
 impl From<sqlx::Error> for Error {
@@ -41,6 +43,11 @@ impl IntoResponse for Error {
             Self::BeansInUse => (StatusCode::CONFLICT, "beans_in_use"),
             Self::TicketNotFound => (StatusCode::NOT_FOUND, "ticket_not_found"),
             Self::AlreadySettled => (StatusCode::CONFLICT, "already_settled"),
+            Self::FairnessRequired => (StatusCode::CONFLICT, "fairness_required"),
+            Self::Proof(reason) => {
+                tracing::warn!(%reason, "lottery proof unavailable");
+                (StatusCode::SERVICE_UNAVAILABLE, "proof_unavailable")
+            }
             Self::Db(e) => {
                 tracing::error!(error=%e, "lottery storage failed");
                 (StatusCode::SERVICE_UNAVAILABLE, "storage_unavailable")
@@ -135,4 +142,13 @@ pub async fn tickets(
     Ok(Json(
         json!({"tickets":store::tickets(&state.pool, auth.user_id, game(&name)?, q.limit.unwrap_or(50).clamp(1,100)).await?}),
     ))
+}
+
+/// Public draw evidence: the announced plan before the draw, and the exact
+/// verified drand pulse plus reproducible numbers afterwards.
+pub async fn proof(
+    State(state): State<AppState>,
+    Path((name, period)): Path<(String, i64)>,
+) -> Result<Json<Value>, Error> {
+    Ok(Json(store::proof(&state.pool, game(&name)?, period).await?))
 }

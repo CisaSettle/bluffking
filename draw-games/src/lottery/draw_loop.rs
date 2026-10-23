@@ -6,7 +6,7 @@ use super::{
     Game, POLICY,
 };
 use crate::wallet;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use serde_json::json;
 use sqlx::{PgPool, Row};
 use std::time::{Duration, Instant};
@@ -49,27 +49,70 @@ pub async fn run(pool: PgPool) {
 
 async fn draw_one(pool: &PgPool, game: Game) -> Result<(), Error> {
     let schedule = game.schedule().ok_or(Error::InvalidEntry)?;
-    let latest = schedule.period(schedule.period_at(super::now_ms()).id - 1);
+    let current = schedule.period_at(super::now_ms());
+    let latest = current.id - 1;
+    // Persist the plan while this period is selling, even when its hall has no
+    // visitors. Never create an already elapsed period with a retrospective plan.
+    {
+        let mut conn = pool.acquire().await?;
+        store::ensure_period(&mut conn, game, &current).await?;
+    }
+    let candidate = sqlx::query("SELECT period,proof_plan FROM lottery_periods WHERE game=$1 AND status <> 'settled' AND status='open' AND draw_at<=now() AND (proof_plan IS NOT NULL OR tickets>0 OR period=$2) ORDER BY period LIMIT 1")
+        .bind(game.as_str()).bind(latest).fetch_optional(pool).await?;
+    let Some(candidate) = candidate else {
+        return Ok(());
+    };
+    let period: i64 = candidate.get("period");
+    let plan_value: Option<serde_json::Value> = candidate.get("proof_plan");
+    // HTTP and BLS verification run before taking a transaction, account lock,
+    // wallet lock or period lock. No replacement pulse or OS-random fallback is
+    // permitted for a planned period; an outage leaves exactly this draw queued.
+    let proof = if let Some(value) = &plan_value {
+        let plan: draw_games::lottery::Plan = serde_json::from_value(value.clone())
+            .map_err(|_| Error::Proof("invalid stored draw plan".into()))?;
+        plan.validate().map_err(Error::Proof)?;
+        if plan.game != game.as_str() || plan.period != period {
+            return Err(Error::Proof("draw plan belongs to another period".into()));
+        }
+        let Some(beacon) = super::beacon::fetch(plan.beacon_round)
+            .await
+            .map_err(Error::Proof)?
+        else {
+            return Ok(());
+        };
+        Some(draw_games::lottery::DrawProof::new(plan, beacon).map_err(Error::Proof)?)
+    } else {
+        None
+    };
     let mut tx = pool.begin().await?;
-    // Contention aborts this attempt; committed tickets remain queued for the next tick.
     sqlx::query(
         "SELECT set_config('lock_timeout','500ms',true),set_config('statement_timeout','2s',true)",
     )
     .execute(&mut *tx)
     .await?;
-    // Only current-1 can be created here: retention can never regenerate old draws.
-    sqlx::query("INSERT INTO lottery_periods (game,period,opens_at,draw_at) VALUES ($1,$2,$3,$4) ON CONFLICT (game,period) DO NOTHING")
-        .bind(game.as_str()).bind(latest.id)
-        .bind(DateTime::from_timestamp_millis(latest.opens_ms).ok_or(Error::InvalidEntry)?)
-        .bind(DateTime::from_timestamp_millis(latest.draw_ms).ok_or(Error::InvalidEntry)?)
-        .execute(&mut *tx).await?;
-    let period: Option<i64> = sqlx::query_scalar("SELECT period FROM lottery_periods WHERE game=$1 AND status <> 'settled' AND status='open' AND draw_at<=now() AND (tickets>0 OR period=$2) ORDER BY period LIMIT 1 FOR UPDATE SKIP LOCKED")
-        .bind(game.as_str()).bind(latest.id).fetch_optional(&mut *tx).await?;
-    if let Some(period) = period {
-        let (numbers, bonus, bonus_numbers) = super::rules::draw(game);
-        sqlx::query("UPDATE lottery_periods SET status='drawn',numbers=$3,bonus=$4,bonus_numbers=$5,drawn_at=now() WHERE game=$1 AND period=$2 AND status='open'")
-            .bind(game.as_str()).bind(period).bind(numbers).bind(bonus).bind(bonus_numbers).execute(&mut *tx).await?;
+    let row = sqlx::query("SELECT proof_plan FROM lottery_periods WHERE game=$1 AND period=$2 AND status='open' AND draw_at<=now() FOR UPDATE SKIP LOCKED")
+        .bind(game.as_str()).bind(period).fetch_optional(&mut *tx).await?;
+    let Some(row) = row else {
+        return Ok(());
+    };
+    if row.get::<Option<serde_json::Value>, _>("proof_plan") != plan_value {
+        return Err(Error::Proof(
+            "draw plan changed while awaiting its beacon".into(),
+        ));
     }
+    let (numbers, bonus, bonus_numbers) = match &proof {
+        Some(proof) => (
+            proof.numbers.clone(),
+            proof.bonus,
+            proof.bonus_numbers.clone(),
+        ),
+        // Existing unproved sales settle under their original random draw path.
+        // They stay explicitly legacy in every API and never receive a proof.
+        None => super::rules::legacy_draw(game),
+    };
+    sqlx::query("UPDATE lottery_periods SET status='drawn',numbers=$3,bonus=$4,bonus_numbers=$5,drawn_at=now(),draw_proof=$6 WHERE game=$1 AND period=$2 AND status='open'")
+        .bind(game.as_str()).bind(period).bind(numbers).bind(bonus).bind(bonus_numbers)
+        .bind(proof.map(|p| json!(p))).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(())
 }

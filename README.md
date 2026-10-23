@@ -2,7 +2,7 @@
 
 # BluffKing — Poker &amp; Draw Games
 
-**Pure-Rust poker rules, equity / post-hand solvers and verifiable dealing, plus the lottery and dice draw backend source.**
+**Pure-Rust poker rules, equity / post-hand solvers and verifiable dealing, plus public lottery/dice draw rules and an offline proof verifier.**
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
 [![Rust 2021](https://img.shields.io/badge/Rust-2021-orange.svg)](https://www.rust-lang.org)
@@ -27,10 +27,18 @@ English · [中文](#中文)
 | [`mental-poker/`](mental-poker) | Verifiable, commit–reveal dealing: a commit–reveal scheme plus a signed, append-only hash-chain transcript and **offline verifiers** (`pf_verify`, `mp-verify`). Also includes the real **server-blind** crypto path (n-of-n re-encryption-mixnet shuffle + threshold decryption) that powers the live *engine-blind* tables (cross-vendor AI-audited; open-source + independently verifiable). Depends on `engine` only for the `Card` type. |
 | [`mp-wasm/`](mp-wasm) | A `wasm-bindgen` surface over `mental_poker::crypto_real` (the real server-blind path) so a browser can run the verifiable dealing locally. A detached crate with its own workspace. |
 | [`gto-solver/`](gto-solver) | Wraps the open-source **AGPL-3.0** `postflop-solver` (Discounted-CFR) behind BluffKing engine types (ADR-012); powers the free public `POST /api/tools/poker/solve` study tool. Its AGPL dependency is why this repo is AGPL-3.0. |
+| [`draw-games/verifier/`](draw-games/verifier) | Shared deterministic lottery, scratch-card and Sicbo rules, pinned drand verification, and the network-free `draw-verify` CLI. Detached workspace; used by the backend code in this snapshot. **This new proof protocol is not yet deployed to production.** |
 
 ### Lottery and dice draws
 
-[`draw-games/`](draw-games) contains the exact server source for SSQ, Daletou, TOTO, Happy8, Fucai3D, scratch cards and Sicbo, including draw selection, prize rules and selected settlement/recovery dependencies. Like the sealed dealer source offer, it is not a standalone build target. These games use the OS RNG; they do not currently provide poker-style commitments, seed reveals or offline-verifiable draw transcripts. [Scope and source guide (中文 / English)](draw-games/index.html).
+[`draw-games/`](draw-games) publishes the inputs, draw/prize rules and selected settlement/recovery source for SSQ, Daletou, TOTO, Happy8, Fucai3D, scratch cards and Sicbo. Scheduled draws bind a fixed future drand round and verify its BLS signature; scratch cards and solo Sicbo combine a precommitted server seed with a browser-generated player seed. Room Sicbo exposes commitments and reveals, with explicit operator-preknowledge and abort limitations. The shared [`verifier/`](draw-games/verifier) crate builds independently and replays proofs without a server; raw [`src/`](draw-games/src) files are integration source, not a standalone server.
+
+**The proof protocol in this source snapshot has not yet been deployed to production.** Proof generation requires the matching backend/client version. Publishing source does not attest the deployed binary, actual wallet credits or publication time. Legacy records remain without proofs; saved pre-bet receipts provide the input comparison, not a signed timestamp or global append-only log. [Protocol, retention, commands and source guide (中文 / English)](draw-games/index.html).
+
+```bash
+cargo build --locked --manifest-path draw-games/verifier/Cargo.toml
+./draw-games/verifier/target/debug/draw-verify proof.json --receipt pre-draw-receipt.json
+```
 
 ### Why verifiable dealing
 
@@ -101,10 +109,18 @@ section) and [`SECURITY.md`](SECURITY.md).
 | [`mental-poker/`](mental-poker) | 可验证发牌(commit–reveal):commit–reveal 承诺-揭示方案 + 签名的只追加哈希链 transcript + **离线验证器**(`pf_verify`、`mp-verify`)。另含真实的**服务端盲发**路径(n-of-n 重加密混洗 + 门限解密),驱动线上 *engine-blind* 牌桌(经 AI 跨厂商审计;开源且可独立验证)。仅依赖 `engine` 的 `Card` 类型。 |
 | [`mp-wasm/`](mp-wasm) | 对 `mental_poker::crypto_real`(真实服务端盲发路径)的 `wasm-bindgen` 封装,让浏览器本地运行可验证发牌。独立 crate,自带 workspace。 |
 | [`gto-solver/`](gto-solver) | 封装开源 **AGPL-3.0** 的 `postflop-solver`(Discounted-CFR),隐藏在 BluffKing engine 类型之后(ADR-012);为免费公开的 `POST /api/tools/poker/solve` 学习工具提供支持。它的 AGPL 依赖是本仓库采用 AGPL 的原因。 |
+| [`draw-games/verifier/`](draw-games/verifier) | 彩票、刮刮乐与骰宝共用的确定性规则、固定 drand 签名验证和不联网的 `draw-verify` 命令行。自带工作区,由本版本后台代码直接引用。**新证明协议尚未部署到生产。** |
 
 ### 彩票与骰宝开奖
 
-[`draw-games/`](draw-games) 公开双色球、大乐透、TOTO、快乐8、福彩3D、刮刮乐和骰宝的原始服务端源码,包括抽样、奖级计算及相关结算/恢复依赖。与密封发牌源码一样,它不是独立构建目标。这些游戏使用系统随机数,目前没有扑克式承诺、种子揭示或可离线核验的开奖记录。[范围与源码导读(中文 / English)](draw-games/index.html)。
+[`draw-games/`](draw-games) 公开双色球、大乐透、TOTO、快乐8、福彩3D、刮刮乐和骰宝的开奖输入、抽样、奖级计算与相关结算/恢复源码。定期开奖固定未来 drand 轮次并验证 BLS 签名；刮刮乐及单人骰宝结合预先承诺的服务器种子与浏览器玩家种子。骰宝房间公开承诺与揭示,同时保留运营方预知结果和中止的明确限制。共用的 [`verifier/`](draw-games/verifier) 可以独立构建、离线重算证明；原始 [`src/`](draw-games/src) 是服务集成源码,不能作为独立服务器构建。
+
+**此源码版本的证明协议尚未部署到生产**,生成证明需要配套后台与客户端。发布源码不证明线上二进制身份、实际钱包入账或公布时间。历史记录无证明时不会补造；开奖前保存的回执用于核对输入,不是签名时间戳或全局只追加日志。[协议、保存期限、使用命令与源码导航(中文 / English)](draw-games/index.html)。
+
+```bash
+cargo build --locked --manifest-path draw-games/verifier/Cargo.toml
+./draw-games/verifier/target/debug/draw-verify proof.json --receipt pre-draw-receipt.json
+```
 
 ### 为什么"可验证"发牌
 

@@ -28,6 +28,7 @@ name = "generate_bnb_hd_xpub"
 path = "examples/generate_bnb_hd_xpub.rs"
 
 [dependencies]
+draw-games = { path = "../draw-games/verifier" }
 libc = "0.2"
 engine = { path = "../engine" }
 mental-poker = { path = "../mental-poker" }
