@@ -241,6 +241,41 @@ pub async fn ensure_on(conn: &mut PgConnection, user: Uuid) -> sqlx::Result<()> 
     Ok(())
 }
 
+/// Credits a tournament reward on its outbox transaction. The caller holds the
+/// user and entry locks and marks the reward granted in the same transaction.
+/// Project the returned balance only after that transaction commits.
+pub(crate) async fn credit_tournament_on(
+    conn: &mut PgConnection,
+    user: Uuid,
+    edition: Uuid,
+    reward: Uuid,
+    amount: i64,
+) -> sqlx::Result<i64> {
+    if !(1..=1_000_000).contains(&amount) {
+        return Err(sqlx::Error::Protocol(
+            "invalid tournament bean award".into(),
+        ));
+    }
+    ensure_on(conn, user).await?;
+    let before = wallet::lock(conn, GAME, user)
+        .await?
+        .ok_or(sqlx::Error::RowNotFound)?;
+    let after = before
+        .checked_add(amount)
+        .ok_or_else(|| sqlx::Error::Protocol("beans balance overflow".into()))?;
+    sqlx::query("UPDATE wallets SET balance=$3,updated_at=now() WHERE user_id=$1 AND game=$2")
+        .bind(user)
+        .bind(GAME)
+        .bind(after)
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("INSERT INTO wallet_ledger(user_id,game,kind,delta,balance_after,details) VALUES($1,$2,'bonus',$3,$4,$5)")
+        .bind(user).bind(GAME).bind(amount).bind(after)
+        .bind(serde_json::json!({"reason":"tournament_participation","edition_id":edition,"tournament_reward_id":reward}))
+        .execute(&mut *conn).await?;
+    Ok(after)
+}
+
 /// Credits a paid pack. Caller holds the purchase row (status flip) in the
 /// same transaction.
 pub async fn credit_purchase_on(
@@ -324,7 +359,11 @@ pub struct LeaderboardRow {
 /// Top beans winners (lifetime net). Only QA identities are excluded: this
 /// is a player-facing board, not a growth metric, so staff accounts that play
 /// rank like everyone else.
-pub async fn leaderboard(pool: &PgPool, limit: i64, offset: i64) -> sqlx::Result<Vec<LeaderboardRow>> {
+pub async fn leaderboard(
+    pool: &PgPool,
+    limit: i64,
+    offset: i64,
+) -> sqlx::Result<Vec<LeaderboardRow>> {
     let rows = sqlx::query(&format!(
         "SELECT w.user_id, NULLIF(TRIM(u.display_name), '') AS display_name, w.net_won, w.hands_played \
          FROM wallets w JOIN users u ON u.id = w.user_id \
