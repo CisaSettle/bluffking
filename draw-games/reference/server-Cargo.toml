@@ -1,0 +1,160 @@
+[package]
+name = "server"
+version.workspace = true
+edition = "2021"
+# Never published to a registry — internal workspace crate (cargo-deny private).
+publish = false
+
+[lints]
+workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Lower only the dedicated, optional hand-analysis thread's scheduling priority.
+libc = "0.2"
+
+[[bin]]
+name = "server"
+path = "src/main.rs"
+
+[lib]
+name = "server"
+path = "src/lib.rs"
+
+[[example]]
+# ADR-086 Option B — OFFLINE ops tool: generates a fresh BIP-39 mnemonic +
+# derives the ADR's account-level xpub. Zero network calls, no DB connection
+# (no AppState/sqlx/reqwest anywhere in it) — run this fully offline.
+name = "generate_bnb_hd_xpub"
+path = "examples/generate_bnb_hd_xpub.rs"
+
+[dependencies]
+libc = "0.2"
+engine = { path = "../engine" }
+mental-poker = { path = "../mental-poker" }
+# Real per-spot postflop CFR solver (wraps the AGPL-3.0 `postflop-solver` crate
+# behind our own engine types — ADR-012). Powers the PUBLIC, honestly-labeled
+# `POST /api/tools/poker/solve` study tool. The AGPL blast radius (deny.toml
+# scoped exception + allow-git) is contained to gto-solver; server only consumes
+# its safe, plain-struct API.
+gto-solver = { path = "../gto-solver" }
+# The solver's CFR loop is rayon-parallel. A dedicated, size-bounded pool keeps a
+# solve from occupying every core of the 2-vCPU host (handlers/gto_solve.rs).
+# Same version postflop-solver already resolves to.
+rayon = "1.12"
+
+# Web framework
+http-body = "1"
+axum = { version = "0.7", features = ["ws"] }
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.5", features = ["fs", "set-header"] }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+prost = "0.14.4"
+flate2 = "1"
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Randomness (bot RNG)
+rand = "0.8"
+
+# Futures utilities (ws split)
+futures = "0.3"
+
+# ADR-043 deleted the old hint SSE relay; ADR-107 uses one bounded JSON request
+# for conversational coach answers. `reqwest` also calls Google's tokeninfo
+# endpoint for the OAuth ID-token verification path. Default native-tls TLS
+# (matches sqlx's runtime-tokio-native-tls — do NOT add rustls and split the TLS
+# stack); the "json" feature gives us `.json()` decode of the tokeninfo response.
+reqwest = { version = "0.12", features = ["json"] }
+# tokio-stream for ReceiverStream (SSE sender→stream bridge in coach handler).
+tokio-stream = "0.1"
+
+# Database (B-a2: Postgres via sqlx)
+# Note: runtime-tokio-native-tls requires native-tls; use rustls alternative if
+# native-tls is unavailable. Spec §3.3.1 specifies runtime-tokio-native-tls.
+# md-5 is already in the tree via sqlx-postgres; used for kwx record ids.
+md-5 = "0.10"
+sqlx = { version = "0.8", features = [
+    "postgres",
+    "runtime-tokio-native-tls",
+    "uuid",
+    "chrono",
+    "json",
+    "macros",
+] }
+
+# IDs and timestamps (B-a2)
+uuid = { workspace = true, features = ["v5"] }
+chrono = { workspace = true }
+
+# Auth (B-a2 / B-a3 / B-a4)
+argon2 = "0.5"
+base64 = "0.22"
+# SHA-256 for token hashing (B-a3 codex MINOR: store hash, not raw token)
+sha2 = "0.10"
+hex = "0.4"
+# Telegram Mini App initData verification (HMAC-SHA256 + form decoding).
+hmac = "0.12"
+url = "2"
+# Email normalization (0057): IDNA/UTS-46 punycoding of internationalized
+# domains so unicode/punycode variants collapse to ONE ownership key. Already
+# in the lockfile transitively via `url` — no new dependency tree.
+idna = "1"
+# Sign in with Apple (ADR-074 §4): verify the RS256-signed Apple identity token
+# locally against Apple's JWKS (RS256-only allowlist, aud/iss/exp pins). Default
+# features include the `rsa` validator used by `DecodingKey::from_rsa_components`.
+jsonwebtoken = "9"
+# App Store Server Notifications V2: validate ES256 JWS signatures and the x5c
+# chain against the pinned official Apple Root CA G3 before provider re-fetch.
+openssl = "0.10"
+x509-parser = "0.18"
+
+# Error handling
+thiserror = { workspace = true }
+
+# ADR-086 Option B — watch-only HD (BIP-32) deposit-address derivation
+# (handlers/billing_hd.rs). `bip32` parses the server-held account xpub and
+# does non-hardened child-key derivation (secp256k1/k256 backend, default
+# features); it never sees a seed or private key on the live server. `sha3`
+# gives the Keccak256 hash Ethereum/BSC addresses use (NOT NIST SHA3-256 —
+# see billing_hd.rs doc comment on that footgun). Money-correctness-critical:
+# see billing_hd.rs's cross-checked-against-ethers.js regression fixture.
+bip32 = "0.5"
+sha3 = "0.12"
+
+# Tower Service/Layer traits (for rate limit middleware)
+tower = { version = "0.4", features = ["util"] }
+
+# Rate limiting (B-a9)
+# Hand-rolled in-memory IP→window→count token-bucket (spec explicitly permits this).
+# Avoids pulling in tower-governor whose axum-0.7 API surface is unstable across
+# minor versions. Uses std::sync::Mutex + HashMap; no external crate needed.
+# dashmap provides concurrent map without global lock (used in rate_limit.rs).
+dashmap = "5"
+
+# Memory (2026-06-01 Render 512MB OOM, see docs/architecture/adr/ADR-052):
+# jemalloc as the global allocator.
+# glibc malloc retains freed pages in per-thread arenas it rarely returns to the
+# OS, so RSS climbed to a high watermark and tripped the limit. jemalloc purges
+# freed pages back to the OS via decay; the arena count + decay knobs are tuned
+# through the `_RJEM_MALLOC_CONF` env, which is set ONLY in
+# deploy/docker-compose.prod.yml (NOT auto-wired in code — without that env
+# jemalloc runs stock defaults). See ADR-052.
+tikv-jemallocator = "0.6"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
+
+[dev-dependencies]
+# ONLY for the offline ops example `examples/generate_bnb_hd_xpub.rs` (ADR-086
+# Option B). The live server binary must never be able to construct a BIP-39
+# mnemonic; it only ever consumes an already-exported xpub string
+# (BILLING_BNB_USDT_HD_XPUB). No tests live in this crate: the E2E suite under
+# scripts/e2e is the only test surface.
+bnb-hd-recovery = { path = "../tools/bnb-hd-recovery" }
+bip39 = { version = "2", features = ["rand_core", "zeroize"] }
+# `rand_core` "std" feature is what makes `OsRng` available.
+rand_core = { version = "0.6", features = ["std"] }
+zeroize = "1"

@@ -1,8 +1,8 @@
 <div align="center">
 
-# BluffKing — Engine &amp; Mental-Poker
+# BluffKing — Poker &amp; Draw Games
 
-**A pure-Rust No-Limit Texas Hold'em rules engine, a Monte-Carlo equity / post-hand solver, and a verifiable card-dealing ("mental poker") crate — no IO, no async, no database.**
+**Pure-Rust poker rules, equity / post-hand solvers and verifiable dealing, plus the lottery and dice draw backend source.**
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
 [![Rust 2021](https://img.shields.io/badge/Rust-2021-orange.svg)](https://www.rust-lang.org)
@@ -17,7 +17,7 @@ English · [中文](#中文)
 ## English
 
 > [!NOTE]
-> **This is the open-source subset of [BluffKing](https://bluffking.ai)** — a fair, **no-real-money** game center funded by memberships, offering Texas Hold'em alongside mahjong, card, board, dice and casual games on the web, Telegram, iOS and Android. These crates are the poker **engine**, the **verifiable ("mental poker") dealing**, and the **postflop CFR solver** behind its Texas Hold'em tables and public poker tools; the game server (except its sealed dealer, published as [`server-integration/sealed_dealer.rs`](server-integration/sealed_dealer.rs)), web/mobile clients, and website stay closed-source. Running at **[bluffking.ai](https://bluffking.ai)**, which offers this repo as the AGPL §13 Corresponding Source for the solver it serves. Its real server-blind cryptography (`crypto_real`) is **live in production for opt-in all-human "engine-blind" tables** (the server can't see your folded or pre-showdown cards) — cross-vendor AI-audited (Claude + OpenAI Codex — the audit consensus is public) and open-source: read the code and run the offline verifier yourself. (A separate, experimental *co-shuffle* toggle uses mock crypto and is disabled in production.)
+> **This is the open-source subset of [BluffKing](https://bluffking.ai)** — a fair, **no-real-money** game center funded by memberships, offering Texas Hold'em alongside mahjong, card, board, dice and casual games on the web, Telegram, iOS and Android. These crates are the poker **engine**, the **verifiable ("mental poker") dealing**, and the **postflop CFR solver** behind its Texas Hold'em tables and public poker tools; the game server (except its sealed dealer, published as [`server-integration/sealed_dealer.rs`](server-integration/sealed_dealer.rs), plus lottery/dice draw and settlement source in [`draw-games/`](draw-games)), web/mobile clients, and website stay closed-source. Running at **[bluffking.ai](https://bluffking.ai)**, which offers this repo as the AGPL §13 Corresponding Source for the solver it serves. Its real server-blind cryptography (`crypto_real`) is **live in production for opt-in all-human "engine-blind" tables** (the server can't see your folded or pre-showdown cards) — cross-vendor AI-audited (Claude + OpenAI Codex — the audit consensus is public) and open-source: read the code and run the offline verifier yourself. (A separate, experimental *co-shuffle* toggle uses mock crypto and is disabled in production.)
 
 ### What's here
 
@@ -27,6 +27,10 @@ English · [中文](#中文)
 | [`mental-poker/`](mental-poker) | Verifiable, commit–reveal dealing: a commit–reveal scheme plus a signed, append-only hash-chain transcript and **offline verifiers** (`pf_verify`, `mp-verify`). Also includes the real **server-blind** crypto path (n-of-n re-encryption-mixnet shuffle + threshold decryption) that powers the live *engine-blind* tables (cross-vendor AI-audited; open-source + independently verifiable). Depends on `engine` only for the `Card` type. |
 | [`mp-wasm/`](mp-wasm) | A `wasm-bindgen` surface over `mental_poker::crypto_real` (the real server-blind path) so a browser can run the verifiable dealing locally. A detached crate with its own workspace. |
 | [`gto-solver/`](gto-solver) | Wraps the open-source **AGPL-3.0** `postflop-solver` (Discounted-CFR) behind BluffKing engine types (ADR-012); powers the free public `POST /api/tools/poker/solve` study tool. Its AGPL dependency is why this repo is AGPL-3.0. |
+
+### Lottery and dice draws
+
+[`draw-games/`](draw-games) contains the exact server source for SSQ, TOTO, Happy8, Fucai3D, scratch cards and Sicbo, including draw selection, prize rules and selected settlement/recovery dependencies. Like the sealed dealer source offer, it is not a standalone build target. These games use the OS RNG; they do not currently provide poker-style commitments, seed reveals or offline-verifiable draw transcripts. [Scope and source guide (中文 / English)](draw-games/index.html).
 
 ### Why verifiable dealing
 
@@ -87,7 +91,7 @@ section) and [`SECURITY.md`](SECURITY.md).
 ## 中文
 
 > [!NOTE]
-> **这是 [BluffKing](https://bluffking.ai) 的开源子集** —— BluffKing 是一个**不涉及真钱**、靠会员服务盈利的公平游戏中心,提供德州扑克以及麻将、棋牌、骰子与休闲游戏(网页、Telegram、iOS 与 Android)。这些 crate 是其德州扑克牌桌与公开扑克工具背后的扑克 **引擎**、**可验证("mental poker")发牌** 与 **翻后 CFR 求解器**;游戏服务器(其中的密封发牌进程除外,已作为 [`server-integration/sealed_dealer.rs`](server-integration/sealed_dealer.rs) 公开)、Web/移动客户端与官网保持闭源。线上运行于 **[bluffking.ai](https://bluffking.ai)**,该站将本仓库作为其求解器的 AGPL §13 对应源码对外提供。它的真实服务端盲发密码学(`crypto_real`)已在生产环境 **为可选的全真人「engine-blind」牌桌启用**(服务器看不到你已弃牌或摊牌前的底牌)——经 AI 跨厂商独立审计(Claude + OpenAI Codex,审计共识已公开)、开源可复核:代码你能读、离线验证器你能自己跑。(另有一个独立的实验性 *co-shuffle* 开关使用 mock 加密,生产环境已禁用。)
+> **这是 [BluffKing](https://bluffking.ai) 的开源子集** —— BluffKing 是一个**不涉及真钱**、靠会员服务盈利的公平游戏中心,提供德州扑克以及麻将、棋牌、骰子与休闲游戏(网页、Telegram、iOS 与 Android)。这些 crate 是其德州扑克牌桌与公开扑克工具背后的扑克 **引擎**、**可验证("mental poker")发牌** 与 **翻后 CFR 求解器**;游戏服务器(其中的密封发牌进程除外,已作为 [`server-integration/sealed_dealer.rs`](server-integration/sealed_dealer.rs) 公开,彩票/骰宝开奖与结算源码另见 [`draw-games/`](draw-games))、Web/移动客户端与官网保持闭源。线上运行于 **[bluffking.ai](https://bluffking.ai)**,该站将本仓库作为其求解器的 AGPL §13 对应源码对外提供。它的真实服务端盲发密码学(`crypto_real`)已在生产环境 **为可选的全真人「engine-blind」牌桌启用**(服务器看不到你已弃牌或摊牌前的底牌)——经 AI 跨厂商独立审计(Claude + OpenAI Codex,审计共识已公开)、开源可复核:代码你能读、离线验证器你能自己跑。(另有一个独立的实验性 *co-shuffle* 开关使用 mock 加密,生产环境已禁用。)
 
 ### 仓库内容
 
@@ -97,6 +101,10 @@ section) and [`SECURITY.md`](SECURITY.md).
 | [`mental-poker/`](mental-poker) | 可验证发牌(commit–reveal):commit–reveal 承诺-揭示方案 + 签名的只追加哈希链 transcript + **离线验证器**(`pf_verify`、`mp-verify`)。另含真实的**服务端盲发**路径(n-of-n 重加密混洗 + 门限解密),驱动线上 *engine-blind* 牌桌(经 AI 跨厂商审计;开源且可独立验证)。仅依赖 `engine` 的 `Card` 类型。 |
 | [`mp-wasm/`](mp-wasm) | 对 `mental_poker::crypto_real`(真实服务端盲发路径)的 `wasm-bindgen` 封装,让浏览器本地运行可验证发牌。独立 crate,自带 workspace。 |
 | [`gto-solver/`](gto-solver) | 封装开源 **AGPL-3.0** 的 `postflop-solver`(Discounted-CFR),隐藏在 BluffKing engine 类型之后(ADR-012);为免费公开的 `POST /api/tools/poker/solve` 学习工具提供支持。它的 AGPL 依赖是本仓库采用 AGPL 的原因。 |
+
+### 彩票与骰宝开奖
+
+[`draw-games/`](draw-games) 公开双色球、TOTO、快乐8、福彩3D、刮刮乐和骰宝的原始服务端源码,包括抽样、奖级计算及相关结算/恢复依赖。与密封发牌源码一样,它不是独立构建目标。这些游戏使用系统随机数,目前没有扑克式承诺、种子揭示或可离线核验的开奖记录。[范围与源码导读(中文 / English)](draw-games/index.html)。
 
 ### 为什么"可验证"发牌
 
