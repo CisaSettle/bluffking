@@ -324,16 +324,17 @@ pub struct LeaderboardRow {
 /// Top beans winners (lifetime net). Only QA identities are excluded: this
 /// is a player-facing board, not a growth metric, so staff accounts that play
 /// rank like everyone else.
-pub async fn leaderboard(pool: &PgPool, limit: i64) -> sqlx::Result<Vec<LeaderboardRow>> {
+pub async fn leaderboard(pool: &PgPool, limit: i64, offset: i64) -> sqlx::Result<Vec<LeaderboardRow>> {
     let rows = sqlx::query(&format!(
         "SELECT w.user_id, NULLIF(TRIM(u.display_name), '') AS display_name, w.net_won, w.hands_played \
          FROM wallets w JOIN users u ON u.id = w.user_id \
          WHERE w.game = $1 AND w.hands_played > 0 AND u.deleted_at IS NULL AND {} \
-         ORDER BY w.net_won DESC, w.hands_played DESC LIMIT $2",
+         ORDER BY w.net_won DESC, w.hands_played DESC, w.user_id LIMIT $2 OFFSET $3",
         crate::internal_accounts::not_qa_flags("u.")
     ))
     .bind(GAME)
-    .bind(limit)
+    .bind(crate::pagination::limit(Some(limit)))
+    .bind(crate::pagination::offset(Some(offset)))
     .fetch_all(pool)
     .await?;
     Ok(rows

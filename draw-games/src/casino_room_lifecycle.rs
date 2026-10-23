@@ -7,31 +7,64 @@ pub async fn recover<R: DealerRoom>(pool: &PgPool) -> sqlx::Result<()> {
     registry
         .recovered
         .get_or_try_init(|| async {
-            let rooms = sqlx::query(&format!("SELECT code, state FROM game_room_checkpoints WHERE game='{}'", R::DEALER))
+            let mut after_code: Option<String> = None;
+            loop {
+                let rooms = sqlx::query(
+                    "SELECT code,state FROM game_room_checkpoints WHERE game=$1 \
+                     AND ($2::text IS NULL OR code>$2) ORDER BY code LIMIT $3",
+                )
+                .bind(R::DEALER)
+                .bind(after_code.as_deref())
+                .bind(crate::pagination::DEFAULT_LIMIT)
                 .fetch_all(pool)
                 .await?;
-            let members = sqlx::query(&format!(
-                "SELECT user_id, code, name FROM game_room_checkpoint_members WHERE game='{}' ORDER BY user_id",
-                R::DEALER
-            ))
-            .fetch_all(pool)
-            .await?;
-            let mut by_room: HashMap<String, BTreeMap<Uuid, Member>> = HashMap::new();
-            for row in &members {
-                by_room
-                    .entry(row.get("code"))
-                    .or_default()
-                    .insert(row.get("user_id"), Member::new(row.get("name"), false));
-            }
-            install::<R>(pool, rooms, by_room)?;
-            // Seated wallets become the in-memory projection before play.
-            let users: Vec<Uuid> = members.iter().map(|r| r.get("user_id")).collect();
-            for (uid, code) in users
-                .iter()
-                .filter_map(|u| registry.seat(*u).map(|c| (*u, c)))
-            {
-                let w = wallet::ensure(pool, R::POLICY, uid).await?;
-                wallet::activate(R::POLICY.game, uid, &code, w);
+                if rooms.is_empty() {
+                    break;
+                }
+                after_code = rooms.last().map(|row| row.get("code"));
+                let codes: Vec<String> = rooms.iter().map(|row| row.get("code")).collect();
+                let mut by_room: HashMap<String, BTreeMap<Uuid, Member>> = HashMap::new();
+                let mut users = Vec::new();
+                let mut after_user: Option<Uuid> = None;
+                loop {
+                    let members = sqlx::query(
+                        "SELECT user_id,code,name FROM game_room_checkpoint_members WHERE game=$1 \
+                         AND code=ANY($2) AND ($3::uuid IS NULL OR user_id>$3) \
+                         ORDER BY user_id LIMIT $4",
+                    )
+                    .bind(R::DEALER)
+                    .bind(&codes)
+                    .bind(after_user)
+                    .bind(crate::pagination::DEFAULT_LIMIT)
+                    .fetch_all(pool)
+                    .await?;
+                    for row in &members {
+                        let uid = row.get("user_id");
+                        by_room
+                            .entry(row.get("code"))
+                            .or_default()
+                            .insert(uid, Member::new(row.get("name"), false));
+                        users.push(uid);
+                        after_user = Some(uid);
+                    }
+                    if members.len() < crate::pagination::DEFAULT_LIMIT as usize {
+                        break;
+                    }
+                }
+                let room_count = rooms.len();
+                install::<R>(pool, rooms, by_room)?;
+                // At most 100 rooms (eight members each) are retained outside
+                // the registry. Activate owned rooms' wallets before admitting
+                // any request through the shared recovery guard.
+                for uid in users {
+                    if let Some(code) = registry.seat(uid) {
+                        let w = wallet::ensure(pool, R::POLICY, uid).await?;
+                        wallet::activate(R::POLICY.game, uid, &code, w);
+                    }
+                }
+                if room_count < crate::pagination::DEFAULT_LIMIT as usize {
+                    break;
+                }
             }
             Ok::<(), sqlx::Error>(())
         })
@@ -51,6 +84,12 @@ pub(super) fn install<R: DealerRoom>(
     let mut seats = registry.seats.lock().unwrap();
     for row in rooms {
         let code: String = row.get("code");
+        // A later page or wallet load may have failed after earlier rooms
+        // were installed. A retry completes recovery without rewinding those
+        // rooms or replacing their writer/handoff registrations.
+        if map.contains_key(&code) {
+            continue;
+        }
         if crate::release_handoff::sealed_boot()
             && crate::release_handoff::rooms::restoring(R::DEALER, &code).is_none()
         {

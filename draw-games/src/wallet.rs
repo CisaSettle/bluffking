@@ -443,6 +443,7 @@ pub async fn ledger(
     game: i16,
     user_id: Uuid,
     limit: i64,
+    offset: i64,
 ) -> sqlx::Result<Vec<LedgerRow>> {
     let rows = sqlx::query(
         "SELECT id, kind, record_id, room_code, revision, delta, balance_after, details, \
@@ -450,11 +451,12 @@ pub async fn ledger(
            FROM wallet_ledger \
           WHERE user_id = $1 AND game = $2 AND kind = 'play' \
           ORDER BY id DESC \
-          LIMIT $3",
+          LIMIT $3 OFFSET $4",
     )
     .bind(user_id)
     .bind(game)
-    .bind(limit)
+    .bind(crate::pagination::limit(Some(limit)))
+    .bind(crate::pagination::offset(Some(offset)))
     .fetch_all(pool)
     .await?;
     Ok(rows

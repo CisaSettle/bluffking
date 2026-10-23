@@ -122,6 +122,7 @@ pub async fn refill(
 #[derive(Deserialize)]
 pub struct Listing {
     limit: Option<i64>,
+    offset: Option<i64>,
 }
 pub async fn draws(
     State(state): State<AppState>,
@@ -130,7 +131,7 @@ pub async fn draws(
     Query(q): Query<Listing>,
 ) -> Result<Json<Value>, Error> {
     Ok(Json(
-        json!({"draws":store::draws(&state.pool, game(&name)?, q.limit.unwrap_or(30).clamp(1,100)).await?}),
+        json!({"draws":store::draws(&state.pool, game(&name)?, crate::pagination::limit(q.limit).min(100), crate::pagination::offset(q.offset)).await?}),
     ))
 }
 pub async fn tickets(
@@ -140,7 +141,7 @@ pub async fn tickets(
     Query(q): Query<Listing>,
 ) -> Result<Json<Value>, Error> {
     Ok(Json(
-        json!({"tickets":store::tickets(&state.pool, auth.user_id, game(&name)?, q.limit.unwrap_or(50).clamp(1,100)).await?}),
+        json!({"tickets":store::tickets(&state.pool, auth.user_id, game(&name)?, crate::pagination::limit(q.limit).min(100), crate::pagination::offset(q.offset)).await?}),
     ))
 }
 

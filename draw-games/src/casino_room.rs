@@ -26,7 +26,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{request::Parts, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -1596,6 +1596,7 @@ pub async fn standings<R: DealerRoom>(
     State(s): State<AppState>,
     auth: AuthUser,
     Path(code): Path<String>,
+    Query(page): Query<crate::pagination::Query>,
 ) -> Response {
     let result = async {
         recover::<R>(&s.pool).await?;
@@ -1604,7 +1605,7 @@ pub async fn standings<R: DealerRoom>(
             .ok_or(Error::Code("room_not_found"))?;
         let room = shared.lock().await;
         seated(&room, auth.user_id)?;
-        Ok(R::standings(&room.state).records(auth.user_id, true))
+        Ok(R::standings(&room.state).records_page(auth.user_id, true, page))
     }
     .await;
     response::<R>(result)

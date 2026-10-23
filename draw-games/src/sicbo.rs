@@ -251,10 +251,7 @@ pub async fn bet(
     Ok(Json(play(&state.pool, auth.user_id, &bet).await?))
 }
 
-#[derive(Deserialize)]
-pub struct LedgerQuery {
-    limit: Option<i64>,
-}
+pub type LedgerQuery = crate::pagination::Query;
 pub async fn ledger(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -264,7 +261,8 @@ pub async fn ledger(
         &state.pool,
         POLICY.game,
         auth.user_id,
-        query.limit.unwrap_or(30).clamp(1, 100),
+        query.limit(),
+        query.offset(),
     )
     .await?;
     Ok(Json(json!({"entries":entries})))

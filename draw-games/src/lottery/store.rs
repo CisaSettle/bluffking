@@ -538,13 +538,15 @@ pub(super) async fn recent_periods(
     conn: &mut PgConnection,
     game: Game,
     limit: i64,
+    offset: i64,
 ) -> sqlx::Result<Vec<PeriodRow>> {
     let rows = sqlx::query(&format!(
         "SELECT {PERIOD_COLUMNS} FROM lottery_periods WHERE game=$1 AND status <> 'open' \
-         ORDER BY drawn_at DESC LIMIT $2"
+         ORDER BY drawn_at DESC, period DESC LIMIT $2 OFFSET $3"
     ))
     .bind(game.as_str())
     .bind(limit)
+    .bind(offset)
     .fetch_all(conn)
     .await?;
     Ok(rows.iter().map(PeriodRow::from_row).collect())
@@ -828,7 +830,7 @@ pub async fn view(pool: &PgPool, user: Uuid, game: Game) -> Result<Value, Error>
         && super::now_ms() < selling.closes_ms;
     let period = period_json(&selling, row.as_ref(), open);
     let my_tickets = tickets_of(&mut conn, game, selling.id, user).await?;
-    let recent = recent_periods(&mut conn, game, RECENT_DRAWS).await?;
+    let recent = recent_periods(&mut conn, game, RECENT_DRAWS, 0).await?;
     let mut feed = scan.purchases;
     let last_draw = match recent.first() {
         Some(last) => {
@@ -868,9 +870,9 @@ fn period_json(selling: &Period, row: Option<&PeriodRow>, open: bool) -> Value {
 }
 
 /// `GET /api/lottery/{game}/draws`.
-pub async fn draws(pool: &PgPool, game: Game, limit: i64) -> Result<Vec<Value>, Error> {
+pub async fn draws(pool: &PgPool, game: Game, limit: i64, offset: i64) -> Result<Vec<Value>, Error> {
     let mut conn = pool.acquire().await?;
-    let rows = recent_periods(&mut conn, game, limit.clamp(1, 100)).await?;
+    let rows = recent_periods(&mut conn, game, limit.clamp(1, 100), offset.max(0)).await?;
     Ok(rows.iter().map(|r| r.summary(game)).collect())
 }
 
@@ -901,17 +903,19 @@ pub async fn tickets(
     user: Uuid,
     game: Game,
     limit: i64,
+    offset: i64,
 ) -> Result<Vec<Value>, Error> {
     let rows = sqlx::query(&format!(
         "SELECT t.{} , p.numbers AS result_numbers, p.bonus AS result_bonus, p.bonus_numbers AS result_bonus_numbers, p.draw_proof AS result_proof \
          FROM lottery_tickets t LEFT JOIN lottery_periods p \
            ON p.game = t.game AND p.period = t.period AND p.status <> 'open' \
-         WHERE t.user_id=$1 AND t.game=$2 ORDER BY t.bought_at DESC, t.id LIMIT $3",
+         WHERE t.user_id=$1 AND t.game=$2 ORDER BY t.bought_at DESC, t.id LIMIT $3 OFFSET $4",
         TICKET_COLUMNS.replace(", ", ", t.")
     ))
     .bind(user)
     .bind(game.as_str())
     .bind(limit.clamp(1, 100))
+    .bind(offset.max(0))
     .fetch_all(pool)
     .await?;
     Ok(rows
