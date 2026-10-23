@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>BluffKing · 开奖源码</title>
+    <title>BluffKing · 开奖证明</title>
     <style>
       :root { color-scheme: light dark; font-family: system-ui, sans-serif; line-height: 1.65; }
       body { max-width: 960px; margin: auto; padding: 28px 20px 64px; }
@@ -14,6 +14,7 @@
       h2 { margin-top: 32px; }
       a { color: light-dark(#174f9e, #9bc2ff); overflow-wrap: anywhere; }
       code { overflow-wrap: anywhere; }
+      pre { padding: 14px; border: 1px solid #8886; white-space: pre-wrap; overflow-wrap: anywhere; }
       table { border-collapse: collapse; width: 100%; }
       th, td { text-align: left; vertical-align: top; padding: 10px; border-bottom: 1px solid #8886; }
       .notice { border-left: 4px solid #608bdb; padding: 4px 16px; }
@@ -27,82 +28,140 @@
     </nav>
     <main>
       <article id="zh" lang="zh-CN">
-        <h1>彩票与骰宝：开奖后台源码</h1>
-        <p>这是现有 BluffKing 开源仓库的 <code>draw-games/</code> 子目录。它公开实际服务端使用的抽样、中奖计算、购票封盘、兑奖和相关持久化源码；不包含数据库内容、账号数据或运行密钥。代码采用根目录的 <a href="../LICENSE">AGPL-3.0-only 许可证</a>，品牌规则见 <a href="../TRADEMARKS.md">商标说明</a>。</p>
-        <p class="notice">这些游戏使用操作系统安全随机数。当前没有预先公开的种子承诺、开奖后种子揭示或可离线验证的开奖证明。公开代码让任何人检查算法与结算规则；它本身不证明某次线上开奖运行了该版本，也不提供德州盲发的密码学保证。</p>
-        <h2>游戏与抽样规则</h2>
+        <h1>彩票与骰宝：公开过程，独立复核</h1>
+        <p><code>draw-games/</code> 是现有 BluffKing 开源仓库的子目录。这里公开开奖输入、确定性抽样、中奖计算、购票封盘及相关持久化代码，并提供无需连接 BluffKing 的离线验证器。覆盖骰宝、刮刮乐、双色球、快乐8、福彩3D、大乐透和 TOTO；奖项与金额均为练习豆。</p>
+        <p class="notice"><strong>本版本的证明协议尚未部署到生产。</strong>公开源码不等于线上已切换协议。生成这些证明需要配套版本的后台与客户端；开源标签不证明生产正在运行对应二进制。没有证明的历史记录明确保留为旧记录，不会补造承诺。</p>
+        <p>代码采用根目录的 <a href="../LICENSE">AGPL-3.0-only 许可证</a>，品牌规则见 <a href="../TRADEMARKS.md">商标说明</a>。仓库不含玩家数据、运行密钥、未揭示种子或未来实际开奖结果。</p>
+
+        <h2>三种开奖流程</h2>
         <table>
-          <thead><tr><th>游戏</th><th>实际实现</th><th>源码</th></tr></thead>
+          <thead><tr><th>游戏</th><th>开奖前</th><th>开奖后及边界</th></tr></thead>
           <tbody>
-            <tr><td>骰宝</td><td>三个独立的 1–6 骰子；4–10 为小、11–17 为大，围骰使大小投注均输。单人入口和同桌共用结果的房间入口均公开。</td><td><a href="src/sicbo.rs">单人规则与结算</a> · <a href="src/sicbo_room/store.rs">房间抽样与结算</a></td></tr>
-            <tr><td>刮刮乐</td><td>六个号码和一个幸运号分别从 1–30 抽取；位置倍率为 1、1、2、2、5、10，中奖位置相加。结果购票时保存；单张逐格揭示，5/10 张批量购买直接揭示。</td><td><a href="src/lottery/scratch.rs">生成、隐藏、揭示、兑奖</a></td></tr>
-            <tr><td>双色球</td><td>1–33 无放回取 6 个红球，独立抽取 1–16 蓝球。</td><td rowspan="5"><a href="src/lottery/rules.rs">抽样、复式注数与完整奖表</a></td></tr>
-            <tr><td>快乐8</td><td>1–80 无放回取 20 个号码。</td></tr>
-            <tr><td>福彩3D</td><td>三个独立的 0–9 数字，支持直选、组三与组六。</td></tr>
-            <tr><td>大乐透</td><td>前区 1–35 无放回取 5 个号码，后区 1–12 独立无放回取 2 个号码。</td></tr>
-            <tr><td>TOTO</td><td>1–49 无放回取 7 个号码；前 6 个为正选，第 7 个为额外号码。</td></tr>
+            <tr><td>骰宝房间</td><td>每轮固定服务器种子承诺，持久化后才能接受投注；投注请求绑定该承诺。成功的 HTTP 投注确认等待该投注持久化。</td><td>公布种子并重算三颗骰子。WebSocket 展示可能早于持久化确认；确认超时表示结果未知，不能当作撤销。房间没有玩家种子，运营方预先知道结果，且承诺本身不能阻止事先筛选种子或中止一轮。</td></tr>
+            <tr><td>刮刮乐、单人骰宝</td><td>先取得持久化的服务器种子承诺，再由浏览器安全随机生成 32 字节玩家种子。请求绑定承诺、玩家种子和购买／投注条件，浏览器在请求前保存回执。</td><td>公布服务器种子后，可重算结果及兑奖。刮刮乐单张全部揭示后才公开完整种子；5／10 张批量购买直接揭示。服务器收到玩家种子后能够计算结果，承诺不能强制其继续服务或支付。</td></tr>
+            <tr><td>双色球及其他定期开奖</td><td>游戏、期号、协议版本、封盘时间、drand 链和未来轮次组成固定计划。购买请求须回传已看到的计划承诺，票据保存同一计划。</td><td>验证指定轮次的 BLS 签名，按公开算法生成号码。没有可选择的服务器种子；只等待已选轮次，不因服务异常换轮次或改用系统随机数。即使运营方不提供结果，持有相应公共信标仍可自行重算。</td></tr>
           </tbody>
         </table>
-        <h2>从开奖到兑奖</h2>
+
+        <h2>定期开奖的固定输入</h2>
+        <p>双色球、大乐透、TOTO 每 5 分钟一期，大乐透错开 75 秒，TOTO 错开 150 秒；快乐8 每 2 分钟，福彩3D 每 3 分钟。所有这些游戏在计划开奖前 5 秒封盘，期号标签使用新加坡时间。计划选择在开奖时间或之后的第一轮 drand quicknet 信标，而不是请求时的“最新轮次”。</p>
+        <p>固定链标识为 <code>52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971</code>，起始时间为 Unix 秒 <code>1692803367</code>，每轮 3 秒。<a href="verifier/src/beacon.rs">beacon.rs</a> 固定公钥并验证 <code>bls-unchained-g1-rfc9380</code> 签名；随机输入是 <code>SHA-256(signature)</code>，不信任 HTTP 响应自带的随机数字段。</p>
+        <p><a href="verifier/src/lottery.rs">lottery.rs</a> 将计划承诺与信标随机输入绑定；<a href="verifier/src/proof.rs">proof.rs</a> 定义带域区分、长度前缀的 SHA-256 输入和计数器流。范围抽样使用拒绝采样消除取模偏差，无放回抽样使用部分 Fisher–Yates。信标网络仍有门限参与者、时钟与可用性假设，详见 <a href="https://docs.drand.love/docs/security-model/">drand 安全模型</a>。签名验证使用固定版本的 <a href="https://docs.rs/drand-verify/0.6.2/drand_verify/">drand-verify 0.6.2</a>。</p>
+        <p>后台在数据库事务与行锁之外进行有超时、响应大小上限和重试间隔的信标请求。无法取得或验证指定信标时，同一期继续待开奖；已公开计划与已完成结果受持久化约束保护，恢复与重试不另选结果。旧期只按原流程完成结算，保持无证明标记。</p>
+
+        <h2>号码与中奖规则</h2>
+        <table>
+          <thead><tr><th>游戏</th><th>确定性抽样与兑奖</th></tr></thead>
+          <tbody>
+            <tr><td>骰宝</td><td>三颗独立的 1–6 骰子；4–10 为小，11–17 为大，围骰使大小投注均输。单人及房间共用<a href="verifier/src/sicbo.rs">骰宝规则</a>。</td></tr>
+            <tr><td>刮刮乐</td><td>六个号码和一个幸运号分别从 1–30 抽取，位置倍率为 1、1、2、2、5、10，命中位置相加。购票时保存结果，未刮号码在响应中隐藏；完整规则见 <a href="verifier/src/scratch.rs">scratch.rs</a>。</td></tr>
+            <tr><td>双色球</td><td>1–33 无放回取 6 个红球，独立抽取 1–16 蓝球。</td></tr>
+            <tr><td>快乐8</td><td>1–80 无放回取 20 个号码。</td></tr>
+            <tr><td>福彩3D</td><td>三个独立的 0–9 数字，支持直选、组三、组六。</td></tr>
+            <tr><td>大乐透</td><td>前区 1–35 无放回取 5 个，后区 1–12 独立无放回取 2 个。</td></tr>
+            <tr><td>TOTO</td><td>1–49 无放回取 7 个；前 6 个为正选，第 7 个为额外号码。</td></tr>
+          </tbody>
+        </table>
+        <p>定期开奖的选号规范化、复式注数、倍数、成本和完整练习豆奖表都在 <a href="verifier/src/lottery.rs">lottery.rs</a>。这套库同时被本版本后台与离线验证器引用，避免各自维护一份计算代码。</p>
+
+        <h2>独立复核</h2>
+        <p>从公开仓库根目录构建独立验证器。首次构建可能下载锁定依赖；运行验证器不联网，不需要数据库或 BluffKing 账号。</p>
+        <pre><code>cargo build --locked --manifest-path draw-games/verifier/Cargo.toml
+./draw-games/verifier/target/debug/draw-verify proof.json
+./draw-games/verifier/target/debug/draw-verify proof.json --receipt pre-draw-receipt.json</code></pre>
         <ol>
-          <li><a href="src/lottery/mod.rs">期次与时间</a>：双色球、大乐透和 TOTO 每 5 分钟一期，大乐透错开 75 秒，TOTO 错开 150 秒；快乐8 每 2 分钟，福彩3D 每 3 分钟。开奖前 5 秒封盘，期号使用新加坡时间。</li>
-          <li><a href="src/lottery/store.rs">购票</a>：校验选号和限额、锁定钱包、检查封盘与余额；重复请求回放已保存结果。请求内容哈希只用于幂等校验，不是开奖承诺。</li>
-          <li><a href="src/lottery/draw_loop.rs">开奖与派奖</a>：数据库行锁协调多个后台，每期生成并保存同一组号码；逐用户事务结算，重启继续处理尚未结算的记录。</li>
-          <li><a href="src/lottery/scratch.rs">刮刮乐揭示</a>：未刮号码在响应中为 <code>null</code>，但后台数据库已保存完整结果；单张最后一格揭示时兑奖，并处理过期卡片。不能据此声称服务器不知道结果。</li>
-          <li><a href="src/wallet.rs">账本</a>、<a href="src/beans.rs">练习豆钱包</a>与<a href="src/game_records.rs">游戏记录</a>展示结算调用和原子余额更新；当前彩票共用练习豆钱包，迁移文件中的旧彩票钱包只保留历史意义。</li>
+          <li>在配套客户端投注前保存承诺回执；开奖后下载证明。客户端可导出 <code>{proof, receipt}</code> 文件；也可分别提供证明与先前保存的回执。</li>
+          <li>验证器重算号码或骰子，并在证明包含投注／票据信息时复核成本与奖金。提供回执时还会比对原承诺、玩家种子及相应投注条件。</li>
+          <li>成功输出 <code>outcome: "replayed"</code>；有相符回执时为 <code>receipt_match: "matched"</code>，未提供时为 <code>"not_provided"</code>。不匹配或证明损坏会输出 <code>"rejected"</code> 并以退出码 1 结束。仅重算成功不代表拥有开奖前的证据。</li>
         </ol>
-        <h2>完整文件导航</h2>
+        <p>定期开奖提供无需账号的 <code>GET /api/draws/:game/:period/proof</code>，返回 <code>plan</code>、<code>proof</code> 和 <code>proof_status</code>；状态为 <code>pending</code>、<code>available</code> 或 <code>legacy</code>。这里不公开个人选票与账号信息。游戏历史中的个人票据可合入证明的 <code>ticket</code> 字段，用于核对中奖计算。</p>
+        <p>若运营方不提供开奖证明，从既定链的 <code>https://api.drand.sh/52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971/public/{round}</code> 取得计划中的准确轮次，保存为 <code>beacon.json</code>，再运行以下命令。把 <code>GAME</code> 和 <code>PERIOD</code> 换成已保存计划中的游戏名和整数期号；命令检查轮次及签名，再输出可复核的完整开奖证明。</p>
+        <pre><code>./draw-games/verifier/target/debug/draw-verify --derive-lottery GAME PERIOD beacon.json &gt; proof.json
+./draw-games/verifier/target/debug/draw-verify proof.json --receipt pre-draw-receipt.json</code></pre>
+
+        <h2>证据保存与保证范围</h2>
+        <p>浏览器回执只存于当前用户、当前浏览器，最多保留 256 条、30 天；清理浏览器数据或更换设备会影响可用性，需要长期保留时请下载文件。后台彩票票据与开奖证明按现有 30 天策略清理；骰宝房间内历史最多 60 轮，账本沿用服务原有保留策略。这里没有永久保存承诺，也没有全局只追加的公开证明日志。</p>
+        <p>本地回执不是签名时间戳。验证器能检查提供的文件是否符合算法及已保存输入，不能单独证明回执何时出现、谁拥有账号、钱是否实际记入钱包、服务一定完成开奖，或线上运行了哪一个二进制。缺少开奖前回执时，只能复核文件内部的一致性；定期开奖仍可检查固定轮次签名并独立推导结果。共享种子承诺不等于服务器盲发，房间骰宝尤其保留运营方预知与中止风险。</p>
+        <p>老虎机中奖逻辑、抓娃娃物理模拟及名单抽奖目前在浏览器运行，没有相应后台开奖模块可放入本目录。它们不在本次七种后台游戏范围内。</p>
+
+        <h2>源码导航与构建范围</h2>
         <ul>
-          <li>彩票模块：<a href="src/lottery/mod.rs">mod.rs</a>、<a href="src/lottery/rules.rs">rules.rs</a>、<a href="src/lottery/store.rs">store.rs</a>、<a href="src/lottery/draw_loop.rs">draw_loop.rs</a>、<a href="src/lottery/scratch.rs">scratch.rs</a>、<a href="src/lottery/handlers.rs">handlers.rs</a>。</li>
-          <li>历史兼容：<a href="src/lottery/legacy_scratch.rs">legacy_scratch.rs</a> 处理旧刮刮乐房间的账号清理，不是当前开奖路径。</li>
-          <li>骰宝模块：<a href="src/sicbo.rs">sicbo.rs</a>、<a href="src/sicbo_room/mod.rs">sicbo_room/mod.rs</a>、<a href="src/sicbo_room/store.rs">sicbo_room/store.rs</a>。</li>
-          <li>房间推进与恢复：<a href="src/casino_room.rs">casino_room.rs</a>、<a href="src/casino_room_lifecycle.rs">casino_room_lifecycle.rs</a>、<a href="src/write_behind.rs">write_behind.rs</a>、<a href="src/room_clock.rs">room_clock.rs</a>；机器人行为见 <a href="src/casino_bots.rs">casino_bots.rs</a>，游戏编号见 <a href="src/game_catalog.rs">game_catalog.rs</a>。</li>
-          <li>参考资料：<a href="schema/0027_lottery_center.up.sql">彩票中心增量迁移</a>及<a href="schema/0027_lottery_center.down.sql">回退迁移</a>、<a href="schema/0029_daletou.up.sql">大乐透增量迁移</a>及<a href="schema/0029_daletou.down.sql">回退迁移</a>、<a href="reference/server-Cargo.toml">服务端依赖声明</a>、<a href="../server-integration/texas-h5-Cargo.toml">上游工作区清单</a>与<a href="../server-integration/texas-h5-Cargo.lock">依赖锁文件</a>。迁移展示原始历史版本，不是独立数据库安装脚本。</li>
+          <li>可独立构建的共用规则库：<a href="verifier/Cargo.toml">Cargo.toml</a>、<a href="verifier/Cargo.lock">Cargo.lock</a>；<a href="verifier/src/proof.rs">承诺、揭示与抽样流</a>、<a href="verifier/src/beacon.rs">信标签名</a>、<a href="verifier/src/lottery.rs">定期开奖与奖表</a>、<a href="verifier/src/scratch.rs">刮刮乐</a>、<a href="verifier/src/sicbo.rs">骰宝</a>、<a href="verifier/src/bin/draw-verify.rs">命令行验证器</a>。</li>
+          <li>彩票服务集成：<a href="src/lottery/mod.rs">模块</a>、<a href="src/lottery/rules.rs">共用规则引用与旧期兼容</a>、<a href="src/lottery/store.rs">购票与查询</a>、<a href="src/lottery/draw_loop.rs">开奖与派奖</a>、<a href="src/lottery/beacon.rs">有界信标请求</a>、<a href="src/lottery/scratch.rs">刮刮乐揭示</a>、<a href="src/lottery/handlers.rs">HTTP 接口</a>、<a href="src/lottery/legacy_scratch.rs">历史房间清理</a>。</li>
+          <li>即时承诺与骰宝：<a href="src/draw_fairness.rs">draw_fairness.rs</a>、<a href="src/sicbo.rs">单人骰宝</a>、<a href="src/sicbo_room/mod.rs">房间模块</a>、<a href="src/sicbo_room/store.rs">房间承诺与结算</a>。</li>
+          <li>持久化与账务：<a href="src/casino_room.rs">房间推进及确认</a>、<a href="src/casino_room_lifecycle.rs">房间生命周期</a>、<a href="src/write_behind.rs">有序写入</a>、<a href="src/wallet.rs">账本</a>、<a href="src/beans.rs">练习豆钱包</a>、<a href="src/game_records.rs">游戏记录</a>、<a href="src/room_clock.rs">时钟</a>、<a href="src/casino_bots.rs">机器人</a>、<a href="src/game_catalog.rs">游戏编号</a>。</li>
+          <li>增量结构：<a href="schema/0031_draw_proofs.up.sql">0031 证明与不可变约束</a>及<a href="schema/0031_draw_proofs.down.sql">回退源码</a>；历史 <a href="schema/0027_lottery_center.up.sql">0027 彩票中心</a>、<a href="schema/0027_lottery_center.down.sql">0027 回退</a>、<a href="schema/0029_daletou.up.sql">0029 大乐透</a>、<a href="schema/0029_daletou.down.sql">0029 回退</a>。这些是原始增量文件，不是独立数据库安装脚本。</li>
+          <li>依赖参考：<a href="reference/server-Cargo.toml">后台依赖</a>、<a href="../server-integration/texas-h5-Cargo.toml">上游工作区</a>、<a href="../server-integration/texas-h5-Cargo.lock">上游锁文件</a>。</li>
         </ul>
-        <h2>运行与验证边界</h2>
-        <p>这是原始源码公开目录，不是独立 Rust crate，根工作区构建不编译本目录。账号生命周期锁、认证、主路由、数据库基础结构、checkpoint 解码、主机所有权、发布接管、统计与社交模块仍由主服务提供；本目录不构成完整服务器或完整主机恢复实现。</p>
-        <p>骰宝房间可能在有序持久化完成前展示已接受的结果；进程在写入前崩溃时，恢复只能依据已保存状态。源码公开不构成“所有已展示结果均已落库”的保证。</p>
-        <p>老虎机的随机中奖目前在浏览器本地运行，抓娃娃使用浏览器物理模拟，名单抽奖也在客户端；它们没有可供本目录发布的后台开奖模块。本次不把这些功能改成服务端游戏。</p>
-        <p>公开文件由上游明确文件清单逐字同步。上游发布流程对这些文件计算内容散列，并下载公开标签逐文件比对。公开标签说明对应的源码快照，不表示该快照已部署到生产。运行密钥、玩家数据与未结束的实际开奖结果均不在仓库中。</p>
+        <p><code>verifier/</code> 自带工作区，可按上面的命令单独构建；公开仓库根工作区的普通构建不包括它。<code>src/</code> 是逐字同步的原始服务端集成源码，不是独立服务器；认证、账号生命周期、基础数据库结构、完整 checkpoint 恢复及主服务路由等仍由上游服务提供。发布流程对明确列出的源码计算散列并下载公开标签逐文件比对；这能标识公开代码快照，不能证明线上部署身份。</p>
       </article>
       <article id="en" lang="en" hidden>
-        <h1>Lottery and Sicbo draw backend source</h1>
-        <p><code>draw-games/</code> is a subdirectory of the existing BluffKing open-source repository. It publishes the actual server implementation for sampling, prize calculation, purchase cutoffs, redemption and related persistence. It contains no database contents, account data or runtime secrets. Code is licensed under the root <a href="../LICENSE">AGPL-3.0-only license</a>; see the separate <a href="../TRADEMARKS.md">trademark policy</a>.</p>
-        <p class="notice">These games use the operating-system RNG. They currently have no published seed commitments, post-draw seed reveals or offline-verifiable draw proofs. Publishing source permits inspection of the algorithms and settlement rules; it does not prove that a particular live draw executed this version or provide poker's server-blind cryptographic guarantees.</p>
-        <h2>Games and sampling</h2>
+        <h1>Lottery and Sicbo: public process, independent replay</h1>
+        <p><code>draw-games/</code> is a subdirectory of the existing BluffKing open-source repository. It publishes draw inputs, deterministic sampling, prize calculation, purchase cutoffs and related persistence, together with an offline verifier that needs no connection to BluffKing. It covers Sicbo, scratch cards, SSQ, Happy8, Fucai3D, Daletou and TOTO. Stakes and prizes use practice beans.</p>
+        <p class="notice"><strong>This proof protocol has not yet been deployed to production.</strong> Source publication does not switch the live protocol. Generating these proofs requires the matching backend and client version; a public tag does not attest the production binary. Historical records without proofs stay explicitly legacy: no retrospective commitments are invented.</p>
+        <p>Code uses the root <a href="../LICENSE">AGPL-3.0-only license</a>; see the <a href="../TRADEMARKS.md">trademark policy</a>. The repository contains no player data, runtime keys, unrevealed seeds or actual future draw results.</p>
+
+        <h2>Three draw flows</h2>
         <table>
-          <thead><tr><th>Game</th><th>Implementation</th><th>Source</th></tr></thead>
+          <thead><tr><th>Game</th><th>Before the draw</th><th>Afterwards and limitations</th></tr></thead>
           <tbody>
-            <tr><td>Sicbo</td><td>Three independent dice in 1–6. Small is 4–10, big is 11–17, and triples lose both bets. Both solo play and shared room outcomes are included.</td><td><a href="src/sicbo.rs">Solo rules and settlement</a> · <a href="src/sicbo_room/store.rs">Room draws and settlement</a></td></tr>
-            <tr><td>Scratch cards</td><td>Six numbers and one lucky number drawn independently from 1–30. Matching positions pay multipliers 1, 1, 2, 2, 5, 10, added together. Results are stored at purchase; single cards reveal by spot, batches of 5/10 reveal immediately.</td><td><a href="src/lottery/scratch.rs">Generation, projection, reveal and redemption</a></td></tr>
-            <tr><td>SSQ</td><td>Six distinct red balls from 1–33 and an independent blue ball from 1–16.</td><td rowspan="5"><a href="src/lottery/rules.rs">Sampling, system entries and full payout tables</a></td></tr>
+            <tr><td>Sicbo rooms</td><td>Each round fixes a server-seed commitment. It must be durable before a wager is accepted; the wager binds that commitment. A successful HTTP wager acknowledgement waits for that wager to become durable.</td><td>The seed is revealed to replay all three dice. WebSocket updates may precede durable acknowledgement; a timeout means unknown acknowledgement, not rollback. There is no player seed in rooms, so the operator knows the outcome beforehand; commitment alone cannot prevent choosing among seeds beforehand or aborting a round.</td></tr>
+            <tr><td>Scratch cards and solo Sicbo</td><td>Obtain a durable server-seed commitment first, then generate a 32-byte player seed with browser cryptographic randomness. The request binds the commitment, player seed and purchase/wager terms. The browser saves a receipt before sending it.</td><td>The revealed server seed reproduces the result and prize. A single scratch card reveals its full seed only after every spot is open; batches of 5/10 reveal immediately. The server can compute the outcome after receiving the player seed. A commitment cannot compel continued service or payment.</td></tr>
+            <tr><td>SSQ and other scheduled lotteries</td><td>A fixed plan binds the game, period, protocol version, sales cutoff, drand chain and future round. A purchase must echo the observed plan commitment; its ticket retains that plan.</td><td>Verify the selected round's BLS signature and derive numbers using the published algorithm. There is no selectable server seed. An outage waits for that exact round, with no substitute round or OS-random fallback. Anyone with its public beacon can reconstruct the result even if the operator withholds it.</td></tr>
+          </tbody>
+        </table>
+
+        <h2>Fixed scheduled-draw inputs</h2>
+        <p>SSQ, Daletou and TOTO draw every five minutes, with Daletou offset by 75 seconds and TOTO by 150 seconds. Happy8 draws every two minutes, Fucai3D every three. Sales close five seconds before the planned draw, with period labels in Singapore time. The plan selects the first drand quicknet round scheduled at or after draw time, never the relay's “latest” round.</p>
+        <p>The pinned chain is <code>52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971</code>, with genesis Unix second <code>1692803367</code> and a three-second period. <a href="verifier/src/beacon.rs">beacon.rs</a> pins its public key and verifies the <code>bls-unchained-g1-rfc9380</code> signature. Randomness is <code>SHA-256(signature)</code>; the relay's supplied randomness field is not trusted.</p>
+        <p><a href="verifier/src/lottery.rs">lottery.rs</a> binds the plan commitment to beacon randomness. <a href="verifier/src/proof.rs">proof.rs</a> specifies domain-separated, length-prefixed SHA-256 inputs and a counter stream. Rejection sampling removes modulo bias; partial Fisher–Yates samples without replacement. Beacon unpredictability and availability still depend on threshold participants and timing assumptions: see the <a href="https://docs.drand.love/docs/security-model/">drand security model</a>. Signature verification uses pinned <a href="https://docs.rs/drand-verify/0.6.2/drand_verify/">drand-verify 0.6.2</a>.</p>
+        <p>Beacon requests have timeouts, response-size limits and retry spacing, and run outside database transactions and row locks. If the selected beacon cannot be obtained or verified, the same draw remains pending. Persistence constraints protect published plans and completed results; retries and recovery do not choose another result. Pre-existing legacy periods finish under their original path and remain without proofs.</p>
+
+        <h2>Numbers and prize rules</h2>
+        <table>
+          <thead><tr><th>Game</th><th>Deterministic sampling and prizes</th></tr></thead>
+          <tbody>
+            <tr><td>Sicbo</td><td>Three independent dice in 1–6. Small is 4–10, big is 11–17, and triples lose both bets. Solo and rooms share <a href="verifier/src/sicbo.rs">the same rules</a>.</td></tr>
+            <tr><td>Scratch cards</td><td>Six numbers and one lucky number independently drawn from 1–30; matching positions pay multipliers 1, 1, 2, 2, 5, 10, added together. Results are stored at purchase and unopened numbers are hidden from responses. See <a href="verifier/src/scratch.rs">scratch.rs</a>.</td></tr>
+            <tr><td>SSQ</td><td>Six distinct red balls from 1–33 and one independent blue ball from 1–16.</td></tr>
             <tr><td>Happy8</td><td>Twenty distinct numbers from 1–80.</td></tr>
             <tr><td>Fucai3D</td><td>Three independent digits from 0–9; straight, group-three and group-six entries.</td></tr>
             <tr><td>Daletou</td><td>Five distinct front numbers from 1–35 and two independently sampled distinct back numbers from 1–12.</td></tr>
             <tr><td>TOTO</td><td>Seven distinct numbers from 1–49; the first six are main numbers and the seventh is additional.</td></tr>
           </tbody>
         </table>
-        <h2>From draw to redemption</h2>
+        <p>Scheduled-game normalization, system-entry stake counts, multipliers, costs and complete practice-bean prize tables are in <a href="verifier/src/lottery.rs">lottery.rs</a>. Both the backend in this snapshot and the offline verifier depend on that same library.</p>
+
+        <h2>Independent verification</h2>
+        <p>Build the independent verifier from the public repository root. An initial build may download locked dependencies; running the verifier is network-free and needs neither a database nor a BluffKing account.</p>
+        <pre><code>cargo build --locked --manifest-path draw-games/verifier/Cargo.toml
+./draw-games/verifier/target/debug/draw-verify proof.json
+./draw-games/verifier/target/debug/draw-verify proof.json --receipt pre-draw-receipt.json</code></pre>
         <ol>
-          <li><a href="src/lottery/mod.rs">Periods and timing</a>: SSQ, Daletou and TOTO draw every five minutes, with Daletou offset by 75 seconds and TOTO by 150 seconds; Happy8 every two minutes and Fucai3D every three. Sales close five seconds before the draw. Period labels use Singapore time.</li>
-          <li><a href="src/lottery/store.rs">Purchases</a>: validate entries and limits, lock the wallet, enforce the cutoff and available balance, and replay stored results for repeated requests. The request-body hash is for idempotency, not a draw commitment.</li>
-          <li><a href="src/lottery/draw_loop.rs">Draws and awards</a>: database row locks arbitrate concurrent backends, storing one set of numbers per period. Settlement proceeds in per-user transactions; unfinished work resumes after restart.</li>
-          <li><a href="src/lottery/scratch.rs">Scratch reveals</a>: unrevealed numbers are <code>null</code> in client responses, but the complete result already exists in the server database. A single card pays on its last reveal; expiry is also handled. This is not server-blind dealing.</li>
-          <li><a href="src/wallet.rs">Ledger</a>, <a href="src/beans.rs">shared practice wallet</a> and <a href="src/game_records.rs">game records</a> expose settlement calls and atomic balance updates. Lottery now shares the beans wallet; the older lottery wallet in the migration is historical.</li>
+          <li>Save the pre-bet commitment receipt in the matching client, then download the proof after the draw. The client can export a <code>{proof, receipt}</code> bundle; separate proof and previously saved receipt files also work.</li>
+          <li>The verifier reconstructs numbers or dice and, when wager/ticket details are present, recomputes costs and prizes. A supplied receipt is compared with the original commitment, player seed and applicable wager terms.</li>
+          <li>Success reports <code>outcome: "replayed"</code>. <code>receipt_match</code> is <code>"matched"</code> for a matching receipt or <code>"not_provided"</code> when none was supplied. A mismatch or invalid proof reports <code>"rejected"</code> and exits with code 1. Successful replay alone does not establish possession of pre-draw evidence.</li>
         </ol>
-        <h2>Complete source navigation</h2>
+        <p>Scheduled draws expose account-free <code>GET /api/draws/:game/:period/proof</code>, returning <code>plan</code>, <code>proof</code> and <code>proof_status</code>: <code>pending</code>, <code>available</code> or <code>legacy</code>. This endpoint exposes no private selections or account data. A personal history ticket can be attached as the proof's <code>ticket</code> field to check its prize calculation.</p>
+        <p>If the operator withholds its proof, obtain the exact round from the saved plan at <code>https://api.drand.sh/52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971/public/{round}</code> and save it as <code>beacon.json</code>. Replace <code>GAME</code> and <code>PERIOD</code> below with the saved game's name and integer period. The command verifies the round and signature, then emits a complete draw proof.</p>
+        <pre><code>./draw-games/verifier/target/debug/draw-verify --derive-lottery GAME PERIOD beacon.json &gt; proof.json
+./draw-games/verifier/target/debug/draw-verify proof.json --receipt pre-draw-receipt.json</code></pre>
+
+        <h2>Evidence retention and guarantees</h2>
+        <p>Browser receipts belong to the current user in that browser, with limits of 256 entries and 30 days. Clearing browser storage or changing devices affects availability; download files for longer retention. Server lottery tickets and draw proofs follow the existing 30-day cleanup policy. Sicbo room history retains up to 60 rounds; ledger records follow the service's existing retention policy. This is neither permanent evidence storage nor a global append-only public proof log.</p>
+        <p>A local receipt is not a signed timestamp. Verification checks the supplied data against the algorithm and saved inputs; it cannot alone prove publication time, account ownership, actual wallet credit, eventual service completion or the deployed binary. Without a pre-bet receipt, verification is unanchored to an earlier observation; scheduled results still have a verifiable fixed-round beacon and can be derived independently. Seed commitments are not server-blind dealing: room Sicbo retains operator preknowledge and abort risk.</p>
+        <p>Slots prize logic, Claw physics and the name picker currently run in the browser. There are no corresponding backend draw modules to include here; these features are outside the seven backend games covered by this publication.</p>
+
+        <h2>Source navigation and build scope</h2>
         <ul>
-          <li>Lottery: <a href="src/lottery/mod.rs">mod.rs</a>, <a href="src/lottery/rules.rs">rules.rs</a>, <a href="src/lottery/store.rs">store.rs</a>, <a href="src/lottery/draw_loop.rs">draw_loop.rs</a>, <a href="src/lottery/scratch.rs">scratch.rs</a>, <a href="src/lottery/handlers.rs">handlers.rs</a>.</li>
-          <li>Historical compatibility: <a href="src/lottery/legacy_scratch.rs">legacy_scratch.rs</a> handles account cleanup in retired scratch-room checkpoints, not current draws.</li>
-          <li>Sicbo: <a href="src/sicbo.rs">sicbo.rs</a>, <a href="src/sicbo_room/mod.rs">sicbo_room/mod.rs</a>, <a href="src/sicbo_room/store.rs">sicbo_room/store.rs</a>.</li>
-          <li>Room progression and recovery: <a href="src/casino_room.rs">casino_room.rs</a>, <a href="src/casino_room_lifecycle.rs">casino_room_lifecycle.rs</a>, <a href="src/write_behind.rs">write_behind.rs</a>, <a href="src/room_clock.rs">room_clock.rs</a>. Bot behavior: <a href="src/casino_bots.rs">casino_bots.rs</a>; game identifiers: <a href="src/game_catalog.rs">game_catalog.rs</a>.</li>
-          <li>References: <a href="schema/0027_lottery_center.up.sql">lottery incremental migration</a> and <a href="schema/0027_lottery_center.down.sql">rollback migration</a>, <a href="schema/0029_daletou.up.sql">Daletou migration</a> and <a href="schema/0029_daletou.down.sql">rollback</a>, <a href="reference/server-Cargo.toml">server dependencies</a>, <a href="../server-integration/texas-h5-Cargo.toml">upstream workspace manifest</a> and <a href="../server-integration/texas-h5-Cargo.lock">dependency lock</a>. Migrations are original historical source, not standalone database installers.</li>
+          <li>Independently buildable shared library: <a href="verifier/Cargo.toml">Cargo.toml</a>, <a href="verifier/Cargo.lock">Cargo.lock</a>; <a href="verifier/src/proof.rs">commitments, reveals and sampling stream</a>, <a href="verifier/src/beacon.rs">beacon signatures</a>, <a href="verifier/src/lottery.rs">lottery rules and prizes</a>, <a href="verifier/src/scratch.rs">scratch cards</a>, <a href="verifier/src/sicbo.rs">Sicbo</a>, <a href="verifier/src/bin/draw-verify.rs">CLI verifier</a>.</li>
+          <li>Lottery integration: <a href="src/lottery/mod.rs">module</a>, <a href="src/lottery/rules.rs">shared rule imports and legacy draws</a>, <a href="src/lottery/store.rs">purchases and queries</a>, <a href="src/lottery/draw_loop.rs">draws and settlement</a>, <a href="src/lottery/beacon.rs">bounded beacon requests</a>, <a href="src/lottery/scratch.rs">scratch reveals</a>, <a href="src/lottery/handlers.rs">HTTP handlers</a>, <a href="src/lottery/legacy_scratch.rs">retired-room cleanup</a>.</li>
+          <li>Immediate commitments and Sicbo: <a href="src/draw_fairness.rs">draw_fairness.rs</a>, <a href="src/sicbo.rs">solo Sicbo</a>, <a href="src/sicbo_room/mod.rs">room module</a>, <a href="src/sicbo_room/store.rs">room commitments and settlement</a>.</li>
+          <li>Persistence and accounting: <a href="src/casino_room.rs">room progression and acknowledgements</a>, <a href="src/casino_room_lifecycle.rs">room lifecycle</a>, <a href="src/write_behind.rs">ordered persistence</a>, <a href="src/wallet.rs">ledger</a>, <a href="src/beans.rs">shared practice wallet</a>, <a href="src/game_records.rs">game records</a>, <a href="src/room_clock.rs">clock</a>, <a href="src/casino_bots.rs">bots</a>, <a href="src/game_catalog.rs">game identifiers</a>.</li>
+          <li>Incremental schema: <a href="schema/0031_draw_proofs.up.sql">0031 proofs and immutability constraints</a> and <a href="schema/0031_draw_proofs.down.sql">rollback source</a>; historical <a href="schema/0027_lottery_center.up.sql">0027 lottery center</a>, <a href="schema/0027_lottery_center.down.sql">0027 rollback</a>, <a href="schema/0029_daletou.up.sql">0029 Daletou</a> and <a href="schema/0029_daletou.down.sql">0029 rollback</a>. These are original incremental files, not standalone database installers.</li>
+          <li>Dependency references: <a href="reference/server-Cargo.toml">server dependencies</a>, <a href="../server-integration/texas-h5-Cargo.toml">upstream workspace</a>, <a href="../server-integration/texas-h5-Cargo.lock">upstream lockfile</a>.</li>
         </ul>
-        <h2>Runtime and verification boundaries</h2>
-        <p>This is a source publication, not an independent Rust crate; the root workspace build does not compile this directory. Account-lifecycle locks, authentication, routing, base database schema, checkpoint decoding, host ownership, release handoff, statistics and social infrastructure still come from the main service. This is not a complete server or complete host-recovery implementation.</p>
-        <p>Sicbo rooms can display accepted outcomes before the ordered persistence finishes. A process crash before persistence can restore only the saved state. Publication is not a guarantee that every displayed result has already become durable.</p>
-        <p>Slots currently generates prizes locally in the browser, Claw uses browser physics, and the name picker also runs client-side. They have no backend draw modules to publish here. This change does not turn them into server games.</p>
-        <p>An explicit upstream file map copies these files byte-for-byte. The upstream publication flow hashes their contents, then downloads the public tag and compares each file. A public tag identifies a source snapshot, not proof of production deployment. Runtime secrets, player data and actual unfinished draw results are not repository contents.</p>
+        <p><code>verifier/</code> has its own workspace and builds with the command above; a normal build of the public root workspace does not include it. <code>src/</code> is byte-for-byte server integration source, not a standalone server. Authentication, account lifecycle, base database schema, complete checkpoint recovery and main-service routing still come from the upstream service. Publication hashes the explicit source subset and downloads the public tag for per-file comparison. This identifies a public source snapshot, not a live deployment.</p>
       </article>
     </main>
     <script>
@@ -112,7 +171,7 @@
           document.querySelectorAll('article').forEach((article) => { article.hidden = article.id !== language; });
           document.querySelectorAll('[data-lang]').forEach((item) => { item.setAttribute('aria-pressed', String(item.dataset.lang === language)); });
           document.documentElement.lang = language === 'zh' ? 'zh-CN' : 'en';
-          document.title = language === 'zh' ? 'BluffKing · 开奖源码' : 'BluffKing · Draw source';
+          document.title = language === 'zh' ? 'BluffKing · 开奖证明' : 'BluffKing · Draw proofs';
         });
       });
     </script>

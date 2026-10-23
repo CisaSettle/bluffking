@@ -1,5 +1,6 @@
 [workspace]
 members = ["engine", "mental-poker", "server", "gto-solver", "tools/bnb-hd-recovery"]
+exclude = ["draw-games/verifier"]
 resolver = "2"
 
 [workspace.package]

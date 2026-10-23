@@ -1,0 +1,23 @@
+[package]
+name = "draw-games"
+version = "0.1.0"
+edition = "2021"
+authors = ["BluffKing Contributors"]
+license = "AGPL-3.0-only"
+description = "BluffKing deterministic draw rules and offline proof verifier"
+publish = false
+
+# Independently buildable inside the existing public repository.
+[workspace]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+drand-verify = "=0.6.2"
+
+[[bin]]
+name = "draw-verify"
+path = "src/bin/draw-verify.rs"
