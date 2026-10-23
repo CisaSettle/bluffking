@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>BluffKing · 开奖源码</title>
+    <style>
+      :root { color-scheme: light dark; font-family: system-ui, sans-serif; line-height: 1.65; }
+      body { max-width: 960px; margin: auto; padding: 28px 20px 64px; }
+      nav { display: flex; gap: 10px; margin-bottom: 28px; }
+      button { font: inherit; padding: 6px 16px; cursor: pointer; }
+      button[aria-pressed="true"] { font-weight: 700; outline: 2px solid #608bdb; }
+      h1 { line-height: 1.25; }
+      h2 { margin-top: 32px; }
+      a { color: light-dark(#174f9e, #9bc2ff); overflow-wrap: anywhere; }
+      code { overflow-wrap: anywhere; }
+      table { border-collapse: collapse; width: 100%; }
+      th, td { text-align: left; vertical-align: top; padding: 10px; border-bottom: 1px solid #8886; }
+      .notice { border-left: 4px solid #608bdb; padding: 4px 16px; }
+      [hidden] { display: none !important; }
+    </style>
+  </head>
+  <body>
+    <nav aria-label="语言 / Language">
+      <button type="button" data-lang="zh" aria-pressed="true">中文</button>
+      <button type="button" data-lang="en" aria-pressed="false">English</button>
+    </nav>
+    <main>
+      <article id="zh" lang="zh-CN">
+        <h1>彩票与骰宝：开奖后台源码</h1>
+        <p>这是现有 BluffKing 开源仓库的 <code>draw-games/</code> 子目录。它公开实际服务端使用的抽样、中奖计算、购票封盘、兑奖和相关持久化源码；不包含数据库内容、账号数据或运行密钥。代码采用根目录的 <a href="../LICENSE">AGPL-3.0-only 许可证</a>，品牌规则见 <a href="../TRADEMARKS.md">商标说明</a>。</p>
+        <p class="notice">这些游戏使用操作系统安全随机数。当前没有预先公开的种子承诺、开奖后种子揭示或可离线验证的开奖证明。公开代码让任何人检查算法与结算规则；它本身不证明某次线上开奖运行了该版本，也不提供德州盲发的密码学保证。</p>
+        <h2>游戏与抽样规则</h2>
+        <table>
+          <thead><tr><th>游戏</th><th>实际实现</th><th>源码</th></tr></thead>
+          <tbody>
+            <tr><td>骰宝</td><td>三个独立的 1–6 骰子；4–10 为小、11–17 为大，围骰使大小投注均输。单人入口和同桌共用结果的房间入口均公开。</td><td><a href="src/sicbo.rs">单人规则与结算</a> · <a href="src/sicbo_room/store.rs">房间抽样与结算</a></td></tr>
+            <tr><td>刮刮乐</td><td>六个号码和一个幸运号分别从 1–30 抽取；位置倍率为 1、1、2、2、5、10，中奖位置相加。结果购票时保存；单张逐格揭示，5/10 张批量购买直接揭示。</td><td><a href="src/lottery/scratch.rs">生成、隐藏、揭示、兑奖</a></td></tr>
+            <tr><td>双色球</td><td>1–33 无放回取 6 个红球，独立抽取 1–16 蓝球。</td><td rowspan="4"><a href="src/lottery/rules.rs">抽样、复式注数与完整奖表</a></td></tr>
+            <tr><td>快乐8</td><td>1–80 无放回取 20 个号码。</td></tr>
+            <tr><td>福彩3D</td><td>三个独立的 0–9 数字，支持直选、组三与组六。</td></tr>
+            <tr><td>TOTO</td><td>1–49 无放回取 7 个号码；前 6 个为正选，第 7 个为额外号码。</td></tr>
+          </tbody>
+        </table>
+        <h2>从开奖到兑奖</h2>
+        <ol>
+          <li><a href="src/lottery/mod.rs">期次与时间</a>：双色球和 TOTO 每 5 分钟一期，TOTO 错开 150 秒；快乐8 每 2 分钟，福彩3D 每 3 分钟。开奖前 5 秒封盘，期号使用新加坡时间。</li>
+          <li><a href="src/lottery/store.rs">购票</a>：校验选号和限额、锁定钱包、检查封盘与余额；重复请求回放已保存结果。请求内容哈希只用于幂等校验，不是开奖承诺。</li>
+          <li><a href="src/lottery/draw_loop.rs">开奖与派奖</a>：数据库行锁协调多个后台，每期生成并保存同一组号码；逐用户事务结算，重启继续处理尚未结算的记录。</li>
+          <li><a href="src/lottery/scratch.rs">刮刮乐揭示</a>：未刮号码在响应中为 <code>null</code>，但后台数据库已保存完整结果；单张最后一格揭示时兑奖，并处理过期卡片。不能据此声称服务器不知道结果。</li>
+          <li><a href="src/wallet.rs">账本</a>、<a href="src/beans.rs">练习豆钱包</a>与<a href="src/game_records.rs">游戏记录</a>展示结算调用和原子余额更新；当前彩票共用练习豆钱包，迁移文件中的旧彩票钱包只保留历史意义。</li>
+        </ol>
+        <h2>完整文件导航</h2>
+        <ul>
+          <li>彩票模块：<a href="src/lottery/mod.rs">mod.rs</a>、<a href="src/lottery/rules.rs">rules.rs</a>、<a href="src/lottery/store.rs">store.rs</a>、<a href="src/lottery/draw_loop.rs">draw_loop.rs</a>、<a href="src/lottery/scratch.rs">scratch.rs</a>、<a href="src/lottery/handlers.rs">handlers.rs</a>。</li>
+          <li>历史兼容：<a href="src/lottery/legacy_scratch.rs">legacy_scratch.rs</a> 处理旧刮刮乐房间的账号清理，不是当前开奖路径。</li>
+          <li>骰宝模块：<a href="src/sicbo.rs">sicbo.rs</a>、<a href="src/sicbo_room/mod.rs">sicbo_room/mod.rs</a>、<a href="src/sicbo_room/store.rs">sicbo_room/store.rs</a>。</li>
+          <li>房间推进与恢复：<a href="src/casino_room.rs">casino_room.rs</a>、<a href="src/casino_room_lifecycle.rs">casino_room_lifecycle.rs</a>、<a href="src/write_behind.rs">write_behind.rs</a>、<a href="src/room_clock.rs">room_clock.rs</a>；机器人行为见 <a href="src/casino_bots.rs">casino_bots.rs</a>，游戏编号见 <a href="src/game_catalog.rs">game_catalog.rs</a>。</li>
+          <li>参考资料：<a href="schema/0027_lottery_center.up.sql">彩票中心增量迁移</a>及<a href="schema/0027_lottery_center.down.sql">回退迁移</a>、<a href="reference/server-Cargo.toml">服务端依赖声明</a>、<a href="../server-integration/texas-h5-Cargo.toml">上游工作区清单</a>与<a href="../server-integration/texas-h5-Cargo.lock">依赖锁文件</a>。迁移展示原始历史版本，不是独立数据库安装脚本。</li>
+        </ul>
+        <h2>运行与验证边界</h2>
+        <p>这是原始源码公开目录，不是独立 Rust crate，根工作区构建不编译本目录。账号生命周期锁、认证、主路由、数据库基础结构、checkpoint 解码、主机所有权、发布接管、统计与社交模块仍由主服务提供；本目录不构成完整服务器或完整主机恢复实现。</p>
+        <p>骰宝房间可能在有序持久化完成前展示已接受的结果；进程在写入前崩溃时，恢复只能依据已保存状态。源码公开不构成“所有已展示结果均已落库”的保证。</p>
+        <p>老虎机的随机中奖目前在浏览器本地运行，抓娃娃使用浏览器物理模拟，名单抽奖也在客户端；它们没有可供本目录发布的后台开奖模块。本次不把这些功能改成服务端游戏。</p>
+        <p>公开文件由上游明确文件清单逐字同步。上游发布流程对这些文件计算内容散列，并下载公开标签逐文件比对。公开标签说明对应的源码快照，不表示该快照已部署到生产。运行密钥、玩家数据与未结束的实际开奖结果均不在仓库中。</p>
+      </article>
+      <article id="en" lang="en" hidden>
+        <h1>Lottery and Sicbo draw backend source</h1>
+        <p><code>draw-games/</code> is a subdirectory of the existing BluffKing open-source repository. It publishes the actual server implementation for sampling, prize calculation, purchase cutoffs, redemption and related persistence. It contains no database contents, account data or runtime secrets. Code is licensed under the root <a href="../LICENSE">AGPL-3.0-only license</a>; see the separate <a href="../TRADEMARKS.md">trademark policy</a>.</p>
+        <p class="notice">These games use the operating-system RNG. They currently have no published seed commitments, post-draw seed reveals or offline-verifiable draw proofs. Publishing source permits inspection of the algorithms and settlement rules; it does not prove that a particular live draw executed this version or provide poker's server-blind cryptographic guarantees.</p>
+        <h2>Games and sampling</h2>
+        <table>
+          <thead><tr><th>Game</th><th>Implementation</th><th>Source</th></tr></thead>
+          <tbody>
+            <tr><td>Sicbo</td><td>Three independent dice in 1–6. Small is 4–10, big is 11–17, and triples lose both bets. Both solo play and shared room outcomes are included.</td><td><a href="src/sicbo.rs">Solo rules and settlement</a> · <a href="src/sicbo_room/store.rs">Room draws and settlement</a></td></tr>
+            <tr><td>Scratch cards</td><td>Six numbers and one lucky number drawn independently from 1–30. Matching positions pay multipliers 1, 1, 2, 2, 5, 10, added together. Results are stored at purchase; single cards reveal by spot, batches of 5/10 reveal immediately.</td><td><a href="src/lottery/scratch.rs">Generation, projection, reveal and redemption</a></td></tr>
+            <tr><td>SSQ</td><td>Six distinct red balls from 1–33 and an independent blue ball from 1–16.</td><td rowspan="4"><a href="src/lottery/rules.rs">Sampling, system entries and full payout tables</a></td></tr>
+            <tr><td>Happy8</td><td>Twenty distinct numbers from 1–80.</td></tr>
+            <tr><td>Fucai3D</td><td>Three independent digits from 0–9; straight, group-three and group-six entries.</td></tr>
+            <tr><td>TOTO</td><td>Seven distinct numbers from 1–49; the first six are main numbers and the seventh is additional.</td></tr>
+          </tbody>
+        </table>
+        <h2>From draw to redemption</h2>
+        <ol>
+          <li><a href="src/lottery/mod.rs">Periods and timing</a>: SSQ and TOTO draw every five minutes, with TOTO offset by 150 seconds; Happy8 every two minutes and Fucai3D every three. Sales close five seconds before the draw. Period labels use Singapore time.</li>
+          <li><a href="src/lottery/store.rs">Purchases</a>: validate entries and limits, lock the wallet, enforce the cutoff and available balance, and replay stored results for repeated requests. The request-body hash is for idempotency, not a draw commitment.</li>
+          <li><a href="src/lottery/draw_loop.rs">Draws and awards</a>: database row locks arbitrate concurrent backends, storing one set of numbers per period. Settlement proceeds in per-user transactions; unfinished work resumes after restart.</li>
+          <li><a href="src/lottery/scratch.rs">Scratch reveals</a>: unrevealed numbers are <code>null</code> in client responses, but the complete result already exists in the server database. A single card pays on its last reveal; expiry is also handled. This is not server-blind dealing.</li>
+          <li><a href="src/wallet.rs">Ledger</a>, <a href="src/beans.rs">shared practice wallet</a> and <a href="src/game_records.rs">game records</a> expose settlement calls and atomic balance updates. Lottery now shares the beans wallet; the older lottery wallet in the migration is historical.</li>
+        </ol>
+        <h2>Complete source navigation</h2>
+        <ul>
+          <li>Lottery: <a href="src/lottery/mod.rs">mod.rs</a>, <a href="src/lottery/rules.rs">rules.rs</a>, <a href="src/lottery/store.rs">store.rs</a>, <a href="src/lottery/draw_loop.rs">draw_loop.rs</a>, <a href="src/lottery/scratch.rs">scratch.rs</a>, <a href="src/lottery/handlers.rs">handlers.rs</a>.</li>
+          <li>Historical compatibility: <a href="src/lottery/legacy_scratch.rs">legacy_scratch.rs</a> handles account cleanup in retired scratch-room checkpoints, not current draws.</li>
+          <li>Sicbo: <a href="src/sicbo.rs">sicbo.rs</a>, <a href="src/sicbo_room/mod.rs">sicbo_room/mod.rs</a>, <a href="src/sicbo_room/store.rs">sicbo_room/store.rs</a>.</li>
+          <li>Room progression and recovery: <a href="src/casino_room.rs">casino_room.rs</a>, <a href="src/casino_room_lifecycle.rs">casino_room_lifecycle.rs</a>, <a href="src/write_behind.rs">write_behind.rs</a>, <a href="src/room_clock.rs">room_clock.rs</a>. Bot behavior: <a href="src/casino_bots.rs">casino_bots.rs</a>; game identifiers: <a href="src/game_catalog.rs">game_catalog.rs</a>.</li>
+          <li>References: <a href="schema/0027_lottery_center.up.sql">lottery incremental migration</a> and <a href="schema/0027_lottery_center.down.sql">rollback migration</a>, <a href="reference/server-Cargo.toml">server dependencies</a>, <a href="../server-integration/texas-h5-Cargo.toml">upstream workspace manifest</a> and <a href="../server-integration/texas-h5-Cargo.lock">dependency lock</a>. Migrations are original historical source, not standalone database installers.</li>
+        </ul>
+        <h2>Runtime and verification boundaries</h2>
+        <p>This is a source publication, not an independent Rust crate; the root workspace build does not compile this directory. Account-lifecycle locks, authentication, routing, base database schema, checkpoint decoding, host ownership, release handoff, statistics and social infrastructure still come from the main service. This is not a complete server or complete host-recovery implementation.</p>
+        <p>Sicbo rooms can display accepted outcomes before the ordered persistence finishes. A process crash before persistence can restore only the saved state. Publication is not a guarantee that every displayed result has already become durable.</p>
+        <p>Slots currently generates prizes locally in the browser, Claw uses browser physics, and the name picker also runs client-side. They have no backend draw modules to publish here. This change does not turn them into server games.</p>
+        <p>An explicit upstream file map copies these files byte-for-byte. The upstream publication flow hashes their contents, then downloads the public tag and compares each file. A public tag identifies a source snapshot, not proof of production deployment. Runtime secrets, player data and actual unfinished draw results are not repository contents.</p>
+      </article>
+    </main>
+    <script>
+      document.querySelectorAll('[data-lang]').forEach((button) => {
+        button.addEventListener('click', () => {
+          const language = button.dataset.lang;
+          document.querySelectorAll('article').forEach((article) => { article.hidden = article.id !== language; });
+          document.querySelectorAll('[data-lang]').forEach((item) => { item.setAttribute('aria-pressed', String(item.dataset.lang === language)); });
+          document.documentElement.lang = language === 'zh' ? 'zh-CN' : 'en';
+          document.title = language === 'zh' ? 'BluffKing · 开奖源码' : 'BluffKing · Draw source';
+        });
+      });
+    </script>
+  </body>
+</html>

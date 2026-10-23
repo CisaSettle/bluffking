@@ -57,6 +57,6 @@ To compile the exact deployed handler, a downstream would drop `gto_solve.rs`
 into a server crate that supplies those sibling modules and resolve it against
 `texas-h5-Cargo.lock` (which pins `gto-solver` + `postflop-solver` at the deployed
 versions). We intentionally do **not** vendor a synthetic wrapper crate around it
-here — that would ship a fork of the closed server's private module surface. Apart from
-`sealed_dealer.rs`, the rest of the BluffKing server, clients, and website remain
-closed.
+here — that would ship a fork of the closed server's private module surface. The lottery and dice draw implementation is also published in
+[`draw-games/`](../draw-games). Other server integration modules, clients, and
+the website remain closed.
