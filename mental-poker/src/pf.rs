@@ -64,14 +64,6 @@ pub struct HandRecord {
     /// players-vec seat order the engine used at hand start (occupied seats only,
     /// ascending). For a sparse table (seats `[2, 5]`) this is `[2, 5]` so the
     /// verifier can map each deal position back to its real seat.
-    ///
-    /// `#[serde(default)]` makes legacy / contiguous-only fixtures (no
-    /// `dealt_seats` field) deserialize as empty. The verifier treats an empty
-    /// `dealt_seats` as "contiguous from 0" (deal_pos == seat) ONLY when that is
-    /// safe (single-seat hole-card checks against contiguous seats); a PF
-    /// multi-seat row whose persisted seats are NOT contiguous-from-0 and that
-    /// omits `dealt_seats` is rejected FAIL-CLOSED.
-    #[serde(default)]
     pub dealt_seats: Vec<u8>,
     /// seat (string key) → the two hole cards persisted for that seat
     /// (`["As","Kd"]`). May be partial (e.g. just the verifying user's seat).
@@ -191,39 +183,7 @@ pub fn verify_hand(rec: &HandRecord) -> Result<PfVerifyReport, PfVerifyError> {
     // Build the seat → deal-position map. The engine deals by player-vector
     // index, NOT by seat (F2): for a sparse table the deal position differs from
     // the seat. `dealt_seats[deal_pos] = seat`, so we invert it.
-    //
-    // FAIL-CLOSED (F3): if `dealt_seats` is present it MUST be well-formed
-    // (length == n, no dup, every persisted/board seat resolvable). If it is
-    // ABSENT, we may only assume deal_pos == seat when the persisted seats are
-    // already contiguous-from-0 — otherwise we reject rather than guess.
-    let deal_pos_of_seat: BTreeMap<u8, usize> = if rec.dealt_seats.is_empty() {
-        // Legacy / contiguous fixture: deal_pos == seat. Validate that the
-        // persisted hole-card seats are all < n AND that none of them could be a
-        // sparse seat we'd silently mis-map. Any persisted seat >= n is rejected
-        // below; a seat < n is treated as its own deal position.
-        let mut needs_explicit = false;
-        for seat_str in rec.hole_cards.keys() {
-            let seat: usize = seat_str
-                .parse()
-                .map_err(|_| PfVerifyError(format!("hole_cards key '{seat_str}' is not a seat")))?;
-            // A persisted seat at index >= n means the table was sparse (a gap
-            // pushed a real seat past the deal-vec length). Without dealt_seats we
-            // cannot map it — fail closed.
-            if seat >= n {
-                needs_explicit = true;
-            }
-        }
-        if needs_explicit {
-            return Err(PfVerifyError(format!(
-                "sparse-seat PF row requires dealt_seats: a persisted hole-card seat \
-                 is >= num_players {n} but dealt_seats is absent (F3 fail-closed — \
-                 refusing to guess the deal order)"
-            )));
-        }
-        // Safe contiguous assumption: deal_pos == seat for seat in 0..n.
-        (0..n as u8).map(|s| (s, s as usize)).collect()
-    } else {
-        // Explicit dealt order. Validate it (F3): length, range, no duplicates.
+    let deal_pos_of_seat: BTreeMap<u8, usize> = {
         if rec.dealt_seats.len() != n {
             return Err(PfVerifyError(format!(
                 "dealt_seats has {} entries but num_players is {n} (F3 fail-closed)",

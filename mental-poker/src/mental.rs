@@ -161,7 +161,7 @@ impl MentalPokerDealingProvider {
         DealtHand {
             deck: run.deck_cards(),
             deck_seed: run.deck_seed(),
-            transcript: Some(builder.finish()),
+            transcript: builder.finish(),
         }
     }
 }

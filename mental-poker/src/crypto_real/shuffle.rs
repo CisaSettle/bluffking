@@ -102,8 +102,7 @@
 //! - **Cross-vendor AI-audited (ADR-076/077/078); open-source + verifiable.** GA'd
 //!   for the engine-blind table class by ADR-070 (which lifted the ADR-063 cage); in
 //!   production reachable ONLY for engine-blind sessions via
-//!   `resolve_mp_crypto_mode`. `guard_provider_allowed` still keeps the generic
-//!   `mental_poker_production` provider rejected at startup.
+//!   `resolve_mp_crypto_mode` and the engine-blind coordinator.
 
 use crate::crypto::{ShuffleProof, ShuffleProofProvider};
 use crate::crypto_real::dkg::challenge_scalar;

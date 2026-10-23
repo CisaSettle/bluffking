@@ -6,10 +6,45 @@
 //! every card immediately).
 
 use crate::proof::Reveal;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 pub const PRIZES: [i64; 6] = [1, 1, 2, 2, 5, 10];
+
+/// Version-one service prizes are additive to the unchanged number-match payout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Reward {
+    Beans { amount: i64 },
+    Membership { tier: String, days: i64 },
+}
+
+/// Separate, reproducible suffix of the committed stream. Skipping the original
+/// card draws preserves every previously published number/payout proof.
+pub fn rewards(reveal: &Reveal, cost: i64, count: usize) -> Result<Vec<Option<Reward>>, String> {
+    if reveal.commitment.game != "scratch" || cost != 100 || ![1, 5, 10].contains(&count) {
+        return Err("invalid service reward purchase".into());
+    }
+    let mut entropy = reveal.entropy()?;
+    for _ in 0..count * 7 {
+        entropy.below(30);
+    }
+    Ok((0..count)
+        .map(|_| match entropy.below(10_000) {
+            0..=19 => Some(Reward::Beans { amount: 10_000 }),
+            20 => Some(Reward::Beans { amount: 100_000 }),
+            21..=30 => Some(Reward::Membership {
+                tier: "pro".into(),
+                days: 30,
+            }),
+            31 => Some(Reward::Membership {
+                tier: "max".into(),
+                days: 30,
+            }),
+            _ => None,
+        })
+        .collect())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Card {
@@ -21,7 +56,7 @@ pub struct Card {
 
 /// The same award calculation is used by the server and independent verifier.
 pub fn payout(cost: i64, lucky: i16, numbers: &[i16; 6]) -> Result<(i64, i16), String> {
-    if ![10, 50, 100].contains(&cost)
+    if cost != 100
         || !(1..=30).contains(&lucky)
         || numbers.iter().any(|number| !(1..=30).contains(number))
     {
@@ -43,7 +78,7 @@ pub fn generate(reveal: &Reveal, cost: i64, count: usize) -> Result<Vec<Card>, S
     if reveal.commitment.game != "scratch" {
         return Err("scratch proof has a different game".into());
     }
-    if ![10, 50, 100].contains(&cost) || ![1, 5, 10].contains(&count) {
+    if cost != 100 || ![1, 5, 10].contains(&count) {
         return Err("invalid scratch purchase".into());
     }
     let mut entropy = reveal.entropy()?;
@@ -84,6 +119,9 @@ struct Receipt {
     lucky: i16,
     prize: i64,
     hits: i16,
+    reward_version: u8,
+    #[serde(default)]
+    reward: Option<Reward>,
 }
 
 /// Verify the commitment, reproduce the card and check the reported award.
@@ -103,7 +141,16 @@ pub fn verify(value: &Value) -> Result<Value, String> {
     {
         return Err("scratch card or prize differs from the committed draw".into());
     }
+    if receipt.reward_version != 1 {
+        return Err("unsupported scratch reward version".into());
+    }
+    let expected = rewards(&receipt.reveal, receipt.cost, receipt.count)?;
+    if expected[receipt.index] != receipt.reward {
+        return Err("service reward differs from the committed draw".into());
+    }
     Ok(json!({
+        "reward_version": receipt.reward_version,
+        "reward": receipt.reward,
         "verified": true,
         "kind": "scratch",
         "draw_id": receipt.reveal.commitment.draw_id,
