@@ -1,12 +1,12 @@
 //! 彩票中心 (lottery center): one server-authoritative hall per lottery game.
 //!
 //! Everybody buys from the same house; there are no rooms, roles or bots.
-//! The number games (双色球 `ssq`, TOTO `toto`, 快乐8 `happy8`, 福彩3D
-//! `fucai3d`) sell tickets for wall-clock periods and a draw loop in every
+//! The number games (双色球 `ssq`, 大乐透 `dlt`, TOTO `toto`, 快乐8 `happy8`,
+//! 福彩3D `fucai3d`) sell tickets for wall-clock periods and a draw loop in every
 //! backend draws each due period exactly once (database-arbitrated) and
 //! settles it one user per transaction. 刮刮乐 `scratch` cards are generated
 //! at purchase and revealed spot by spot. One shared practice wallet
-//! (`game_catalog::BEANS`, grant 10,000) backs all five games; every ledger
+//! (`game_catalog::BEANS`, grant 10,000) backs all six games; every ledger
 //! record id is derived here, so retries never debit or credit twice.
 //!
 //! Module map: [`rules`] entry validation, stakes and prizes; [`store`]
@@ -37,6 +37,7 @@ pub const SGT_OFFSET_SECS: i32 = 8 * 60 * 60;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Game {
     Ssq,
+    Dlt,
     Toto,
     Happy8,
     Fucai3d,
@@ -44,19 +45,27 @@ pub enum Game {
 }
 
 impl Game {
-    pub const ALL: [Game; 5] = [
+    pub const ALL: [Game; 6] = [
         Game::Ssq,
+        Game::Dlt,
         Game::Toto,
         Game::Happy8,
         Game::Fucai3d,
         Game::Scratch,
     ];
-    /// The four scheduled number games, in draw-loop order.
-    pub const DRAWN: [Game; 4] = [Game::Happy8, Game::Fucai3d, Game::Ssq, Game::Toto];
+    /// The scheduled number games, in draw-loop order.
+    pub const DRAWN: [Game; 5] = [
+        Game::Happy8,
+        Game::Fucai3d,
+        Game::Ssq,
+        Game::Dlt,
+        Game::Toto,
+    ];
 
     pub fn parse(name: &str) -> Option<Game> {
         Some(match name {
             "ssq" => Game::Ssq,
+            "dlt" => Game::Dlt,
             "toto" => Game::Toto,
             "happy8" => Game::Happy8,
             "fucai3d" => Game::Fucai3d,
@@ -67,6 +76,7 @@ impl Game {
     pub fn as_str(self) -> &'static str {
         match self {
             Game::Ssq => "ssq",
+            Game::Dlt => "dlt",
             Game::Toto => "toto",
             Game::Happy8 => "happy8",
             Game::Fucai3d => "fucai3d",
@@ -76,7 +86,7 @@ impl Game {
     /// Chips per 注 (scratch: the smallest card).
     pub fn unit(self) -> i64 {
         match self {
-            Game::Ssq | Game::Toto => 10,
+            Game::Ssq | Game::Dlt | Game::Toto => 10,
             Game::Happy8 => 4,
             Game::Fucai3d => 2,
             Game::Scratch => 10,
@@ -87,6 +97,10 @@ impl Game {
             Game::Ssq => Schedule {
                 interval_ms: 300_000,
                 offset_ms: 0,
+            },
+            Game::Dlt => Schedule {
+                interval_ms: 300_000,
+                offset_ms: 75_000,
             },
             Game::Toto => Schedule {
                 interval_ms: 300_000,

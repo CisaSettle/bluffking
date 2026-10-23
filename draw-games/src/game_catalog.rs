@@ -62,7 +62,7 @@ pub fn from_name(name: &str) -> Option<i16> {
 }
 
 /// Discovery order, including games with no account record rows.
-pub const HUB_GAMES: [&str; 25] = [
+pub const HUB_GAMES: [&str; 26] = [
     "poker",
     "shortdeck",
     "baccarat",
@@ -85,6 +85,7 @@ pub const HUB_GAMES: [&str; 25] = [
     "slots",
     "toto",
     "ssq",
+    "dlt",
     "happy8",
     "fucai3d",
     "2048",

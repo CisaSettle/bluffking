@@ -36,15 +36,16 @@
           <tbody>
             <tr><td>骰宝</td><td>三个独立的 1–6 骰子；4–10 为小、11–17 为大，围骰使大小投注均输。单人入口和同桌共用结果的房间入口均公开。</td><td><a href="src/sicbo.rs">单人规则与结算</a> · <a href="src/sicbo_room/store.rs">房间抽样与结算</a></td></tr>
             <tr><td>刮刮乐</td><td>六个号码和一个幸运号分别从 1–30 抽取；位置倍率为 1、1、2、2、5、10，中奖位置相加。结果购票时保存；单张逐格揭示，5/10 张批量购买直接揭示。</td><td><a href="src/lottery/scratch.rs">生成、隐藏、揭示、兑奖</a></td></tr>
-            <tr><td>双色球</td><td>1–33 无放回取 6 个红球，独立抽取 1–16 蓝球。</td><td rowspan="4"><a href="src/lottery/rules.rs">抽样、复式注数与完整奖表</a></td></tr>
+            <tr><td>双色球</td><td>1–33 无放回取 6 个红球，独立抽取 1–16 蓝球。</td><td rowspan="5"><a href="src/lottery/rules.rs">抽样、复式注数与完整奖表</a></td></tr>
             <tr><td>快乐8</td><td>1–80 无放回取 20 个号码。</td></tr>
             <tr><td>福彩3D</td><td>三个独立的 0–9 数字，支持直选、组三与组六。</td></tr>
+            <tr><td>大乐透</td><td>前区 1–35 无放回取 5 个号码，后区 1–12 独立无放回取 2 个号码。</td></tr>
             <tr><td>TOTO</td><td>1–49 无放回取 7 个号码；前 6 个为正选，第 7 个为额外号码。</td></tr>
           </tbody>
         </table>
         <h2>从开奖到兑奖</h2>
         <ol>
-          <li><a href="src/lottery/mod.rs">期次与时间</a>：双色球和 TOTO 每 5 分钟一期，TOTO 错开 150 秒；快乐8 每 2 分钟，福彩3D 每 3 分钟。开奖前 5 秒封盘，期号使用新加坡时间。</li>
+          <li><a href="src/lottery/mod.rs">期次与时间</a>：双色球、大乐透和 TOTO 每 5 分钟一期，大乐透错开 75 秒，TOTO 错开 150 秒；快乐8 每 2 分钟，福彩3D 每 3 分钟。开奖前 5 秒封盘，期号使用新加坡时间。</li>
           <li><a href="src/lottery/store.rs">购票</a>：校验选号和限额、锁定钱包、检查封盘与余额；重复请求回放已保存结果。请求内容哈希只用于幂等校验，不是开奖承诺。</li>
           <li><a href="src/lottery/draw_loop.rs">开奖与派奖</a>：数据库行锁协调多个后台，每期生成并保存同一组号码；逐用户事务结算，重启继续处理尚未结算的记录。</li>
           <li><a href="src/lottery/scratch.rs">刮刮乐揭示</a>：未刮号码在响应中为 <code>null</code>，但后台数据库已保存完整结果；单张最后一格揭示时兑奖，并处理过期卡片。不能据此声称服务器不知道结果。</li>
@@ -56,7 +57,7 @@
           <li>历史兼容：<a href="src/lottery/legacy_scratch.rs">legacy_scratch.rs</a> 处理旧刮刮乐房间的账号清理，不是当前开奖路径。</li>
           <li>骰宝模块：<a href="src/sicbo.rs">sicbo.rs</a>、<a href="src/sicbo_room/mod.rs">sicbo_room/mod.rs</a>、<a href="src/sicbo_room/store.rs">sicbo_room/store.rs</a>。</li>
           <li>房间推进与恢复：<a href="src/casino_room.rs">casino_room.rs</a>、<a href="src/casino_room_lifecycle.rs">casino_room_lifecycle.rs</a>、<a href="src/write_behind.rs">write_behind.rs</a>、<a href="src/room_clock.rs">room_clock.rs</a>；机器人行为见 <a href="src/casino_bots.rs">casino_bots.rs</a>，游戏编号见 <a href="src/game_catalog.rs">game_catalog.rs</a>。</li>
-          <li>参考资料：<a href="schema/0027_lottery_center.up.sql">彩票中心增量迁移</a>及<a href="schema/0027_lottery_center.down.sql">回退迁移</a>、<a href="reference/server-Cargo.toml">服务端依赖声明</a>、<a href="../server-integration/texas-h5-Cargo.toml">上游工作区清单</a>与<a href="../server-integration/texas-h5-Cargo.lock">依赖锁文件</a>。迁移展示原始历史版本，不是独立数据库安装脚本。</li>
+          <li>参考资料：<a href="schema/0027_lottery_center.up.sql">彩票中心增量迁移</a>及<a href="schema/0027_lottery_center.down.sql">回退迁移</a>、<a href="schema/0029_daletou.up.sql">大乐透增量迁移</a>及<a href="schema/0029_daletou.down.sql">回退迁移</a>、<a href="reference/server-Cargo.toml">服务端依赖声明</a>、<a href="../server-integration/texas-h5-Cargo.toml">上游工作区清单</a>与<a href="../server-integration/texas-h5-Cargo.lock">依赖锁文件</a>。迁移展示原始历史版本，不是独立数据库安装脚本。</li>
         </ul>
         <h2>运行与验证边界</h2>
         <p>这是原始源码公开目录，不是独立 Rust crate，根工作区构建不编译本目录。账号生命周期锁、认证、主路由、数据库基础结构、checkpoint 解码、主机所有权、发布接管、统计与社交模块仍由主服务提供；本目录不构成完整服务器或完整主机恢复实现。</p>
@@ -74,15 +75,16 @@
           <tbody>
             <tr><td>Sicbo</td><td>Three independent dice in 1–6. Small is 4–10, big is 11–17, and triples lose both bets. Both solo play and shared room outcomes are included.</td><td><a href="src/sicbo.rs">Solo rules and settlement</a> · <a href="src/sicbo_room/store.rs">Room draws and settlement</a></td></tr>
             <tr><td>Scratch cards</td><td>Six numbers and one lucky number drawn independently from 1–30. Matching positions pay multipliers 1, 1, 2, 2, 5, 10, added together. Results are stored at purchase; single cards reveal by spot, batches of 5/10 reveal immediately.</td><td><a href="src/lottery/scratch.rs">Generation, projection, reveal and redemption</a></td></tr>
-            <tr><td>SSQ</td><td>Six distinct red balls from 1–33 and an independent blue ball from 1–16.</td><td rowspan="4"><a href="src/lottery/rules.rs">Sampling, system entries and full payout tables</a></td></tr>
+            <tr><td>SSQ</td><td>Six distinct red balls from 1–33 and an independent blue ball from 1–16.</td><td rowspan="5"><a href="src/lottery/rules.rs">Sampling, system entries and full payout tables</a></td></tr>
             <tr><td>Happy8</td><td>Twenty distinct numbers from 1–80.</td></tr>
             <tr><td>Fucai3D</td><td>Three independent digits from 0–9; straight, group-three and group-six entries.</td></tr>
+            <tr><td>Daletou</td><td>Five distinct front numbers from 1–35 and two independently sampled distinct back numbers from 1–12.</td></tr>
             <tr><td>TOTO</td><td>Seven distinct numbers from 1–49; the first six are main numbers and the seventh is additional.</td></tr>
           </tbody>
         </table>
         <h2>From draw to redemption</h2>
         <ol>
-          <li><a href="src/lottery/mod.rs">Periods and timing</a>: SSQ and TOTO draw every five minutes, with TOTO offset by 150 seconds; Happy8 every two minutes and Fucai3D every three. Sales close five seconds before the draw. Period labels use Singapore time.</li>
+          <li><a href="src/lottery/mod.rs">Periods and timing</a>: SSQ, Daletou and TOTO draw every five minutes, with Daletou offset by 75 seconds and TOTO by 150 seconds; Happy8 every two minutes and Fucai3D every three. Sales close five seconds before the draw. Period labels use Singapore time.</li>
           <li><a href="src/lottery/store.rs">Purchases</a>: validate entries and limits, lock the wallet, enforce the cutoff and available balance, and replay stored results for repeated requests. The request-body hash is for idempotency, not a draw commitment.</li>
           <li><a href="src/lottery/draw_loop.rs">Draws and awards</a>: database row locks arbitrate concurrent backends, storing one set of numbers per period. Settlement proceeds in per-user transactions; unfinished work resumes after restart.</li>
           <li><a href="src/lottery/scratch.rs">Scratch reveals</a>: unrevealed numbers are <code>null</code> in client responses, but the complete result already exists in the server database. A single card pays on its last reveal; expiry is also handled. This is not server-blind dealing.</li>
@@ -94,7 +96,7 @@
           <li>Historical compatibility: <a href="src/lottery/legacy_scratch.rs">legacy_scratch.rs</a> handles account cleanup in retired scratch-room checkpoints, not current draws.</li>
           <li>Sicbo: <a href="src/sicbo.rs">sicbo.rs</a>, <a href="src/sicbo_room/mod.rs">sicbo_room/mod.rs</a>, <a href="src/sicbo_room/store.rs">sicbo_room/store.rs</a>.</li>
           <li>Room progression and recovery: <a href="src/casino_room.rs">casino_room.rs</a>, <a href="src/casino_room_lifecycle.rs">casino_room_lifecycle.rs</a>, <a href="src/write_behind.rs">write_behind.rs</a>, <a href="src/room_clock.rs">room_clock.rs</a>. Bot behavior: <a href="src/casino_bots.rs">casino_bots.rs</a>; game identifiers: <a href="src/game_catalog.rs">game_catalog.rs</a>.</li>
-          <li>References: <a href="schema/0027_lottery_center.up.sql">lottery incremental migration</a> and <a href="schema/0027_lottery_center.down.sql">rollback migration</a>, <a href="reference/server-Cargo.toml">server dependencies</a>, <a href="../server-integration/texas-h5-Cargo.toml">upstream workspace manifest</a> and <a href="../server-integration/texas-h5-Cargo.lock">dependency lock</a>. Migrations are original historical source, not standalone database installers.</li>
+          <li>References: <a href="schema/0027_lottery_center.up.sql">lottery incremental migration</a> and <a href="schema/0027_lottery_center.down.sql">rollback migration</a>, <a href="schema/0029_daletou.up.sql">Daletou migration</a> and <a href="schema/0029_daletou.down.sql">rollback</a>, <a href="reference/server-Cargo.toml">server dependencies</a>, <a href="../server-integration/texas-h5-Cargo.toml">upstream workspace manifest</a> and <a href="../server-integration/texas-h5-Cargo.lock">dependency lock</a>. Migrations are original historical source, not standalone database installers.</li>
         </ul>
         <h2>Runtime and verification boundaries</h2>
         <p>This is a source publication, not an independent Rust crate; the root workspace build does not compile this directory. Account-lifecycle locks, authentication, routing, base database schema, checkpoint decoding, host ownership, release handoff, statistics and social infrastructure still come from the main service. This is not a complete server or complete host-recovery implementation.</p>

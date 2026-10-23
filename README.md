@@ -30,7 +30,7 @@ English · [中文](#中文)
 
 ### Lottery and dice draws
 
-[`draw-games/`](draw-games) contains the exact server source for SSQ, TOTO, Happy8, Fucai3D, scratch cards and Sicbo, including draw selection, prize rules and selected settlement/recovery dependencies. Like the sealed dealer source offer, it is not a standalone build target. These games use the OS RNG; they do not currently provide poker-style commitments, seed reveals or offline-verifiable draw transcripts. [Scope and source guide (中文 / English)](draw-games/index.html).
+[`draw-games/`](draw-games) contains the exact server source for SSQ, Daletou, TOTO, Happy8, Fucai3D, scratch cards and Sicbo, including draw selection, prize rules and selected settlement/recovery dependencies. Like the sealed dealer source offer, it is not a standalone build target. These games use the OS RNG; they do not currently provide poker-style commitments, seed reveals or offline-verifiable draw transcripts. [Scope and source guide (中文 / English)](draw-games/index.html).
 
 ### Why verifiable dealing
 
@@ -104,7 +104,7 @@ section) and [`SECURITY.md`](SECURITY.md).
 
 ### 彩票与骰宝开奖
 
-[`draw-games/`](draw-games) 公开双色球、TOTO、快乐8、福彩3D、刮刮乐和骰宝的原始服务端源码,包括抽样、奖级计算及相关结算/恢复依赖。与密封发牌源码一样,它不是独立构建目标。这些游戏使用系统随机数,目前没有扑克式承诺、种子揭示或可离线核验的开奖记录。[范围与源码导读(中文 / English)](draw-games/index.html)。
+[`draw-games/`](draw-games) 公开双色球、大乐透、TOTO、快乐8、福彩3D、刮刮乐和骰宝的原始服务端源码,包括抽样、奖级计算及相关结算/恢复依赖。与密封发牌源码一样,它不是独立构建目标。这些游戏使用系统随机数,目前没有扑克式承诺、种子揭示或可离线核验的开奖记录。[范围与源码导读(中文 / English)](draw-games/index.html)。
 
 ### 为什么"可验证"发牌
 

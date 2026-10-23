@@ -16,7 +16,7 @@ use uuid::Uuid;
 pub const TICKET_COLUMNS: &str =
     "id, purchase_id, period, bought_at, entry, stakes, multiplier, cost, revealed, prize, tier, settled_at";
 const PERIOD_COLUMNS: &str =
-    "period, status, numbers, bonus, drawn_at, tickets, stakes, players, sales, paid, winners";
+    "period, status, numbers, bonus, bonus_numbers, drawn_at, tickets, stakes, players, sales, paid, winners";
 /// Tickets scanned for the hall feed (a purchase holds at most 10).
 const FEED_SCAN: i64 = 100;
 const FEED_LEN: usize = 10;
@@ -83,6 +83,7 @@ pub struct PeriodRow {
     pub status: String,
     pub numbers: Option<Vec<i16>>,
     pub bonus: Option<i16>,
+    pub bonus_numbers: Vec<i16>,
     pub drawn_at: Option<DateTime<Utc>>,
     pub tickets: i32,
     pub stakes: i32,
@@ -99,6 +100,7 @@ impl PeriodRow {
             status: row.get("status"),
             numbers: row.get("numbers"),
             bonus: row.get("bonus"),
+            bonus_numbers: row.get("bonus_numbers"),
             drawn_at: row.get("drawn_at"),
             tickets: row.get("tickets"),
             stakes: row.get("stakes"),
@@ -114,6 +116,7 @@ impl PeriodRow {
             "period": self.period, "label": label,
             "drawn_at_ms": self.drawn_at.map(|d| d.timestamp_millis()),
             "numbers": self.numbers.clone().unwrap_or_default(), "bonus": self.bonus,
+            "bonus_numbers": self.bonus_numbers,
             "tickets": self.tickets, "players": self.players, "paid": self.paid,
         })
     }
@@ -716,6 +719,7 @@ async fn draw_json(
         "period": row.period, "label": label,
         "drawn_at_ms": row.drawn_at.map(|d| d.timestamp_millis()).unwrap_or_default(),
         "status": row.status, "numbers": row.numbers.clone().unwrap_or_default(), "bonus": row.bonus,
+        "bonus_numbers": row.bonus_numbers,
         "tickets": row.tickets, "players": row.players, "sales": row.sales, "paid": row.paid,
         "winners_count": row.winners, "winners": winners,
         "mine": mine.iter().map(|t| ticket_json(game, t)).collect::<Vec<_>>(),
@@ -806,7 +810,7 @@ pub async fn tickets(
     limit: i64,
 ) -> Result<Vec<Value>, Error> {
     let rows = sqlx::query(&format!(
-        "SELECT t.{} , p.numbers AS result_numbers, p.bonus AS result_bonus \
+        "SELECT t.{} , p.numbers AS result_numbers, p.bonus AS result_bonus, p.bonus_numbers AS result_bonus_numbers \
          FROM lottery_tickets t LEFT JOIN lottery_periods p \
            ON p.game = t.game AND p.period = t.period AND p.status <> 'open' \
          WHERE t.user_id=$1 AND t.game=$2 ORDER BY t.bought_at DESC, t.id LIMIT $3",
@@ -824,7 +828,8 @@ pub async fn tickets(
             let numbers: Option<Vec<i16>> = r.get("result_numbers");
             ticket["result"] = match numbers {
                 Some(numbers) => {
-                    json!({ "numbers": numbers, "bonus": r.get::<Option<i16>, _>("result_bonus") })
+                    json!({ "numbers": numbers, "bonus": r.get::<Option<i16>, _>("result_bonus"),
+                        "bonus_numbers": r.get::<Option<Vec<i16>>, _>("result_bonus_numbers").unwrap_or_default() })
                 }
                 None => Value::Null,
             };

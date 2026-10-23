@@ -1,8 +1,7 @@
 //! Tickets a station sells and what they win: entry normalisation, 注数 and
 //! the closed-form prize of a 复式 ticket. Unit prices and payout tables are
-//! the client's current constants (`client-game/src/views/games/*/`): SSQ and
-//! TOTO payouts are multipliers of the 10-chip 注 (written here as chip
-//! amounts), Happy8 and FC3D payouts are chip amounts per 注.
+//! the client's current constants (`client-game/src/views/games/*/`). These
+//! are fixed practice gold-bean prizes, not real-money lottery pool prizes.
 use super::Game;
 use rand::rngs::OsRng;
 use serde_json::{json, Value};
@@ -15,12 +14,16 @@ pub const MAX_STAKES_PER_PERIOD: i64 = 1_000;
 
 pub const SSQ_RED_MAX: u8 = 33;
 pub const SSQ_BLUE_MAX: u8 = 16;
+pub const DLT_FRONT_MAX: u8 = 35;
+pub const DLT_BACK_MAX: u8 = 12;
 pub const TOTO_MAX: u8 = 49;
 pub const HAPPY8_MAX: u8 = 80;
 pub const HAPPY8_DRAW: usize = 20;
 
 /// Chips per winning 注 by prize group (`PAYOUTS × BET 10`).
 pub const SSQ_PRIZE: [i64; 7] = [0, 10_000_000, 1_000_000, 15_000, 1_000, 50, 25];
+/// Seven prize tiers under the 2026 DLT matching rules, in practice beans.
+pub const DLT_PRIZE: [i64; 8] = [0, 10_000_000, 1_000_000, 25_000, 1_500, 750, 75, 25];
 pub const TOTO_PRIZE: [i64; 8] = [0, 10_000_000, 1_000_000, 10_000, 3_000, 500, 250, 100];
 pub const FC3D_STRAIGHT: i64 = 1_040;
 pub const FC3D_GROUP3: i64 = 346;
@@ -76,6 +79,8 @@ pub fn happy8_prize(picks: usize, hits: usize) -> i64 {
 pub enum Entry {
     /// 6–12 red of 1–33 × 1–16 blue of 1–16.
     Ssq { red: Vec<u8>, blue: Vec<u8> },
+    /// 5–8 front of 1–35 × 2–12 back of 1–12, at most 100 single stakes.
+    Dlt { front: Vec<u8>, back: Vec<u8> },
     /// 6–9 of 1–49 (system 7/8/9).
     Toto { numbers: Vec<u8> },
     /// 1–10 of 1–80.
@@ -118,6 +123,22 @@ fn numbers(
     Ok(out)
 }
 
+/// DLT selections must be distinct; legacy games keep `numbers` deduplication.
+fn distinct_numbers(
+    value: &Value,
+    min_len: usize,
+    max_len: usize,
+    lo: u8,
+    hi: u8,
+) -> Result<Vec<u8>, Invalid> {
+    let submitted_len = value.as_array().ok_or(Invalid)?.len();
+    let out = numbers(value, min_len, max_len, lo, hi)?;
+    if out.len() != submitted_len {
+        return Err(Invalid);
+    }
+    Ok(out)
+}
+
 fn object_keys(value: &Value, allowed: &[&str]) -> Result<(), Invalid> {
     let object = value.as_object().ok_or(Invalid)?;
     if object.keys().any(|k| !allowed.contains(&k.as_str())) {
@@ -127,7 +148,7 @@ fn object_keys(value: &Value, allowed: &[&str]) -> Result<(), Invalid> {
 }
 
 impl Entry {
-    /// Normalises (sorted, deduplicated) one submitted entry of `game`.
+    /// Sorts one submitted entry; DLT rejects duplicates, legacy games deduplicate.
     pub fn parse(game: Game, value: &Value) -> Result<Entry, Invalid> {
         let entry = match game {
             Game::Ssq => {
@@ -135,6 +156,13 @@ impl Entry {
                 Entry::Ssq {
                     red: numbers(&value["red"], 6, 12, 1, SSQ_RED_MAX)?,
                     blue: numbers(&value["blue"], 1, 16, 1, SSQ_BLUE_MAX)?,
+                }
+            }
+            Game::Dlt => {
+                object_keys(value, &["front", "back"])?;
+                Entry::Dlt {
+                    front: distinct_numbers(&value["front"], 5, 8, 1, DLT_FRONT_MAX)?,
+                    back: distinct_numbers(&value["back"], 2, 12, 1, DLT_BACK_MAX)?,
                 }
             }
             Game::Toto => {
@@ -184,6 +212,7 @@ impl Entry {
     pub fn to_value(&self) -> Value {
         match self {
             Entry::Ssq { red, blue } => json!({ "red": red, "blue": blue }),
+            Entry::Dlt { front, back } => json!({ "front": front, "back": back }),
             Entry::Toto { numbers } | Entry::Happy8 { numbers } => json!({ "numbers": numbers }),
             Entry::Straight(sets) => json!({ "mode": "straight", "digits": sets }),
             Entry::Group3(digits) => json!({ "mode": "group3", "digits": digits }),
@@ -195,6 +224,7 @@ impl Entry {
     pub fn stakes(&self) -> i64 {
         match self {
             Entry::Ssq { red, blue } => choose(red.len(), 6) * blue.len() as i64,
+            Entry::Dlt { front, back } => choose(front.len(), 5) * choose(back.len(), 2),
             Entry::Toto { numbers } => choose(numbers.len(), 6),
             Entry::Happy8 { .. } => 1,
             Entry::Straight(sets) => sets.iter().map(|s| s.len() as i64).product(),
@@ -214,6 +244,7 @@ impl Entry {
         multiplier: i64,
         numbers: &[i16],
         bonus: Option<i16>,
+        bonus_numbers: &[i16],
     ) -> Option<(i64, i16)> {
         let (per_multiplier, tier) = match self {
             Entry::Ssq { red, blue } => {
@@ -248,6 +279,47 @@ impl Entry {
                         total = total.checked_add(
                             ways.checked_mul((b - bh).checked_mul(SSQ_PRIZE[miss as usize])?)?,
                         )?;
+                    }
+                }
+                (total, tier)
+            }
+            Entry::Dlt { front, back } => {
+                if bonus.is_some()
+                    || !valid_distinct_draw(numbers, 5, DLT_FRONT_MAX)
+                    || !valid_distinct_draw(bonus_numbers, 2, DLT_BACK_MAX)
+                    || !(1..=MAX_MULTIPLIER).contains(&multiplier)
+                {
+                    return None;
+                }
+                let front_hits = front
+                    .iter()
+                    .filter(|n| numbers.contains(&i16::from(**n)))
+                    .count();
+                let back_hits = back
+                    .iter()
+                    .filter(|n| bonus_numbers.contains(&i16::from(**n)))
+                    .count();
+                let mut total = 0i64;
+                let mut tier = 0i16;
+                // Count every 5+2 subset, including lower-tier wins on the
+                // same compound ticket. Selecting more numbers never turns
+                // the ticket into a single top-tier payout.
+                for f in 0..=5usize {
+                    let front_ways = choose(front_hits, f)
+                        .checked_mul(choose(front.len() - front_hits, 5 - f))?;
+                    if front_ways == 0 {
+                        continue;
+                    }
+                    for b in 0..=2usize {
+                        let ways = front_ways
+                            .checked_mul(choose(back_hits, b))?
+                            .checked_mul(choose(back.len() - back_hits, 2 - b))?;
+                        let group = dlt_group(f, b);
+                        if ways > 0 && group > 0 {
+                            tier = best_tier(tier, group);
+                            total =
+                                total.checked_add(ways.checked_mul(DLT_PRIZE[group as usize])?)?;
+                        }
                     }
                 }
                 (total, tier)
@@ -346,6 +418,28 @@ fn best_tier(current: i16, group: i16) -> i16 {
     }
 }
 
+fn valid_distinct_draw(numbers: &[i16], count: usize, max: u8) -> bool {
+    numbers.len() == count
+        && numbers
+            .iter()
+            .enumerate()
+            .all(|(i, n)| (1..=i16::from(max)).contains(n) && !numbers[..i].contains(n))
+}
+
+/// 2026 seven-tier basic DLT rules for one 5+2 stake (no additional bet).
+fn dlt_group(front: usize, back: usize) -> i16 {
+    match (front, back) {
+        (5, 2) => 1,
+        (5, 1) => 2,
+        (5, 0) | (4, 2) => 3,
+        (4, 1) => 4,
+        (4, 0) | (3, 2) => 5,
+        (3, 1) | (2, 2) => 6,
+        (3, 0) | (2, 1) | (1, 2) | (0, 2) => 7,
+        _ => 0,
+    }
+}
+
 /// Today's `prizeGroup` for a single 6+1 注 with `k` red matches.
 fn ssq_group(k: usize, blue_hit: bool) -> i16 {
     match (k, blue_hit) {
@@ -396,14 +490,17 @@ fn sample(max: u8, count: usize) -> Vec<i16> {
     picked
 }
 
-/// Winning numbers of one period: `(numbers, bonus)`.
-pub fn draw(game: Game) -> (Vec<i16>, Option<i16>) {
+/// Winning numbers of one period: `(numbers, scalar bonus, bonus numbers)`.
+/// DLT uses two back numbers; existing scalar-bonus games keep their wire shape.
+pub fn draw(game: Game) -> (Vec<i16>, Option<i16>, Vec<i16>) {
     use rand::Rng;
     match game {
         Game::Ssq => (
             sample(SSQ_RED_MAX, 6),
             Some(OsRng.gen_range(1..=i16::from(SSQ_BLUE_MAX))),
+            Vec::new(),
         ),
+        Game::Dlt => (sample(DLT_FRONT_MAX, 5), None, sample(DLT_BACK_MAX, 2)),
         Game::Toto => {
             let seven: Vec<i16> = rand::seq::index::sample(&mut OsRng, usize::from(TOTO_MAX), 7)
                 .into_iter()
@@ -411,10 +508,14 @@ pub fn draw(game: Game) -> (Vec<i16>, Option<i16>) {
                 .collect();
             let mut winning = seven[..6].to_vec();
             winning.sort_unstable();
-            (winning, Some(seven[6]))
+            (winning, Some(seven[6]), Vec::new())
         }
-        Game::Happy8 => (sample(HAPPY8_MAX, HAPPY8_DRAW), None),
-        Game::Fucai3d => ((0..3).map(|_| OsRng.gen_range(0..=9i16)).collect(), None),
-        Game::Scratch => (Vec::new(), None),
+        Game::Happy8 => (sample(HAPPY8_MAX, HAPPY8_DRAW), None, Vec::new()),
+        Game::Fucai3d => (
+            (0..3).map(|_| OsRng.gen_range(0..=9i16)).collect(),
+            None,
+            Vec::new(),
+        ),
+        Game::Scratch => (Vec::new(), None, Vec::new()),
     }
 }

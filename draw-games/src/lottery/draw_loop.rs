@@ -66,18 +66,19 @@ async fn draw_one(pool: &PgPool, game: Game) -> Result<(), Error> {
     let period: Option<i64> = sqlx::query_scalar("SELECT period FROM lottery_periods WHERE game=$1 AND status <> 'settled' AND status='open' AND draw_at<=now() AND (tickets>0 OR period=$2) ORDER BY period LIMIT 1 FOR UPDATE SKIP LOCKED")
         .bind(game.as_str()).bind(latest.id).fetch_optional(&mut *tx).await?;
     if let Some(period) = period {
-        let (numbers, bonus) = super::rules::draw(game);
-        sqlx::query("UPDATE lottery_periods SET status='drawn',numbers=$3,bonus=$4,drawn_at=now() WHERE game=$1 AND period=$2 AND status='open'")
-            .bind(game.as_str()).bind(period).bind(numbers).bind(bonus).execute(&mut *tx).await?;
+        let (numbers, bonus, bonus_numbers) = super::rules::draw(game);
+        sqlx::query("UPDATE lottery_periods SET status='drawn',numbers=$3,bonus=$4,bonus_numbers=$5,drawn_at=now() WHERE game=$1 AND period=$2 AND status='open'")
+            .bind(game.as_str()).bind(period).bind(numbers).bind(bonus).bind(bonus_numbers).execute(&mut *tx).await?;
     }
     tx.commit().await?;
     Ok(())
 }
 
 async fn settle_one(pool: &PgPool) -> Result<bool, Error> {
-    // Four small index probes, then choose the oldest period across games.
-    let work = sqlx::query("SELECT p.game,p.period FROM (VALUES ('ssq'),('toto'),('happy8'),('fucai3d')) AS g(game) CROSS JOIN LATERAL (SELECT game,period,draw_at FROM lottery_periods WHERE game=g.game AND status<>'settled' AND status='drawn' ORDER BY period LIMIT 1) p ORDER BY p.draw_at,p.game LIMIT 1")
-        .fetch_optional(pool).await?;
+    // One small index probe per scheduled game, then choose the oldest period.
+    let games: Vec<&str> = Game::DRAWN.iter().map(|game| game.as_str()).collect();
+    let work = sqlx::query("SELECT p.game,p.period FROM UNNEST($1::text[]) AS g(game) CROSS JOIN LATERAL (SELECT game,period,draw_at FROM lottery_periods WHERE game=g.game AND status<>'settled' AND status='drawn' ORDER BY period LIMIT 1) p ORDER BY p.draw_at,p.game LIMIT 1")
+        .bind(games).fetch_optional(pool).await?;
     let Some(work) = work else {
         return Ok(false);
     };
@@ -91,13 +92,14 @@ async fn settle_one(pool: &PgPool) -> Result<bool, Error> {
     )
     .execute(&mut *tx)
     .await?;
-    let row = sqlx::query("SELECT numbers,bonus FROM lottery_periods WHERE game=$1 AND period=$2 AND status='drawn' FOR UPDATE SKIP LOCKED")
+    let row = sqlx::query("SELECT numbers,bonus,bonus_numbers FROM lottery_periods WHERE game=$1 AND period=$2 AND status='drawn' FOR UPDATE SKIP LOCKED")
         .bind(game.as_str()).bind(period).fetch_optional(&mut *tx).await?;
     let Some(row) = row else {
         return Ok(false);
     };
     let numbers: Vec<i16> = row.get("numbers");
     let bonus: Option<i16> = row.get("bonus");
+    let bonus_numbers: Vec<i16> = row.get("bonus_numbers");
     let user:Option<Uuid> = sqlx::query_scalar("SELECT user_id FROM lottery_tickets WHERE game=$1 AND period=$2 AND settled_at IS NULL ORDER BY user_id,id LIMIT 1")
         .bind(game.as_str()).bind(period).fetch_optional(&mut *tx).await?;
     let Some(user) = user else {
@@ -126,7 +128,14 @@ async fn settle_one(pool: &PgPool) -> Result<bool, Error> {
     for ticket in &mut tickets {
         let (prize, tier) = if balance.is_some() {
             Entry::from_stored(game, &ticket.entry)
-                .and_then(|e| e.prize(i64::from(ticket.multiplier), &numbers, bonus))
+                .and_then(|e| {
+                    e.prize(
+                        i64::from(ticket.multiplier),
+                        &numbers,
+                        bonus,
+                        &bonus_numbers,
+                    )
+                })
                 .ok_or(Error::InvalidEntry)?
         } else {
             (0, 0)
