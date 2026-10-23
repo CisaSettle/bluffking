@@ -74,6 +74,9 @@ reqwest = { version = "0.12", features = ["json"] }
 # tokio-stream for ReceiverStream (SSE sender→stream bridge in coach handler).
 tokio-stream = "0.1"
 
+# Offline IP-to-city lookup; no player IP is sent to a third party.
+maxminddb = "0.27"
+
 # Database (B-a2: Postgres via sqlx)
 # Note: runtime-tokio-native-tls requires native-tls; use rustls alternative if
 # native-tls is unavailable. Spec §3.3.1 specifies runtime-tokio-native-tls.

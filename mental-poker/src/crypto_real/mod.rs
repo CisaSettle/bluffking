@@ -20,15 +20,8 @@
 //! - the GA gate was a clean cross-vendor AI audit (ADR-076/077/078); the code
 //!   is **open-source and the transcript is independently verifiable offline**,
 //!   play-money only;
-//! - [`guard_provider_allowed`](crate::guard_provider_allowed) keeps the generic
-//!   `mental_poker_production` provider **rejected at startup**;
-//! - [`select_provider`](crate::select_provider) returns `None` for it, and there
-//!   is **no** new `DealingProviderKind` variant — engine-blind selects the real
-//!   crypto via `resolve_mp_crypto_mode` + the engine-blind session path, NOT via
-//!   the generic provider.
-//!
-//! Un-caging the GENERIC provider is separate future work (ADR-062
-//! Milestone E); ADR-070 already un-caged the specific engine-blind composition.
+//! - real crypto is selected by `server::mp_dealing::resolve_mp_crypto_mode`
+//!   and the engine-blind session coordinator.
 
 pub mod decrypt;
 pub mod dkg;

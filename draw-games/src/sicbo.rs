@@ -25,9 +25,7 @@ pub struct Bet {
     pub side: Side,
     pub stake: i64,
     pub session_id: Uuid,
-    /// Required only for a new roll; historical request retries stay readable.
-    #[serde(default)]
-    pub fairness: Option<crate::draw_fairness::Challenge>,
+    pub fairness: crate::draw_fairness::Challenge,
 }
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Receipt {
@@ -38,9 +36,7 @@ pub struct Receipt {
     pub total: u8,
     pub triple: bool,
     pub won: bool,
-    /// Existing ledger receipts never acquire a fabricated proof on readback.
-    #[serde(default)]
-    pub fairness: Option<serde_json::Value>,
+    pub fairness: serde_json::Value,
 }
 #[derive(Debug, Serialize)]
 pub struct BetResult {
@@ -100,7 +96,8 @@ async fn saved(
     if receipt.side != bet.side || receipt.stake != bet.stake {
         return Err(Error::Conflict);
     }
-    if let (Some(challenge), Some(proof)) = (&bet.fairness, &receipt.fairness) {
+    {
+        let (challenge, proof) = (&bet.fairness, &receipt.fairness);
         let reveal = &proof["reveal"];
         if reveal["draw_id"] != json!(challenge.offer_id)
             || reveal["commitment"] != json!(challenge.commitment)
@@ -154,7 +151,7 @@ pub async fn play(pool: &PgPool, user: Uuid, bet: &Bet) -> Result<BetResult, Err
     if bet.stake > balance {
         return Err(Error::Balance);
     }
-    let challenge = bet.fairness.as_ref().ok_or(Error::Invalid)?;
+    let challenge = &bet.fairness;
     let reveal = crate::draw_fairness::claim(&mut tx, user, "sicbo", bet.request_id, challenge)
         .await
         .map_err(|error| match error {
@@ -173,9 +170,7 @@ pub async fn play(pool: &PgPool, user: Uuid, bet: &Bet) -> Result<BetResult, Err
         total: dice.iter().sum(),
         triple: dice[0] == dice[1] && dice[1] == dice[2],
         won,
-        fairness: Some(draw_games::sicbo::payout_proof(
-            &reveal, dice, bet.side, bet.stake,
-        )),
+        fairness: draw_games::sicbo::payout_proof(&reveal, dice, bet.side, bet.stake),
     };
     let play = wallet::Play {
         record_id: bet.request_id,

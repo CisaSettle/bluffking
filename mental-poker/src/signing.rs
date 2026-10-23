@@ -9,8 +9,8 @@
 //! HMAC-SHA256. It is *symmetric*: the "public key" is the HMAC key itself, so
 //! anyone holding it can forge signatures. It exists so the transcript / hash
 //! chain / verifier can be exercised without pulling in an asymmetric crypto
-//! dependency. **Never enable it in production** — the runtime guard in
-//! `crate::guard_provider_allowed` enforces this.
+//! dependency. **Never enable it in production** — the server coordinator
+//! rejects mock hands.
 
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};

@@ -1,11 +1,4 @@
-//! The [`DealingProvider`] abstraction.
-//!
-//! Game logic no longer reaches for a shuffle directly: it asks a
-//! `DealingProvider` for a [`DealtHand`]. Two providers exist —
-//! [`crate::existing::ExistingServerDealingProvider`] (the legacy
-//! trusted-server shuffle, retained for rollback) and
-//! [`crate::mental::MentalPokerDealingProvider`] (the untrusted-dealer
-//! protocol). Selection is by feature flag — see [`DealingProviderKind`].
+//! Offline protocol dealing interface used by the transcript CLI.
 
 use crate::transcript::Transcript;
 use engine::{Card, DeckSeed};
@@ -27,7 +20,7 @@ pub struct DealRequest {
     pub small_blind: u64,
 }
 
-/// The output of a deal: a 52-card deck order plus an optional transcript.
+/// The output of a protocol deal: a 52-card deck order and signed transcript.
 #[derive(Debug, Clone)]
 pub struct DealtHand {
     /// The 52 cards in final deal order. The engine consumes this via
@@ -37,9 +30,8 @@ pub struct DealtHand {
     /// A 256-bit reproducibility seed recorded on the `hands` row
     /// (`deck_seed_b` BYTEA — ADR-062 §2).
     pub deck_seed: DeckSeed,
-    /// The signed, verifiable transcript — `None` for the legacy provider,
-    /// which offers no untrusted-dealer guarantee.
-    pub transcript: Option<Transcript>,
+    /// The signed, verifiable transcript.
+    pub transcript: Transcript,
 }
 
 /// Abstraction over how a hand's deck is produced.
@@ -52,57 +44,4 @@ pub trait DealingProvider {
 
     /// Deal one hand.
     fn deal(&self, request: &DealRequest) -> DealtHand;
-}
-
-/// Runtime values accepted by the offline provider selector.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DealingProviderKind {
-    /// Legacy trusted-server shuffle. Not a Mental Poker provider.
-    ExistingServer,
-    /// Mental Poker protocol with **mock** crypto. Dev only.
-    MentalPokerMock,
-    /// Mental Poker protocol with **generic, UNAUDITED** real crypto. Rejected
-    /// everywhere by [`crate::guard_provider_allowed`]; ADR-070 un-caged only the
-    /// cross-vendor-AI-audited engine-blind composition. ADR-070 does NOT un-cage this generic path — only the specific
-    /// engine-blind composition ([`Self::MentalPokerEngineBlind`]).
-    MentalPokerProduction,
-    /// The **cross-vendor-AI-audited engine-blind n-of-n composition** (ADR-066/067/068; crypto
-    /// in `mental-poker/src/crypto_real/`). ADR-070 P5 permits this variant in
-    /// production behind the clean-Codex audit gate. **NOTE:** the live
-    /// engine-blind path is NOT selected via this `DealingProviderKind` — it is
-    /// routed by the per-session `engine_blind` flag (`session.rs`
-    /// `engine_blind_routes_blind_coordinator`) and gated by
-    /// `server::mp_dealing::resolve_mp_crypto_mode` (+ the Mock-void safety net).
-    /// This variant exists so [`crate::guard_provider_allowed`] can record, as a
-    /// reviewable distinction, that the cross-vendor-AI-audited engine-blind composition is
-    /// prod-permitted while the generic [`Self::MentalPokerProduction`] stays
-    /// caged. It is intentionally NOT parseable from a provider name.
-    MentalPokerEngineBlind,
-}
-
-impl DealingProviderKind {
-    /// Parse the provider name. Unknown values map to `None`.
-    ///
-    /// `MentalPokerEngineBlind` is intentionally **NOT** parseable here: the live
-    /// engine-blind path is routed by the per-session `engine_blind` flag, never
-    /// by a startup provider-name selection, so it must never be
-    /// reachable through the env-var startup path.
-    pub fn parse(value: &str) -> Option<Self> {
-        match value.trim() {
-            "existing_server" => Some(Self::ExistingServer),
-            "mental_poker_mock" => Some(Self::MentalPokerMock),
-            "mental_poker_production" => Some(Self::MentalPokerProduction),
-            _ => None,
-        }
-    }
-
-    /// The canonical flag string.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::ExistingServer => "existing_server",
-            Self::MentalPokerMock => "mental_poker_mock",
-            Self::MentalPokerProduction => "mental_poker_production",
-            Self::MentalPokerEngineBlind => "mental_poker_engine_blind",
-        }
-    }
 }

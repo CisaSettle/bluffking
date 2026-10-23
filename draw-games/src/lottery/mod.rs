@@ -11,13 +11,11 @@
 //!
 //! Module map: [`rules`] entry validation, stakes and prizes; [`store`]
 //! purchases, views, refills; [`scratch`] cards; [`draw_loop`] draws,
-//! settlement and retention; [`handlers`] HTTP; [`legacy_scratch`] the
-//! account-purge transform for pre-switch scratch room checkpoints.
+//! settlement and retention; [`handlers`] HTTP.
 
 pub mod beacon;
 pub mod draw_loop;
 pub mod handlers;
-pub mod legacy_scratch;
 pub mod rules;
 pub mod scratch;
 pub mod store;

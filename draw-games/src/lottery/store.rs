@@ -81,7 +81,7 @@ pub fn ticket_json(game: Game, t: &TicketRow) -> Value {
         out["proof_status"] = json!(if t.proof_plan.is_some() {
             "planned"
         } else {
-            "legacy"
+            "unavailable"
         });
         if t.proof_plan.is_some() {
             out["proof_url"] = json!(format!("/api/draws/{}/{}/proof", game.as_str(), t.period));
@@ -157,7 +157,7 @@ pub struct NumberBuy {
     pub period: i64,
     pub multiplier: i64,
     pub tickets: Vec<Value>,
-    pub proof_commitment: Option<String>,
+    pub proof_commitment: String,
 }
 
 fn proof_status(plan: Option<&Value>, proof: Option<&Value>) -> &'static str {
@@ -166,12 +166,12 @@ fn proof_status(plan: Option<&Value>, proof: Option<&Value>) -> &'static str {
     } else if plan.is_some() {
         "pending"
     } else {
-        "legacy"
+        "unavailable"
     }
 }
 
 /// Publish the current period's fixed plan before sales close. Existing periods
-/// are immutable: a legacy sale cannot acquire a retrospective proof plan.
+/// are immutable and cannot acquire a retrospective proof plan.
 pub(super) async fn ensure_period(
     conn: &mut PgConnection,
     game: Game,
@@ -228,12 +228,15 @@ pub(super) async fn replay(
     }
     let ids: Vec<Uuid> = serde_json::from_value(details["ticket_ids"].clone()).unwrap_or_default();
     let rows = sqlx::query(&format!(
-        "SELECT {TICKET_COLUMNS} FROM lottery_tickets WHERE purchase_id=$1"
+        "SELECT {TICKET_COLUMNS} FROM lottery_tickets WHERE purchase_id=$1 AND (game<>'scratch' OR (cost=100 AND entry->'reward_version'='1'::jsonb))"
     ))
     .bind(record_id)
     .fetch_all(conn)
     .await?;
     let mut tickets: Vec<TicketRow> = rows.iter().map(TicketRow::from_row).collect();
+    if game == Game::Scratch && tickets.is_empty() {
+        return Err(Error::RequestConflict);
+    }
     tickets.sort_by_key(|t| ids.iter().position(|id| *id == t.id).unwrap_or(usize::MAX));
     Ok(Some(Purchase {
         purchased: tickets.iter().map(|t| ticket_json(game, t)).collect(),
@@ -319,11 +322,7 @@ pub async fn buy_numbers(
         "game": game.as_str(), "period": body.period, "multiplier": body.multiplier,
         "tickets": entries.iter().map(Entry::to_value).collect::<Vec<_>>(),
     });
-    // The old normalized body remains unchanged only for completed legacy
-    // retries. Fresh purchases below require the plan the buyer already saw.
-    if let Some(commitment) = &body.proof_commitment {
-        normalised["proof_commitment"] = json!(commitment);
-    }
+    normalised["proof_commitment"] = json!(body.proof_commitment);
     let body_hash = body_sha256(&normalised);
     let record_id = super::purchase_id(user, body.request_id);
     let stakes: Vec<i64> = entries.iter().map(Entry::stakes).collect();
@@ -385,11 +384,8 @@ pub async fn buy_numbers(
     let plan: Plan = serde_json::from_value(accepted_plan.clone().ok_or(Error::FairnessRequired)?)
         .map_err(|_| Error::InvalidEntry)?;
     plan.validate().map_err(|_| Error::InvalidEntry)?;
-    let expected = body
-        .proof_commitment
-        .as_deref()
-        .ok_or(Error::FairnessRequired)?;
-    if plan.game != game.as_str() || plan.period != selling.id || plan.commitment != expected {
+    let expected = &body.proof_commitment;
+    if plan.game != game.as_str() || plan.period != selling.id || &plan.commitment != expected {
         return Err(Error::RequestConflict);
     }
     let (count, used): (i64, i64) = sqlx::query_as(
@@ -483,7 +479,7 @@ pub async fn buy_numbers(
     })
 }
 
-/// Legacy lottery route shares the single daily beans entitlement.
+/// Lottery refill shares the single daily beans entitlement.
 pub async fn refill(pool: &PgPool, user: Uuid, request_id: Uuid) -> Result<i64, Error> {
     if request_id.is_nil() {
         return Err(Error::InvalidEntry);
@@ -597,7 +593,7 @@ struct FeedScan {
 async fn feed_scan(conn: &mut PgConnection, game: Game) -> sqlx::Result<FeedScan> {
     let rows = sqlx::query(
         "SELECT purchase_id, user_id, bought_at, stakes, prize, tier, settled_at FROM lottery_tickets \
-         WHERE game=$1 ORDER BY bought_at DESC LIMIT $2",
+         WHERE game=$1 AND (game<>'scratch' OR (cost=100 AND entry->'reward_version'='1'::jsonb)) ORDER BY bought_at DESC LIMIT $2",
     )
     .bind(game.as_str())
     .bind(FEED_SCAN)
@@ -870,7 +866,12 @@ fn period_json(selling: &Period, row: Option<&PeriodRow>, open: bool) -> Value {
 }
 
 /// `GET /api/lottery/{game}/draws`.
-pub async fn draws(pool: &PgPool, game: Game, limit: i64, offset: i64) -> Result<Vec<Value>, Error> {
+pub async fn draws(
+    pool: &PgPool,
+    game: Game,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<Value>, Error> {
     let mut conn = pool.acquire().await?;
     let rows = recent_periods(&mut conn, game, limit.clamp(1, 100), offset.max(0)).await?;
     Ok(rows.iter().map(|r| r.summary(game)).collect())
@@ -909,7 +910,7 @@ pub async fn tickets(
         "SELECT t.{} , p.numbers AS result_numbers, p.bonus AS result_bonus, p.bonus_numbers AS result_bonus_numbers, p.draw_proof AS result_proof \
          FROM lottery_tickets t LEFT JOIN lottery_periods p \
            ON p.game = t.game AND p.period = t.period AND p.status <> 'open' \
-         WHERE t.user_id=$1 AND t.game=$2 ORDER BY t.bought_at DESC, t.id LIMIT $3 OFFSET $4",
+         WHERE t.user_id=$1 AND t.game=$2 AND (t.game<>'scratch' OR (t.cost=100 AND t.entry->'reward_version'='1'::jsonb)) ORDER BY t.bought_at DESC, t.id LIMIT $3 OFFSET $4",
         TICKET_COLUMNS.replace(", ", ", t.")
     ))
     .bind(user)

@@ -336,8 +336,7 @@ pub fn verify(transcript: &Transcript) -> Result<VerifyReport, VerifyError> {
         // the same trusted, contributor-signed source F2 sums into the joint key.
         // This makes an exported real-crypto transcript end-to-end checkable
         // offline and independent of dealing. In production real dealing runs only
-        // for the engine-blind table class (ADR-070); guard_provider_allowed still
-        // rejects the generic mental_poker_production provider.
+        // for the engine-blind table class through the server coordinator.
         crate::crypto_real::decrypt::SCHEME => {
             let party_pubkeys = collect_party_pubkeys(transcript)?;
             // F3 (mp-phase4 audit — DEFENSIVE, decouple from the shuffle scheme):

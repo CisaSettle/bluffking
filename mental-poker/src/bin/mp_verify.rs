@@ -63,9 +63,7 @@ fn run_demo(out_path: Option<&str>) -> i32 {
     };
     let provider = MentalPokerDealingProvider::deterministic();
     let dealt = provider.deal(&request);
-    let transcript = dealt
-        .transcript
-        .expect("mental poker provider always produces a transcript");
+    let transcript = dealt.transcript;
 
     println!(
         "dealt {}-player hand '{}'",

@@ -50,15 +50,14 @@ pub async fn run(pool: PgPool) {
 async fn draw_one(pool: &PgPool, game: Game) -> Result<(), Error> {
     let schedule = game.schedule().ok_or(Error::InvalidEntry)?;
     let current = schedule.period_at(super::now_ms());
-    let latest = current.id - 1;
     // Persist the plan while this period is selling, even when its hall has no
     // visitors. Never create an already elapsed period with a retrospective plan.
     {
         let mut conn = pool.acquire().await?;
         store::ensure_period(&mut conn, game, &current).await?;
     }
-    let candidate = sqlx::query("SELECT period,proof_plan FROM lottery_periods WHERE game=$1 AND status <> 'settled' AND status='open' AND draw_at<=now() AND (proof_plan IS NOT NULL OR tickets>0 OR period=$2) ORDER BY period LIMIT 1")
-        .bind(game.as_str()).bind(latest).fetch_optional(pool).await?;
+    let candidate = sqlx::query("SELECT period,proof_plan FROM lottery_periods WHERE game=$1 AND status <> 'settled' AND status='open' AND draw_at<=now() AND proof_plan IS NOT NULL ORDER BY period LIMIT 1")
+        .bind(game.as_str()).fetch_optional(pool).await?;
     let Some(candidate) = candidate else {
         return Ok(());
     };
@@ -67,7 +66,10 @@ async fn draw_one(pool: &PgPool, game: Game) -> Result<(), Error> {
     // HTTP and BLS verification run before taking a transaction, account lock,
     // wallet lock or period lock. No replacement pulse or OS-random fallback is
     // permitted for a planned period; an outage leaves exactly this draw queued.
-    let proof = if let Some(value) = &plan_value {
+    let proof = {
+        let value = plan_value
+            .as_ref()
+            .ok_or_else(|| Error::Proof("missing draw plan".into()))?;
         let plan: draw_games::lottery::Plan = serde_json::from_value(value.clone())
             .map_err(|_| Error::Proof("invalid stored draw plan".into()))?;
         plan.validate().map_err(Error::Proof)?;
@@ -80,9 +82,7 @@ async fn draw_one(pool: &PgPool, game: Game) -> Result<(), Error> {
         else {
             return Ok(());
         };
-        Some(draw_games::lottery::DrawProof::new(plan, beacon).map_err(Error::Proof)?)
-    } else {
-        None
+        draw_games::lottery::DrawProof::new(plan, beacon).map_err(Error::Proof)?
     };
     let mut tx = pool.begin().await?;
     sqlx::query(
@@ -100,19 +100,9 @@ async fn draw_one(pool: &PgPool, game: Game) -> Result<(), Error> {
             "draw plan changed while awaiting its beacon".into(),
         ));
     }
-    let (numbers, bonus, bonus_numbers) = match &proof {
-        Some(proof) => (
-            proof.numbers.clone(),
-            proof.bonus,
-            proof.bonus_numbers.clone(),
-        ),
-        // Existing unproved sales settle under their original random draw path.
-        // They stay explicitly legacy in every API and never receive a proof.
-        None => super::rules::legacy_draw(game),
-    };
     sqlx::query("UPDATE lottery_periods SET status='drawn',numbers=$3,bonus=$4,bonus_numbers=$5,drawn_at=now(),draw_proof=$6 WHERE game=$1 AND period=$2 AND status='open'")
-        .bind(game.as_str()).bind(period).bind(numbers).bind(bonus).bind(bonus_numbers)
-        .bind(proof.map(|p| json!(p))).execute(&mut *tx).await?;
+        .bind(game.as_str()).bind(period).bind(&proof.numbers).bind(proof.bonus).bind(&proof.bonus_numbers)
+        .bind(json!(proof)).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -247,7 +237,6 @@ async fn retention(pool: &PgPool) -> Result<(), Error> {
         "DELETE FROM lottery_winners WHERE ctid IN (SELECT w.ctid FROM lottery_periods p JOIN lottery_winners w USING (game,period) WHERE p.status='settled' AND p.settled_at < now()-interval '30 days' ORDER BY p.settled_at LIMIT 1000 FOR UPDATE OF w SKIP LOCKED)",
         "DELETE FROM lottery_periods WHERE (game,period) IN (SELECT p.game,p.period FROM lottery_periods p WHERE status='settled' AND settled_at < now()-interval '30 days' AND NOT EXISTS (SELECT 1 FROM lottery_winners w WHERE w.game=p.game AND w.period=p.period) ORDER BY settled_at LIMIT 1000 FOR UPDATE SKIP LOCKED)",
         "DELETE FROM lottery_presence WHERE (game,user_id) IN (SELECT game,user_id FROM lottery_presence WHERE seen_at < now()-interval '1 hour' ORDER BY seen_at LIMIT 1000 FOR UPDATE SKIP LOCKED)",
-        "DELETE FROM game_room_checkpoints WHERE ctid IN (SELECT ctid FROM game_room_checkpoints WHERE game='scratch' AND (updated_at < now()-interval '7 days' OR (updated_at < now()-interval '1 day' AND state->>'closed'='true')) ORDER BY updated_at LIMIT 1000 FOR UPDATE SKIP LOCKED)",
      ] {
         let mut tx = pool.begin().await?;
         sqlx::query("SELECT set_config('lock_timeout','500ms',true),set_config('statement_timeout','2s',true)")

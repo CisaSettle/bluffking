@@ -48,6 +48,9 @@ fn match_receipt(proof: &Value, receipt: &Value) -> Result<(), String> {
         if kind != "sicbo-room" && receipt["client_seed"] != reveal.client_seed {
             return Err("Client seed differs from saved challenge".into());
         }
+        if kind == "scratch" && terms["reward_version"] != proof["reward_version"] {
+            return Err("Service reward version differs from saved purchase terms".into());
+        }
         let fields: &[&str] = if kind == "scratch" {
             &["cost", "count"]
         } else if proof.get("stake").is_some() {

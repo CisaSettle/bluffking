@@ -1516,42 +1516,6 @@ impl ActiveHand {
             && self.client.delivery_received(self.hand_id, seat).await.ok() == Some(false)
     }
 
-    pub async fn sync_solo_ticket(
-        &self,
-        seat: u8,
-        slot: &tokio::sync::Mutex<Option<crate::session_registry::WsSender>>,
-    ) {
-        let Some((conn_id, tx)) = slot
-            .lock()
-            .await
-            .as_ref()
-            .map(|c| (c.conn_id, c.tx.clone()))
-        else {
-            return;
-        };
-        let mut sent = self.sent_connections.lock().await;
-        if sent.get(&Uuid::nil()) == Some(&conn_id) {
-            return;
-        }
-        let Some(ticket) = self.deal.tickets.iter().find(|t| t.seat == seat) else {
-            return;
-        };
-        let msg = crate::protocol::ServerMsg::SealedDealTicket {
-            hand_id: self.hand_id,
-            seat,
-            ticket: ticket.ticket.clone(),
-            endpoint: self.endpoint.clone(),
-            commitment: self.deal.commitment.clone(),
-        };
-        if let Ok(json) = serde_json::to_string(&msg) {
-            if crate::runtime_checkpoint::try_send(&tx, crate::outbound::Outbound::Text(json))
-                .is_ok()
-            {
-                sent.insert(Uuid::nil(), conn_id);
-            }
-        }
-    }
-
     pub async fn advance(&self, hand: &mut engine::GameHand) -> Result<(), String> {
         while let Some(street) = hand.pending_board_street() {
             let ids = self.client.reveal_board(self.hand_id, street).await?;

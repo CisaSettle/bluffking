@@ -4,11 +4,7 @@
 -- `IF NOT EXISTS`; the practice wallet whitelist gains game 23 (LOTTERY).
 -- No physical foreign keys (account purge removes rows explicitly).
 --
--- The scratch room trigger that mirrored settled rooms into game_rounds
--- (game=16) goes with the room model; existing game_rounds rows stay for the
--- daily report's history. Old scratch checkpoint rows are NOT deleted here:
--- the lottery retention sweep retires them with the old policy (closed > 1 d,
--- any > 7 d) and account purge still passes through them.
+-- Retired room trigger definitions are removed; persisted business rows remain.
 
 CREATE TABLE IF NOT EXISTS public.lottery_periods (
  game text NOT NULL,

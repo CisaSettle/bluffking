@@ -29,8 +29,8 @@
     <main>
       <article id="zh" lang="zh-CN">
         <h1>彩票与骰宝：公开过程，独立复核</h1>
-        <p><code>draw-games/</code> 是现有 BluffKing 开源仓库的子目录。这里公开开奖输入、确定性抽样、中奖计算、购票封盘及相关持久化代码，并提供无需连接 BluffKing 的离线验证器。覆盖骰宝、刮刮乐、双色球、快乐8、福彩3D、大乐透和 TOTO；奖项与金额均为练习豆。</p>
-        <p class="notice"><strong>本版本的证明协议尚未部署到生产。</strong>公开源码不等于线上已切换协议。生成这些证明需要配套版本的后台与客户端；开源标签不证明生产正在运行对应二进制。没有证明的历史记录明确保留为旧记录，不会补造承诺。</p>
+        <p><code>draw-games/</code> 是现有 BluffKing 开源仓库的子目录。这里公开开奖输入、确定性抽样、中奖计算、购票封盘及相关持久化代码，并提供无需连接 BluffKing 的离线验证器。覆盖骰宝、刮刮乐、双色球、快乐8、福彩3D、大乐透和 TOTO；金豆无现金价值，刮刮乐还可赢取站内会员时长。</p>
+        <p class="notice"><strong>本版本的证明协议尚未部署到生产。</strong>公开源码不等于线上已切换协议。生成这些证明需要配套版本的后台与客户端；开源标签不证明生产正在运行对应二进制。当前开奖必须有预先公开的证明计划；缺失证明时报告不可用，不补造承诺。</p>
         <p>代码采用根目录的 <a href="../LICENSE">AGPL-3.0-only 许可证</a>，品牌规则见 <a href="../TRADEMARKS.md">商标说明</a>。仓库不含玩家数据、运行密钥、未揭示种子或未来实际开奖结果。</p>
 
         <h2>三种开奖流程</h2>
@@ -47,14 +47,14 @@
         <p>双色球、大乐透、TOTO 每 5 分钟一期，大乐透错开 75 秒，TOTO 错开 150 秒；快乐8 每 2 分钟，福彩3D 每 3 分钟。所有这些游戏在计划开奖前 5 秒封盘，期号标签使用新加坡时间。计划选择在开奖时间或之后的第一轮 drand quicknet 信标，而不是请求时的“最新轮次”。</p>
         <p>固定链标识为 <code>52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971</code>，起始时间为 Unix 秒 <code>1692803367</code>，每轮 3 秒。<a href="verifier/src/beacon.rs">beacon.rs</a> 固定公钥并验证 <code>bls-unchained-g1-rfc9380</code> 签名；随机输入是 <code>SHA-256(signature)</code>，不信任 HTTP 响应自带的随机数字段。</p>
         <p><a href="verifier/src/lottery.rs">lottery.rs</a> 将计划承诺与信标随机输入绑定；<a href="verifier/src/proof.rs">proof.rs</a> 定义带域区分、长度前缀的 SHA-256 输入和计数器流。范围抽样使用拒绝采样消除取模偏差，无放回抽样使用部分 Fisher–Yates。信标网络仍有门限参与者、时钟与可用性假设，详见 <a href="https://docs.drand.love/docs/security-model/">drand 安全模型</a>。签名验证使用固定版本的 <a href="https://docs.rs/drand-verify/0.6.2/drand_verify/">drand-verify 0.6.2</a>。</p>
-        <p>后台在数据库事务与行锁之外进行有超时、响应大小上限和重试间隔的信标请求。无法取得或验证指定信标时，同一期继续待开奖；已公开计划与已完成结果受持久化约束保护，恢复与重试不另选结果。旧期只按原流程完成结算，保持无证明标记。</p>
+        <p>后台在数据库事务与行锁之外进行有超时、响应大小上限和重试间隔的信标请求。无法取得或验证指定信标时，同一期继续待开奖；已公开计划与已完成结果受持久化约束保护，恢复与重试不另选结果。缺少预先公开计划的期次不进入开奖。</p>
 
         <h2>号码与中奖规则</h2>
         <table>
           <thead><tr><th>游戏</th><th>确定性抽样与兑奖</th></tr></thead>
           <tbody>
             <tr><td>骰宝</td><td>三颗独立的 1–6 骰子；4–10 为小，11–17 为大，围骰使大小投注均输。单人及房间共用<a href="verifier/src/sicbo.rs">骰宝规则</a>。</td></tr>
-            <tr><td>刮刮乐</td><td>六个号码和一个幸运号分别从 1–30 抽取，位置倍率为 1、1、2、2、5、10，命中位置相加。购票时保存结果，未刮号码在响应中隐藏；完整规则见 <a href="verifier/src/scratch.rs">scratch.rs</a>。</td></tr>
+            <tr><td>刮刮乐</td><td>六个号码和一个幸运号分别从 1–30 抽取，位置倍率为 1、1、2、2、5、10，命中位置相加。每张固定 100 金豆，并额外抽取最多一项奖励：10,000 金豆（0.2%）、100,000 金豆（0.01%）、Pro 30 天（0.1%）或 Max 30 天（0.01%）。只支持当前福利卡规则。购票时保存结果，号码和额外奖励在完整揭示前按规则隐藏；完整规则见 <a href="verifier/src/scratch.rs">scratch.rs</a>。</td></tr>
             <tr><td>双色球</td><td>1–33 无放回取 6 个红球，独立抽取 1–16 蓝球。</td></tr>
             <tr><td>快乐8</td><td>1–80 无放回取 20 个号码。</td></tr>
             <tr><td>福彩3D</td><td>三个独立的 0–9 数字，支持直选、组三、组六。</td></tr>
@@ -74,7 +74,7 @@
           <li>验证器重算号码或骰子，并在证明包含投注／票据信息时复核成本与奖金。提供回执时还会比对原承诺、玩家种子及相应投注条件。</li>
           <li>成功输出 <code>outcome: "replayed"</code>；有相符回执时为 <code>receipt_match: "matched"</code>，未提供时为 <code>"not_provided"</code>。不匹配或证明损坏会输出 <code>"rejected"</code> 并以退出码 1 结束。仅重算成功不代表拥有开奖前的证据。</li>
         </ol>
-        <p>定期开奖提供无需账号的 <code>GET /api/draws/:game/:period/proof</code>，返回 <code>plan</code>、<code>proof</code> 和 <code>proof_status</code>；状态为 <code>pending</code>、<code>available</code> 或 <code>legacy</code>。这里不公开个人选票与账号信息。游戏历史中的个人票据可合入证明的 <code>ticket</code> 字段，用于核对中奖计算。</p>
+        <p>定期开奖提供无需账号的 <code>GET /api/draws/:game/:period/proof</code>，返回 <code>plan</code>、<code>proof</code> 和 <code>proof_status</code>；状态为 <code>pending</code>、<code>available</code> 或 <code>unavailable</code>。这里不公开个人选票与账号信息。游戏历史中的个人票据可合入证明的 <code>ticket</code> 字段，用于核对中奖计算。</p>
         <p>若运营方不提供开奖证明，从既定链的 <code>https://api.drand.sh/52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971/public/{round}</code> 取得计划中的准确轮次，保存为 <code>beacon.json</code>，再运行以下命令。把 <code>GAME</code> 和 <code>PERIOD</code> 换成已保存计划中的游戏名和整数期号；命令检查轮次及签名，再输出可复核的完整开奖证明。</p>
         <pre><code>./draw-games/verifier/target/debug/draw-verify --derive-lottery GAME PERIOD beacon.json &gt; proof.json
 ./draw-games/verifier/target/debug/draw-verify proof.json --receipt pre-draw-receipt.json</code></pre>
@@ -87,7 +87,7 @@
         <h2>源码导航与构建范围</h2>
         <ul>
           <li>可独立构建的共用规则库：<a href="verifier/Cargo.toml">Cargo.toml</a>、<a href="verifier/Cargo.lock">Cargo.lock</a>；<a href="verifier/src/proof.rs">承诺、揭示与抽样流</a>、<a href="verifier/src/beacon.rs">信标签名</a>、<a href="verifier/src/lottery.rs">定期开奖与奖表</a>、<a href="verifier/src/scratch.rs">刮刮乐</a>、<a href="verifier/src/sicbo.rs">骰宝</a>、<a href="verifier/src/bin/draw-verify.rs">命令行验证器</a>。</li>
-          <li>彩票服务集成：<a href="src/lottery/mod.rs">模块</a>、<a href="src/lottery/rules.rs">共用规则引用与旧期兼容</a>、<a href="src/lottery/store.rs">购票与查询</a>、<a href="src/lottery/draw_loop.rs">开奖与派奖</a>、<a href="src/lottery/beacon.rs">有界信标请求</a>、<a href="src/lottery/scratch.rs">刮刮乐揭示</a>、<a href="src/lottery/handlers.rs">HTTP 接口</a>、<a href="src/lottery/legacy_scratch.rs">历史房间清理</a>。</li>
+          <li>彩票服务集成：<a href="src/lottery/mod.rs">模块</a>、<a href="src/lottery/rules.rs">共用规则引用</a>、<a href="src/lottery/store.rs">购票与查询</a>、<a href="src/lottery/draw_loop.rs">开奖与派奖</a>、<a href="src/lottery/beacon.rs">有界信标请求</a>、<a href="src/lottery/scratch.rs">刮刮乐揭示</a>、<a href="src/lottery/handlers.rs">HTTP 接口</a>。</li>
           <li>即时承诺与骰宝：<a href="src/draw_fairness.rs">draw_fairness.rs</a>、<a href="src/sicbo.rs">单人骰宝</a>、<a href="src/sicbo_room/mod.rs">房间模块</a>、<a href="src/sicbo_room/store.rs">房间承诺与结算</a>。</li>
           <li>持久化与账务：<a href="src/casino_room.rs">房间推进及确认</a>、<a href="src/casino_room_lifecycle.rs">房间生命周期</a>、<a href="src/write_behind.rs">有序写入</a>、<a href="src/wallet.rs">账本</a>、<a href="src/beans.rs">练习豆钱包</a>、<a href="src/game_records.rs">游戏记录</a>、<a href="src/room_clock.rs">时钟</a>、<a href="src/casino_bots.rs">机器人</a>、<a href="src/game_catalog.rs">游戏编号</a>。</li>
           <li>增量结构：<a href="schema/0031_draw_proofs.up.sql">0031 证明与不可变约束</a>及<a href="schema/0031_draw_proofs.down.sql">回退源码</a>；历史 <a href="schema/0027_lottery_center.up.sql">0027 彩票中心</a>、<a href="schema/0027_lottery_center.down.sql">0027 回退</a>、<a href="schema/0029_daletou.up.sql">0029 大乐透</a>、<a href="schema/0029_daletou.down.sql">0029 回退</a>。这些是原始增量文件，不是独立数据库安装脚本。</li>
@@ -97,8 +97,8 @@
       </article>
       <article id="en" lang="en" hidden>
         <h1>Lottery and Sicbo: public process, independent replay</h1>
-        <p><code>draw-games/</code> is a subdirectory of the existing BluffKing open-source repository. It publishes draw inputs, deterministic sampling, prize calculation, purchase cutoffs and related persistence, together with an offline verifier that needs no connection to BluffKing. It covers Sicbo, scratch cards, SSQ, Happy8, Fucai3D, Daletou and TOTO. Stakes and prizes use practice beans.</p>
-        <p class="notice"><strong>This proof protocol has not yet been deployed to production.</strong> Source publication does not switch the live protocol. Generating these proofs requires the matching backend and client version; a public tag does not attest the production binary. Historical records without proofs stay explicitly legacy: no retrospective commitments are invented.</p>
+        <p><code>draw-games/</code> is a subdirectory of the existing BluffKing open-source repository. It publishes draw inputs, deterministic sampling, prize calculation, purchase cutoffs and related persistence, together with an offline verifier that needs no connection to BluffKing. It covers Sicbo, scratch cards, SSQ, Happy8, Fucai3D, Daletou and TOTO. Beans have no cash value; scratch cards can also award in-app membership time.</p>
+        <p class="notice"><strong>This proof protocol has not yet been deployed to production.</strong> Source publication does not switch the live protocol. Generating these proofs requires the matching backend and client version; a public tag does not attest the production binary. Current draws require a previously published plan. Missing proofs are unavailable; retrospective commitments are never invented.</p>
         <p>Code uses the root <a href="../LICENSE">AGPL-3.0-only license</a>; see the <a href="../TRADEMARKS.md">trademark policy</a>. The repository contains no player data, runtime keys, unrevealed seeds or actual future draw results.</p>
 
         <h2>Three draw flows</h2>
@@ -115,14 +115,14 @@
         <p>SSQ, Daletou and TOTO draw every five minutes, with Daletou offset by 75 seconds and TOTO by 150 seconds. Happy8 draws every two minutes, Fucai3D every three. Sales close five seconds before the planned draw, with period labels in Singapore time. The plan selects the first drand quicknet round scheduled at or after draw time, never the relay's “latest” round.</p>
         <p>The pinned chain is <code>52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971</code>, with genesis Unix second <code>1692803367</code> and a three-second period. <a href="verifier/src/beacon.rs">beacon.rs</a> pins its public key and verifies the <code>bls-unchained-g1-rfc9380</code> signature. Randomness is <code>SHA-256(signature)</code>; the relay's supplied randomness field is not trusted.</p>
         <p><a href="verifier/src/lottery.rs">lottery.rs</a> binds the plan commitment to beacon randomness. <a href="verifier/src/proof.rs">proof.rs</a> specifies domain-separated, length-prefixed SHA-256 inputs and a counter stream. Rejection sampling removes modulo bias; partial Fisher–Yates samples without replacement. Beacon unpredictability and availability still depend on threshold participants and timing assumptions: see the <a href="https://docs.drand.love/docs/security-model/">drand security model</a>. Signature verification uses pinned <a href="https://docs.rs/drand-verify/0.6.2/drand_verify/">drand-verify 0.6.2</a>.</p>
-        <p>Beacon requests have timeouts, response-size limits and retry spacing, and run outside database transactions and row locks. If the selected beacon cannot be obtained or verified, the same draw remains pending. Persistence constraints protect published plans and completed results; retries and recovery do not choose another result. Pre-existing legacy periods finish under their original path and remain without proofs.</p>
+        <p>Beacon requests have timeouts, response-size limits and retry spacing, and run outside database transactions and row locks. If the selected beacon cannot be obtained or verified, the same draw remains pending. Persistence constraints protect published plans and completed results; retries and recovery do not choose another result. Periods without a previously published plan do not enter drawing.</p>
 
         <h2>Numbers and prize rules</h2>
         <table>
           <thead><tr><th>Game</th><th>Deterministic sampling and prizes</th></tr></thead>
           <tbody>
             <tr><td>Sicbo</td><td>Three independent dice in 1–6. Small is 4–10, big is 11–17, and triples lose both bets. Solo and rooms share <a href="verifier/src/sicbo.rs">the same rules</a>.</td></tr>
-            <tr><td>Scratch cards</td><td>Six numbers and one lucky number independently drawn from 1–30; matching positions pay multipliers 1, 1, 2, 2, 5, 10, added together. Results are stored at purchase and unopened numbers are hidden from responses. See <a href="verifier/src/scratch.rs">scratch.rs</a>.</td></tr>
+            <tr><td>Scratch cards</td><td>Six numbers and one lucky number independently drawn from 1–30; matching positions pay multipliers 1, 1, 2, 2, 5, 10, added together. Each card costs 100 beans and draws at most one extra reward: 10,000 beans (0.2%), 100,000 beans (0.01%), Pro for 30 days (0.1%), or Max for 30 days (0.01%). Only the current reward-card rules are supported. Results are stored at purchase; unopened numbers and the bonus remain hidden until their reveal. See <a href="verifier/src/scratch.rs">scratch.rs</a>.</td></tr>
             <tr><td>SSQ</td><td>Six distinct red balls from 1–33 and one independent blue ball from 1–16.</td></tr>
             <tr><td>Happy8</td><td>Twenty distinct numbers from 1–80.</td></tr>
             <tr><td>Fucai3D</td><td>Three independent digits from 0–9; straight, group-three and group-six entries.</td></tr>
@@ -142,7 +142,7 @@
           <li>The verifier reconstructs numbers or dice and, when wager/ticket details are present, recomputes costs and prizes. A supplied receipt is compared with the original commitment, player seed and applicable wager terms.</li>
           <li>Success reports <code>outcome: "replayed"</code>. <code>receipt_match</code> is <code>"matched"</code> for a matching receipt or <code>"not_provided"</code> when none was supplied. A mismatch or invalid proof reports <code>"rejected"</code> and exits with code 1. Successful replay alone does not establish possession of pre-draw evidence.</li>
         </ol>
-        <p>Scheduled draws expose account-free <code>GET /api/draws/:game/:period/proof</code>, returning <code>plan</code>, <code>proof</code> and <code>proof_status</code>: <code>pending</code>, <code>available</code> or <code>legacy</code>. This endpoint exposes no private selections or account data. A personal history ticket can be attached as the proof's <code>ticket</code> field to check its prize calculation.</p>
+        <p>Scheduled draws expose account-free <code>GET /api/draws/:game/:period/proof</code>, returning <code>plan</code>, <code>proof</code> and <code>proof_status</code>: <code>pending</code>, <code>available</code> or <code>unavailable</code>. This endpoint exposes no private selections or account data. A personal history ticket can be attached as the proof's <code>ticket</code> field to check its prize calculation.</p>
         <p>If the operator withholds its proof, obtain the exact round from the saved plan at <code>https://api.drand.sh/52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971/public/{round}</code> and save it as <code>beacon.json</code>. Replace <code>GAME</code> and <code>PERIOD</code> below with the saved game's name and integer period. The command verifies the round and signature, then emits a complete draw proof.</p>
         <pre><code>./draw-games/verifier/target/debug/draw-verify --derive-lottery GAME PERIOD beacon.json &gt; proof.json
 ./draw-games/verifier/target/debug/draw-verify proof.json --receipt pre-draw-receipt.json</code></pre>
@@ -155,7 +155,7 @@
         <h2>Source navigation and build scope</h2>
         <ul>
           <li>Independently buildable shared library: <a href="verifier/Cargo.toml">Cargo.toml</a>, <a href="verifier/Cargo.lock">Cargo.lock</a>; <a href="verifier/src/proof.rs">commitments, reveals and sampling stream</a>, <a href="verifier/src/beacon.rs">beacon signatures</a>, <a href="verifier/src/lottery.rs">lottery rules and prizes</a>, <a href="verifier/src/scratch.rs">scratch cards</a>, <a href="verifier/src/sicbo.rs">Sicbo</a>, <a href="verifier/src/bin/draw-verify.rs">CLI verifier</a>.</li>
-          <li>Lottery integration: <a href="src/lottery/mod.rs">module</a>, <a href="src/lottery/rules.rs">shared rule imports and legacy draws</a>, <a href="src/lottery/store.rs">purchases and queries</a>, <a href="src/lottery/draw_loop.rs">draws and settlement</a>, <a href="src/lottery/beacon.rs">bounded beacon requests</a>, <a href="src/lottery/scratch.rs">scratch reveals</a>, <a href="src/lottery/handlers.rs">HTTP handlers</a>, <a href="src/lottery/legacy_scratch.rs">retired-room cleanup</a>.</li>
+          <li>Lottery integration: <a href="src/lottery/mod.rs">module</a>, <a href="src/lottery/rules.rs">shared rule imports</a>, <a href="src/lottery/store.rs">purchases and queries</a>, <a href="src/lottery/draw_loop.rs">draws and settlement</a>, <a href="src/lottery/beacon.rs">bounded beacon requests</a>, <a href="src/lottery/scratch.rs">scratch reveals</a>, <a href="src/lottery/handlers.rs">HTTP handlers</a>.</li>
           <li>Immediate commitments and Sicbo: <a href="src/draw_fairness.rs">draw_fairness.rs</a>, <a href="src/sicbo.rs">solo Sicbo</a>, <a href="src/sicbo_room/mod.rs">room module</a>, <a href="src/sicbo_room/store.rs">room commitments and settlement</a>.</li>
           <li>Persistence and accounting: <a href="src/casino_room.rs">room progression and acknowledgements</a>, <a href="src/casino_room_lifecycle.rs">room lifecycle</a>, <a href="src/write_behind.rs">ordered persistence</a>, <a href="src/wallet.rs">ledger</a>, <a href="src/beans.rs">shared practice wallet</a>, <a href="src/game_records.rs">game records</a>, <a href="src/room_clock.rs">clock</a>, <a href="src/casino_bots.rs">bots</a>, <a href="src/game_catalog.rs">game identifiers</a>.</li>
           <li>Incremental schema: <a href="schema/0031_draw_proofs.up.sql">0031 proofs and immutability constraints</a> and <a href="schema/0031_draw_proofs.down.sql">rollback source</a>; historical <a href="schema/0027_lottery_center.up.sql">0027 lottery center</a>, <a href="schema/0027_lottery_center.down.sql">0027 rollback</a>, <a href="schema/0029_daletou.up.sql">0029 Daletou</a> and <a href="schema/0029_daletou.down.sql">0029 rollback</a>. These are original incremental files, not standalone database installers.</li>

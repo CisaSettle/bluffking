@@ -535,13 +535,13 @@ impl Game {
             Game::Scratch => "scratch",
         }
     }
-    /// Chips per 注 (scratch: the smallest card).
+    /// Chips per 注 (scratch: the current service card).
     pub fn unit(self) -> i64 {
         match self {
             Game::Ssq | Game::Dlt | Game::Toto => 10,
             Game::Happy8 => 4,
             Game::Fucai3d => 2,
-            Game::Scratch => 10,
+            Game::Scratch => 100,
         }
     }
     pub fn schedule(self) -> Option<Schedule> {

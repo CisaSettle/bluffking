@@ -17,8 +17,7 @@ pub struct ScratchBuy {
     pub request_id: Uuid,
     pub cost: i64,
     pub count: usize,
-    #[serde(default)]
-    pub fairness: Option<draw_fairness::Challenge>,
+    pub fairness: draw_fairness::Challenge,
 }
 
 pub fn project(out: &mut Value, ticket: &TicketRow) {
@@ -33,16 +32,18 @@ pub fn project(out: &mut Value, ticket: &TicketRow) {
         })
         .collect();
     let all = (0..6).all(|i| revealed.get(i) == Some(&true));
-    let fairness = match ticket.entry.get("fairness") {
-        // Verify the card and award actually returned by storage, not a
-        // second, potentially divergent copy inside the stored proof.
-        Some(proof) if all => json!({
+    let proof = &ticket.entry["fairness"];
+    let fairness = if all {
+        // Verify the card and reward actually returned by storage.
+        json!({
             "kind": "scratch", "reveal": proof["reveal"],
             "cost": ticket.cost, "count": proof["count"], "index": proof["index"],
             "numbers": ticket.entry["numbers"], "lucky": ticket.entry["lucky"],
             "prize": ticket.prize, "hits": ticket.tier,
-        }),
-        Some(proof) => json!({
+            "reward_version": 1, "reward": ticket.entry["reward"],
+        })
+    } else {
+        json!({
             "kind": "scratch",
             "commitment": {
                 "protocol": proof["reveal"]["protocol"],
@@ -51,12 +52,20 @@ pub fn project(out: &mut Value, ticket: &TicketRow) {
                 "commitment": proof["reveal"]["commitment"],
             },
             "client_seed": proof["reveal"]["client_seed"],
-            "cost": ticket.cost,
-            "count": proof["count"],
-            "index": proof["index"],
+            "cost": ticket.cost, "count": proof["count"], "index": proof["index"],
             "verified": false,
-        }),
-        None => json!({"kind": "scratch", "verified": false, "reason": "legacy"}),
+        })
+    };
+    out["reward_version"] = json!(1);
+    out["reward"] = if all && ticket.settled_at.is_some() {
+        ticket.entry["reward"].clone()
+    } else {
+        Value::Null
+    };
+    out["reward_grant"] = if all && ticket.settled_at.is_some() {
+        ticket.entry["reward_grant"].clone()
+    } else {
+        Value::Null
     };
     // Whitelist both copies: the persisted proof contains the server seed and
     // complete card, neither of which may escape before all six spots open.
@@ -76,10 +85,7 @@ fn prize(entry: &Value, cost: i64) -> Result<(i64, i16), Error> {
 }
 
 pub async fn buy(pool: &PgPool, user: Uuid, body: &ScratchBuy) -> Result<Purchase, Error> {
-    if body.request_id.is_nil()
-        || ![10, 50, 100].contains(&body.cost)
-        || ![1, 5, 10].contains(&body.count)
-    {
+    if body.request_id.is_nil() || body.cost != 100 || ![1, 5, 10].contains(&body.count) {
         return Err(Error::InvalidEntry);
     }
     let batch = body.count > 1;
@@ -88,14 +94,8 @@ pub async fn buy(pool: &PgPool, user: Uuid, body: &ScratchBuy) -> Result<Purchas
     } else {
         super::purchase_id(user, body.request_id)
     };
-    let mut identity = json!({"game":"scratch", "cost":body.cost, "count":body.count});
-    if let Some(fairness) = &body.fairness {
-        identity["fairness"] = json!({
-            "offer_id": fairness.offer_id,
-            "commitment": fairness.commitment,
-            "client_seed": fairness.client_seed,
-        });
-    }
+    let identity = json!({"game":"scratch", "cost":body.cost, "count":body.count,
+        "fairness": {"offer_id":body.fairness.offer_id,"commitment":body.fairness.commitment,"client_seed":body.fairness.client_seed}});
     let hash = store::body_sha256(&identity);
     store::ensure_wallet(pool, user).await?;
     {
@@ -115,7 +115,7 @@ pub async fn buy(pool: &PgPool, user: Uuid, body: &ScratchBuy) -> Result<Purchas
     }
     store::require_spendable(&mut tx, user).await?;
     if !batch {
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM lottery_tickets WHERE game='scratch' AND period=0 AND user_id=$1 AND settled_at IS NULL")
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM lottery_tickets WHERE game='scratch' AND period=0 AND user_id=$1 AND settled_at IS NULL AND cost=100 AND entry->'reward_version'='1'::jsonb")
             .bind(user).fetch_one(&mut *tx).await?;
         if count >= 50 {
             return Err(Error::TooManyTickets);
@@ -125,9 +125,8 @@ pub async fn buy(pool: &PgPool, user: Uuid, body: &ScratchBuy) -> Result<Purchas
     if charged > before {
         return Err(Error::InsufficientBalance);
     }
-    // Legacy purchases replay above without an offer. Every new purchase must
-    // consume the previously published commitment in this same transaction.
-    let challenge = body.fairness.as_ref().ok_or(Error::InvalidEntry)?;
+    // Consume the previously published commitment in this same transaction.
+    let challenge = &body.fairness;
     let proof = draw_fairness::claim(&mut tx, user, "scratch", body.request_id, challenge)
         .await
         .map_err(|error| match error {
@@ -137,6 +136,8 @@ pub async fn buy(pool: &PgPool, user: Uuid, body: &ScratchBuy) -> Result<Purchas
         })?;
     let generated =
         scratch::generate(&proof, body.cost, body.count).map_err(|_| Error::InvalidEntry)?;
+    let rewards =
+        scratch::rewards(&proof, body.cost, body.count).map_err(|_| Error::InvalidEntry)?;
     let now = Utc::now();
     let mut cards = Vec::with_capacity(body.count);
     for (index, card) in generated.into_iter().enumerate() {
@@ -148,7 +149,7 @@ pub async fn buy(pool: &PgPool, user: Uuid, body: &ScratchBuy) -> Result<Purchas
         });
         let entry = json!({
             "cost": body.cost, "lucky": card.lucky, "numbers": card.numbers,
-            "fairness": fairness,
+            "fairness": fairness, "reward_version":1, "reward":rewards[index],
         });
         cards.push(TicketRow {
             id: Uuid::new_v4(),
@@ -166,6 +167,14 @@ pub async fn buy(pool: &PgPool, user: Uuid, body: &ScratchBuy) -> Result<Purchas
             proof_plan: None,
         });
     }
+    // Bonus rows precede the purchase row so its stored balance also replays
+    // the final post-bonus balance after a lost response.
+    let mut membership_granted = false;
+    if batch {
+        for card in &mut cards {
+            membership_granted |= grant_reward(&mut tx, user, card).await?;
+        }
+    }
     let paid: i64 = cards.iter().filter_map(|t| t.prize).sum();
     let ids: Vec<Uuid> = cards.iter().map(|t| t.id).collect();
     let after = wallet::settle(&mut tx, POLICY.game, user, &wallet::Play {
@@ -179,6 +188,10 @@ pub async fn buy(pool: &PgPool, user: Uuid, body: &ScratchBuy) -> Result<Purchas
             .execute(&mut *tx).await?;
     }
     tx.commit().await?;
+    wallet::project_session_balance(POLICY.game, user, after);
+    if membership_granted {
+        crate::entitlement::invalidate_tier(pool, user);
+    }
     crate::stats_writer::send(crate::stats_writer::StatsEvent::LotteryPurchase {
         day: super::sgt_day(now),
         game: "scratch",
@@ -220,7 +233,7 @@ async fn replay(
 }
 
 pub async fn my_cards(conn: &mut PgConnection, user: Uuid) -> sqlx::Result<Vec<TicketRow>> {
-    let rows = sqlx::query(&format!("SELECT {TICKET_COLUMNS} FROM lottery_tickets WHERE game='scratch' AND period=0 AND user_id=$1 AND settled_at IS NULL UNION SELECT {TICKET_COLUMNS} FROM lottery_tickets WHERE purchase_id=(SELECT purchase_id FROM lottery_tickets WHERE game='scratch' AND user_id=$1 ORDER BY bought_at DESC,id DESC LIMIT 1) ORDER BY bought_at DESC,id"))
+    let rows = sqlx::query(&format!("SELECT {TICKET_COLUMNS} FROM lottery_tickets WHERE game='scratch' AND period=0 AND user_id=$1 AND cost=100 AND entry->'reward_version'='1'::jsonb AND settled_at IS NULL UNION SELECT {TICKET_COLUMNS} FROM lottery_tickets WHERE purchase_id=(SELECT purchase_id FROM lottery_tickets WHERE game='scratch' AND user_id=$1 AND cost=100 AND entry->'reward_version'='1'::jsonb ORDER BY bought_at DESC,id DESC LIMIT 1) ORDER BY bought_at DESC,id"))
         .bind(user).fetch_all(conn).await?;
     Ok(rows.iter().map(TicketRow::from_row).collect())
 }
@@ -260,7 +273,7 @@ async fn reveal_inner(
     } else {
         wallet::lock(&mut tx, POLICY.game, user).await?
     };
-    let row = sqlx::query(&format!("SELECT {TICKET_COLUMNS} FROM lottery_tickets WHERE id=$1 AND game='scratch' AND user_id=$2 FOR UPDATE"))
+    let row = sqlx::query(&format!("SELECT {TICKET_COLUMNS} FROM lottery_tickets WHERE id=$1 AND game='scratch' AND user_id=$2 AND cost=100 AND entry->'reward_version'='1'::jsonb FOR UPDATE"))
         .bind(ticket).bind(user).fetch_optional(&mut *tx).await?.ok_or(Error::TicketNotFound)?;
     let mut card = TicketRow::from_row(&row);
     if card.settled_at.is_some() {
@@ -276,6 +289,7 @@ async fn reveal_inner(
     let all = shown.iter().all(|v| *v);
     let mut after = balance.unwrap_or(0);
     let mut paid = 0;
+    let mut membership_granted = false;
     if all {
         let (amount, tier) = if balance.is_some() {
             prize(&card.entry, card.cost)?
@@ -284,6 +298,7 @@ async fn reveal_inner(
         };
         paid = amount;
         if balance.is_some() {
+            membership_granted = grant_reward(&mut tx, user, &mut card).await?;
             after = wallet::settle(
                 &mut tx,
                 POLICY.game,
@@ -310,20 +325,75 @@ async fn reveal_inner(
     }
     card.revealed = Some(shown);
     sqlx::query(
-        "UPDATE lottery_tickets SET revealed=$2,prize=$3,tier=$4,settled_at=$5 WHERE id=$1",
+        "UPDATE lottery_tickets SET revealed=$2,prize=$3,tier=$4,settled_at=$5,entry=$6 WHERE id=$1",
     )
     .bind(card.id)
     .bind(&card.revealed)
     .bind(card.prize)
     .bind(card.tier)
     .bind(card.settled_at)
+    .bind(&card.entry)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
+    if balance.is_some() {
+        wallet::project_session_balance(POLICY.game, user, after);
+    }
+    if membership_granted {
+        crate::entitlement::invalidate_tier(pool, user);
+    }
     if all && balance.is_some() {
         emit_paid(user, paid);
     }
     Ok((store::ticket_json(Game::Scratch, &card), after))
+}
+
+/// Caller holds the user, wallet and (for reveals) ticket locks. Award, ledger,
+/// entitlement and settlement commit or roll back together; replay never enters
+/// this function for an already settled card/purchase.
+async fn grant_reward(
+    conn: &mut PgConnection,
+    user: Uuid,
+    card: &mut TicketRow,
+) -> Result<bool, Error> {
+    let reward: Option<scratch::Reward> =
+        serde_json::from_value(card.entry["reward"].clone()).map_err(|_| Error::InvalidEntry)?;
+    match reward {
+        Some(scratch::Reward::Beans { amount }) => {
+            sqlx::query(
+                "WITH updated AS (UPDATE wallets SET balance=balance+$3,updated_at=now() WHERE user_id=$1 AND game=$2 RETURNING balance) \
+                 INSERT INTO wallet_ledger(user_id,game,kind,delta,balance_after,details) \
+                 SELECT $1,$2,'bonus',$3,balance,$4 FROM updated"
+            ).bind(user).bind(POLICY.game).bind(amount)
+                .bind(json!({"purpose":"scratch_reward","ticket_id":card.id,"reward_version":1}))
+                .execute(&mut *conn).await?;
+            Ok(false)
+        }
+        Some(scratch::Reward::Membership { tier, days }) => {
+            // Queue behind all existing paid/gift time. Never overwrite paid
+            // entitlements or consume a lower-tier gift under active Max.
+            let start: chrono::DateTime<Utc> = sqlx::query_scalar(
+                "SELECT GREATEST(now(),COALESCE(MAX(valid_until),now())) FROM membership_entitlements WHERE user_id=$1 AND revoked_at IS NULL"
+            ).bind(user).fetch_one(&mut *conn).await?;
+            let end = start + chrono::Duration::days(days);
+            sqlx::query(
+                "INSERT INTO membership_entitlements(user_id,tier,valid_from,valid_until,source_kind,source_scratch_ticket_id) VALUES($1,$2,$3,$4,'scratch',$5)"
+            ).bind(user).bind(tier).bind(start).bind(end).bind(card.id).execute(&mut *conn).await?;
+            sqlx::query(
+                "UPDATE users SET pro_until=GREATEST(COALESCE(pro_until,$2),$2) WHERE id=$1",
+            )
+            .bind(user)
+            .bind(end)
+            .execute(&mut *conn)
+            .await?;
+            card.entry["reward_grant"] = json!({
+                "starts_at_ms": start.timestamp_millis(),
+                "ends_at_ms": end.timestamp_millis(),
+            });
+            Ok(true)
+        }
+        None => Ok(false),
+    }
 }
 
 fn emit_paid(user: Uuid, paid: i64) {
@@ -337,7 +407,7 @@ fn emit_paid(user: Uuid, paid: i64) {
 
 /// Bounded expiry work: never delete an unfinished card before its payout.
 pub async fn expire(pool: &PgPool) -> Result<(), Error> {
-    let rows = sqlx::query("SELECT id,user_id FROM lottery_tickets WHERE game='scratch' AND settled_at IS NULL AND bought_at < now()-interval '30 days' ORDER BY bought_at,id LIMIT 20")
+    let rows = sqlx::query("SELECT id,user_id FROM lottery_tickets WHERE game='scratch' AND cost=100 AND entry->'reward_version'='1'::jsonb AND settled_at IS NULL AND bought_at < now()-interval '30 days' ORDER BY bought_at,id LIMIT 20")
         .fetch_all(pool).await?;
     for row in rows {
         match reveal_inner(pool, row.get("user_id"), row.get("id"), None, true).await {

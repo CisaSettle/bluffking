@@ -53,9 +53,6 @@ impl Roll {
         }
     }
 }
-fn random_dice() -> [u8; 3] {
-    std::array::from_fn(|_| OsRng.gen_range(1..=6))
-}
 
 /// Kept only in the room checkpoint until settlement. Views select the public
 /// commitment explicitly, never serialize this pending reveal.
@@ -84,9 +81,7 @@ pub struct State {
     history_session_id: Uuid,
     throws: crate::game_hub::throws::RoomThrows,
     round_id: Uuid,
-    /// Absent in legacy checkpoints; do not invent proof for an existing round.
-    #[serde(default)]
-    fairness: Option<Reveal>,
+    fairness: Reveal,
     round_no: i64,
     deadline_ms: i64,
     bets: BTreeMap<Uuid, Wager>,
@@ -103,7 +98,7 @@ pub struct State {
     clock: RoomClock,
     /// The room leaderboard (输赢排行).
     standings: crate::game_hub::standings::RoomStandings,
-    /// 允许朋友观战; rooms saved before the option read as allowed.
+    /// 允许朋友观战; defaults to on at creation.
     #[serde(default = "crate::game_hub::spectators::default_allow")]
     allow_spectators: bool,
 }
@@ -113,7 +108,7 @@ impl State {
         let mut state = Self {
             history_session_id: Uuid::now_v7(),
             round_id,
-            fairness: Some(new_fairness(round_id)),
+            fairness: new_fairness(round_id),
             round_no: 1,
             deadline_ms: now + BET_MS,
             bets: BTreeMap::new(),
@@ -138,7 +133,7 @@ impl State {
     }
     fn next(&mut self, now: i64) {
         self.round_id = Uuid::now_v7();
-        self.fairness = Some(new_fairness(self.round_id));
+        self.fairness = new_fairness(self.round_id);
         self.round_no += 1;
         self.deadline_ms = now + BET_MS;
         self.bets.clear();
@@ -177,7 +172,7 @@ pub struct Round {
     round_id: Uuid,
     round_no: i64,
     result: Roll,
-    fairness: Option<Reveal>,
+    fairness: Reveal,
     has_bots: bool,
     bettors: Vec<(Uuid, Wager, i64)>,
 }
@@ -204,7 +199,6 @@ pub struct SicboRoom;
 #[serde(deny_unknown_fields)]
 pub struct BetRequest {
     round_id: Uuid,
-    #[serde(default)]
     bet_revision: u64,
     /// Commitment the bettor received before submitting this wager.
     #[serde(default)]
@@ -215,29 +209,24 @@ pub struct BetRequest {
 
 static REGISTRY: Registry<SicboRoom> = Registry::new();
 
-/// Replays the committed round seed. Only an old checkpoint without a seed
-/// uses the legacy RNG, and its result is explicitly left without a proof.
+/// Replays the committed round seed.
 fn settle_round(state: &mut State, now: i64) -> Option<Round> {
     if state.result.is_some() || now < state.deadline_ms {
         return None;
     }
-    let dice = match &state.fairness {
-        Some(reveal) => {
-            if reveal.commitment.game != "sicbo-room"
-                || reveal.commitment.draw_id != state.round_id.to_string()
-            {
-                tracing::error!(round_id=%state.round_id, "sicbo room proof identity mismatch");
-                return None;
-            }
-            match draw_games::sicbo::draw(reveal) {
-                Ok(dice) => dice,
-                Err(error) => {
-                    tracing::error!(round_id=%state.round_id, %error, "sicbo room proof invalid");
-                    return None;
-                }
-            }
+    let reveal = &state.fairness;
+    if reveal.commitment.game != "sicbo-room"
+        || reveal.commitment.draw_id != state.round_id.to_string()
+    {
+        tracing::error!(round_id=%state.round_id, "sicbo room proof identity mismatch");
+        return None;
+    }
+    let dice = match draw_games::sicbo::draw(reveal) {
+        Ok(dice) => dice,
+        Err(error) => {
+            tracing::error!(round_id=%state.round_id, %error, "sicbo room proof invalid");
+            return None;
         }
-        None => random_dice(),
     };
     let result = Roll::new(dice);
     let mut bettors = Vec::with_capacity(state.bets.len());
@@ -260,10 +249,7 @@ fn settle_round(state: &mut State, now: i64) -> Option<Round> {
             );
         }
     }
-    let fairness = state
-        .fairness
-        .as_ref()
-        .map(|reveal| draw_games::sicbo::draw_proof(reveal, dice));
+    let fairness = draw_games::sicbo::draw_proof(&state.fairness, dice);
     state
         .history
         .push(json!({"round_id":state.round_id,"round_no":state.round_no,
@@ -367,13 +353,11 @@ impl DealerRoom for SicboRoom {
         if state.round_id != req.round_id {
             return Err(Error::Code("bet_closed"));
         }
-        if req.commitment.as_deref().is_some_and(|expected| {
-            state
-                .fairness
-                .as_ref()
-                .map(|proof| proof.commitment.commitment.as_str())
-                != Some(expected)
-        }) {
+        if req
+            .commitment
+            .as_deref()
+            .is_some_and(|expected| state.fairness.commitment.commitment.as_str() != expected)
+        {
             return Err(Error::Code("fairness_conflict"));
         }
         // Exact retries are read-only, including after closing/settlement.
@@ -384,12 +368,7 @@ impl DealerRoom for SicboRoom {
             return Err(Error::Code("bet_closed"));
         }
         if wager.is_some() {
-            // Old in-flight wagers can settle or be cancelled, but this round
-            // cannot accept a new wager without a pre-existing commitment.
-            let reveal = state
-                .fairness
-                .as_ref()
-                .ok_or(Error::Code("fairness_legacy_round"))?;
+            let reveal = &state.fairness;
             if req.commitment.as_deref() != Some(reveal.commitment.commitment.as_str()) {
                 return Err(Error::Code("fairness_required"));
             }
@@ -424,7 +403,8 @@ impl DealerRoom for SicboRoom {
         };
         let result = state.result.map(|roll| {
             let mut result = json!(roll);
-            result["fairness"] = json!(state.fairness.as_ref().map(|reveal| {
+            result["fairness"] = {
+                let reveal = &state.fairness;
                 if let Some((wager, delta)) = bet.zip(state.deltas.get(&uid)) {
                     let mut proof =
                         draw_games::sicbo::payout_proof(reveal, roll.dice, wager.side, wager.stake);
@@ -436,12 +416,10 @@ impl DealerRoom for SicboRoom {
                 } else {
                     draw_games::sicbo::draw_proof(reveal, roll.dice)
                 }
-            }));
+            };
             result
         });
-        let fairness_status = if state.fairness.is_none() {
-            "legacy"
-        } else if state.result.is_some() {
+        let fairness_status = if state.result.is_some() {
             "revealed"
         } else {
             "committed"
@@ -451,7 +429,7 @@ impl DealerRoom for SicboRoom {
         "bet_close_ms":if state.result.is_none(){Some(state.deadline_ms-BET_LOCK_MS)}else{None},
         "bet_revision":state.bet_revisions.get(&uid).copied().unwrap_or(0),
         "balance":balance,"available":balance-reserved,"bet":bet,"result":result,"delta":state.deltas.get(&uid),
-        "fairness_commitment":state.fairness.as_ref().map(|reveal| &reveal.commitment),
+        "fairness_commitment":&state.fairness.commitment,
         "fairness_status":fairness_status,
         "min_stake":MIN_STAKE,"max_stake":MAX_STAKE,"ai":!state.bots.is_empty(),
         "members":members_view(state,members,uid,now),"history":state.history})
@@ -485,8 +463,7 @@ impl DealerRoom for SicboRoom {
             let details = json!({"request_id":round.round_id,"side":wager.side,"stake":wager.stake,
                 "dice":round.result.dice,"total":round.result.total,"triple":round.result.triple,"won":delta>0,
                 "room_code":code,"round_no":round.round_no,
-                "fairness":round.fairness.as_ref().map(|reveal|
-                    draw_games::sicbo::payout_proof(reveal, round.result.dice, wager.side, wager.stake))});
+                "fairness":draw_games::sicbo::payout_proof(&round.fairness, round.result.dice, wager.side, wager.stake)});
             let play = wallet::Play {
                 record_id: round.round_id,
                 delta,
