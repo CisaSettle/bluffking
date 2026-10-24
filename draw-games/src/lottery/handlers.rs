@@ -68,10 +68,16 @@ pub async fn view(
         store::view(&state.pool, auth.user_id, game(&name)?).await?,
     ))
 }
+#[derive(Default, Deserialize)]
+pub struct BuyQuery {
+    #[serde(default)]
+    receipt_only: bool,
+}
 pub async fn buy(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(name): Path<String>,
+    Query(query): Query<BuyQuery>,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Result<Json<Value>, Error> {
     let game = game(&name)?;
@@ -83,6 +89,17 @@ pub async fn buy(
         let body = serde_json::from_value(body).map_err(|_| Error::InvalidEntry)?;
         store::buy_numbers(&state.pool, auth.user_id, game, &body).await?
     };
+    if query.receipt_only && game != Game::Scratch {
+        // The transaction has committed. Hall crowd/feed/history reads must not
+        // delay its receipt or turn their failure into a failed purchase.
+        // A replay's balance_after is historical; read the current wallet once.
+        let balance = store::ensure_wallet(&state.pool, auth.user_id).await?;
+        return Ok(Json(json!({
+            "purchased": purchase.purchased, "charged": purchase.charged,
+            "balance_before": purchase.balance_before, "balance_after": purchase.balance_after,
+            "balance": balance,
+        })));
+    }
     let view = store::view(&state.pool, auth.user_id, game).await?;
     Ok(Json(
         json!({"view":view,"purchased":purchase.purchased,"charged":purchase.charged,"balance_before":purchase.balance_before,"balance_after":purchase.balance_after}),
