@@ -294,7 +294,8 @@ pub async fn ledger(
     // receipts, without leaking unrelated shared-wallet games into dice history.
     let entries: Vec<serde_json::Value> = sqlx::query_scalar(
         "SELECT to_jsonb(l) FROM (SELECT id,kind,record_id,room_code,revision,delta,
-         balance_after,details,hand_completed,has_bots,created_at FROM wallet_ledger
+         balance_after,COALESCE(details,'{}'::jsonb) || jsonb_build_object('unit', CASE WHEN game=$2 THEN 'practice' ELSE 'beans' END) AS details,
+         hand_completed,has_bots,created_at FROM wallet_ledger
          WHERE user_id=$1 AND kind='play' AND (game=$2 OR (game=$3 AND details->>'game'='sicbo'))
          ORDER BY id DESC LIMIT $4 OFFSET $5) l",
     )

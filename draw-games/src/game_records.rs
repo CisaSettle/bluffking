@@ -378,6 +378,7 @@ WHEN 7 THEN (SELECT jsonb_build_object(
     'has_bots', (m.red_user_id IS NULL OR m.black_user_id IS NULL))
     FROM (SELECT id,room_code,started_at,ended_at,(detail->>'stake')::bigint AS stake,(detail->>'red_user_id')::uuid AS red_user_id,(detail->>'black_user_id')::uuid AS black_user_id,detail->>'red_name' AS red_name,detail->>'black_name' AS black_name,detail->>'winner' AS winner,detail->>'reason' AS reason,detail->'moves' AS moves FROM game_rounds WHERE game=7) m WHERE m.id=page.record_id)
 WHEN 8 THEN (SELECT details FROM wallet_ledger WHERE game=8 AND user_id=$1 AND record_id=page.record_id ORDER BY id DESC LIMIT 1)
-WHEN 11 THEN (SELECT details FROM wallet_ledger WHERE (game=10 AND details->>'game'='sicbo') AND user_id=$1 AND record_id=page.record_id ORDER BY id DESC LIMIT 1)
+WHEN 11 THEN (SELECT COALESCE(details,'{}'::jsonb) || jsonb_build_object('unit', CASE WHEN game=11 THEN 'practice' ELSE 'beans' END)
+    FROM wallet_ledger WHERE (game=11 OR (game=10 AND details->>'game'='sicbo')) AND kind='play' AND user_id=$1 AND record_id=page.record_id ORDER BY id ASC LIMIT 1)
 ELSE NULL END END
 "#;

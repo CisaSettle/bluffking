@@ -21,6 +21,24 @@ const HISTORY: usize = 60;
 
 pub use crate::casino_room::{Error, Result};
 
+/// Missing checkpoint metadata means a wager accepted before the bean upgrade.
+/// Keep the denomination on the round, including after repeated crash recovery.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WalletUnit {
+    #[default]
+    Practice,
+    Beans,
+}
+impl WalletUnit {
+    fn game(self) -> i16 {
+        match self {
+            Self::Practice => crate::game_catalog::SICBO,
+            Self::Beans => crate::game_catalog::BEANS,
+        }
+    }
+}
+
 /// One player's whole wager for a round: the solo game's sides and limits.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -78,6 +96,8 @@ struct BotBet {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct State {
+    #[serde(default)]
+    wallet_unit: WalletUnit,
     history_session_id: Uuid,
     throws: crate::game_hub::throws::RoomThrows,
     round_id: Uuid,
@@ -108,6 +128,7 @@ impl State {
     fn new(now: i64, bots: Vec<Bot>) -> Self {
         let round_id = Uuid::now_v7();
         let mut state = Self {
+            wallet_unit: WalletUnit::Beans,
             history_session_id: Uuid::now_v7(),
             round_id,
             fairness: new_fairness(round_id),
@@ -135,6 +156,13 @@ impl State {
         self.result.is_none() && now < self.deadline_ms - BET_LOCK_MS
     }
     fn next(&mut self, now: i64) {
+        if self.wallet_unit == WalletUnit::Practice {
+            // The old session remains in durable records; don't sum its chips
+            // into the new bean session or its room leaderboard.
+            self.history_session_id = Uuid::now_v7();
+            self.standings = Default::default();
+        }
+        self.wallet_unit = WalletUnit::Beans;
         self.round_id = Uuid::now_v7();
         self.fairness = new_fairness(self.round_id);
         self.round_no += 1;
@@ -172,6 +200,7 @@ impl State {
 /// One settled round, as the writer makes it durable.
 #[derive(Clone)]
 pub struct Round {
+    wallet_unit: WalletUnit,
     session_id: Uuid,
     round_id: Uuid,
     round_no: i64,
@@ -238,7 +267,10 @@ fn settle_round(state: &mut State, now: i64) -> Option<Round> {
     for (&uid, &wager) in &state.bets {
         let delta = wager.delta(dice);
         state.deltas.insert(uid, delta);
-        if delta > 0 && crate::sicbo::wins_max(reveal, uid) {
+        if state.wallet_unit == WalletUnit::Beans
+            && delta > 0
+            && crate::sicbo::wins_max(reveal, uid)
+        {
             state.max_rewards.insert(uid);
         }
         bettors.push((uid, wager, delta));
@@ -261,13 +293,15 @@ fn settle_round(state: &mut State, now: i64) -> Option<Round> {
     state
         .history
         .push(json!({"round_id":state.round_id,"round_no":state.round_no,
-        "dice":dice,"total":result.total,"triple":result.triple,"fairness":fairness}));
+        "dice":dice,"total":result.total,"triple":result.triple,"fairness":fairness,
+        "unit":state.wallet_unit}));
     if state.history.len() > HISTORY {
         state.history.remove(0);
     }
     state.result = Some(result);
     state.deadline_ms = now + RESULT_MS;
     Some(Round {
+        wallet_unit: state.wallet_unit,
         session_id: state.history_session_id,
         round_id: state.round_id,
         round_no: state.round_no,
@@ -346,6 +380,18 @@ impl DealerRoom for SicboRoom {
     fn deltas(round: &Round) -> Vec<(Uuid, i64)> {
         round.bettors.iter().map(|(u, _, d)| (*u, *d)).collect()
     }
+    fn projection_deltas(round: &Round) -> Vec<(Uuid, i64)> {
+        // Recovery activates the current bean wallet. A legacy practice result
+        // remains durable in its original wallet and cannot change that display.
+        if round.wallet_unit == WalletUnit::Beans {
+            Self::deltas(round)
+        } else {
+            Vec::new()
+        }
+    }
+    fn uses_current_wallet(state: &State) -> bool {
+        state.wallet_unit == WalletUnit::Beans
+    }
     fn reward_users(round: &Round) -> Vec<Uuid> {
         round.max_rewards.iter().copied().collect()
     }
@@ -365,9 +411,6 @@ impl DealerRoom for SicboRoom {
     /// Replace the caller's whole wager atomically; `None` cancels it.
     fn bet(state: &mut State, uid: Uuid, req: BetRequest, balance: i64, now: i64) -> Result<bool> {
         let wager = req.bet;
-        if wager.is_some_and(|w| !w.valid()) {
-            return Err(Error::Code("invalid_bet"));
-        }
         if state.round_id != req.round_id {
             return Err(Error::Code("bet_closed"));
         }
@@ -382,8 +425,13 @@ impl DealerRoom for SicboRoom {
         if state.bets.get(&uid).copied() == wager {
             return Ok(false);
         }
-        if !state.betting_open(now) {
+        // Old accepted wagers retain their exact receipt/retry semantics, but
+        // no new wager may join a legacy round under the new bean UI.
+        if state.wallet_unit != WalletUnit::Beans || !state.betting_open(now) {
             return Err(Error::Code("bet_closed"));
+        }
+        if wager.is_some_and(|w| !w.valid()) {
+            return Err(Error::Code("invalid_bet"));
         }
         if wager.is_some() {
             let reveal = &state.fairness;
@@ -414,7 +462,7 @@ impl DealerRoom for SicboRoom {
         now: i64,
     ) -> Value {
         let bet = state.bets.get(&uid);
-        let reserved = if state.result.is_none() {
+        let reserved = if state.wallet_unit == WalletUnit::Beans && state.result.is_none() {
             bet.map(|w| w.stake).unwrap_or(0)
         } else {
             0
@@ -443,6 +491,7 @@ impl DealerRoom for SicboRoom {
             "committed"
         };
         json!({"code":code,"round_id":state.round_id,"round_no":state.round_no,
+        "unit":state.wallet_unit,"balance_unit":"beans",
         "phase":if state.result.is_some(){"result"}else{"betting"},"deadline_ms":state.deadline_ms,"server_now_ms":now,
         "bet_close_ms":if state.result.is_none(){Some(state.deadline_ms-BET_LOCK_MS)}else{None},
         "bet_revision":state.bet_revisions.get(&uid).copied().unwrap_or(0),
@@ -455,6 +504,7 @@ impl DealerRoom for SicboRoom {
     }
     async fn persist_round(conn: &mut PgConnection, code: &str, round: &Round) -> sqlx::Result<()> {
         let mut records = Vec::new();
+        let wallet_game = round.wallet_unit.game();
         // Deterministic UUID order also defines wallet-lock order.
         for &(uid, wager, delta) in &round.bettors {
             match crate::db::lock_game_participants(&mut *conn, &[uid]).await {
@@ -470,7 +520,7 @@ impl DealerRoom for SicboRoom {
                 "SELECT EXISTS(SELECT 1 FROM wallet_ledger WHERE game=$2 AND record_id=$3 AND user_id=$1)",
             )
             .bind(uid)
-            .bind(POLICY.game)
+            .bind(wallet_game)
             .bind(round.round_id)
             .fetch_one(&mut *conn)
             .await?;
@@ -478,20 +528,21 @@ impl DealerRoom for SicboRoom {
                 tracing::warn!(%uid, %code, "sicbo room wager reused a solo receipt id; voided");
                 continue;
             }
-            if wallet::lock(&mut *conn, POLICY.game, uid).await?.is_none() {
+            if wallet::lock(&mut *conn, wallet_game, uid).await?.is_none() {
                 continue;
             }
             // Keep the membership grant in the same transaction as the original bean payout.
-            let max_reward = if round.max_rewards.contains(&uid) {
-                Some(
-                    crate::game_rewards::grant_max_on(&mut *conn, uid, "sicbo", round.round_id)
-                        .await?,
-                )
-            } else {
-                None
-            };
+            let max_reward =
+                if round.wallet_unit == WalletUnit::Beans && round.max_rewards.contains(&uid) {
+                    Some(
+                        crate::game_rewards::grant_max_on(&mut *conn, uid, "sicbo", round.round_id)
+                            .await?,
+                    )
+                } else {
+                    None
+                };
             // Same receipt shape as a solo roll, so history renders both alike.
-            let details = json!({"game":"sicbo","unit":"beans",
+            let details = json!({"game":"sicbo","unit":round.wallet_unit,
                 "request_id":round.round_id,"side":wager.side,"stake":wager.stake,
                 "dice":round.result.dice,"total":round.result.total,"triple":round.result.triple,"won":delta>0,
                 "room_code":code,"round_no":round.round_no,"max_reward":max_reward,
@@ -507,7 +558,7 @@ impl DealerRoom for SicboRoom {
                 hand_completed: Some(true),
                 has_bots: Some(round.has_bots),
             };
-            match wallet::settle(&mut *conn, POLICY.game, uid, &play).await {
+            match wallet::settle(&mut *conn, wallet_game, uid, &play).await {
                 Ok(_) => {}
                 // Account deletion removes the wallet; its hold vanishes with it.
                 Err(sqlx::Error::RowNotFound) => {

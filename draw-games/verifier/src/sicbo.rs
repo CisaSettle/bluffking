@@ -101,7 +101,10 @@ pub fn verify(value: &Value) -> Result<Value, String> {
     }
     match (proof.side, proof.stake, proof.won, proof.delta) {
         (Some(side), Some(stake), Some(won), Some(claimed_delta)) => {
-            if !(MIN_STAKE..=MAX_STAKE).contains(&stake) {
+            // Historical practice receipts used 10..=1000. Proof verification
+            // preserves those accepted stakes; live wager admission still uses
+            // MIN_STAKE/MAX_STAKE (the fixed 100-bean product rule).
+            if !(10..=1_000).contains(&stake) {
                 return Err("sicbo stake is outside the allowed range".into());
             }
             if won != wins(dice, side) || claimed_delta != delta(dice, side, stake) {

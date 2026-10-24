@@ -100,6 +100,15 @@ pub trait DealerRoom: Send + Sync + Sized + 'static {
     fn settle(code: &str, state: &mut Self::State, now: i64) -> Option<Self::Round>;
     /// Per-bettor chip deltas of a settled round.
     fn deltas(round: &Self::Round) -> Vec<(Uuid, i64)>;
+    /// Deltas belonging to the current seated-wallet projection. Recovered
+    /// rounds may owe settlement in an older denomination instead.
+    fn projection_deltas(round: &Self::Round) -> Vec<(Uuid, i64)> {
+        Self::deltas(round)
+    }
+    /// Whether this round accepts stakes from the current wallet denomination.
+    fn uses_current_wallet(_state: &Self::State) -> bool {
+        true
+    }
     /// Membership recipients whose tier cache must be refreshed after commit/replay.
     fn reward_users(_round: &Self::Round) -> Vec<Uuid> {
         Vec::new()
@@ -457,7 +466,7 @@ fn accept_change<R: DealerRoom>(
         }))
         .map_err(|_| Error::Unavailable)?;
     if let Some(round) = round {
-        for (uid, delta) in R::deltas(&round) {
+        for (uid, delta) in R::projection_deltas(&round) {
             if let Some(w) = wallet::projected(R::POLICY.game, uid) {
                 wallet::project_play(
                     R::POLICY.game,
@@ -1109,7 +1118,7 @@ pub async fn place_bet<R: DealerRoom>(
     room.touched = Instant::now();
     let mut next = room.state.as_ref().clone();
     // Check the round and deadline again after the persistence wait.
-    if R::POLICY.game == crate::game_catalog::BEANS {
+    if R::POLICY.game == crate::game_catalog::BEANS && R::uses_current_wallet(&room.state) {
         // The prior round is durable, and the room lock prevents a new round
         // transition. Read the locked shared wallet rather than an old display
         // projection: daily grants may arrive while a player stays seated.
@@ -1117,6 +1126,24 @@ pub async fn place_bet<R: DealerRoom>(
         let current = wallet::lock(&mut tx, crate::game_catalog::BEANS, uid)
             .await?
             .ok_or(Error::Code("storage_unavailable"))?;
+        // A recovered legacy practice seat could coexist with a public bean
+        // table before this upgrade. Recheck that obligation under the bean
+        // wallet lock before allowing the recovered room to accept bean bets.
+        let public_seat: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM session_users su JOIN game_sessions gs ON gs.id=su.session_id
+             JOIN public_tables pt ON pt.session_id=gs.id
+             WHERE su.user_id=$1 AND su.left_at IS NULL AND gs.ended_at IS NULL AND pt.beans)",
+        )
+        .bind(uid)
+        .fetch_one(&mut *tx)
+        .await?;
+        if public_seat
+            || crate::beans::holds::outstanding(uid)
+            || crate::local_runtime::beans_held(uid)
+                .map_err(|error| Error::Db(sqlx::Error::Io(error)))?
+        {
+            return Err(Error::Code("beans_in_use"));
+        }
         if !R::settled(&room.state) {
             let collision: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM wallet_ledger WHERE user_id=$1 AND game=$2 AND record_id=$3)",
