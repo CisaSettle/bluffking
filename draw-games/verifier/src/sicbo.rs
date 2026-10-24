@@ -8,8 +8,8 @@ use crate::proof::Reveal;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-pub const MIN_STAKE: i64 = 10;
-pub const MAX_STAKE: i64 = 1_000;
+pub const MIN_STAKE: i64 = 100;
+pub const MAX_STAKE: i64 = 100;
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

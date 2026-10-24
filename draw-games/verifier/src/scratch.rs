@@ -19,8 +19,7 @@ pub enum Reward {
     Membership { tier: String, days: i64 },
 }
 
-/// Separate, reproducible suffix of the committed stream. Skipping the original
-/// card draws preserves every previously published number/payout proof.
+/// Reproducible reward suffix after the current purchase's number draws.
 pub fn rewards(reveal: &Reveal, cost: i64, count: usize) -> Result<Vec<Option<Reward>>, String> {
     if reveal.commitment.game != "scratch" || cost != 100 || ![1, 5, 10].contains(&count) {
         return Err("invalid service reward purchase".into());
@@ -33,10 +32,7 @@ pub fn rewards(reveal: &Reveal, cost: i64, count: usize) -> Result<Vec<Option<Re
         .map(|_| match entropy.below(10_000) {
             0..=19 => Some(Reward::Beans { amount: 10_000 }),
             20 => Some(Reward::Beans { amount: 100_000 }),
-            21..=30 => Some(Reward::Membership {
-                tier: "pro".into(),
-                days: 30,
-            }),
+            21..=30 => Some(Reward::Beans { amount: 1_000 }),
             31 => Some(Reward::Membership {
                 tier: "max".into(),
                 days: 30,
