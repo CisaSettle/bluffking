@@ -1,6 +1,5 @@
 //! Optional correlation evidence, deliberately separate from card/auth data.
 //! A fixed queue and try_send keep log I/O/backpressure off the dealing task.
-use serde::Deserialize;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     mpsc::{sync_channel, SyncSender},
@@ -37,13 +36,6 @@ pub(super) fn valid_trace(value: &str) -> Option<Uuid> {
     }
     let id = Uuid::parse_str(value).ok()?;
     (id.get_version_num() == 4 && id.to_string() == value).then_some(id)
-}
-
-pub(crate) fn deserialize_trace<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<Uuid>, D::Error> {
-    let value = serde_json::Value::deserialize(deserializer)?;
-    Ok(value.as_str().and_then(valid_trace))
 }
 
 pub(super) fn query_trace(query: Option<&str>) -> Option<Uuid> {

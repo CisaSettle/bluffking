@@ -77,6 +77,11 @@ pub fn ticket_json(game: Game, t: &TicketRow) -> Value {
     if game == Game::Scratch {
         super::scratch::project(&mut out, t);
     } else {
+        out["reward_grant"] = t.entry["reward_grant"].clone();
+        // Public entries remain the normalized selected numbers used by proofs.
+        if let Some(entry) = out["entry"].as_object_mut() {
+            entry.remove("reward_grant");
+        }
         out["proof_plan"] = json!(t.proof_plan);
         out["proof_status"] = json!(if t.proof_plan.is_some() {
             "planned"
@@ -307,7 +312,7 @@ pub async fn buy_numbers(
 ) -> Result<Purchase, Error> {
     let schedule = game.schedule().ok_or(Error::InvalidEntry)?;
     if body.request_id.is_nil()
-        || !(1..=rules::MAX_MULTIPLIER).contains(&body.multiplier)
+        || body.multiplier != 1
         || body.tickets.is_empty()
         || body.tickets.len() > rules::MAX_TICKETS_PER_PURCHASE
     {
@@ -493,20 +498,7 @@ pub async fn refill(pool: &PgPool, user: Uuid, request_id: Uuid) -> Result<i64, 
 /// Called after locking the shared wallet: poker admission uses this same lock.
 /// A seated stack or unfinished hand is not available for a second game's stake.
 pub(super) async fn require_spendable(conn: &mut PgConnection, user: Uuid) -> Result<(), Error> {
-    let seated: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM session_users su JOIN game_sessions gs ON gs.id=su.session_id
-         JOIN public_tables pt ON pt.session_id=gs.id
-         WHERE su.user_id=$1 AND su.left_at IS NULL AND gs.ended_at IS NULL AND pt.beans)",
-    )
-    .bind(user)
-    .fetch_one(&mut *conn)
-    .await?;
-    if seated || crate::beans::holds::outstanding(user) {
-        return Err(Error::BeansInUse);
-    }
-    // Exact hand-scoped locks cover departed players on another local backend;
-    // a completed hand releases them even while its table stays open.
-    if crate::local_runtime::beans_held(user).map_err(sqlx::Error::Io)? {
+    if !crate::beans::spendable(conn, user).await? {
         return Err(Error::BeansInUse);
     }
     Ok(())

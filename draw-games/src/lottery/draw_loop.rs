@@ -157,19 +157,27 @@ async fn settle_one(pool: &PgPool) -> Result<bool, Error> {
     let mut tickets: Vec<TicketRow> = rows.iter().map(TicketRow::from_row).collect();
     let mut paid = 0i64;
     let mut best = 0i16;
+    let mut membership_granted = false;
     let now = Utc::now();
     for ticket in &mut tickets {
         let (prize, tier) = if balance.is_some() {
-            Entry::from_stored(game, &ticket.entry)
-                .and_then(|e| {
-                    e.prize(
-                        i64::from(ticket.multiplier),
-                        &numbers,
-                        bonus,
-                        &bonus_numbers,
-                    )
-                })
-                .ok_or(Error::InvalidEntry)?
+            let entry = Entry::from_stored(game, &ticket.entry).ok_or(Error::InvalidEntry)?;
+            let (prize, tier) = entry
+                .prize(
+                    i64::from(ticket.multiplier),
+                    &numbers,
+                    bonus,
+                    &bonus_numbers,
+                )
+                .ok_or(Error::InvalidEntry)?;
+            if entry.awards_max(prize, tier) {
+                let grant =
+                    crate::game_rewards::grant_max_on(&mut tx, user, game.as_str(), ticket.id)
+                        .await?;
+                ticket.entry["reward_grant"] = json!(grant);
+                membership_granted = true;
+            }
+            (prize, tier)
         } else {
             (0, 0)
         };
@@ -197,8 +205,9 @@ async fn settle_one(pool: &PgPool) -> Result<bool, Error> {
     let ids: Vec<Uuid> = tickets.iter().map(|t| t.id).collect();
     let prizes: Vec<i64> = tickets.iter().map(|t| t.prize.unwrap_or(0)).collect();
     let tiers: Vec<i16> = tickets.iter().map(|t| t.tier.unwrap_or(0)).collect();
-    sqlx::query("UPDATE lottery_tickets t SET prize=u.prize,tier=u.tier,settled_at=$4 FROM UNNEST($1::uuid[],$2::int8[],$3::int2[]) AS u(id,prize,tier) WHERE t.id=u.id")
-        .bind(ids).bind(prizes).bind(tiers).bind(now).execute(&mut *tx).await?;
+    let entries: Vec<serde_json::Value> = tickets.iter().map(|t| t.entry.clone()).collect();
+    sqlx::query("UPDATE lottery_tickets t SET prize=u.prize,tier=u.tier,entry=u.entry,settled_at=$5 FROM UNNEST($1::uuid[],$2::int8[],$3::int2[],$4::jsonb[]) AS u(id,prize,tier,entry) WHERE t.id=u.id")
+        .bind(ids).bind(prizes).bind(tiers).bind(entries).bind(now).execute(&mut *tx).await?;
     if paid > 0 {
         let display: Option<String> =
             sqlx::query_scalar("SELECT display_name FROM users WHERE id=$1")
@@ -218,6 +227,9 @@ async fn settle_one(pool: &PgPool) -> Result<bool, Error> {
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
+    if membership_granted {
+        crate::entitlement::invalidate_tier(pool, user);
+    }
     if balance.is_some() {
         crate::stats_writer::send(crate::stats_writer::StatsEvent::LotteryPaid {
             day: super::sgt_day(now),

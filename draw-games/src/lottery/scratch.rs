@@ -370,26 +370,11 @@ async fn grant_reward(
             Ok(false)
         }
         Some(scratch::Reward::Membership { tier, days }) => {
-            // Queue behind all existing paid/gift time. Never overwrite paid
-            // entitlements or consume a lower-tier gift under active Max.
-            let start: chrono::DateTime<Utc> = sqlx::query_scalar(
-                "SELECT GREATEST(now(),COALESCE(MAX(valid_until),now())) FROM membership_entitlements WHERE user_id=$1 AND revoked_at IS NULL"
-            ).bind(user).fetch_one(&mut *conn).await?;
-            let end = start + chrono::Duration::days(days);
-            sqlx::query(
-                "INSERT INTO membership_entitlements(user_id,tier,valid_from,valid_until,source_kind,source_scratch_ticket_id) VALUES($1,$2,$3,$4,'scratch',$5)"
-            ).bind(user).bind(tier).bind(start).bind(end).bind(card.id).execute(&mut *conn).await?;
-            sqlx::query(
-                "UPDATE users SET pro_until=GREATEST(COALESCE(pro_until,$2),$2) WHERE id=$1",
-            )
-            .bind(user)
-            .bind(end)
-            .execute(&mut *conn)
-            .await?;
-            card.entry["reward_grant"] = json!({
-                "starts_at_ms": start.timestamp_millis(),
-                "ends_at_ms": end.timestamp_millis(),
-            });
+            if tier != "max" || days != 30 {
+                return Err(Error::InvalidEntry);
+            }
+            let grant = crate::game_rewards::grant_max_on(conn, user, "scratch", card.id).await?;
+            card.entry["reward_grant"] = json!(grant);
             Ok(true)
         }
         None => Ok(false),

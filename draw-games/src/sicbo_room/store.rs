@@ -9,7 +9,7 @@ use rand::{rngs::OsRng, Rng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::PgConnection;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
 const BET_MS: i64 = 8_000;
@@ -88,6 +88,8 @@ pub struct State {
     bet_revisions: BTreeMap<Uuid, u64>,
     result: Option<Roll>,
     deltas: BTreeMap<Uuid, i64>,
+    #[serde(default)]
+    max_rewards: BTreeSet<Uuid>,
     history: Vec<Value>,
     bots: Vec<Bot>,
     bot_bets: BTreeMap<Uuid, BotBet>,
@@ -115,6 +117,7 @@ impl State {
             bet_revisions: BTreeMap::new(),
             result: None,
             deltas: BTreeMap::new(),
+            max_rewards: BTreeSet::new(),
             history: Vec::new(),
             bots,
             bot_bets: BTreeMap::new(),
@@ -140,6 +143,7 @@ impl State {
         self.bet_revisions.clear();
         self.result = None;
         self.deltas.clear();
+        self.max_rewards.clear();
         self.bot_deltas.clear();
         self.deal_bot_bets(now);
     }
@@ -175,6 +179,7 @@ pub struct Round {
     fairness: Reveal,
     has_bots: bool,
     bettors: Vec<(Uuid, Wager, i64)>,
+    max_rewards: BTreeSet<Uuid>,
 }
 
 /// The room the player is seated in, from memory.
@@ -233,6 +238,9 @@ fn settle_round(state: &mut State, now: i64) -> Option<Round> {
     for (&uid, &wager) in &state.bets {
         let delta = wager.delta(dice);
         state.deltas.insert(uid, delta);
+        if delta > 0 && crate::sicbo::wins_max(reveal, uid) {
+            state.max_rewards.insert(uid);
+        }
         bettors.push((uid, wager, delta));
     }
     // Bots settle on their cosmetic stacks only: no wallet, no ledger, and
@@ -267,6 +275,7 @@ fn settle_round(state: &mut State, now: i64) -> Option<Round> {
         fairness: state.fairness.clone(),
         has_bots: !state.bots.is_empty(),
         bettors,
+        max_rewards: state.max_rewards.clone(),
     })
 }
 
@@ -276,8 +285,14 @@ impl DealerRoom for SicboRoom {
     const MAX_MEMBERS: usize = MAX_MEMBERS;
     const POLICY: wallet::Policy = POLICY;
     const REQUIRE_DURABLE_BETS: bool = true;
-    const PRIVATE_FIELDS: &'static [&'static str] =
-        &["balance", "available", "bet", "bet_revision", "delta"];
+    const PRIVATE_FIELDS: &'static [&'static str] = &[
+        "balance",
+        "available",
+        "bet",
+        "bet_revision",
+        "delta",
+        "max_reward",
+    ];
     type Bet = BetRequest;
     type State = State;
     type Round = Round;
@@ -330,6 +345,9 @@ impl DealerRoom for SicboRoom {
     }
     fn deltas(round: &Round) -> Vec<(Uuid, i64)> {
         round.bettors.iter().map(|(u, _, d)| (*u, *d)).collect()
+    }
+    fn reward_users(round: &Round) -> Vec<Uuid> {
+        round.max_rewards.iter().copied().collect()
     }
     fn advance(state: &mut State, now: i64) -> bool {
         if state.result.is_some() && now >= state.deadline_ms {
@@ -429,6 +447,7 @@ impl DealerRoom for SicboRoom {
         "bet_close_ms":if state.result.is_none(){Some(state.deadline_ms-BET_LOCK_MS)}else{None},
         "bet_revision":state.bet_revisions.get(&uid).copied().unwrap_or(0),
         "balance":balance,"available":balance-reserved,"bet":bet,"result":result,"delta":state.deltas.get(&uid),
+        "max_reward":state.max_rewards.contains(&uid),
         "fairness_commitment":&state.fairness.commitment,
         "fairness_status":fairness_status,
         "min_stake":MIN_STAKE,"max_stake":MAX_STAKE,"ai":!state.bots.is_empty(),
@@ -459,10 +478,23 @@ impl DealerRoom for SicboRoom {
                 tracing::warn!(%uid, %code, "sicbo room wager reused a solo receipt id; voided");
                 continue;
             }
+            if wallet::lock(&mut *conn, POLICY.game, uid).await?.is_none() {
+                continue;
+            }
+            // Keep the membership grant in the same transaction as the original bean payout.
+            let max_reward = if round.max_rewards.contains(&uid) {
+                Some(
+                    crate::game_rewards::grant_max_on(&mut *conn, uid, "sicbo", round.round_id)
+                        .await?,
+                )
+            } else {
+                None
+            };
             // Same receipt shape as a solo roll, so history renders both alike.
-            let details = json!({"request_id":round.round_id,"side":wager.side,"stake":wager.stake,
+            let details = json!({"game":"sicbo","unit":"beans",
+                "request_id":round.round_id,"side":wager.side,"stake":wager.stake,
                 "dice":round.result.dice,"total":round.result.total,"triple":round.result.triple,"won":delta>0,
-                "room_code":code,"round_no":round.round_no,
+                "room_code":code,"round_no":round.round_no,"max_reward":max_reward,
                 "fairness":draw_games::sicbo::payout_proof(&round.fairness, round.result.dice, wager.side, wager.stake)});
             let play = wallet::Play {
                 record_id: round.round_id,
@@ -488,7 +520,7 @@ impl DealerRoom for SicboRoom {
         }
         crate::game_records::record(
             &mut *conn,
-            POLICY.game,
+            crate::game_catalog::SICBO,
             round.round_id,
             Some(round.session_id),
             Utc::now(),

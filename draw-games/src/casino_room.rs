@@ -100,6 +100,10 @@ pub trait DealerRoom: Send + Sync + Sized + 'static {
     fn settle(code: &str, state: &mut Self::State, now: i64) -> Option<Self::Round>;
     /// Per-bettor chip deltas of a settled round.
     fn deltas(round: &Self::Round) -> Vec<(Uuid, i64)>;
+    /// Membership recipients whose tier cache must be refreshed after commit/replay.
+    fn reward_users(_round: &Self::Round) -> Vec<Uuid> {
+        Vec::new()
+    }
     /// Opens the next round once the result has been shown; true if it did.
     fn advance(state: &mut Self::State, now: i64) -> bool;
     /// The player has a wager on a round that has not settled yet.
@@ -366,6 +370,12 @@ async fn persist<R: DealerRoom>(pool: &PgPool, code: &str, snap: &Snapshot<R>) -
         return Ok(());
     };
     if stored >= snap.revision {
+        tx.rollback().await?;
+        if let Some(round) = &snap.round {
+            for user in R::reward_users(round) {
+                crate::entitlement::invalidate_tier(pool, user);
+            }
+        }
         return Ok(());
     }
     if let Some((user, before, after, receipt)) =
@@ -394,7 +404,13 @@ async fn persist<R: DealerRoom>(pool: &PgPool, code: &str, snap: &Snapshot<R>) -
     .bind(json!(snap.state.as_ref()))
     .execute(&mut *tx)
     .await?;
-    tx.commit().await
+    tx.commit().await?;
+    if let Some(round) = &snap.round {
+        for user in R::reward_users(round) {
+            crate::entitlement::invalidate_tier(pool, user);
+        }
+    }
+    Ok(())
 }
 
 /// Commits `next` as the room's new state: queued for the writer first, so a
@@ -813,7 +829,6 @@ async fn open_room_now<R: DealerRoom>(
     let bots = bots
         .min(crate::casino_bots::MAX_BOTS)
         .min(R::MAX_MEMBERS - 1);
-    wallet::ensure(pool, R::POLICY, uid).await?;
     if registry.seat(uid).is_some() {
         return Err(Error::Code("in_other_room"));
     }
@@ -825,6 +840,8 @@ async fn open_room_now<R: DealerRoom>(
             .ok_or(Error::Unavailable)?;
     let now = now_ms();
     let mut state = R::new_state(now, bots);
+    let policy = R::POLICY;
+    wallet::ensure(pool, policy, uid).await?;
     R::set_allow_spectators(&mut state, allow_spectators);
     // Rounds deal from the start, so the session clock does too.
     let clock = R::clock_mut(&mut state);
@@ -835,10 +852,18 @@ async fn open_room_now<R: DealerRoom>(
         let mut tx = pool.begin().await.map_err(|e| Commit::Refused(e.into()))?;
         crate::db::lock_active_users(&mut tx, &[uid]).await.map_err(|e| Commit::Refused(e.into()))?;
         // Admission lock: serializes refills and solo play against taking a seat.
-        let mut wallet = lock_wallet(&mut tx, R::POLICY.game, uid)
+        let mut wallet = lock_wallet(&mut tx, policy.game, uid)
             .await
             .map_err(|e| Commit::Refused(e.into()))?
             .ok_or(Commit::Refused(Error::Code("storage_unavailable")))?;
+        if policy.game == crate::game_catalog::BEANS {
+            if !crate::beans::spendable(&mut tx, uid).await.map_err(|e| Commit::Refused(e.into()))? {
+                return Err(Commit::Refused(Error::Code("beans_in_use")));
+            }
+            if wallet.balance < crate::sicbo::MIN_STAKE {
+                return Err(Commit::Refused(Error::Code("insufficient_chips")));
+            }
+        }
         // Persist the room and its first member in one database round trip.
         // A membership conflict still refuses admission and rolls back this
         // transaction, including the checkpoint written by the CTE.
@@ -860,9 +885,11 @@ async fn open_room_now<R: DealerRoom>(
         if inserted == 0 {
             return Err(Commit::Refused(Error::Code("in_other_room")));
         }
-        wallet.balance = wallet::start_session_on(&mut tx, R::POLICY, uid, Some(&code))
-            .await
-            .map_err(|e| Commit::Refused(e.into()))?;
+        if policy.game != crate::game_catalog::BEANS {
+            wallet.balance = wallet::start_session_on(&mut tx, policy, uid, Some(&code))
+                .await
+                .map_err(|e| Commit::Refused(e.into()))?;
+        }
         tx.commit().await.map_err(|e| Commit::Unknown(e.into()))?;
         Ok(wallet)
     }
@@ -872,14 +899,14 @@ async fn open_room_now<R: DealerRoom>(
         Commit::Refused(e) => return Err(e),
         Commit::Unknown(e) => match member_row::<R>(pool, uid, &code).await {
             Some(false) => return Err(e),
-            Some(true) => (wallet::ensure(pool, R::POLICY, uid).await.ok(), false),
+            Some(true) => (wallet::ensure(pool, policy, uid).await.ok(), false),
             None => (None, true),
         },
     };
     // Without a wallet in hand the seat stays reserved; the sweep finishes it.
     let joining = joining || wallet.is_none();
     if let Some(w) = wallet {
-        wallet::activate(R::POLICY.game, uid, &code, w);
+        wallet::activate(policy.game, uid, &code, w);
     }
     let mut members = BTreeMap::new();
     members.insert(uid, Member::new(name, joining));
@@ -928,8 +955,9 @@ async fn join_room_now<R: DealerRoom>(
 ) -> Result<()> {
     recover::<R>(pool).await?;
     let registry = R::registry();
-    wallet::ensure(pool, R::POLICY, uid).await?;
     let shared = registry.room(code).ok_or(Error::Code("room_not_found"))?;
+    let policy = R::POLICY;
+    wallet::ensure(pool, policy, uid).await?;
     match registry.seat(uid) {
         Some(c) if c == code => {
             // Seated already, or a join whose outcome is still unknown.
@@ -962,10 +990,18 @@ async fn join_room_now<R: DealerRoom>(
         sqlx::query("SELECT 1 FROM game_room_checkpoints WHERE game=$1 AND code=$2 FOR KEY SHARE")
             .bind(R::DEALER).bind(code).fetch_one(&mut *tx).await
             .map_err(|e| Commit::Refused(e.into()))?;
-        let mut wallet = lock_wallet(&mut tx, R::POLICY.game, uid)
+        let mut wallet = lock_wallet(&mut tx, policy.game, uid)
             .await
             .map_err(|e| Commit::Refused(e.into()))?
             .ok_or(Commit::Refused(Error::Code("storage_unavailable")))?;
+        if policy.game == crate::game_catalog::BEANS {
+            if !crate::beans::spendable(&mut tx, uid).await.map_err(|e| Commit::Refused(e.into()))? {
+                return Err(Commit::Refused(Error::Code("beans_in_use")));
+            }
+            if wallet.balance < crate::sicbo::MIN_STAKE {
+                return Err(Commit::Refused(Error::Code("insufficient_chips")));
+            }
+        }
         let inserted = sqlx::query(&format!(
             "INSERT INTO game_room_checkpoint_members(game,user_id,code,name) VALUES('{}',$1,$2,$3) ON CONFLICT(game,user_id) DO NOTHING",
             R::DEALER
@@ -980,9 +1016,11 @@ async fn join_room_now<R: DealerRoom>(
         if inserted == 0 {
             return Err(Commit::Refused(Error::Code("in_other_room")));
         }
-        wallet.balance = wallet::start_session_on(&mut tx, R::POLICY, uid, Some(code))
-            .await
-            .map_err(|e| Commit::Refused(e.into()))?;
+        if policy.game != crate::game_catalog::BEANS {
+            wallet.balance = wallet::start_session_on(&mut tx, policy, uid, Some(code))
+                .await
+                .map_err(|e| Commit::Refused(e.into()))?;
+        }
         tx.commit().await.map_err(|e| Commit::Unknown(e.into()))?;
         Ok(wallet)
     }
@@ -992,14 +1030,14 @@ async fn join_room_now<R: DealerRoom>(
         Commit::Refused(e) => Err(e),
         Commit::Unknown(e) => match member_row::<R>(pool, uid, code).await {
             Some(false) => Err(e),
-            Some(true) => Ok(wallet::ensure(pool, R::POLICY, uid).await.ok()),
+            Some(true) => Ok(wallet::ensure(pool, policy, uid).await.ok()),
             None => Ok(None),
         },
     };
     let mut room = shared.lock().await;
     match outcome {
         Ok(Some(w)) => {
-            wallet::activate(R::POLICY.game, uid, code, w);
+            wallet::activate(policy.game, uid, code, w);
             if let Some(m) = room.members.get_mut(&uid) {
                 m.joining = false;
             }
@@ -1071,6 +1109,26 @@ pub async fn place_bet<R: DealerRoom>(
     room.touched = Instant::now();
     let mut next = room.state.as_ref().clone();
     // Check the round and deadline again after the persistence wait.
+    if R::POLICY.game == crate::game_catalog::BEANS {
+        // The prior round is durable, and the room lock prevents a new round
+        // transition. Read the locked shared wallet rather than an old display
+        // projection: daily grants may arrive while a player stays seated.
+        let mut tx = pool.begin().await?;
+        let current = wallet::lock(&mut tx, crate::game_catalog::BEANS, uid)
+            .await?
+            .ok_or(Error::Code("storage_unavailable"))?;
+        if !R::settled(&room.state) {
+            let collision: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM wallet_ledger WHERE user_id=$1 AND game=$2 AND record_id=$3)",
+            ).bind(uid).bind(crate::game_catalog::BEANS).bind(R::round_id(&room.state))
+                .fetch_one(&mut *tx).await?;
+            if collision {
+                return Err(Error::Code("request_conflict"));
+            }
+        }
+        wallet::project_session_balance(crate::game_catalog::BEANS, uid, current);
+        tx.commit().await?;
+    }
     if R::bet(&mut next, uid, bet, balance::<R>(uid), now_ms())? {
         accept(code, &mut room, next, None)?;
         room.idle.activity();
@@ -1731,6 +1789,9 @@ fn add_chips<R: DealerRoom>(
     req: &BuyInRequest,
 ) -> Result<()> {
     seated(room, user)?;
+    if R::POLICY.game == crate::game_catalog::BEANS {
+        return Err(Error::Code("beans_buy_in_disabled"));
+    }
     if R::clock(&room.state).expired(now_ms()) || room.members.get(&user).is_some_and(|m| m.leaving)
     {
         return Err(Error::Code("room_expired"));

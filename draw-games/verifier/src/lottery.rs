@@ -237,6 +237,17 @@ impl Entry {
         }
     }
 
+    /// One Max 30-day award per winning ticket, regardless of its stake count.
+    pub fn awards_max(&self, prize: i64, tier: i16) -> bool {
+        prize > 0
+            && match self {
+                Entry::Ssq { .. } | Entry::Dlt { .. } | Entry::Toto { .. } => tier == 1,
+                Entry::Happy8 { numbers } => numbers.len() == 10 && tier == 10,
+                Entry::Straight(_) => tier == 1,
+                Entry::Group3(_) | Entry::Group6(_) => false,
+            }
+    }
+
     /// Prize in chips and tier for `multiplier` × this ticket against a draw.
     /// `None` when the stored draw does not fit the game (never for rows the
     /// draw loop wrote).
@@ -537,12 +548,7 @@ impl Game {
     }
     /// Chips per 注 (scratch: the current service card).
     pub fn unit(self) -> i64 {
-        match self {
-            Game::Ssq | Game::Dlt | Game::Toto => 10,
-            Game::Happy8 => 4,
-            Game::Fucai3d => 2,
-            Game::Scratch => 100,
-        }
+        100
     }
     pub fn schedule(self) -> Option<Schedule> {
         Some(match self {
@@ -850,8 +856,27 @@ pub fn verify(value: &Value) -> Result<Value, String> {
         if !settled && (!ticket["prize"].is_null() || !ticket["tier"].is_null()) {
             return Err("unsettled ticket claims a credited prize".into());
         }
+        let max_award = entry.awards_max(prize, tier);
+        let grant = &ticket["reward_grant"];
+        if settled && max_award {
+            let start = grant["starts_at_ms"]
+                .as_i64()
+                .ok_or("missing Max reward start")?;
+            let end = grant["ends_at_ms"]
+                .as_i64()
+                .ok_or("missing Max reward end")?;
+            if start <= 0
+                || start.checked_add(30 * 86_400_000) != Some(end)
+                || grant["entitlement_id"].as_str().is_none_or(str::is_empty)
+            {
+                return Err("invalid Max 30-day reward grant".into());
+            }
+        } else if !grant.is_null() {
+            return Err("ticket claims an unearned membership reward".into());
+        }
         receipt_result = json!({ "stakes": entry.stakes(), "cost": cost, "prize": prize, "tier": tier,
-            "settled": settled, "credited_prize_checked": settled });
+            "max_membership_days": if max_award { 30 } else { 0 },
+            "reward_grant": grant, "settled": settled, "credited_prize_checked": settled });
     }
     Ok(
         json!({ "kind": "lottery", "valid": true, "game": game.as_str(), "period": proof.plan.period,

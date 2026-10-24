@@ -66,6 +66,28 @@ pub async fn ensure(pool: &PgPool, user: Uuid) -> sqlx::Result<Wallet> {
     wallet::ensure(pool, POLICY, user).await
 }
 
+/// Call with the shared wallet locked, before a new debit. Poker admission
+/// takes the same lock, so a stack cannot be spent in two games at once.
+pub async fn sicbo_seated(conn: &mut PgConnection, user: Uuid) -> sqlx::Result<bool> {
+    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM game_room_checkpoint_members m JOIN game_room_checkpoints c ON c.game=m.game AND c.code=m.code WHERE m.game='sicbo' AND m.user_id=$1)")
+        .bind(user).fetch_one(conn).await
+}
+
+pub async fn spendable(conn: &mut PgConnection, user: Uuid) -> sqlx::Result<bool> {
+    let seated: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM session_users su JOIN game_sessions gs ON gs.id=su.session_id
+         JOIN public_tables pt ON pt.session_id=gs.id
+         WHERE su.user_id=$1 AND su.left_at IS NULL AND gs.ended_at IS NULL AND pt.beans)",
+    )
+    .bind(user)
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(!seated
+        && !sicbo_seated(conn, user).await?
+        && !holds::outstanding(user)
+        && !crate::local_runtime::beans_held(user).map_err(sqlx::Error::Io)?)
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Profile {
     pub balance: i64,
@@ -323,6 +345,11 @@ pub async fn debit_refund_on(
     let before = wallet::lock(conn, GAME, user)
         .await?
         .ok_or(sqlx::Error::RowNotFound)?;
+    if !spendable(conn, user).await? {
+        return Err(sqlx::Error::Protocol(
+            "beans_in_use: retry refund after settlement".into(),
+        ));
+    }
     let debit = beans.min(before).max(0);
     let after = before - debit;
     sqlx::query(

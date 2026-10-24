@@ -17,6 +17,7 @@ pub(crate) mod diagnostics;
 mod metrics;
 
 use crate::auth::constant_time::constant_time_eq;
+use crate::sealed_wire::{self, TicketAuth};
 use std::{
     collections::{BTreeMap, HashMap},
     net::SocketAddr,
@@ -263,26 +264,6 @@ pub struct HoleDelivery {
     pub seat: u8,
     pub cards: [u8; 2],
     pub commitment: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TicketAuth {
-    ticket: String,
-    // Malformed optional diagnostics never reject an otherwise valid ticket.
-    #[serde(default, deserialize_with = "diagnostics::deserialize_trace")]
-    diagnostic_trace: Option<Uuid>,
-}
-
-#[derive(Serialize)]
-struct ObservedHoleDelivery<'a> {
-    #[serde(flatten)]
-    delivery: &'a HoleDelivery,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    diagnostic_trace: Option<Uuid>,
-    /// Receipt of the text frame through lookup, before serialization/send.
-    /// Does not include the handshake, network, send/backpressure or receipt ack.
-    server_work_ms: f64,
-    server_lookup_ms: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -724,7 +705,7 @@ async fn hole_ws(
         .into_response()
 }
 
-/// One socket serves every hand of a seated player: each text frame is a
+/// One socket serves every hand of a seated player: each protobuf binary frame is a
 /// ticket, answered with that seat's hole cards (or an error frame). Opening a
 /// fresh connection per hand cost a TCP + TLS + WebSocket handshake before
 /// every deal.
@@ -761,8 +742,8 @@ async fn deliver_holes(
                 continue;
             }
             frame = tokio::time::timeout_at(deadline, socket.recv()) => match frame {
-                Ok(Some(Ok(Message::Text(raw)))) => Some(raw),
-                Ok(Some(Ok(Message::Binary(_)))) => None,
+                Ok(Some(Ok(Message::Binary(raw)))) => Some(raw),
+                Ok(Some(Ok(Message::Text(_)))) => None,
                 Ok(Some(Err(_))) => { close_reason = "receive_error"; break; },
                 _ if expired(deadline) => { close_reason = "ticket_deadline"; break; },
                 Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => continue,
@@ -824,7 +805,7 @@ async fn deliver_holes(
                 || !matches!(
                     tokio::time::timeout_at(
                         deadline,
-                        socket.send(Message::Text(r#"{"error":"unknown_ticket"}"#.into())),
+                        socket.send(Message::Binary(sealed_wire::encode_unknown_ticket())),
                     )
                     .await,
                     Ok(Ok(()))
@@ -845,19 +826,15 @@ async fn deliver_holes(
         );
         misses = 0;
         deadline = tokio::time::Instant::now() + HOLE_IDLE_TIMEOUT;
-        let observed = ObservedHoleDelivery {
-            delivery: &delivery,
-            diagnostic_trace: trace,
-            server_work_ms: elapsed_ms(received),
-            server_lookup_ms: lookup_ms,
-        };
-        let Ok(json) = serde_json::to_string(&observed) else {
+        let Some(encoded) =
+            sealed_wire::encode_delivery(&delivery, trace, elapsed_ms(received), lookup_ms)
+        else {
             close_reason = "serialize_failed";
             closing_timer = Some(timing);
             break;
         };
         let send_started = std::time::Instant::now();
-        let sent = tokio::time::timeout_at(deadline, socket.send(Message::Text(json))).await;
+        let sent = tokio::time::timeout_at(deadline, socket.send(Message::Binary(encoded))).await;
         let outcome = match sent {
             Ok(Ok(())) => "send_complete",
             Ok(Err(_)) => "send_error",
@@ -887,14 +864,14 @@ fn elapsed_ms(started: std::time::Instant) -> f64 {
 }
 
 fn ticket_observation(
-    raw: Option<&str>,
+    raw: Option<&[u8]>,
     expired: bool,
     received: std::time::Instant,
 ) -> (Option<TicketAuth>, crate::request_timing::WsTimer) {
     let auth = if expired {
         None
     } else {
-        raw.and_then(|raw| serde_json::from_str(raw).ok())
+        raw.and_then(sealed_wire::decode_ticket)
     };
     let operation = if auth.is_some() {
         crate::server_performance::WsOperation::Crypto
@@ -1232,11 +1209,12 @@ impl SealedDealerClient {
 
     pub async fn delete_hand(&self, hand_id: Uuid) {
         let _ = self
-            .request(
-                self.http
-                    .delete(format!("{}/internal/hands/{hand_id}", self.base_url)),
+            .send_with_retry(
+                self.request(
+                    self.http
+                        .delete(format!("{}/internal/hands/{hand_id}", self.base_url)),
+                ),
             )
-            .send()
             .await;
     }
 }
