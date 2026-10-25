@@ -137,22 +137,27 @@ pub enum DailyOutcome {
 /// One extra [`DAILY_REFILL_TO`] grant per Singapore calendar day. The day counter,
 /// the wallet update and the ledger row commit together.
 pub async fn claim_daily(pool: &PgPool, user: Uuid) -> sqlx::Result<DailyOutcome> {
-    let _beans_mutation = crate::beans_read_memory::mutation(pool, [user]);
+    let _daily = crate::beans_read_memory::lock_daily(pool, user).await?;
+    let beans_mutation = crate::beans_read_memory::daily_mutation(pool, user);
     ensure(pool, user).await?;
     let mut tx = pool.begin().await?;
     let before = wallet::lock(&mut tx, GAME, user)
         .await?
         .ok_or(sqlx::Error::RowNotFound)?;
-    let consumed: Option<chrono::NaiveDate> = sqlx::query_scalar(
-        "INSERT INTO daily_usage (scope,subject_key, feature, usage_date, count)           VALUES ('feature_user',$1::uuid::text, $2, (now() AT TIME ZONE 'Asia/Singapore')::date, 1)           ON CONFLICT (scope, subject_key, feature, usage_date) DO UPDATE              SET count = daily_usage.count + 1              WHERE daily_usage.count < 1           RETURNING usage_date",
+    let (consumed, day): (Option<chrono::NaiveDate>, chrono::NaiveDate) = sqlx::query_as(
+        "WITH claim AS (INSERT INTO daily_usage (scope,subject_key, feature, usage_date, count) \
+         VALUES ('feature_user',$1::uuid::text, $2, (now() AT TIME ZONE 'Asia/Singapore')::date, 1) \
+         ON CONFLICT (scope, subject_key, feature, usage_date) DO UPDATE \
+         SET count = daily_usage.count + 1 WHERE daily_usage.count < 1 RETURNING usage_date) \
+         SELECT (SELECT usage_date FROM claim), (now() AT TIME ZONE 'Asia/Singapore')::date",
     )
     .bind(user)
     .bind(DAILY_FEATURE)
-    .fetch_optional(&mut *tx)
+    .fetch_one(&mut *tx)
     .await?;
     if consumed.is_none() {
         tx.rollback().await?;
-        crate::beans_read_memory::invalidate_user(pool, user);
+        beans_mutation.publish_daily(day, before);
         return Ok(DailyOutcome::AlreadyClaimed { balance: before });
     }
     let granted = DAILY_REFILL_TO;
@@ -178,10 +183,9 @@ pub async fn claim_daily(pool: &PgPool, user: Uuid) -> sqlx::Result<DailyOutcome
     .bind(serde_json::json!({ "reason": "daily_refill" }))
     .execute(&mut *tx)
     .await?;
-    let committed = tx.commit().await;
-    crate::beans_read_memory::invalidate_user(pool, user);
-    committed?;
+    tx.commit().await?;
     wallet::project_session_balance(GAME, user, after);
+    beans_mutation.publish_daily(day, after);
     Ok(DailyOutcome::Granted {
         granted,
         balance: after,
