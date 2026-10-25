@@ -65,6 +65,7 @@
         <p>定期开奖的选号规范化、复式注数、倍数、成本和完整练习豆奖表都在 <a href="verifier/src/lottery.rs">lottery.rs</a>。这套库同时被本版本后台与离线验证器引用，避免各自维护一份计算代码。</p>
 
         <h2>独立复核</h2>
+        <p>本版本在游戏内「工具 → 彩票公平性验证」提供证明与开奖前回执的上传、粘贴和核对；彩票记录中的「在工具中验证」可直接带入证明。在线工具把输入提交服务器，调用与命令行相同的 <a href="verifier/src/document.rs">文档及回执验证器</a>。需要独立验证时，可<a href="https://github.com/CisaSettle/bluffking/archive/refs/heads/main.zip">下载开源代码 ZIP</a>，解压后在仓库根目录执行以下命令（先安装 Rust/Cargo）；构建完成后的验证过程不联网。此说明描述当前源码功能，不代表生产部署状态。</p>
         <p>从公开仓库根目录构建独立验证器。首次构建可能下载锁定依赖；运行验证器不联网，不需要数据库或 BluffKing 账号。</p>
         <pre><code>cargo build --locked --manifest-path draw-games/verifier/Cargo.toml
 ./draw-games/verifier/target/debug/draw-verify proof.json
@@ -133,6 +134,7 @@
         <p>Scheduled-game normalization, system-entry stake counts, multipliers, costs and complete practice-bean prize tables are in <a href="verifier/src/lottery.rs">lottery.rs</a>. Both the backend in this snapshot and the offline verifier depend on that same library.</p>
 
         <h2>Independent verification</h2>
+        <p>This version provides proof and pre-draw receipt import under Tools → Lottery fairness verification. “Verify in Tools” on a draw record carries its proof directly into the tool. Online verification sends the input to the server and calls the same <a href="verifier/src/document.rs">document and receipt verifier</a> as the CLI. For independent verification, <a href="https://github.com/CisaSettle/bluffking/archive/refs/heads/main.zip">download the source ZIP</a>, extract it, and run the following commands from the repository root with Rust/Cargo installed. Verification after building is network-free. This describes the source in this version, not its production deployment status.</p>
         <p>Build the independent verifier from the public repository root. An initial build may download locked dependencies; running the verifier is network-free and needs neither a database nor a BluffKing account.</p>
         <pre><code>cargo build --locked --manifest-path draw-games/verifier/Cargo.toml
 ./draw-games/verifier/target/debug/draw-verify proof.json

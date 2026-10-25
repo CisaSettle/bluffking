@@ -1,5 +1,6 @@
 //! Deterministic production rules and a network-free, independently runnable verifier.
 pub mod beacon;
+pub mod document;
 pub mod lottery;
 pub mod proof;
 pub mod scratch;
