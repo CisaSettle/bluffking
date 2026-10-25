@@ -272,6 +272,8 @@ pub(super) async fn drop_room<R: DealerRoom>(
     code: &str,
     shared: &Shared<R>,
 ) -> Result<()> {
+    let mut registration = crate::room_registry::mutation(pool, Some(code));
+    let round = R::round_id(&shared.lock().await.state);
     {
         let mut rooms = R::registry().rooms.lock().unwrap();
         if rooms.get(code).is_some_and(|r| Arc::ptr_eq(r, shared)) {
@@ -279,13 +281,17 @@ pub(super) async fn drop_room<R: DealerRoom>(
         }
     }
     flushed(shared).await?;
+    let mut tx = pool.begin().await?;
     sqlx::query(&format!(
-        "DELETE FROM game_room_checkpoints r WHERE code=$1 AND game='{}' AND NOT EXISTS(SELECT 1 FROM game_room_checkpoint_members m WHERE m.code=$1 AND m.game=r.game)",
+        "DELETE FROM game_room_checkpoints r WHERE code=$1 AND game='{}' AND state->>'round_id'=$2 \
+         AND NOT EXISTS(SELECT 1 FROM game_room_checkpoint_members m WHERE m.code=$1 AND m.game=r.game)",
         R::DEALER
     ))
     .bind(code)
-    .execute(pool)
+    .bind(round.to_string())
+    .execute(&mut *tx)
     .await?;
+    registration.commit(tx.commit()).await?;
     Ok(())
 }
 
@@ -429,6 +435,7 @@ pub(super) async fn finish_close<R: DealerRoom>(
     shared: Shared<R>,
     closing: Closing,
 ) {
+    let mut registration = crate::room_registry::mutation(&pool, Some(&code));
     let mut wait = Duration::from_millis(200);
     loop {
         let deleted = async {
@@ -454,7 +461,7 @@ pub(super) async fn finish_close<R: DealerRoom>(
                     .execute(&mut *tx)
                     .await?;
             }
-            tx.commit().await?;
+            registration.commit(tx.commit()).await?;
             Ok::<(), Error>(())
         }
         .await;

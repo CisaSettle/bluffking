@@ -19,6 +19,7 @@
 //! implement [`DealerRoom`]; storage, membership, HTTP and the dealer loop
 //! live here once.
 
+use crate::api_resources::OperationPath as Path;
 use crate::game_hub::standings::{Finish, RoomStandings};
 use crate::handlers::respond::error_code;
 use std::collections::{BTreeMap, HashMap};
@@ -26,7 +27,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Query, State};
 use axum::http::{request::Parts, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -347,7 +348,6 @@ fn writer<R: DealerRoom>(pool: &PgPool, code: &str) -> Ordered<Option<Snapshot<R
 /// One accepted change, exactly once: the stored revision fences a retry
 /// whose first attempt committed but lost its acknowledgement.
 async fn persist<R: DealerRoom>(pool: &PgPool, code: &str, snap: &Snapshot<R>) -> sqlx::Result<()> {
-    let mut tx = pool.begin().await?;
     // Account-before-room-before-wallet matches deletion and other game writers.
     // Pending settlements include soft-deleted participants until purge claim.
     let mut users = snap.users.clone();
@@ -359,6 +359,9 @@ async fn persist<R: DealerRoom>(pool: &PgPool, code: &str, snap: &Snapshot<R>) -
     users.extend(snap.buy_in.map(|(user, _, _, _)| user));
     users.sort_unstable();
     users.dedup();
+    let _beans_mutation = (R::POLICY.game == crate::game_catalog::BEANS)
+        .then(|| crate::beans_read_memory::mutation(pool, users.iter().copied()));
+    let mut tx = pool.begin().await?;
     let mut active = Vec::new();
     for user in users {
         match crate::db::lock_game_participants(&mut tx, &[user]).await {
@@ -380,6 +383,11 @@ async fn persist<R: DealerRoom>(pool: &PgPool, code: &str, snap: &Snapshot<R>) -
     };
     if stored >= snap.revision {
         tx.rollback().await?;
+        if R::POLICY.game == crate::game_catalog::BEANS {
+            for user in &active {
+                crate::beans_read_memory::invalidate_user(pool, *user);
+            }
+        }
         if let Some(round) = &snap.round {
             for user in R::reward_users(round) {
                 crate::entitlement::invalidate_tier(pool, user);
@@ -413,7 +421,13 @@ async fn persist<R: DealerRoom>(pool: &PgPool, code: &str, snap: &Snapshot<R>) -
     .bind(json!(snap.state.as_ref()))
     .execute(&mut *tx)
     .await?;
-    tx.commit().await?;
+    let committed = tx.commit().await;
+    if R::POLICY.game == crate::game_catalog::BEANS {
+        for user in &active {
+            crate::beans_read_memory::invalidate_user(pool, *user);
+        }
+    }
+    committed?;
     if let Some(round) = &snap.round {
         for user in R::reward_users(round) {
             crate::entitlement::invalidate_tier(pool, user);
@@ -844,6 +858,7 @@ async fn open_room_now<R: DealerRoom>(
     let code = crate::room_code::allocate(pool, R::DEALER)
         .await
         .map_err(|e| Error::Code(e.code()))?;
+    let _code_claim = crate::room_registry::allocation_guard(pool, &code);
     let handoff_guard =
         crate::release_handoff::register(crate::release_handoff::rooms::id(R::DEALER, &code), true)
             .ok_or(Error::Unavailable)?;
@@ -857,6 +872,7 @@ async fn open_room_now<R: DealerRoom>(
     *clock = RoomClock::new(duration_secs);
     clock.start(now);
     R::set_revision(&mut state, 1);
+    let mut registration = crate::room_registry::mutation(pool, Some(&code));
     let committed = async {
         let mut tx = pool.begin().await.map_err(|e| Commit::Refused(e.into()))?;
         crate::db::lock_active_users(&mut tx, &[uid]).await.map_err(|e| Commit::Refused(e.into()))?;
@@ -899,7 +915,10 @@ async fn open_room_now<R: DealerRoom>(
                 .await
                 .map_err(|e| Commit::Refused(e.into()))?;
         }
-        tx.commit().await.map_err(|e| Commit::Unknown(e.into()))?;
+        registration
+            .commit(tx.commit())
+            .await
+            .map_err(|e| Commit::Unknown(e.into()))?;
         Ok(wallet)
     }
     .await;
@@ -940,6 +959,7 @@ async fn open_room_now<R: DealerRoom>(
     if joining {
         return Err(Error::Unavailable);
     }
+    crate::room_registry::publish(pool, R::DEALER, &code)?;
     Ok(code)
 }
 
@@ -1642,10 +1662,15 @@ pub async fn create<R: DealerRoom>(
     )
 }
 
+#[derive(Deserialize)]
+pub struct RoomPath {
+    code: String,
+}
+
 pub async fn join<R: DealerRoom>(
     State(s): State<AppState>,
     auth: AuthUser,
-    Path(code): Path<String>,
+    Path(RoomPath { code }): Path<RoomPath>,
     parts: Parts,
 ) -> Response {
     if let Some(r) = csrf(&parts) {
@@ -1665,7 +1690,7 @@ pub async fn join<R: DealerRoom>(
 pub async fn state<R: DealerRoom>(
     State(s): State<AppState>,
     auth: AuthUser,
-    Path(code): Path<String>,
+    Path(RoomPath { code }): Path<RoomPath>,
     headers: axum::http::HeaderMap,
 ) -> Response {
     let result = room_state::<R>(&s.pool, &code, auth.user_id).await;
@@ -1680,7 +1705,7 @@ pub async fn state<R: DealerRoom>(
 pub async fn standings<R: DealerRoom>(
     State(s): State<AppState>,
     auth: AuthUser,
-    Path(code): Path<String>,
+    Path(RoomPath { code }): Path<RoomPath>,
     Query(page): Query<crate::pagination::Query>,
 ) -> Response {
     let result = async {
@@ -1699,7 +1724,7 @@ pub async fn standings<R: DealerRoom>(
 pub async fn bet<R: DealerRoom>(
     State(s): State<AppState>,
     auth: AuthUser,
-    Path(code): Path<String>,
+    Path(RoomPath { code }): Path<RoomPath>,
     parts: Parts,
     Json(req): Json<R::Bet>,
 ) -> Response {
@@ -1789,7 +1814,7 @@ pub struct BuyInRequest {
 pub async fn buy_in<R: DealerRoom>(
     State(s): State<AppState>,
     auth: AuthUser,
-    Path(code): Path<String>,
+    Path(RoomPath { code }): Path<RoomPath>,
     parts: Parts,
     Json(req): Json<BuyInRequest>,
 ) -> Response {

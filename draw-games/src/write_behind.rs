@@ -63,14 +63,6 @@ pub(crate) fn reserve_members(
     }
     Ok(added)
 }
-/// Frees every reservation a room holds, including users only named by
-/// snapshots a fenced writer abandoned.
-pub(crate) fn release_room(game: &'static str, code: &str) {
-    memberships()
-        .lock()
-        .unwrap()
-        .retain(|(g, _), c| *g != game || c != code);
-}
 pub(crate) fn release_members(game: &'static str, code: &str, users: &[uuid::Uuid]) {
     let mut members = memberships().lock().unwrap();
     for user in users {
@@ -141,6 +133,24 @@ pub struct Ordered<T> {
     progress: watch::Receiver<Progress<T>>,
     drain_state: Arc<DrainState>,
     sequence: u64,
+}
+
+/// Reserved capacity for a memory mutation. Dropping before publish releases
+/// the slot without advancing the accepted/durable sequence.
+pub struct ReservedWrite<'a, T> {
+    owner: &'a mut Ordered<T>,
+    permit: tokio::sync::mpsc::OwnedPermit<(u64, T)>,
+}
+impl<T> ReservedWrite<'_, T> {
+    pub fn publish(self, next: T) {
+        let sequence = self.owner.sequence + 1;
+        self.owner.sequence = sequence;
+        self.owner
+            .drain_state
+            .queued
+            .store(sequence, Ordering::Release);
+        self.permit.send((sequence, next));
+    }
 }
 
 /// Folds a queued item into the one about to be written, or hands it back when
@@ -276,6 +286,21 @@ impl<T: Clone + Send + Sync + 'static> Ordered<T> {
         }
         Ok(())
     }
+    /// Reserve before applying a memory mutation so an enqueue rejection
+    /// cannot leave an unpersistable value visible to subsequent requests.
+    pub fn try_reserve(&mut self) -> Result<ReservedWrite<'_, T>, String> {
+        self.health()?;
+        let permit = self
+            .pending
+            .clone()
+            .try_reserve_owned()
+            .map_err(|_| "room_writer_full_or_closed".to_string())?;
+        Ok(ReservedWrite {
+            owner: self,
+            permit,
+        })
+    }
+
     /// Number of snapshots accepted by this writer, including its durable prefix.
     pub fn accepted_count(&self) -> u64 {
         self.sequence

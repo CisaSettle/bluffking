@@ -108,7 +108,11 @@ pub fn ticket_json(game: Game, t: &TicketRow) -> Value {
             "unavailable"
         });
         if t.proof_plan.is_some() {
-            out["proof_url"] = json!(format!("/api/draws/{}/{}/proof", game.as_str(), t.period));
+            out["proof_url"] = json!(format!(
+                "/api/history/draws-proof?game={}&period={}",
+                game.as_str(),
+                t.period
+            ));
         }
     }
     out
@@ -307,6 +311,7 @@ pub(super) async fn ensure_wallet(pool: &PgPool, user: Uuid) -> sqlx::Result<i64
     {
         return Ok(balance);
     }
+    let _beans_mutation = crate::beans_read_memory::mutation(pool, [user]);
     let mut tx = pool.begin().await?;
     crate::db::lock_active_users(&mut tx, &[user]).await?;
     let inserted = sqlx::query(
@@ -322,7 +327,9 @@ pub(super) async fn ensure_wallet(pool: &PgPool, user: Uuid) -> sqlx::Result<i64
         .bind(POLICY.game)
         .fetch_one(&mut *tx)
         .await?;
-    tx.commit().await?;
+    let committed = tx.commit().await;
+    crate::beans_read_memory::invalidate_user(pool, user);
+    committed?;
     Ok(balance)
 }
 
@@ -373,9 +380,11 @@ pub async fn buy_numbers(
         if let Some(stored) =
             replay_request(&mut conn, game, user, body.request_id, &body_hash).await?
         {
+            crate::beans_read_memory::invalidate_user(pool, user);
             return Ok(stored);
         }
     }
+    let _beans_mutation = crate::beans_read_memory::mutation(pool, [user]);
     let mut tx = pool.begin().await?;
     // (B) The period row, only for the period on sale right now.
     let mut selling = schedule.period_at(super::now_ms());
@@ -405,7 +414,9 @@ pub async fn buy_numbers(
         .await?
         .ok_or(sqlx::Error::RowNotFound)?;
     if let Some(stored) = replay_request(&mut tx, game, user, body.request_id, &body_hash).await? {
-        tx.commit().await?;
+        let committed = tx.commit().await;
+        crate::beans_read_memory::invalidate_user(pool, user);
+        committed?;
         return Ok(stored);
     }
     require_spendable(&mut tx, user).await?;
@@ -560,7 +571,9 @@ pub async fn buy_numbers(
     .bind(record_id)
     .fetch_all(&mut *tx)
     .await?;
-    tx.commit().await?;
+    let committed = tx.commit().await;
+    crate::beans_read_memory::invalidate_user(pool, user);
+    committed?;
     crate::stats_writer::send(crate::stats_writer::StatsEvent::LotteryPurchase {
         day: super::sgt_day(now),
         game: game.as_str(),

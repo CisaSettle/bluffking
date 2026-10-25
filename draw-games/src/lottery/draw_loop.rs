@@ -118,6 +118,7 @@ async fn settle_one(pool: &PgPool) -> Result<bool, Error> {
     let name: String = work.get("game");
     let game = Game::parse(&name).ok_or(Error::InvalidEntry)?;
     let period: i64 = work.get("period");
+    let mut beans_mutation = crate::beans_read_memory::mutation(pool, []);
     let mut tx = pool.begin().await?;
     // Contention aborts this attempt; committed tickets remain queued for the next tick.
     sqlx::query(
@@ -141,6 +142,7 @@ async fn settle_one(pool: &PgPool) -> Result<bool, Error> {
         tx.commit().await?;
         return Ok(true);
     };
+    beans_mutation.watch(user);
     let live = crate::db::lock_live_accounts(&mut tx, &[user]).await?;
     let balance = if live.is_empty() {
         None
@@ -227,7 +229,9 @@ async fn settle_one(pool: &PgPool) -> Result<bool, Error> {
     .bind(i32::from(paid > 0))
     .execute(&mut *tx)
     .await?;
-    tx.commit().await?;
+    let committed = tx.commit().await;
+    crate::beans_read_memory::invalidate_user(pool, user);
+    committed?;
     if paid > 0 {
         crate::read_cache::invalidate_unread_count(pool, user);
     }

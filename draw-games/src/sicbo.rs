@@ -143,6 +143,7 @@ pub async fn play(pool: &PgPool, user: Uuid, bet: &Bet) -> Result<BetResult, Err
         crate::casino_room::round_in_play::<crate::sicbo_room::SicboRoom>(pool, bet.request_id)
             .await
             .unwrap_or(true);
+    let _beans_mutation = crate::beans_read_memory::mutation(pool, [user]);
     wallet::ensure(pool, POLICY, user).await?;
     let mut tx = pool.begin().await?;
     crate::db::lock_active_users(&mut tx, &[user]).await?;
@@ -151,7 +152,9 @@ pub async fn play(pool: &PgPool, user: Uuid, bet: &Bet) -> Result<BetResult, Err
         .ok_or(sqlx::Error::RowNotFound)?;
     // Lookup MUST follow the wallet lock, including retries from another tab.
     if let Some(result) = saved(&mut tx, user, bet, balance).await? {
-        tx.commit().await?;
+        let committed = tx.commit().await;
+        crate::beans_read_memory::invalidate_user(pool, user);
+        committed?;
         if result.receipt.max_reward.is_some() {
             crate::entitlement::invalidate_tier(pool, user);
         }
@@ -233,7 +236,9 @@ pub async fn play(pool: &PgPool, user: Uuid, bet: &Bet) -> Result<BetResult, Err
             let result = saved(&mut tx, user, bet, balance)
                 .await?
                 .ok_or(sqlx::Error::RowNotFound)?;
-            tx.commit().await?;
+            let committed = tx.commit().await;
+            crate::beans_read_memory::invalidate_user(pool, user);
+            committed?;
             if result.receipt.max_reward.is_some() {
                 crate::entitlement::invalidate_tier(pool, user);
             }
@@ -250,7 +255,9 @@ pub async fn play(pool: &PgPool, user: Uuid, bet: &Bet) -> Result<BetResult, Err
         &[(user, delta)],
     )
     .await?;
-    tx.commit().await?;
+    let committed = tx.commit().await;
+    crate::beans_read_memory::invalidate_user(pool, user);
+    committed?;
     wallet::project_session_balance(POLICY.game, user, balance_after);
     if receipt.max_reward.is_some() {
         crate::entitlement::invalidate_tier(pool, user);

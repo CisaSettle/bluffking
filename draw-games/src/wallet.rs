@@ -1,11 +1,23 @@
-//! Practice-chip wallet primitives and their in-memory seated projection.
+//! Wallet primitives and the runtime baseline for migrated game writers.
 //!
 //! One `wallets` row per (user, game); every balance change is one
 //! `wallet_ledger` row written in the same transaction, so a balance always
 //! equals the sum of that wallet's ledger deltas. Poker chips (`users.chips`)
 //! are a different economy and never pass through here.
+//! Startup hydrates migrated games once. Their room projection and idle reads
+//! share each entry and their accepted writes keep ordered ledger persistence.
+//! Legacy domains retain durable idle reads and their active-seat projections.
 
 use std::collections::HashMap;
+use std::sync::{
+    atomic::{AtomicBool, AtomicI64, Ordering},
+    Arc, Mutex, OnceLock,
+};
+
+use futures::{
+    future::{BoxFuture, Shared},
+    FutureExt,
+};
 
 use chrono::{DateTime, Utc};
 use md5::{Digest, Md5};
@@ -20,7 +32,7 @@ pub struct Policy {
     pub grant: i64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Wallet {
     pub balance: i64,
     pub hands_played: i32,
@@ -29,61 +41,228 @@ pub struct Wallet {
     pub refills: i32,
 }
 
-// Authoritative projection for seated players. It is installed before play,
-// updated by the room owner, and retired only after the leave checkpoint commits.
+// One canonical database pool owns this runtime. Retaining its options Arc
+// prevents pointer reuse; a second pool is rejected instead of mixing wallets.
+struct BaselineState {
+    options: Arc<sqlx::postgres::PgConnectOptions>,
+    ready: AtomicBool,
+    loader: tokio::sync::Mutex<()>,
+}
+fn baseline_state(pool: &PgPool) -> sqlx::Result<&'static BaselineState> {
+    static STATE: OnceLock<BaselineState> = OnceLock::new();
+    let options = pool.connect_options();
+    let state = STATE.get_or_init(|| BaselineState {
+        options: options.clone(),
+        ready: AtomicBool::new(false),
+        loader: tokio::sync::Mutex::new(()),
+    });
+    if !Arc::ptr_eq(&state.options, &options) {
+        return Err(sqlx::Error::Protocol(
+            "wallet baseline belongs to another pool".into(),
+        ));
+    }
+    Ok(state)
+}
+
+const MAX_WALLETS: usize = 2_000_000;
+const MAX_INITIALIZATIONS: usize = 1024;
+const WALLET_PAGE: i64 = 1000;
+type InitialGrant = Shared<BoxFuture<'static, Result<(), String>>>;
+fn initializations() -> &'static Mutex<HashMap<(i16, Uuid), InitialGrant>> {
+    static PENDING: OnceLock<Mutex<HashMap<(i16, Uuid), InitialGrant>>> = OnceLock::new();
+    PENDING.get_or_init(Default::default)
+}
+
+// Baseline and seated projection are the same entry, updated under one lock.
+// Leaving releases only the room binding, never the user's balance/counters.
 struct MemoryWallet {
-    room: String,
+    room: Option<String>,
     seated: bool,
     wallet: Wallet,
+    failed: bool,
 }
 fn memory() -> &'static dashmap::DashMap<(i16, Uuid), MemoryWallet> {
-    static CACHE: std::sync::OnceLock<dashmap::DashMap<(i16, Uuid), MemoryWallet>> =
-        std::sync::OnceLock::new();
+    static CACHE: OnceLock<dashmap::DashMap<(i16, Uuid), MemoryWallet>> = OnceLock::new();
     CACHE.get_or_init(Default::default)
 }
-pub(crate) fn projected(game: i16, user: Uuid) -> Option<Wallet> {
-    memory().get(&(game, user)).map(|v| v.wallet.clone())
+pub fn ready(pool: &PgPool) -> bool {
+    baseline_state(pool).is_ok_and(|state| state.ready.load(Ordering::Acquire))
 }
+
+/// Startup-only keyset hydration of migrated games. Their normal runtime reads
+/// never refresh from SQL; recovery explicitly reconciles any replayed receipts.
+/// Exceeding the memory ceiling fails readiness rather than truncating balances.
+pub async fn hydrate(pool: &PgPool) -> sqlx::Result<()> {
+    let baseline = baseline_state(pool)?;
+    let _loader = baseline.loader.lock().await;
+    if baseline.ready.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    if !memory().is_empty() {
+        return Err(sqlx::Error::Protocol(
+            "wallet hydration must precede runtime activity".into(),
+        ));
+    }
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+    let mut after: Option<(Uuid, i16)> = None;
+    let mut loaded = Vec::new();
+    loop {
+        let rows = sqlx::query(
+            "SELECT user_id,game,balance,hands_played,hands_won,net_won,refills FROM wallets \
+             WHERE ($1::uuid IS NULL OR (user_id,game)>($1,$2)) AND game=ANY($4) \
+             ORDER BY user_id,game LIMIT $3",
+        )
+        .bind(after.map(|(user, _)| user))
+        .bind(after.map(|(_, game)| game))
+        .bind(WALLET_PAGE)
+        .bind(MEMORY_GAMES)
+        .fetch_all(&mut *tx)
+        .await?;
+        let count = rows.len();
+        if loaded.len() + count > MAX_WALLETS {
+            return Err(sqlx::Error::Protocol(
+                "wallet baseline capacity exceeded".into(),
+            ));
+        }
+        for row in rows {
+            let user: Uuid = row.get("user_id");
+            let game: i16 = row.get("game");
+            after = Some((user, game));
+            if memory_authoritative(game) {
+                loaded.push(((game, user), wallet_from(&row)));
+            }
+        }
+        if count < WALLET_PAGE as usize {
+            break;
+        }
+    }
+    tx.commit().await?;
+    for (key, wallet) in loaded {
+        memory().insert(
+            key,
+            MemoryWallet {
+                room: None,
+                seated: false,
+                wallet,
+                failed: false,
+            },
+        );
+    }
+    baseline.ready.store(true, Ordering::Release);
+    Ok(())
+}
+
+/// Only these domains publish every wallet counter through their room actor
+/// and persist all mutations through its ordered checkpoint writer. Other
+/// domains keep their existing active-seat projection and durable idle reads
+/// until their complete writer lifecycle is migrated.
+const MEMORY_GAMES: &[i16] = &[
+    crate::game_catalog::DDZ,
+    crate::game_catalog::NIUNIU,
+    crate::game_catalog::SANGONG,
+    crate::game_catalog::BLACKJACK,
+    crate::game_catalog::XIANGQI,
+];
+fn memory_authoritative(game: i16) -> bool {
+    MEMORY_GAMES.contains(&game)
+}
+
+pub(crate) fn projected(game: i16, user: Uuid) -> Option<Wallet> {
+    memory()
+        .get(&(game, user))
+        .filter(|v| {
+            !v.failed
+                && (v.room.is_some()
+                    || (crate::realtime_mode::enabled() && memory_authoritative(game)))
+        })
+        .map(|v| v.wallet.clone())
+}
+/// A balance projection still requires a complete, non-quarantined baseline.
+pub(crate) fn projected_balance(game: i16, user: Uuid) -> Option<i64> {
+    projected(game, user).map(|wallet| wallet.balance)
+}
+
 pub(crate) fn projected_room(game: i16, user: Uuid) -> Option<String> {
     memory()
         .get(&(game, user))
         .filter(|v| v.seated)
-        .map(|v| v.room.clone())
+        .and_then(|v| v.room.clone())
 }
-/// The room a projection belongs to, seated or still waiting on its leave checkpoint.
+/// The room a projection belongs to, seated or still awaiting its leave commit.
 pub(crate) fn projection_room(game: i16, user: Uuid) -> Option<String> {
-    memory().get(&(game, user)).map(|v| v.room.clone())
+    memory().get(&(game, user)).and_then(|v| v.room.clone())
 }
 pub(crate) fn activate(game: i16, user: Uuid, room: &str, wallet: Wallet) {
-    memory()
+    let mut entry = memory()
         .entry((game, user))
         .or_insert_with(|| MemoryWallet {
-            room: room.to_owned(),
-            seated: true,
-            wallet,
+            room: None,
+            seated: false,
+            wallet: wallet.clone(),
+            failed: false,
         });
+    if entry.room.is_none() {
+        entry.room = Some(room.to_owned());
+        entry.seated = true;
+        entry.wallet = wallet;
+    }
 }
-/// Whether any room still holds `user`'s session wallet of `game`.
+/// Roll back a room session reset whose attach command was never accepted.
+/// The caller first verifies its exact membership epoch under the hub binding
+/// lock, so this cannot overwrite a later claim or accepted game projection.
+pub(crate) fn cancel_admission(game: i16, user: Uuid, room: &str, previous: Wallet) {
+    if let Some(mut entry) = memory().get_mut(&(game, user)) {
+        if entry.room.is_none() || entry.room.as_deref() == Some(room) {
+            entry.wallet = previous;
+        }
+    }
+    retire(game, user, room);
+}
+
+/// An idle baseline does not reserve a seat or exclude another room.
 pub(crate) fn held(game: i16, user: Uuid) -> bool {
-    memory().contains_key(&(game, user))
+    memory()
+        .get(&(game, user))
+        .is_some_and(|v| v.room.is_some())
 }
 pub(crate) fn reserved_elsewhere(game: i16, user: Uuid, room: &str) -> bool {
-    memory().get(&(game, user)).is_some_and(|v| v.room != room)
+    memory()
+        .get(&(game, user))
+        .is_some_and(|v| v.room.as_deref().is_some_and(|held| held != room))
 }
 pub(crate) fn depart(game: i16, user: Uuid, room: &str) {
     if let Some(mut entry) = memory().get_mut(&(game, user)) {
-        if entry.room == room {
+        if entry.room.as_deref() == Some(room) {
             entry.seated = false;
         }
     }
 }
 pub(crate) fn retire(game: i16, user: Uuid, room: &str) {
-    memory().remove_if(&(game, user), |_, v| v.room == room);
+    if memory_authoritative(game) {
+        if let Some(mut entry) = memory().get_mut(&(game, user)) {
+            if entry.room.as_deref() == Some(room) {
+                entry.room = None;
+                entry.seated = false;
+            }
+        }
+    } else {
+        memory().remove_if(&(game, user), |_, entry| {
+            entry.room.as_deref() == Some(room)
+        });
+    }
 }
-/// Retires every projection a room installed, whoever it belonged to.
-pub(crate) fn retire_room(game: i16, room: &str) {
-    memory().retain(|(g, _), v| *g != game || v.room != room);
+/// A failed accepted membership invalidates every later optimistic projection
+/// for that same wallet, including a successor room waiting on its receipt.
+/// Values are retained for recovery; normal transient retries never call this.
+pub(crate) fn quarantine_user(game: i16, user: Uuid) {
+    if let Some(mut entry) = memory().get_mut(&(game, user)) {
+        entry.failed = true;
+    }
 }
+
 pub(crate) fn project_play(
     game: i16,
     user: Uuid,
@@ -99,19 +278,38 @@ pub(crate) fn project_play(
         entry.wallet.hands_won += i32::from(completed && won);
     }
 }
-
 pub(crate) fn project_session_balance(game: i16, user: Uuid, balance: i64) {
     if let Some(mut entry) = memory().get_mut(&(game, user)) {
         entry.wallet.balance = balance;
     }
 }
-
 pub(crate) fn project_refill(game: i16, user: Uuid, balance: i64) {
     if let Some(mut entry) = memory().get_mut(&(game, user)) {
         entry.wallet.balance = balance;
         entry.wallet.refills += 1;
     }
 }
+
+/// Background admission/settlement writers must order themselves after the
+/// initial grant. This barrier belongs off the player request/action path.
+pub(crate) async fn await_initial_grant(game: i16, user: Uuid) -> sqlx::Result<()> {
+    let pending = initializations()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(game, user))
+        .cloned();
+    if let Some(pending) = pending {
+        pending.await.map_err(sqlx::Error::Protocol)?;
+    }
+    if memory()
+        .get(&(game, user))
+        .is_some_and(|entry| entry.failed)
+    {
+        return Err(sqlx::Error::Protocol("wallet initialization failed".into()));
+    }
+    Ok(())
+}
+
 /// The caller holds the room checkpoint row lock in this transaction. Its
 /// accepted purchase UUID is the receipt key, including lost-ACK retries.
 // Each argument is one ledger column of the refill receipt.
@@ -157,11 +355,203 @@ fn wallet_from(row: &sqlx::postgres::PgRow) -> Wallet {
     }
 }
 
-/// Creates the wallet with its grant on first use; idempotent afterwards.
+/// Migrated games read their complete runtime baseline. A known user's first
+/// wallet is a real accepted grant: enqueue the atomic wallet/ledger write
+/// before exposing it. Legacy idle reads and first grants remain durable until
+/// every writer in that domain can publish a coherent full-wallet projection.
 pub async fn ensure(pool: &PgPool, policy: Policy, user_id: Uuid) -> sqlx::Result<Wallet> {
-    if let Some(wallet) = projected(policy.game, user_id) {
-        return Ok(wallet);
+    if !crate::realtime_mode::enabled() || !memory_authoritative(policy.game) {
+        if held(policy.game, user_id) {
+            if let Some(wallet) = projected(policy.game, user_id) {
+                return Ok(wallet);
+            }
+        }
+        // Legacy transaction callers require a committed first grant before
+        // locking or creating this wallet themselves. No optimistic idle
+        // baseline may hide their independently committed mutations.
+        return ensure_durable(pool, policy, user_id).await;
     }
+    let baseline = baseline_state(pool)?;
+    if !baseline.ready.load(Ordering::Acquire) {
+        return Err(sqlx::Error::Protocol("wallet baseline not ready".into()));
+    }
+    let player = crate::player_directory::lookup(pool, user_id)?.ok_or(sqlx::Error::RowNotFound)?;
+    if player.deleted_at.is_some() {
+        return Err(sqlx::Error::RowNotFound);
+    }
+    if let Some(entry) = memory().get(&(policy.game, user_id)) {
+        if entry.failed {
+            return Err(sqlx::Error::Protocol("wallet initialization failed".into()));
+        }
+        return Ok(entry.wallet.clone());
+    }
+    if policy.grant < 0 || !crate::write_behind::accepting() {
+        return Err(sqlx::Error::Protocol(
+            "wallet initialization unavailable".into(),
+        ));
+    }
+    let mut pending = initializations().lock().unwrap_or_else(|e| e.into_inner());
+    // Another first-use request can have published while this one took the lock.
+    if let Some(entry) = memory().get(&(policy.game, user_id)) {
+        if entry.failed {
+            return Err(sqlx::Error::Protocol("wallet initialization failed".into()));
+        }
+        return Ok(entry.wallet.clone());
+    }
+    if pending.len() >= MAX_INITIALIZATIONS || memory().len() >= MAX_WALLETS {
+        return Err(sqlx::Error::Protocol(
+            "wallet initialization capacity reached".into(),
+        ));
+    }
+    let wallet = Wallet {
+        balance: policy.grant,
+        hands_played: 0,
+        hands_won: 0,
+        net_won: 0,
+        refills: 0,
+    };
+    let receipt = Arc::new(AtomicI64::new(0));
+    let writer_pool = pool.clone();
+    let mut writer = crate::write_behind::Ordered::new(false, move |_old, next| {
+        let (pool, receipt) = (writer_pool.clone(), receipt.clone());
+        async move {
+            match persist_initial_grant(&pool, policy, user_id, &receipt).await {
+                Ok(()) => Ok(next),
+                Err(error) => {
+                    if matches!(error, sqlx::Error::RowNotFound)
+                        || matches!(&error, sqlx::Error::Protocol(message) if message == "wallet_initialization_conflict")
+                    {
+                        if let Some(mut entry) = memory().get_mut(&(policy.game, user_id)) {
+                            entry.failed = true;
+                        }
+                        return Err(crate::write_behind::fenced("wallet initialization refused"));
+                    }
+                    Err(error.to_string())
+                }
+            }
+        }
+    });
+    writer.enqueue(true).map_err(sqlx::Error::Protocol)?;
+    let durable = writer.durable().boxed().shared();
+    memory().insert(
+        (policy.game, user_id),
+        MemoryWallet {
+            room: None,
+            seated: false,
+            wallet: wallet.clone(),
+            failed: false,
+        },
+    );
+    pending.insert((policy.game, user_id), durable.clone());
+    drop(pending);
+    // Dropping the sender does not discard its accepted item: Ordered retains
+    // and retries that item, and the global shutdown drain tracks its worker.
+    drop(writer);
+    tokio::spawn(async move {
+        if durable.await.is_err() {
+            // The worker may finish before the accepting task publishes the
+            // entry. This continuation is spawned only after publication.
+            if let Some(mut entry) = memory().get_mut(&(policy.game, user_id)) {
+                entry.failed = true;
+            }
+        }
+        initializations()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(policy.game, user_id));
+    });
+    Ok(wallet)
+}
+
+async fn persist_initial_grant(
+    pool: &PgPool,
+    policy: Policy,
+    user: Uuid,
+    receipt: &AtomicI64,
+) -> sqlx::Result<()> {
+    static WRITERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+    let _permit = WRITERS
+        .acquire()
+        .await
+        .map_err(|_| sqlx::Error::PoolClosed)?;
+    let mut tx = pool.begin().await?;
+    crate::db::lock_active_users(&mut tx, &[user]).await?;
+    let inserted = sqlx::query(
+        "INSERT INTO wallets(user_id,game,balance) VALUES($1,$2,$3) ON CONFLICT(user_id,game) DO NOTHING",
+    ).bind(user).bind(policy.game).bind(policy.grant).execute(&mut *tx).await?.rows_affected();
+    if inserted == 1 {
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO wallet_ledger(user_id,game,kind,delta,balance_after) VALUES($1,$2,'grant',$3,$3) RETURNING id",
+        ).bind(user).bind(policy.game).bind(policy.grant).fetch_one(&mut *tx).await?;
+        // Retain the exact receipt before COMMIT: a lost acknowledgement can
+        // then be proven by one primary-key lookup without replaying the grant.
+        receipt.store(id, Ordering::Release);
+    } else {
+        let id = receipt.load(Ordering::Acquire);
+        let committed = if id > 0 {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM wallet_ledger WHERE id=$1 AND user_id=$2 AND game=$3 AND kind='grant' AND delta=$4 AND balance_after=$4)",
+            ).bind(id).bind(user).bind(policy.game).bind(policy.grant).fetch_one(&mut *tx).await?
+        } else {
+            false
+        };
+        if !committed {
+            return Err(sqlx::Error::Protocol(
+                "wallet_initialization_conflict".into(),
+            ));
+        }
+    }
+    tx.commit().await?;
+    drop(_permit);
+    crate::card_ledger_memory::retain_publish_grant(pool, policy.game, user).await;
+    Ok(())
+}
+
+/// Recovery can settle an interrupted hand after startup hydration. Refresh
+/// its complete wallet once after those durable writes and before activating
+/// the restored actor. Ordinary requests and actions never call this helper.
+pub(crate) async fn recover_wallet(
+    pool: &PgPool,
+    policy: Policy,
+    user: Uuid,
+    room: &str,
+) -> sqlx::Result<Wallet> {
+    if !memory().contains_key(&(policy.game, user)) {
+        // Missing startup rows use the same initializer as runtime admission;
+        // never race a second first-grant INSERT against its accepted receipt.
+        ensure(pool, policy, user).await?;
+    }
+    let pending = initializations()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&(policy.game, user))
+        .cloned();
+    if let Some(pending) = pending {
+        pending.await.map_err(sqlx::Error::Protocol)?;
+    }
+    let wallet = ensure_durable(pool, policy, user).await?;
+    if crate::realtime_mode::enabled() && memory_authoritative(policy.game) {
+        let mut entry = memory()
+            .entry((policy.game, user))
+            .or_insert_with(|| MemoryWallet {
+                room: None,
+                seated: false,
+                wallet: wallet.clone(),
+                failed: false,
+            });
+        if entry.room.as_deref().is_some_and(|held| held != room) {
+            return Err(sqlx::Error::Protocol(
+                "wallet already owned during recovery".into(),
+            ));
+        }
+        entry.wallet = wallet.clone();
+        entry.failed = false;
+    }
+    Ok(wallet)
+}
+
+/// Creates the wallet with its grant on first use; idempotent afterwards.
+async fn ensure_durable(pool: &PgPool, policy: Policy, user_id: Uuid) -> sqlx::Result<Wallet> {
     // Profile reads must not start a write transaction for an existing wallet.
     // Read fresh committed balances; keep first-use grant + ledger atomic below.
     let started = std::time::Instant::now();
@@ -180,8 +570,14 @@ pub async fn ensure(pool: &PgPool, policy: Policy, user_id: Uuid) -> sqlx::Resul
         query_ms=acquired.elapsed().as_secs_f64()*1000.0);
     drop(conn);
     if let Some(row) = row {
+        // A previous first-grant COMMIT acknowledgement may have been lost.
+        // This committed row is its retry path; reconcile the real grant
+        // receipts even though this attempt does not create another wallet.
+        crate::card_ledger_memory::retain_publish_grant(pool, policy.game, user_id).await;
         return Ok(wallet_from(&row));
     }
+    let _beans_mutation = (policy.game == crate::game_catalog::BEANS)
+        .then(|| crate::beans_read_memory::mutation(pool, [user_id]));
     let mut tx = pool.begin().await?;
     let inserted = sqlx::query(
         "INSERT INTO wallets (user_id, game, balance) VALUES ($1, $2, $3) \
@@ -212,7 +608,12 @@ pub async fn ensure(pool: &PgPool, policy: Policy, user_id: Uuid) -> sqlx::Resul
     .bind(policy.game)
     .fetch_one(&mut *tx)
     .await?;
-    tx.commit().await?;
+    let committed = tx.commit().await;
+    if policy.game == crate::game_catalog::BEANS {
+        crate::beans_read_memory::invalidate_user(pool, user_id);
+    }
+    committed?;
+    crate::card_ledger_memory::retain_publish_grant(pool, policy.game, user_id).await;
     Ok(wallet_from(&row))
 }
 
@@ -291,6 +692,24 @@ pub(crate) fn room_policy(name: &str) -> Option<Policy> {
     }
 }
 
+pub(crate) fn session_policy(
+    name: &str,
+    state: &serde_json::Value,
+) -> sqlx::Result<Option<Policy>> {
+    let Some(mut policy) = room_policy(name) else {
+        return Ok(None);
+    };
+    if matches!(name, "ddz" | "niuniu" | "sangong" | "blackjack") {
+        let opts = &state["opts"];
+        policy.grant = opts["initial_antes"]
+            .as_u64()
+            .and_then(|n| opts["ante"].as_u64().and_then(|ante| n.checked_mul(ante)))
+            .and_then(|n| i64::try_from(n).ok())
+            .ok_or_else(|| sqlx::Error::Protocol("missing session buy-in".into()))?;
+    }
+    Ok(Some(policy))
+}
+
 pub async fn balances(
     pool: &PgPool,
     game: i16,
@@ -298,6 +717,21 @@ pub async fn balances(
 ) -> sqlx::Result<HashMap<Uuid, i64>> {
     if user_ids.is_empty() {
         return Ok(HashMap::new());
+    }
+    if crate::realtime_mode::enabled() && memory_authoritative(game) {
+        if !ready(pool) {
+            return Err(sqlx::Error::Protocol("wallet baseline not ready".into()));
+        }
+        let mut balances = HashMap::with_capacity(user_ids.len());
+        for user in user_ids {
+            if let Some(entry) = memory().get(&(game, *user)) {
+                if entry.failed {
+                    return Err(sqlx::Error::Protocol("wallet initialization failed".into()));
+                }
+                balances.insert(*user, entry.wallet.balance);
+            }
+        }
+        return Ok(balances);
     }
     let rows =
         sqlx::query("SELECT user_id, balance FROM wallets WHERE game = $1 AND user_id = ANY($2)")

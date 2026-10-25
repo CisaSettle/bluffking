@@ -17,7 +17,7 @@
 //! at the next hand boundary without changing the current pot or wallet.
 
 use serde::Serialize;
-use sqlx::{PgConnection, PgPool, Row};
+use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 use crate::game_catalog::BEANS as GAME;
@@ -106,14 +106,7 @@ pub struct Profile {
 }
 
 pub async fn profile(pool: &PgPool, user: Uuid) -> sqlx::Result<Profile> {
-    let w = ensure(pool, user).await?;
-    let claimed_today: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM (SELECT * FROM daily_usage WHERE scope='feature_user') AS usage           WHERE subject_key = $1::uuid::text AND feature = $2 AND usage_date = (now() AT TIME ZONE 'Asia/Singapore')::date)",
-    )
-    .bind(user)
-    .bind(DAILY_FEATURE)
-    .fetch_one(pool)
-    .await?;
+    let (w, daily_available) = crate::beans_read_memory::profile(pool, user)?;
     Ok(Profile {
         balance: w.balance,
         net_won: w.net_won,
@@ -122,7 +115,7 @@ pub async fn profile(pool: &PgPool, user: Uuid) -> sqlx::Result<Profile> {
         buy_in: BUY_IN,
         stake: STAKE_KEY,
         daily_refill_to: DAILY_REFILL_TO,
-        daily_available: !claimed_today,
+        daily_available,
         pack_beans: PACK_BEANS,
         pack_usd_cents: pack_usd_cents(),
         pack_available: pack_enabled(),
@@ -144,6 +137,7 @@ pub enum DailyOutcome {
 /// One extra [`DAILY_REFILL_TO`] grant per Singapore calendar day. The day counter,
 /// the wallet update and the ledger row commit together.
 pub async fn claim_daily(pool: &PgPool, user: Uuid) -> sqlx::Result<DailyOutcome> {
+    let _beans_mutation = crate::beans_read_memory::mutation(pool, [user]);
     ensure(pool, user).await?;
     let mut tx = pool.begin().await?;
     let before = wallet::lock(&mut tx, GAME, user)
@@ -158,6 +152,7 @@ pub async fn claim_daily(pool: &PgPool, user: Uuid) -> sqlx::Result<DailyOutcome
     .await?;
     if consumed.is_none() {
         tx.rollback().await?;
+        crate::beans_read_memory::invalidate_user(pool, user);
         return Ok(DailyOutcome::AlreadyClaimed { balance: before });
     }
     let granted = DAILY_REFILL_TO;
@@ -183,7 +178,9 @@ pub async fn claim_daily(pool: &PgPool, user: Uuid) -> sqlx::Result<DailyOutcome
     .bind(serde_json::json!({ "reason": "daily_refill" }))
     .execute(&mut *tx)
     .await?;
-    tx.commit().await?;
+    let committed = tx.commit().await;
+    crate::beans_read_memory::invalidate_user(pool, user);
+    committed?;
     wallet::project_session_balance(GAME, user, after);
     Ok(DailyOutcome::Granted {
         granted,
@@ -397,33 +394,7 @@ pub async fn leaderboard(
     limit: i64,
     offset: i64,
 ) -> sqlx::Result<Vec<LeaderboardRow>> {
-    let rows = sqlx::query(&format!(
-        "SELECT w.user_id, NULLIF(TRIM(u.display_name), '') AS display_name, w.net_won, w.hands_played \
-         FROM wallets w JOIN users u ON u.id = w.user_id \
-         WHERE w.game = $1 AND w.hands_played > 0 AND u.deleted_at IS NULL AND {} \
-         ORDER BY w.net_won DESC, w.hands_played DESC, w.user_id LIMIT $2 OFFSET $3",
-        crate::internal_accounts::not_qa_flags("u.")
-    ))
-    .bind(GAME)
-    .bind(crate::pagination::limit(Some(limit)))
-    .bind(crate::pagination::offset(Some(offset)))
-    .fetch_all(pool)
-    .await?;
-    Ok(rows
-        .into_iter()
-        .map(|r| {
-            let user_id: Uuid = r.get("user_id");
-            LeaderboardRow {
-                user_id,
-                display_name: crate::content_moderation::public_name_or_fallback(
-                    r.get::<Option<String>, _>("display_name").as_deref(),
-                    user_id,
-                ),
-                net_won: r.get("net_won"),
-                hands_played: r.get("hands_played"),
-            }
-        })
-        .collect())
+    crate::beans_read_memory::leaderboard(pool, limit, offset)
 }
 
 /// Unsettled public-hand liabilities, held per process: the runtime owner

@@ -118,16 +118,20 @@ pub async fn buy(pool: &PgPool, user: Uuid, body: &ScratchBuy) -> Result<Purchas
     {
         let mut conn = pool.acquire().await?;
         if let Some(p) = replay(&mut conn, user, body.request_id, &hash).await? {
+            crate::beans_read_memory::invalidate_user(pool, user);
             return Ok(p);
         }
     }
+    let _beans_mutation = crate::beans_read_memory::mutation(pool, [user]);
     let mut tx = pool.begin().await?;
     crate::db::lock_active_users(&mut tx, &[user]).await?;
     let before = wallet::lock(&mut tx, POLICY.game, user)
         .await?
         .ok_or(sqlx::Error::RowNotFound)?;
     if let Some(p) = replay(&mut tx, user, body.request_id, &hash).await? {
-        tx.commit().await?;
+        let committed = tx.commit().await;
+        crate::beans_read_memory::invalidate_user(pool, user);
+        committed?;
         return Ok(p);
     }
     store::require_spendable(&mut tx, user).await?;
@@ -242,7 +246,9 @@ pub async fn buy(pool: &PgPool, user: Uuid, body: &ScratchBuy) -> Result<Purchas
     } else {
         false
     };
-    tx.commit().await?;
+    let committed = tx.commit().await;
+    crate::beans_read_memory::invalidate_user(pool, user);
+    committed?;
     if notified {
         crate::read_cache::invalidate_unread_count(pool, user);
     }
@@ -315,6 +321,7 @@ async fn reveal_inner(
     if index.is_some_and(|i| i >= 6) {
         return Err(Error::InvalidEntry);
     }
+    let _beans_mutation = crate::beans_read_memory::mutation(pool, [user]);
     let mut tx = pool.begin().await?;
     if expiry {
         sqlx::query("SELECT set_config('lock_timeout','500ms',true),set_config('statement_timeout','2s',true)")
@@ -397,7 +404,9 @@ async fn reveal_inner(
     .bind(&card.entry)
     .execute(&mut *tx)
     .await?;
-    tx.commit().await?;
+    let committed = tx.commit().await;
+    crate::beans_read_memory::invalidate_user(pool, user);
+    committed?;
     if notified {
         crate::read_cache::invalidate_unread_count(pool, user);
     }

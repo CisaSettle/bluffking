@@ -1,8 +1,9 @@
 //! Authenticated lottery HTTP endpoints; rule failures have stable wire codes.
 use super::{scratch, store, Game};
+use crate::api_resources::OperationPath as Path;
 use crate::{app_state::AppState, auth::middleware::AuthUser, handlers::respond::error_code};
 use axum::{
-    extract::{rejection::JsonRejection, Path, Query, State},
+    extract::{rejection::JsonRejection, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
