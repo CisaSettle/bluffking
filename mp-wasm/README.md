@@ -1,8 +1,11 @@
-# mp-wasm — Phase-4 server-blind WEB crypto client (PROTOTYPE)
+# mp-wasm — browser crypto client for advanced encrypted dealing
 
 A thin `wasm-bindgen` wrapper over `mental_poker::crypto_real` (ADR-063), so a
 browser can run DKG / verifiable shuffle / threshold decryption locally — the
-server only ever sees ciphertext. **Prototype, pending external audit.** The
+game server receives ciphertext for unshown hole cards. The browser client is
+integrated into the opt-in advanced encrypted-dealing path for all-human
+tables (ADR-101 trusted-operator scope). Cross-vendor AI review is not an
+independent human security audit or proof of the running remote binary. The
 crate is deliberately **detached from the parent Cargo workspace** (it has its
 own `[workspace]` table and `Cargo.lock`).
 
