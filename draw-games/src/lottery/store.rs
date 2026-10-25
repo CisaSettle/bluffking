@@ -65,9 +65,28 @@ impl TicketRow {
     }
 }
 
+/// Existing period IDs used each game's old interval. Never reinterpret them
+/// through today's minute schedule: the immutable plan identifies its version.
+fn period_label(game: Game, period: i64, stored: Option<&Value>) -> Option<String> {
+    if let Some(stored) = stored {
+        let plan: Plan = serde_json::from_value(stored.clone()).ok()?;
+        if plan.game != game.as_str() || plan.period != period {
+            return None;
+        }
+        return plan.label().ok();
+    }
+    // Every current period is created with a plan; plan-less rows predate it.
+    let schedule = game.legacy_schedule()?;
+    let draw_ms = period
+        .checked_add(1)?
+        .checked_mul(schedule.interval_ms)?
+        .checked_add(schedule.offset_ms)?;
+    Some(schedule.label(draw_ms))
+}
+
 /// The contract's `Ticket` (scratch numbers projected by `revealed`).
 pub fn ticket_json(game: Game, t: &TicketRow) -> Value {
-    let label = game.schedule().map(|s| s.period(t.period).label);
+    let label = period_label(game, t.period, t.proof_plan.as_ref());
     let mut out = json!({
         "id": t.id, "purchase_id": t.purchase_id, "period": t.period, "label": label,
         "bought_at_ms": t.bought_at.timestamp_millis(),
@@ -133,7 +152,7 @@ impl PeriodRow {
         }
     }
     fn summary(&self, game: Game) -> Value {
-        let label = game.schedule().map(|s| s.period(self.period).label);
+        let label = period_label(game, self.period, self.proof_plan.as_ref());
         json!({
             "period": self.period, "label": label,
             "drawn_at_ms": self.drawn_at.map(|d| d.timestamp_millis()),
@@ -163,6 +182,10 @@ pub struct NumberBuy {
     pub multiplier: i64,
     pub tickets: Vec<Value>,
     pub proof_commitment: String,
+    #[serde(default)]
+    pub all_in: bool,
+    #[serde(default)]
+    pub expected_balance: Option<i64>,
 }
 
 fn proof_status(plan: Option<&Value>, proof: Option<&Value>) -> &'static str {
@@ -315,6 +338,8 @@ pub async fn buy_numbers(
         || body.multiplier != 1
         || body.tickets.is_empty()
         || body.tickets.len() > rules::MAX_TICKETS_PER_PURCHASE
+        || (body.all_in && body.expected_balance.is_none())
+        || (!body.all_in && body.expected_balance.is_some())
     {
         return Err(Error::InvalidEntry);
     }
@@ -328,15 +353,18 @@ pub async fn buy_numbers(
         "tickets": entries.iter().map(Entry::to_value).collect::<Vec<_>>(),
     });
     normalised["proof_commitment"] = json!(body.proof_commitment);
+    // Ordinary requests keep their exact historical replay hash. ALL-IN binds
+    // both the explicit mode and the balance the player saw before confirming.
+    if body.all_in {
+        normalised["all_in"] = json!(true);
+        normalised["expected_balance"] = json!(body.expected_balance);
+    }
     let body_hash = body_sha256(&normalised);
     let record_id = super::purchase_id(user, body.request_id);
     let stakes: Vec<i64> = entries.iter().map(Entry::stakes).collect();
-    let new_stakes: i64 = stakes.iter().sum();
-    let costs: Vec<i64> = stakes
-        .iter()
-        .map(|s| s * game.unit() * body.multiplier)
-        .collect();
-    let charged: i64 = costs.iter().sum();
+    if body.all_in && stakes.iter().any(|stakes| *stakes != 1) {
+        return Err(Error::InvalidEntry);
+    }
 
     ensure_wallet(pool, user).await?;
     // (A) Replay without locks.
@@ -353,10 +381,12 @@ pub async fn buy_numbers(
     let mut selling = schedule.period_at(super::now_ms());
     let mut period_status: Option<String> = None;
     let mut accepted_plan: Option<Value> = None;
+    let mut period_stakes = 0i32;
+    let mut period_sales = 0i64;
     if body.period == selling.id {
         ensure_period(&mut tx, game, &selling).await?;
         let row = sqlx::query(
-            "SELECT status,proof_plan FROM lottery_periods WHERE game=$1 AND period=$2 FOR UPDATE",
+            "SELECT status,proof_plan,stakes,sales FROM lottery_periods WHERE game=$1 AND period=$2 FOR UPDATE",
         )
         .bind(game.as_str())
         .bind(selling.id)
@@ -365,6 +395,8 @@ pub async fn buy_numbers(
         if let Some(row) = row {
             period_status = Some(row.get("status"));
             accepted_plan = row.get("proof_plan");
+            period_stakes = row.get("stakes");
+            period_sales = row.get("sales");
         }
     }
     // (C) Account, wallet, then the replay check again under the locks.
@@ -390,11 +422,15 @@ pub async fn buy_numbers(
         .map_err(|_| Error::InvalidEntry)?;
     plan.validate().map_err(|_| Error::InvalidEntry)?;
     let expected = &body.proof_commitment;
-    if plan.game != game.as_str() || plan.period != selling.id || &plan.commitment != expected {
+    if plan.protocol != draw_games::lottery::PROTOCOL
+        || plan.game != game.as_str()
+        || plan.period != selling.id
+        || &plan.commitment != expected
+    {
         return Err(Error::RequestConflict);
     }
     let (count, used): (i64, i64) = sqlx::query_as(
-        "SELECT COUNT(*)::bigint, COALESCE(SUM(stakes), 0)::bigint FROM lottery_tickets \
+        "SELECT COUNT(*)::bigint, COALESCE(SUM(stakes::bigint * multiplier), 0)::bigint FROM lottery_tickets \
          WHERE game=$1 AND period=$2 AND user_id=$3",
     )
     .bind(game.as_str())
@@ -402,13 +438,72 @@ pub async fn buy_numbers(
     .bind(user)
     .fetch_one(&mut *tx)
     .await?;
-    if count + entries.len() as i64 > rules::MAX_TICKETS_PER_PERIOD
-        || used + new_stakes > rules::MAX_STAKES_PER_PERIOD
+    if count + entries.len() as i64 > rules::MAX_TICKETS_PER_PERIOD {
+        return Err(Error::TooManyTickets);
+    }
+    let multipliers: Vec<i16> = if body.all_in {
+        if body.expected_balance != Some(balance) {
+            return Err(Error::RequestConflict);
+        }
+        let copies = balance / game.unit();
+        if copies <= 0 {
+            return Err(Error::InsufficientBalance);
+        }
+        let groups = entries.len() as i64;
+        if groups != copies.min(rules::MAX_TICKETS_PER_PURCHASE as i64) {
+            return Err(Error::InvalidEntry);
+        }
+        let base = copies / groups;
+        let remainder = copies % groups;
+        (0..groups)
+            .map(|index| {
+                let multiplier = base
+                    .checked_add(i64::from(index < remainder))
+                    .ok_or(Error::TooManyTickets)?;
+                if !(1..=rules::MAX_ALL_IN_MULTIPLIER).contains(&multiplier) {
+                    return Err(Error::TooManyTickets);
+                }
+                i16::try_from(multiplier).map_err(|_| Error::TooManyTickets)
+            })
+            .collect::<Result<_, _>>()?
+    } else {
+        vec![1; entries.len()]
+    };
+    let effective_stakes: Vec<i64> = stakes
+        .iter()
+        .zip(&multipliers)
+        .map(|(stakes, multiplier)| {
+            stakes
+                .checked_mul(i64::from(*multiplier))
+                .ok_or(Error::InvalidEntry)
+        })
+        .collect::<Result<_, _>>()?;
+    let new_stakes = effective_stakes.iter().try_fold(0i64, |sum, stakes| {
+        sum.checked_add(*stakes).ok_or(Error::InvalidEntry)
+    })?;
+    if !body.all_in
+        && used
+            .checked_add(new_stakes)
+            .is_none_or(|total| total > rules::MAX_STAKES_PER_PERIOD)
     {
         return Err(Error::TooManyTickets);
     }
+    let costs: Vec<i64> = effective_stakes
+        .iter()
+        .map(|stakes| stakes.checked_mul(game.unit()).ok_or(Error::InvalidEntry))
+        .collect::<Result<_, _>>()?;
+    let charged = costs.iter().try_fold(0i64, |sum, cost| {
+        sum.checked_add(*cost).ok_or(Error::InvalidEntry)
+    })?;
     if charged > balance {
         return Err(Error::InsufficientBalance);
+    }
+    // This also protects the period's existing integer counter bind.
+    let new_stakes_i32 = i32::try_from(new_stakes).map_err(|_| Error::TooManyTickets)?;
+    if period_stakes.checked_add(new_stakes_i32).is_none()
+        || period_sales.checked_add(charged).is_none()
+    {
+        return Err(Error::TooManyTickets);
     }
     let ids: Vec<Uuid> = (0..entries.len()).map(|_| Uuid::new_v4()).collect();
     let play = wallet::Play {
@@ -431,19 +526,19 @@ pub async fn buy_numbers(
     let stakes_i32: Vec<i32> = stakes.iter().map(|s| *s as i32).collect();
     sqlx::query(
         "INSERT INTO lottery_tickets (id, purchase_id, game, period, user_id, bought_at, entry, stakes, multiplier, cost, proof_plan) \
-         SELECT u.id, $5, $6, $7, $8, $9, u.entry, u.stakes, $10, u.cost, $11 \
-         FROM UNNEST($1::uuid[], $2::jsonb[], $3::int4[], $4::int8[]) AS u(id, entry, stakes, cost)",
+         SELECT u.id, $6, $7, $8, $9, $10, u.entry, u.stakes, u.multiplier, u.cost, $11 \
+         FROM UNNEST($1::uuid[], $2::jsonb[], $3::int4[], $4::int8[], $5::int2[]) AS u(id, entry, stakes, cost, multiplier)",
     )
     .bind(&ids)
     .bind(&entry_values)
     .bind(&stakes_i32)
     .bind(&costs)
+    .bind(&multipliers)
     .bind(record_id)
     .bind(game.as_str())
     .bind(selling.id)
     .bind(user)
     .bind(now)
-    .bind(body.multiplier as i16)
     .bind(&accepted_plan)
     .execute(&mut *tx)
     .await?;
@@ -454,7 +549,7 @@ pub async fn buy_numbers(
     .bind(game.as_str())
     .bind(selling.id)
     .bind(entries.len() as i32)
-    .bind(new_stakes as i32)
+    .bind(new_stakes_i32)
     .bind(charged)
     .bind(i32::from(count == 0))
     .execute(&mut *tx)
@@ -584,7 +679,7 @@ struct FeedScan {
 /// The newest purchases of a game (grouped by purchase) from the feed index.
 async fn feed_scan(conn: &mut PgConnection, game: Game) -> sqlx::Result<FeedScan> {
     let rows = sqlx::query(
-        "SELECT purchase_id, user_id, bought_at, stakes, prize, tier, settled_at FROM lottery_tickets \
+        "SELECT purchase_id, user_id, bought_at, stakes, multiplier, prize, tier, settled_at FROM lottery_tickets \
          WHERE game=$1 AND (game<>'scratch' OR (cost=100 AND entry->'reward_version'='1'::jsonb)) ORDER BY bought_at DESC LIMIT $2",
     )
     .bind(game.as_str())
@@ -597,12 +692,13 @@ async fn feed_scan(conn: &mut PgConnection, game: Game) -> sqlx::Result<FeedScan
         let purchase: Uuid = row.get("purchase_id");
         let user: Uuid = row.get("user_id");
         let at: DateTime<Utc> = row.get("bought_at");
-        let stakes: i32 = row.get("stakes");
+        let stakes =
+            i64::from(row.get::<i32, _>("stakes")) * i64::from(row.get::<i16, _>("multiplier"));
         if let Some(p) = purchases.iter_mut().find(|p| p.0 == purchase) {
             p.3 += 1;
-            p.4 += i64::from(stakes);
+            p.4 += stakes;
         } else if purchases.len() < FEED_LEN {
-            purchases.push((purchase, user, at, 1, i64::from(stakes)));
+            purchases.push((purchase, user, at, 1, stakes));
         }
         if game == Game::Scratch && wins.len() < FEED_LEN {
             if let (Some(prize), Some(settled)) = (
@@ -766,7 +862,7 @@ async fn draw_json(
         })
         .collect();
     let mine = tickets_of(conn, game, row.period, user).await?;
-    let label = game.schedule().map(|s| s.period(row.period).label);
+    let label = period_label(game, row.period, row.proof_plan.as_ref());
     Ok(json!({
         "period": row.period, "label": label,
         "drawn_at_ms": row.drawn_at.map(|d| d.timestamp_millis()).unwrap_or_default(),
@@ -889,6 +985,30 @@ pub async fn proof(pool: &PgPool, game: Game, period: i64) -> Result<Value, Erro
         "proof_status": proof_status(plan.as_ref(), proof.as_ref()), "plan": plan, "proof": proof }))
 }
 
+/// Filtering happens before pagination, so older wins remain discoverable.
+#[derive(Clone, Copy, Default, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TicketFilter {
+    #[default]
+    All,
+    Pending,
+    Won,
+    Lost,
+}
+
+impl TicketFilter {
+    fn predicate(self) -> &'static str {
+        // Rewards count as wins even when the number-match payout is zero.
+        // Unsettled cards must not expose their hidden reward through a filter.
+        match self {
+            Self::All => "TRUE",
+            Self::Pending => "t.settled_at IS NULL",
+            Self::Won => "t.settled_at IS NOT NULL AND (COALESCE(t.prize,0)>0 OR (t.game='scratch' AND t.entry->'reward'->>'kind' IN ('beans','membership')) OR (t.entry->'reward_grant' IS NOT NULL AND t.entry->'reward_grant'<>'null'::jsonb))",
+            Self::Lost => "t.settled_at IS NOT NULL AND NOT (COALESCE(t.prize,0)>0 OR (t.game='scratch' AND COALESCE(t.entry->'reward'->>'kind','') IN ('beans','membership')) OR (t.entry->'reward_grant' IS NOT NULL AND t.entry->'reward_grant'<>'null'::jsonb))",
+        }
+    }
+}
+
 /// `GET /api/lottery/{game}/tickets`: the viewer's newest tickets with the
 /// period result once drawn.
 pub async fn tickets(
@@ -897,17 +1017,19 @@ pub async fn tickets(
     game: Game,
     limit: i64,
     offset: i64,
+    filter: TicketFilter,
 ) -> Result<Vec<Value>, Error> {
     let rows = sqlx::query(&format!(
         "SELECT t.{} , p.numbers AS result_numbers, p.bonus AS result_bonus, p.bonus_numbers AS result_bonus_numbers, p.draw_proof AS result_proof \
          FROM lottery_tickets t LEFT JOIN lottery_periods p \
            ON p.game = t.game AND p.period = t.period AND p.status <> 'open' \
-         WHERE t.user_id=$1 AND t.game=$2 AND (t.game<>'scratch' OR (t.cost=100 AND t.entry->'reward_version'='1'::jsonb)) ORDER BY t.bought_at DESC, t.id LIMIT $3 OFFSET $4",
-        TICKET_COLUMNS.replace(", ", ", t.")
+         WHERE t.user_id=$1 AND t.game=$2 AND (t.game<>'scratch' OR (t.cost=100 AND t.entry->'reward_version'='1'::jsonb)) AND ({}) ORDER BY t.bought_at DESC, t.id LIMIT $3 OFFSET $4",
+        TICKET_COLUMNS.replace(", ", ", t."),
+        filter.predicate()
     ))
     .bind(user)
     .bind(game.as_str())
-    .bind(limit.clamp(1, 100))
+    .bind(limit.clamp(1, 101))
     .bind(offset.max(0))
     .fetch_all(pool)
     .await?;

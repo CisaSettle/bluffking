@@ -18,6 +18,10 @@ pub struct ScratchBuy {
     pub cost: i64,
     pub count: usize,
     pub fairness: draw_fairness::Challenge,
+    #[serde(default)]
+    pub all_in: bool,
+    #[serde(default)]
+    pub expected_balance: Option<i64>,
 }
 
 pub fn project(out: &mut Value, ticket: &TicketRow) {
@@ -85,17 +89,30 @@ fn prize(entry: &Value, cost: i64) -> Result<(i64, i16), Error> {
 }
 
 pub async fn buy(pool: &PgPool, user: Uuid, body: &ScratchBuy) -> Result<Purchase, Error> {
-    if body.request_id.is_nil() || body.cost != 100 || ![1, 5, 10].contains(&body.count) {
+    if body.request_id.is_nil()
+        || body.cost != 100
+        || (!body.all_in && ![1, 5, 10].contains(&body.count))
+        || (body.all_in && (body.count == 0 || body.expected_balance.is_none()))
+        || (!body.all_in && body.expected_balance.is_some())
+    {
         return Err(Error::InvalidEntry);
     }
-    let batch = body.count > 1;
+    if body.count > scratch::MAX_BATCH_CARDS {
+        return Err(Error::TooManyTickets);
+    }
+    // ALL-IN is an immediate reveal even when the balance buys just one card.
+    let batch = body.count > 1 || body.all_in;
     let record_id = if batch {
         super::scratch_batch_id(user, body.request_id)
     } else {
         super::purchase_id(user, body.request_id)
     };
-    let identity = json!({"game":"scratch", "cost":body.cost, "count":body.count,
+    let mut identity = json!({"game":"scratch", "cost":body.cost, "count":body.count,
         "fairness": {"offer_id":body.fairness.offer_id,"commitment":body.fairness.commitment,"client_seed":body.fairness.client_seed}});
+    if body.all_in {
+        identity["all_in"] = json!(true);
+        identity["expected_balance"] = json!(body.expected_balance);
+    }
     let hash = store::body_sha256(&identity);
     store::ensure_wallet(pool, user).await?;
     {
@@ -114,6 +131,14 @@ pub async fn buy(pool: &PgPool, user: Uuid, body: &ScratchBuy) -> Result<Purchas
         return Ok(p);
     }
     store::require_spendable(&mut tx, user).await?;
+    if body.all_in {
+        if body.expected_balance != Some(before) {
+            return Err(Error::RequestConflict);
+        }
+        if before / body.cost != body.count as i64 {
+            return Err(Error::InvalidEntry);
+        }
+    }
     if !batch {
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM lottery_tickets WHERE game='scratch' AND period=0 AND user_id=$1 AND settled_at IS NULL AND cost=100 AND entry->'reward_version'='1'::jsonb")
             .bind(user).fetch_one(&mut *tx).await?;
@@ -121,7 +146,10 @@ pub async fn buy(pool: &PgPool, user: Uuid, body: &ScratchBuy) -> Result<Purchas
             return Err(Error::TooManyTickets);
         }
     }
-    let charged = body.cost * body.count as i64;
+    let charged = body
+        .cost
+        .checked_mul(body.count as i64)
+        .ok_or(Error::InvalidEntry)?;
     if charged > before {
         return Err(Error::InsufficientBalance);
     }
@@ -175,19 +203,49 @@ pub async fn buy(pool: &PgPool, user: Uuid, body: &ScratchBuy) -> Result<Purchas
             membership_granted |= grant_reward(&mut tx, user, card).await?;
         }
     }
-    let paid: i64 = cards.iter().filter_map(|t| t.prize).sum();
+    let paid = cards
+        .iter()
+        .filter_map(|t| t.prize)
+        .try_fold(0i64, |sum, prize| {
+            sum.checked_add(prize).ok_or(Error::InvalidEntry)
+        })?;
     let ids: Vec<Uuid> = cards.iter().map(|t| t.id).collect();
     let after = wallet::settle(&mut tx, POLICY.game, user, &wallet::Play {
         record_id, delta: paid - charged, completes_hand: batch, won: paid > 0,
         room_code: None, revision: None, hand_completed: None, has_bots: None,
         details: Some(json!({"purpose":if batch {"scratch_batch"} else {"purchase"}, "game":"scratch", "body_sha256":hash, "ticket_ids":ids, "charged":charged, "balance_before":before})),
     }).await?;
-    for t in &cards {
-        sqlx::query("INSERT INTO lottery_tickets (id,purchase_id,game,period,user_id,bought_at,entry,stakes,multiplier,cost,revealed,prize,tier,settled_at) VALUES ($1,$2,'scratch',0,$3,$4,$5,1,1,$6,$7,$8,$9,$10)")
-            .bind(t.id).bind(record_id).bind(user).bind(now).bind(&t.entry).bind(t.cost).bind(&t.revealed).bind(t.prize).bind(t.tier).bind(t.settled_at)
-            .execute(&mut *tx).await?;
-    }
+    // One bounded insert keeps a 1,000-card purchase from issuing a query per
+    // card while the account wallet is locked. All cards share reveal state.
+    let entries: Vec<Value> = cards.iter().map(|card| card.entry.clone()).collect();
+    let prizes: Vec<Option<i64>> = cards.iter().map(|card| card.prize).collect();
+    let tiers: Vec<Option<i16>> = cards.iter().map(|card| card.tier).collect();
+    sqlx::query(
+        "INSERT INTO lottery_tickets (id,purchase_id,game,period,user_id,bought_at,entry,stakes,multiplier,cost,revealed,prize,tier,settled_at) \
+         SELECT u.id,$5,'scratch',0,$6,$7,u.entry,1,1,$8,$9,u.prize,u.tier,$10 \
+         FROM UNNEST($1::uuid[],$2::jsonb[],$3::int8[],$4::int2[]) AS u(id,entry,prize,tier)",
+    )
+    .bind(&ids)
+    .bind(&entries)
+    .bind(&prizes)
+    .bind(&tiers)
+    .bind(record_id)
+    .bind(user)
+    .bind(now)
+    .bind(body.cost)
+    .bind(vec![batch; 6])
+    .bind(batch.then_some(now))
+    .execute(&mut *tx)
+    .await?;
+    let notified = if batch {
+        notify_winners(&mut tx, user, &cards).await?
+    } else {
+        false
+    };
     tx.commit().await?;
+    if notified {
+        crate::read_cache::invalidate_unread_count(pool, user);
+    }
     wallet::project_session_balance(POLICY.game, user, after);
     if membership_granted {
         crate::entitlement::invalidate_tier(pool, user);
@@ -290,6 +348,7 @@ async fn reveal_inner(
     let mut after = balance.unwrap_or(0);
     let mut paid = 0;
     let mut membership_granted = false;
+    let mut notified = false;
     if all {
         let (amount, tier) = if balance.is_some() {
             prize(&card.entry, card.cost)?
@@ -322,6 +381,9 @@ async fn reveal_inner(
         card.prize = Some(paid);
         card.tier = Some(tier);
         card.settled_at = Some(Utc::now());
+        if balance.is_some() {
+            notified = notify_winner(&mut tx, user, &card).await?;
+        }
     }
     card.revealed = Some(shown);
     sqlx::query(
@@ -336,6 +398,9 @@ async fn reveal_inner(
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
+    if notified {
+        crate::read_cache::invalidate_unread_count(pool, user);
+    }
     if balance.is_some() {
         wallet::project_session_balance(POLICY.game, user, after);
     }
@@ -379,6 +444,112 @@ async fn grant_reward(
         }
         None => Ok(false),
     }
+}
+
+/// Include both number-match winnings and the service reward actually granted.
+/// This runs only after the caller has credited the card in the same transaction.
+async fn notify_winner(
+    conn: &mut PgConnection,
+    user: Uuid,
+    card: &TicketRow,
+) -> Result<bool, Error> {
+    notify_winners(conn, user, std::slice::from_ref(card)).await
+}
+
+/// Aggregate a settled batch into one durable notice, including exact grants.
+/// Replay exits before this function, and the purchase key deduplicates it.
+async fn notify_winners(
+    conn: &mut PgConnection,
+    user: Uuid,
+    cards: &[TicketRow],
+) -> Result<bool, Error> {
+    let Some(first) = cards.first() else {
+        return Ok(false);
+    };
+    let mut prize = 0i64;
+    let mut bonus = 0i64;
+    let mut winning_tickets = 0usize;
+    let mut grants = Vec::new();
+    for card in cards {
+        let amount = card.prize.unwrap_or(0);
+        prize = prize.checked_add(amount).ok_or(Error::InvalidEntry)?;
+        let reward: Option<scratch::Reward> = serde_json::from_value(card.entry["reward"].clone())
+            .map_err(|_| Error::InvalidEntry)?;
+        if amount > 0 || reward.is_some() {
+            winning_tickets += 1;
+        }
+        match reward {
+            Some(scratch::Reward::Beans { amount }) => {
+                bonus = bonus.checked_add(amount).ok_or(Error::InvalidEntry)?;
+            }
+            Some(scratch::Reward::Membership { .. }) => {
+                let grant: crate::game_rewards::Grant =
+                    serde_json::from_value(card.entry["reward_grant"].clone())
+                        .map_err(|_| Error::InvalidEntry)?;
+                grants.push(grant);
+            }
+            None => {}
+        }
+    }
+    if winning_tickets == 0 {
+        return Ok(false);
+    }
+    let membership = if grants.is_empty() {
+        Value::Null
+    } else {
+        json!({
+            "tier": "max", "days": 30, "grants": grants.len(),
+            "entitlement_id": grants.last().map(|grant| grant.entitlement_id),
+            "starts_at_ms": grants.first().map(|grant| grant.starts_at_ms),
+            "ends_at_ms": grants.last().map(|grant| grant.ends_at_ms),
+        })
+    };
+    let credited = prize.checked_add(bonus).ok_or(Error::InvalidEntry)?;
+    let zh_title = "刮刮乐中奖奖励已到账";
+    let en_title = "Scratch-card winnings credited";
+    let mut zh_body = format!(
+        "本次 {} 张刮刮乐中有 {winning_tickets} 张中奖。中奖派彩 {prize} 金豆、额外奖励 {bonus} 金豆，共 {credited} 金豆已自动到账，无需领取。",
+        cards.len(),
+    );
+    let mut en_body = format!(
+        "{winning_tickets} of {} scratch cards won. Your {prize} gold-bean prize and {bonus} bonus beans ({credited} total) were credited automatically. No claim needed.",
+        cards.len(),
+    );
+    if !grants.is_empty() {
+        let days = grants.len() * 30;
+        zh_body.push_str(&format!(
+            "Max 会员共 {days} 天已自动增加到会员期限，无需领取。"
+        ));
+        en_body.push_str(&format!(" {days} days of Max membership were added to your membership term automatically. No claim needed."));
+    }
+    let key = if cards.len() == 1 {
+        // Single reveals retain the existing ticket-based identity.
+        format!("lottery-win:{}", super::scratch_credit_id(first.id))
+    } else {
+        format!("lottery-win:scratch-batch:{}", first.purchase_id)
+    };
+    sqlx::query(
+        "INSERT INTO notifications (id,user_id,type,title,body,payload,dedupe_key) \
+         VALUES ($1,$2,'rank',$3,$4,$5,$6) \
+         ON CONFLICT (user_id,dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING",
+    )
+    .bind(super::record_id(&key))
+    .bind(user)
+    .bind(zh_title)
+    .bind(&zh_body)
+    .bind(json!({
+        "lottery": {
+            "game": "scratch", "period": 0, "ticket_id": first.id,
+            "purchase_id": first.purchase_id,
+            "prize": prize, "bonus_beans": bonus, "credited_beans": credited,
+            "ticket_count": cards.len(), "winning_tickets": winning_tickets, "membership": membership,
+        },
+        "i18n": {"zh": {"title": zh_title, "body": zh_body}, "en": {"title": en_title, "body": en_body}},
+    }))
+    .bind(key)
+    .execute(conn)
+    .await?;
+    Ok(true)
 }
 
 fn emit_paid(user: Uuid, paid: i64) {

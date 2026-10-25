@@ -271,9 +271,15 @@ pub(crate) async fn credit_tournament_on(
     user: Uuid,
     edition: Uuid,
     reward: Uuid,
+    reward_kind: &str,
     amount: i64,
 ) -> sqlx::Result<i64> {
-    if !(1..=1_000_000).contains(&amount) {
+    if !(1..=1_000_000).contains(&amount)
+        || !matches!(
+            reward_kind,
+            "champion" | "runner_up" | "third" | "participation"
+        )
+    {
         return Err(sqlx::Error::Protocol(
             "invalid tournament bean award".into(),
         ));
@@ -293,7 +299,7 @@ pub(crate) async fn credit_tournament_on(
         .await?;
     sqlx::query("INSERT INTO wallet_ledger(user_id,game,kind,delta,balance_after,details) VALUES($1,$2,'bonus',$3,$4,$5)")
         .bind(user).bind(GAME).bind(amount).bind(after)
-        .bind(serde_json::json!({"reason":"tournament_participation","edition_id":edition,"tournament_reward_id":reward}))
+        .bind(serde_json::json!({"reason":format!("tournament_{reward_kind}"),"reward_kind":reward_kind,"edition_id":edition,"tournament_reward_id":reward}))
         .execute(&mut *conn).await?;
     Ok(after)
 }

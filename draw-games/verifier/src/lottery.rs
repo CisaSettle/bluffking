@@ -9,6 +9,8 @@ use serde_json::{json, Value};
 
 pub const MAX_STAKES: i64 = 100;
 pub const MAX_MULTIPLIER: i64 = 10;
+/// Current ALL-IN compresses repeated basic stakes into bounded smallint rows.
+pub const MAX_ALL_IN_MULTIPLIER: i64 = i16::MAX as i64;
 pub const MAX_TICKETS_PER_PURCHASE: usize = 10;
 pub const MAX_TICKETS_PER_PERIOD: i64 = 50;
 pub const MAX_STAKES_PER_PERIOD: i64 = 1_000;
@@ -258,6 +260,9 @@ impl Entry {
         bonus: Option<i16>,
         bonus_numbers: &[i16],
     ) -> Option<(i64, i16)> {
+        if !(1..=MAX_ALL_IN_MULTIPLIER).contains(&multiplier) {
+            return None;
+        }
         let (per_multiplier, tier) = match self {
             Entry::Ssq { red, blue } => {
                 if numbers.len() != 6 {
@@ -299,7 +304,6 @@ impl Entry {
                 if bonus.is_some()
                     || !valid_distinct_draw(numbers, 5, DLT_FRONT_MAX)
                     || !valid_distinct_draw(bonus_numbers, 2, DLT_BACK_MAX)
-                    || !(1..=MAX_MULTIPLIER).contains(&multiplier)
                 {
                     return None;
                 }
@@ -550,7 +554,16 @@ impl Game {
     pub fn unit(self) -> i64 {
         100
     }
+    /// All current number lotteries share the minute boundary.
     pub fn schedule(self) -> Option<Schedule> {
+        (self != Game::Scratch).then_some(Schedule {
+            interval_ms: 60_000,
+            offset_ms: 0,
+        })
+    }
+
+    /// Only persisted v1 draws/receipts and historical labels use this schedule.
+    pub fn legacy_schedule(self) -> Option<Schedule> {
         Some(match self {
             Game::Ssq => Schedule {
                 interval_ms: 300_000,
@@ -639,7 +652,8 @@ pub fn sgt() -> FixedOffset {
     FixedOffset::east_opt(SGT_OFFSET_SECS).expect("Singapore UTC offset is valid")
 }
 
-pub const PROTOCOL: &str = "bluffking-lottery-drand-v1";
+pub const PROTOCOL: &str = "bluffking-lottery-drand-v2-minute";
+pub const LEGACY_PROTOCOL: &str = "bluffking-lottery-drand-v1";
 
 /// All choice points are derived from the game and wall-clock period. The
 /// commitment binds the protocol version, sales deadline and exact future pulse.
@@ -658,7 +672,20 @@ pub struct Plan {
 
 impl Plan {
     pub fn new(game: Game, period: i64) -> Result<Self, String> {
-        let schedule = game.schedule().ok_or("not a scheduled lottery")?;
+        Self::with_protocol(game, period, PROTOCOL)
+    }
+
+    fn schedule_for(game: Game, protocol: &str) -> Result<Schedule, String> {
+        match protocol {
+            PROTOCOL => game.schedule(),
+            LEGACY_PROTOCOL => game.legacy_schedule(),
+            _ => return Err("unsupported lottery protocol".into()),
+        }
+        .ok_or_else(|| "not a scheduled lottery".into())
+    }
+
+    fn with_protocol(game: Game, period: i64, protocol: &str) -> Result<Self, String> {
+        let schedule = Self::schedule_for(game, protocol)?;
         let draw_at_ms = period
             .checked_add(1)
             .and_then(|n| n.checked_mul(schedule.interval_ms))
@@ -667,7 +694,7 @@ impl Plan {
         let closes_at_ms = draw_at_ms.checked_sub(CLOSE_MS).ok_or("period overflow")?;
         let beacon_round = crate::beacon::round_at_or_after(draw_at_ms)?;
         let commitment = hex::encode(sha256_fields(&[
-            PROTOCOL.as_bytes(),
+            protocol.as_bytes(),
             game.as_str().as_bytes(),
             &period.to_be_bytes(),
             &draw_at_ms.to_be_bytes(),
@@ -676,7 +703,7 @@ impl Plan {
             &beacon_round.to_be_bytes(),
         ]));
         Ok(Self {
-            protocol: PROTOCOL.into(),
+            protocol: protocol.into(),
             game: game.as_str().into(),
             period,
             draw_at_ms,
@@ -689,10 +716,23 @@ impl Plan {
 
     pub fn validate(&self) -> Result<Game, String> {
         let game = Game::parse(&self.game).ok_or("unknown lottery game")?;
-        if *self != Self::new(game, self.period)? {
+        if *self != Self::with_protocol(game, self.period, &self.protocol)? {
             return Err("plan does not match the fixed public schedule and protocol".into());
         }
         Ok(game)
+    }
+
+    /// Use the accepted plan's own schedule for saved ticket windows and labels.
+    pub fn sales_opens_at_ms(&self) -> Result<i64, String> {
+        let game = self.validate()?;
+        self.draw_at_ms
+            .checked_sub(Self::schedule_for(game, &self.protocol)?.interval_ms)
+            .ok_or_else(|| "sales window overflow".into())
+    }
+
+    pub fn label(&self) -> Result<String, String> {
+        let game = self.validate()?;
+        Ok(Self::schedule_for(game, &self.protocol)?.label(self.draw_at_ms))
     }
 }
 
@@ -810,11 +850,7 @@ pub fn verify(value: &Value) -> Result<Value, String> {
         let bought_at_ms = ticket["bought_at_ms"]
             .as_i64()
             .ok_or("missing ticket purchase time")?;
-        let opens_at_ms = plan.draw_at_ms
-            - game
-                .schedule()
-                .ok_or("not a scheduled lottery")?
-                .interval_ms;
+        let opens_at_ms = plan.sales_opens_at_ms()?;
         if !(opens_at_ms..plan.closes_at_ms).contains(&bought_at_ms) {
             return Err("ticket purchase time is outside the published sales window".into());
         }
@@ -822,9 +858,14 @@ pub fn verify(value: &Value) -> Result<Value, String> {
         if entry.to_value() != ticket["entry"] {
             return Err("ticket entry is not normalized".into());
         }
+        let max_multiplier = if plan.protocol == LEGACY_PROTOCOL {
+            MAX_MULTIPLIER
+        } else {
+            MAX_ALL_IN_MULTIPLIER
+        };
         let multiplier = ticket["multiplier"]
             .as_i64()
-            .filter(|m| (1..=MAX_MULTIPLIER).contains(m))
+            .filter(|m| (1..=max_multiplier).contains(m))
             .ok_or("invalid ticket multiplier")?;
         let cost = entry
             .stakes()

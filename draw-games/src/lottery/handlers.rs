@@ -151,14 +151,35 @@ pub async fn draws(
         json!({"draws":store::draws(&state.pool, game(&name)?, crate::pagination::limit(q.limit).min(100), crate::pagination::offset(q.offset)).await?}),
     ))
 }
+#[derive(Deserialize)]
+pub struct TicketListing {
+    limit: Option<i64>,
+    offset: Option<i64>,
+    #[serde(default)]
+    status: store::TicketFilter,
+}
 pub async fn tickets(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(name): Path<String>,
-    Query(q): Query<Listing>,
+    Query(q): Query<TicketListing>,
 ) -> Result<Json<Value>, Error> {
+    let limit = crate::pagination::limit(q.limit).min(100);
+    let offset = crate::pagination::offset(q.offset);
+    let mut tickets = store::tickets(
+        &state.pool,
+        auth.user_id,
+        game(&name)?,
+        limit + 1,
+        offset,
+        q.status,
+    )
+    .await?;
+    let has_more = tickets.len() > limit as usize;
+    tickets.truncate(limit as usize);
+    let next_offset = has_more.then_some(offset + tickets.len() as i64);
     Ok(Json(
-        json!({"tickets":store::tickets(&state.pool, auth.user_id, game(&name)?, crate::pagination::limit(q.limit).min(100), crate::pagination::offset(q.offset)).await?}),
+        json!({ "tickets": tickets, "has_more": has_more, "next_offset": next_offset }),
     ))
 }
 

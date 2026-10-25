@@ -216,6 +216,7 @@ async fn settle_one(pool: &PgPool) -> Result<bool, Error> {
                 .await?;
         sqlx::query("INSERT INTO lottery_winners (id,game,period,user_id,name,tier,prize) VALUES ($1,$2,$3,$4,$5,$6,$7)")
             .bind(record_id).bind(game.as_str()).bind(period).bind(user).bind(store::public_name(user,display)).bind(best).bind(paid).execute(&mut *tx).await?;
+        notify_winner(&mut tx, user, game, period, paid, &tickets).await?;
     }
     sqlx::query(
         "UPDATE lottery_periods SET paid=paid+$3,winners=winners+$4 WHERE game=$1 AND period=$2",
@@ -227,6 +228,9 @@ async fn settle_one(pool: &PgPool) -> Result<bool, Error> {
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
+    if paid > 0 {
+        crate::read_cache::invalidate_unread_count(pool, user);
+    }
     if membership_granted {
         crate::entitlement::invalidate_tier(pool, user);
     }
@@ -239,6 +243,84 @@ async fn settle_one(pool: &PgPool) -> Result<bool, Error> {
         });
     }
     Ok(true)
+}
+
+/// A winner's inbox receipt commits atomically with the credited prizes. The
+/// deterministic identity and unique per-user key also make replay harmless.
+async fn notify_winner(
+    conn: &mut sqlx::PgConnection,
+    user: Uuid,
+    game: Game,
+    period: i64,
+    paid: i64,
+    tickets: &[TicketRow],
+) -> sqlx::Result<()> {
+    let (zh_game, en_game) = match game {
+        Game::Ssq => ("双色球", "Double Color Ball"),
+        Game::Dlt => ("超级大乐透", "Super Lotto"),
+        Game::Toto => ("TOTO", "TOTO"),
+        Game::Happy8 => ("快乐8", "Happy 8"),
+        Game::Fucai3d => ("福彩3D", "Welfare 3D"),
+        Game::Scratch => return Ok(()),
+    };
+    let mut grant_count = 0i64;
+    let mut starts_at: Option<i64> = None;
+    let mut ends_at: Option<i64> = None;
+    for ticket in tickets {
+        let grant = &ticket.entry["reward_grant"];
+        if let (Some(start), Some(end)) =
+            (grant["starts_at_ms"].as_i64(), grant["ends_at_ms"].as_i64())
+        {
+            grant_count += 1;
+            starts_at = Some(starts_at.map_or(start, |previous| previous.min(start)));
+            ends_at = Some(ends_at.map_or(end, |previous| previous.max(end)));
+        }
+    }
+    let days = grant_count * 30;
+    let membership = if grant_count == 0 {
+        serde_json::Value::Null
+    } else {
+        json!({
+            "tier": "max", "days": days, "grants": grant_count,
+            "starts_at_ms": starts_at, "ends_at_ms": ends_at,
+        })
+    };
+    let zh_title = format!("{zh_game}中奖奖励已到账");
+    let en_title = format!("{en_game} winnings credited");
+    let mut zh_body = format!("本期中奖 {paid} 金豆已自动到账，无需领取。");
+    let mut en_body = format!(
+        "Your {paid} gold beans from this draw were credited automatically. No claim needed."
+    );
+    if days > 0 {
+        zh_body.push_str(&format!("另获 Max 会员 {days} 天，已自动增加到会员期限。"));
+        en_body.push_str(&format!(
+            " An additional {days} days of Max membership were added to your membership term."
+        ));
+    }
+    let key = format!("lottery-win:{}", super::draw_credit_id(game, period, user));
+    sqlx::query(
+        "INSERT INTO notifications (id,user_id,type,title,body,payload,dedupe_key) \
+         VALUES ($1,$2,'rank',$3,$4,$5,$6) \
+         ON CONFLICT (user_id,dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING",
+    )
+    .bind(super::record_id(&key))
+    .bind(user)
+    .bind(&zh_title)
+    .bind(&zh_body)
+    .bind(json!({
+        "lottery": {
+            "game": game.as_str(), "period": period, "prize": paid, "bonus_beans": 0,
+            "credited_beans": paid,
+            "ticket_count": tickets.len(),
+            "winning_tickets": tickets.iter().filter(|t| t.prize.unwrap_or(0) > 0).count(),
+            "membership": membership,
+        },
+        "i18n": {"zh": {"title": zh_title, "body": zh_body}, "en": {"title": en_title, "body": en_body}},
+    }))
+    .bind(key)
+    .execute(conn)
+    .await?;
+    Ok(())
 }
 
 async fn retention(pool: &PgPool) -> Result<(), Error> {
