@@ -28,11 +28,54 @@ fn match_receipt(proof: &Value, receipt: &Value) -> Result<(), String> {
             return Err("Draw differs from saved pre-purchase plan".into());
         }
         if let Some(ticket) = proof.get("ticket") {
-            if ticket["multiplier"] != terms["multiplier"]
-                || !terms["tickets"]
-                    .as_array()
-                    .ok_or("Missing saved selections")?
-                    .contains(&ticket["entry"])
+            let selections = terms["tickets"]
+                .as_array()
+                .ok_or("Missing saved selections")?;
+            if terms["all_in"].as_bool() == Some(true) {
+                if proof["plan"]["protocol"] != draw_games::lottery::PROTOCOL
+                    || terms["multiplier"].as_i64() != Some(1)
+                {
+                    return Err("Invalid ALL-IN receipt mode or protocol".into());
+                }
+                let game = draw_games::lottery::Game::parse(
+                    proof["plan"]["game"]
+                        .as_str()
+                        .ok_or("Missing lottery game")?,
+                )
+                .ok_or("Unknown lottery game")?;
+                let balance = terms["expected_balance"]
+                    .as_i64()
+                    .filter(|balance| *balance >= game.unit())
+                    .ok_or("Missing or invalid ALL-IN balance")?;
+                let copies = balance / game.unit();
+                let groups = selections.len() as i64;
+                if groups != copies.min(draw_games::lottery::MAX_TICKETS_PER_PURCHASE as i64)
+                    || groups == 0
+                {
+                    return Err("Invalid ALL-IN selection count".into());
+                }
+                for selection in selections {
+                    let entry = draw_games::lottery::Entry::parse(game, selection)
+                        .map_err(|_| "Invalid saved ALL-IN entry")?;
+                    if entry.stakes() != 1 || entry.to_value() != *selection {
+                        return Err("ALL-IN requires normalized basic selections".into());
+                    }
+                }
+                let base = copies / groups;
+                let remainder = copies % groups;
+                if base + i64::from(remainder > 0) > draw_games::lottery::MAX_ALL_IN_MULTIPLIER {
+                    return Err("ALL-IN receipt exceeds ticket capacity".into());
+                }
+                let matches = selections.iter().enumerate().any(|(index, selection)| {
+                    *selection == ticket["entry"]
+                        && ticket["multiplier"].as_i64()
+                            == Some(base + i64::from((index as i64) < remainder))
+                });
+                if !matches {
+                    return Err("Ticket differs from saved ALL-IN selections or copies".into());
+                }
+            } else if ticket["multiplier"] != terms["multiplier"]
+                || !selections.contains(&ticket["entry"])
             {
                 return Err("Ticket differs from saved selections or multiplier".into());
             }
@@ -48,8 +91,25 @@ fn match_receipt(proof: &Value, receipt: &Value) -> Result<(), String> {
         if kind != "sicbo-room" && receipt["client_seed"] != reveal.client_seed {
             return Err("Client seed differs from saved challenge".into());
         }
-        if kind == "scratch" && terms["reward_version"] != proof["reward_version"] {
-            return Err("Service reward version differs from saved purchase terms".into());
+        if kind == "scratch" {
+            if terms["reward_version"] != proof["reward_version"] {
+                return Err("Service reward version differs from saved purchase terms".into());
+            }
+            if terms["all_in"].as_bool() == Some(true) {
+                let balance = terms["expected_balance"]
+                    .as_i64()
+                    .filter(|balance| *balance >= 100)
+                    .ok_or("Missing or invalid scratch ALL-IN balance")?;
+                let count = terms["count"].as_u64().ok_or("Missing scratch count")?;
+                if terms["cost"].as_i64() != Some(100)
+                    || count != (balance / 100) as u64
+                    || !(1..=draw_games::scratch::MAX_BATCH_CARDS as u64).contains(&count)
+                {
+                    return Err("Scratch ALL-IN count differs from saved balance".into());
+                }
+            } else if ![1, 5, 10].contains(&terms["count"].as_u64().unwrap_or(0)) {
+                return Err("Invalid ordinary scratch count".into());
+            }
         }
         let fields: &[&str] = if kind == "scratch" {
             &["cost", "count"]

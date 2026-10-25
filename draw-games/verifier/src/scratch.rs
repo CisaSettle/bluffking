@@ -9,6 +9,8 @@ use crate::proof::Reveal;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+pub const MAX_BATCH_CARDS: usize = 1_000;
+
 pub const PRIZES: [i64; 6] = [1, 1, 2, 2, 5, 10];
 
 /// Version-one service prizes are additive to the unchanged number-match payout.
@@ -21,7 +23,8 @@ pub enum Reward {
 
 /// Reproducible reward suffix after the current purchase's number draws.
 pub fn rewards(reveal: &Reveal, cost: i64, count: usize) -> Result<Vec<Option<Reward>>, String> {
-    if reveal.commitment.game != "scratch" || cost != 100 || ![1, 5, 10].contains(&count) {
+    if reveal.commitment.game != "scratch" || cost != 100 || !(1..=MAX_BATCH_CARDS).contains(&count)
+    {
         return Err("invalid service reward purchase".into());
     }
     let mut entropy = reveal.entropy()?;
@@ -74,7 +77,7 @@ pub fn generate(reveal: &Reveal, cost: i64, count: usize) -> Result<Vec<Card>, S
     if reveal.commitment.game != "scratch" {
         return Err("scratch proof has a different game".into());
     }
-    if cost != 100 || ![1, 5, 10].contains(&count) {
+    if cost != 100 || !(1..=MAX_BATCH_CARDS).contains(&count) {
         return Err("invalid scratch purchase".into());
     }
     let mut entropy = reveal.entropy()?;
