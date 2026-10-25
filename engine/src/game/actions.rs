@@ -48,6 +48,8 @@ impl GameHand {
             forced_straddle: self.forced_straddle,
             bomb_pot: self.bomb_pot,
             ante: self.ante,
+            big_blind_ante: self.big_blind_ante,
+            posted_big_blind_ante: self.posted_big_blind_ante,
             preflop_bring_in: self.preflop_bring_in,
             mode: self.mode,
             deck: self.deck.clone(),
