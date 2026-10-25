@@ -70,6 +70,8 @@ impl GameHand {
             forced_straddle: None,
             bomb_pot: None,
             ante: Chips::ZERO,
+            big_blind_ante: Chips::ZERO,
+            posted_big_blind_ante: None,
             preflop_bring_in: big_blind,
             mode: HandMode::Plaintext,
             deck,
@@ -138,6 +140,8 @@ impl GameHand {
             forced_straddle: None,
             bomb_pot: None,
             ante: Chips::ZERO,
+            big_blind_ante: Chips::ZERO,
+            posted_big_blind_ante: None,
             preflop_bring_in: big_blind,
             mode: HandMode::Blind,
             // Empty deck: blind mode never deals from it. Any accidental
@@ -185,6 +189,19 @@ impl GameHand {
         self
     }
 
+    /// Big-blind ante: reserve the live big blind first, then post up to
+    /// `amount` as dead money contested by every non-folded player. Mutually
+    /// exclusive with individual antes and bomb pots.
+    pub fn with_big_blind_ante(mut self, amount: Chips) -> Self {
+        self.big_blind_ante = amount;
+        self
+    }
+
+    pub fn posted_big_blind_ante(&self) -> Chips {
+        self.posted_big_blind_ante
+            .map_or(Chips::ZERO, |(_, amount)| amount)
+    }
+
     /// Tournament dead-button rule: post no small blind this hand. With three
     /// or more players the big blind is the seat left of `dealer_idx`, preflop
     /// action opens left of the big blind and postflop action still starts
@@ -214,6 +231,10 @@ impl GameHand {
         let n = self.seats.len();
         if n < 2 {
             return Err(ActionError::NotInHand);
+        }
+
+        if self.big_blind_ante.0 > 0 && (self.ante.0 > 0 || self.bomb_pot.is_some()) {
+            return Err(ActionError::InvalidAction);
         }
 
         // Post antes first: dead money that goes straight into the completed
@@ -246,6 +267,28 @@ impl GameHand {
 
         // Determine blind positions.
         let (sb_idx, bb_idx) = self.forced_blind_positions(n);
+        // Reserve the live blind before taking the BBA. The ante never raises
+        // the preflop call amount or a player's side-pot contribution cap.
+        if self.big_blind_ante.0 > 0 {
+            let seat = &mut self.seats[bb_idx];
+            let posted = seat
+                .stack
+                .0
+                .saturating_sub(self.big_blind.0)
+                .min(self.big_blind_ante.0);
+            if posted > 0 {
+                seat.stack.0 -= posted;
+                ante_total += posted;
+                self.posted_big_blind_ante = Some((seat.player_id, Chips(posted)));
+                self.completed_pot.0 += posted;
+                self.cumulative_side_pots.push(SidePot {
+                    cap: Chips::ZERO,
+                    amount: Chips(posted),
+                    eligible: self.seats.iter().map(|s| s.player_id).collect(),
+                    refund_to: Vec::new(),
+                });
+            }
+        }
         let sb_id = sb_idx.map(|idx| self.seats[idx].player_id);
         let bb_id = self.seats[bb_idx].player_id;
         let straddle_idx = self

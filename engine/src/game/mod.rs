@@ -397,6 +397,9 @@ pub struct GameHand {
     bomb_pot: Option<Chips>,
     /// Per-seat ante posted as dead money before the blinds (zero = none).
     ante: Chips,
+    /// Tournament dead money paid by the big blind, after reserving its live blind.
+    big_blind_ante: Chips,
+    posted_big_blind_ante: Option<(PlayerId, Chips)>,
     /// The preflop opening wager / minimum raise increment ACTUALLY handed to
     /// [`BettingRound::new_preflop`] when the hand started: the big blind
     /// normally, the straddle when a live straddle was fully funded (a SHORT

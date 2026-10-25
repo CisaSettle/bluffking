@@ -660,32 +660,28 @@ impl GameHand {
     /// pot boundaries arise when total contributions (normally all-in caps)
     /// change the set of players entitled to a layer.
     pub(super) fn hand_side_pots(&self) -> Vec<SidePot> {
+        let contribution = |seat: &HandSeat| {
+            let total = seat
+                .starting_stack
+                .0
+                .checked_sub(seat.stack.0)
+                .expect("in-hand stack cannot exceed its starting stack");
+            let ante = self
+                .posted_big_blind_ante
+                .filter(|(payer, _)| *payer == seat.player_id)
+                .map_or(0, |(_, amount)| amount.0);
+            total.saturating_sub(ante)
+        };
         let all: Vec<(PlayerId, u32)> = self
             .seats
             .iter()
-            .map(|seat| {
-                (
-                    seat.player_id,
-                    seat.starting_stack
-                        .0
-                        .checked_sub(seat.stack.0)
-                        .expect("in-hand stack cannot exceed its starting stack"),
-                )
-            })
+            .map(|seat| (seat.player_id, contribution(seat)))
             .collect();
         let eligible: Vec<(PlayerId, u32)> = self
             .seats
             .iter()
             .filter(|seat| !seat.folded)
-            .map(|seat| {
-                (
-                    seat.player_id,
-                    seat.starting_stack
-                        .0
-                        .checked_sub(seat.stack.0)
-                        .expect("in-hand stack cannot exceed its starting stack"),
-                )
-            })
+            .map(|seat| (seat.player_id, contribution(seat)))
             .collect();
         if eligible.is_empty() {
             return Vec::new();
@@ -696,6 +692,16 @@ impl GameHand {
         levels.dedup();
         let mut previous = 0u32;
         let mut pots: Vec<SidePot> = Vec::new();
+        if let Some((_, amount)) = self.posted_big_blind_ante {
+            // A table ante is shared dead money, even when another contender
+            // is all-in for less than one big blind. Never refund it to its payer.
+            pots.push(SidePot {
+                cap: Chips::ZERO,
+                amount,
+                eligible: eligible.iter().map(|(player, _)| *player).collect(),
+                refund_to: Vec::new(),
+            });
+        }
 
         for level in levels.into_iter().filter(|level| *level > 0) {
             let slice = level - previous;
