@@ -134,12 +134,12 @@ pub async fn buy(pool: &PgPool, user: Uuid, body: &ScratchBuy) -> Result<Purchas
         committed?;
         return Ok(p);
     }
-    store::require_spendable(pool, &mut tx, user).await?;
+    let available = crate::beans::available_on(pool, &mut tx, user, before, None).await?;
     if body.all_in {
-        if body.expected_balance != Some(before) {
+        if body.expected_balance != Some(available) {
             return Err(Error::RequestConflict);
         }
-        if before / body.cost != body.count as i64 {
+        if available / body.cost != body.count as i64 {
             return Err(Error::InvalidEntry);
         }
     }
@@ -154,7 +154,7 @@ pub async fn buy(pool: &PgPool, user: Uuid, body: &ScratchBuy) -> Result<Purchas
         .cost
         .checked_mul(body.count as i64)
         .ok_or(Error::InvalidEntry)?;
-    if charged > before {
+    if charged > available {
         return Err(Error::InsufficientBalance);
     }
     // Consume the previously published commitment in this same transaction.

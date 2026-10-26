@@ -149,6 +149,7 @@ pub(super) fn install<R: DealerRoom>(
             memberships,
         });
         let room = Room {
+            pool: pool.clone(),
             registry_generation: Some(crate::room_registry::publish_committed(
                 pool,
                 R::DEALER,

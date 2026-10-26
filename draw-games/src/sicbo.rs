@@ -160,18 +160,12 @@ pub async fn play(pool: &PgPool, user: Uuid, bet: &Bet) -> Result<BetResult, Err
         }
         return Ok(result);
     }
-    if crate::sicbo_room::seated(&mut tx, user).await? {
-        return Err(Error::InRoom);
-    }
-    if !crate::beans::spendable(pool, &mut tx, user).await? {
-        return Err(Error::BeansInUse);
-    }
     // A room settlement uses its round id as the receipt key; a solo roll may
     // not take the id of a round still open in any room (fails closed).
     if round_in_play {
         return Err(Error::Conflict);
     }
-    if bet.stake > balance {
+    if bet.stake > crate::beans::available_on(pool, &mut tx, user, balance, None).await? {
         return Err(Error::Balance);
     }
     let challenge = &bet.fairness;
@@ -331,12 +325,6 @@ pub async fn open_session(pool: &PgPool, user: Uuid, session: Uuid) -> Result<i6
     let balance = wallet::lock(&mut tx, POLICY.game, user)
         .await?
         .ok_or(sqlx::Error::RowNotFound)?;
-    if crate::sicbo_room::seated(&mut tx, user).await? {
-        return Err(Error::InRoom);
-    }
-    if !crate::beans::spendable(pool, &mut tx, user).await? {
-        return Err(Error::BeansInUse);
-    }
     tx.commit().await?;
     Ok(balance)
 }

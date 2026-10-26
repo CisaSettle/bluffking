@@ -20,7 +20,6 @@ pub enum Error {
     InsufficientBalance,
     RequestConflict,
     DailyAlreadyClaimed,
-    BeansInUse,
     TicketNotFound,
     AlreadySettled,
     FairnessRequired,
@@ -41,7 +40,6 @@ impl IntoResponse for Error {
             Self::InsufficientBalance => (StatusCode::CONFLICT, "insufficient_balance"),
             Self::RequestConflict => (StatusCode::CONFLICT, "request_conflict"),
             Self::DailyAlreadyClaimed => (StatusCode::CONFLICT, "daily_already_claimed"),
-            Self::BeansInUse => (StatusCode::CONFLICT, "beans_in_use"),
             Self::TicketNotFound => (StatusCode::NOT_FOUND, "ticket_not_found"),
             Self::AlreadySettled => (StatusCode::CONFLICT, "already_settled"),
             Self::FairnessRequired => (StatusCode::CONFLICT, "fairness_required"),
@@ -95,10 +93,12 @@ pub async fn buy(
         // delay its receipt or turn their failure into a failed purchase.
         // A replay's balance_after is historical; read the current wallet once.
         let balance = store::ensure_wallet(&state.pool, auth.user_id).await?;
+        let available_balance =
+            crate::beans_read_memory::available(&state.pool, auth.user_id, balance, false, None)?;
         return Ok(Json(json!({
             "purchased": purchase.purchased, "charged": purchase.charged,
             "balance_before": purchase.balance_before, "balance_after": purchase.balance_after,
-            "balance": balance,
+            "balance": balance, "available_balance": available_balance,
         })));
     }
     let view = store::view(&state.pool, auth.user_id, game).await?;

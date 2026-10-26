@@ -104,9 +104,63 @@ pub async fn spendable(pool: &PgPool, conn: &mut PgConnection, user: Uuid) -> sq
         && !crate::local_runtime::beans_held(user).map_err(sqlx::Error::Io)?)
 }
 
+/// One affordability rule for every SQL bean debit. The old overlapping-owner
+/// mode keeps its exclusive-wallet guard; numeric reservations require the
+/// current single-owner runtime and its checkpoint authority.
+pub async fn available_on(
+    pool: &PgPool,
+    conn: &mut PgConnection,
+    user: Uuid,
+    balance: i64,
+    excluding_sicbo: Option<&str>,
+) -> sqlx::Result<i64> {
+    if !crate::realtime_mode::enabled() {
+        if excluding_sicbo.is_some() {
+            let poker_seated: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM session_users su JOIN game_sessions gs ON gs.id=su.session_id JOIN public_tables pt ON pt.session_id=gs.id WHERE su.user_id=$1 AND su.left_at IS NULL AND gs.ended_at IS NULL AND pt.beans)",
+            ).bind(user).fetch_one(&mut *conn).await?;
+            return Ok(
+                if poker_seated
+                    || holds::outstanding(user)
+                    || crate::local_runtime::beans_held(user).map_err(sqlx::Error::Io)?
+                {
+                    0
+                } else {
+                    balance
+                },
+            );
+        }
+        return Ok(if spendable(pool, conn, user).await? {
+            balance
+        } else {
+            0
+        });
+    }
+    if crate::local_runtime::enabled() {
+        let code: Option<String> = sqlx::query_scalar(
+            "SELECT code FROM game_room_checkpoint_members WHERE game='sicbo' AND user_id=$1",
+        )
+        .bind(user)
+        .fetch_optional(&mut *conn)
+        .await?;
+        if code.is_some_and(|code| {
+            crate::local_runtime::owned_by_another_backend(crate::release_handoff::rooms::id(
+                "sicbo", &code,
+            ))
+        }) {
+            return Err(sqlx::Error::Protocol(
+                "beans read memory unavailable".into(),
+            ));
+        }
+    }
+    crate::beans_read_memory::available(pool, user, balance, true, excluding_sicbo)
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Profile {
     pub balance: i64,
+    pub available_balance: i64,
+    pub reserved_balance: i64,
     pub net_won: i64,
     pub hands_played: i32,
     pub hands_won: i32,
@@ -126,8 +180,12 @@ pub async fn profile(pool: &PgPool, user: Uuid) -> sqlx::Result<Profile> {
         crate::beans_read_memory::profile(pool, user)
     })
     .await?;
+    let available_balance =
+        crate::beans_read_memory::available(pool, user, w.balance, false, None)?;
     Ok(Profile {
         balance: w.balance,
+        available_balance,
+        reserved_balance: w.balance - available_balance,
         net_won: w.net_won,
         hands_played: w.hands_played,
         hands_won: w.hands_won,
@@ -449,6 +507,7 @@ pub mod holds {
     struct OpenHand {
         session: Uuid,
         users: HashSet<Uuid>,
+        amounts: HashMap<Uuid, i64>,
         /// Completed; its wallet settlement is queued.
         settling: bool,
         /// The table's unsettled counter: the session actor and every queued
@@ -469,10 +528,11 @@ pub mod holds {
     pub fn open(
         session: Uuid,
         hand: Uuid,
-        users: impl IntoIterator<Item = Uuid>,
+        amounts: impl IntoIterator<Item = (Uuid, i64)>,
         alive: &Arc<AtomicUsize>,
     ) -> std::io::Result<()> {
-        let users: HashSet<Uuid> = users.into_iter().collect();
+        let amounts: HashMap<Uuid, i64> = amounts.into_iter().collect();
+        let users: HashSet<Uuid> = amounts.keys().copied().collect();
         // Acquire every user's guard before publishing the hand. Partial
         // acquisition drops its guards on error; callers must not deal.
         let local_holds = users
@@ -489,6 +549,7 @@ pub mod holds {
             OpenHand {
                 session,
                 users,
+                amounts,
                 settling: false,
                 alive: Arc::downgrade(alive),
                 _local_holds: local_holds,
@@ -522,5 +583,18 @@ pub mod holds {
         open.retain(|_, h| h.alive.strong_count() > 0);
         open.iter()
             .any(|(hand, h)| h.users.contains(&user) && !accounted(*hand))
+    }
+
+    pub fn amounts(user: Uuid) -> HashMap<Uuid, i64> {
+        let mut open = open_hands();
+        open.retain(|_, h| h.alive.strong_count() > 0);
+        let mut amounts = HashMap::<Uuid, i64>::new();
+        for hand in open.values() {
+            if let Some(amount) = hand.amounts.get(&user) {
+                let entry = amounts.entry(hand.session).or_default();
+                *entry = (*entry).max(*amount);
+            }
+        }
+        amounts
     }
 }

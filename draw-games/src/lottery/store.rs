@@ -419,7 +419,7 @@ pub async fn buy_numbers(
         committed?;
         return Ok(stored);
     }
-    require_spendable(pool, &mut tx, user).await?;
+    let available = crate::beans::available_on(pool, &mut tx, user, balance, None).await?;
     // (D) Sales window, caps, balance.
     let now = Utc::now();
     selling = schedule.period_at(now.timestamp_millis());
@@ -453,10 +453,10 @@ pub async fn buy_numbers(
         return Err(Error::TooManyTickets);
     }
     let multipliers: Vec<i16> = if body.all_in {
-        if body.expected_balance != Some(balance) {
+        if body.expected_balance != Some(available) {
             return Err(Error::RequestConflict);
         }
-        let copies = balance / game.unit();
+        let copies = available / game.unit();
         if copies <= 0 {
             return Err(Error::InsufficientBalance);
         }
@@ -506,7 +506,7 @@ pub async fn buy_numbers(
     let charged = costs.iter().try_fold(0i64, |sum, cost| {
         sum.checked_add(*cost).ok_or(Error::InvalidEntry)
     })?;
-    if charged > balance {
+    if charged > available {
         return Err(Error::InsufficientBalance);
     }
     // This also protects the period's existing integer counter bind.
@@ -601,19 +601,6 @@ pub async fn refill(pool: &PgPool, user: Uuid, request_id: Uuid) -> Result<i64, 
         crate::beans::DailyOutcome::Granted { balance, .. } => Ok(balance),
         crate::beans::DailyOutcome::AlreadyClaimed { .. } => Err(Error::DailyAlreadyClaimed),
     }
-}
-
-/// Called after locking the shared wallet: poker admission uses this same lock.
-/// A seated stack or unfinished hand is not available for a second game's stake.
-pub(super) async fn require_spendable(
-    pool: &PgPool,
-    conn: &mut PgConnection,
-    user: Uuid,
-) -> Result<(), Error> {
-    if !crate::beans::spendable(pool, conn, user).await? {
-        return Err(Error::BeansInUse);
-    }
-    Ok(())
 }
 
 async fn tickets_of(
@@ -896,6 +883,7 @@ async fn draw_json(
 /// `GET /api/lottery/{game}`.
 pub async fn view(pool: &PgPool, user: Uuid, game: Game) -> Result<Value, Error> {
     let balance = ensure_wallet(pool, user).await?;
+    let available_balance = crate::beans_read_memory::available(pool, user, balance, false, None)?;
     schedule_presence(pool, game, user);
     let now = Utc::now();
     let now_ms = now.timestamp_millis();
@@ -907,7 +895,7 @@ pub async fn view(pool: &PgPool, user: Uuid, game: Game) -> Result<Value, Error>
         drop(conn);
         let fairness_offer = crate::draw_fairness::offer(pool, user, "scratch").await?;
         return Ok(json!({
-            "game": game.as_str(), "now_ms": now_ms, "balance": balance, "unit": game.unit(),
+            "game": game.as_str(), "now_ms": now_ms, "balance": balance, "available_balance": available_balance, "unit": game.unit(),
             "period": Value::Null,
             "my_tickets": my_tickets.iter().map(|t| ticket_json(game, t)).collect::<Vec<_>>(),
             "last_draw": Value::Null, "recent": [], "crowd": crowd,
@@ -949,7 +937,7 @@ pub async fn view(pool: &PgPool, user: Uuid, game: Game) -> Result<Value, Error>
         None => Value::Null,
     };
     Ok(json!({
-        "game": game.as_str(), "now_ms": now_ms, "balance": balance, "unit": game.unit(),
+        "game": game.as_str(), "now_ms": now_ms, "balance": balance, "available_balance": available_balance, "unit": game.unit(),
         "period": period,
         "my_tickets": my_tickets.iter().map(|t| ticket_json(game, t)).collect::<Vec<_>>(),
         "last_draw": last_draw,

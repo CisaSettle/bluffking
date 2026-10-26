@@ -245,6 +245,7 @@ impl<R: DealerRoom> Clone for Snapshot<R> {
 }
 
 struct Room<R: DealerRoom> {
+    pool: PgPool,
     registry_generation: Option<Uuid>,
     state: Arc<R::State>,
     members: BTreeMap<Uuid, Member>,
@@ -441,6 +442,13 @@ fn writer<R: DealerRoom>(
                             .await
                             .map_err(|e| e.to_string())?;
                     }
+                    if R::POLICY.game == crate::game_catalog::BEANS {
+                        crate::beans_read_memory::sicbo_committed(
+                            &pool,
+                            &code,
+                            &json!(snapshot.state.as_ref()),
+                        );
+                    }
                 }
                 Ok(next)
             }
@@ -590,30 +598,38 @@ fn accept_change<R: DealerRoom>(
     // The room and ordered writer share immutable snapshots, including retries.
     let next = Arc::new(next);
     let round = round.map(Arc::new);
-    room.writer
-        .enqueue(Some(Snapshot {
-            users: room.members.keys().copied().collect(),
-            names: room
-                .members
-                .iter()
-                .map(|(user, member)| (*user, member.name.clone()))
-                .collect(),
-            revision,
-            state: next.clone(),
-            round: round.clone(),
-            buy_in,
-            memberships: if memory_lifecycle::<R>() {
-                memory_membership::capture(
-                    R::DEALER,
-                    code,
-                    &room.members.keys().copied().collect::<Vec<_>>(),
-                )
-                .map_err(|_| Error::Unavailable)?
-            } else {
-                Vec::new()
-            },
-        }))
-        .map_err(|_| Error::Unavailable)?;
+    let snapshot = Snapshot {
+        users: room.members.keys().copied().collect(),
+        names: room
+            .members
+            .iter()
+            .map(|(user, member)| (*user, member.name.clone()))
+            .collect(),
+        revision,
+        state: next.clone(),
+        round: round.clone(),
+        buy_in,
+        memberships: if memory_lifecycle::<R>() {
+            memory_membership::capture(
+                R::DEALER,
+                code,
+                &room.members.keys().copied().collect::<Vec<_>>(),
+            )
+            .map_err(|_| Error::Unavailable)?
+        } else {
+            Vec::new()
+        },
+    };
+    let enqueue = || {
+        room.writer
+            .enqueue(Some(snapshot))
+            .map_err(|_| Error::Unavailable)
+    };
+    if R::POLICY.game == crate::game_catalog::BEANS {
+        crate::beans_read_memory::sicbo_accepted(&room.pool, code, &json!(next.as_ref()), enqueue)?;
+    } else {
+        enqueue()?;
+    }
     if let Some(round) = round {
         for (uid, delta) in R::projection_deltas(&round) {
             if let Some(w) = wallet::projected(R::POLICY.game, uid) {
@@ -1095,6 +1111,7 @@ async fn open_room_memory<R: DealerRoom>(
     let mut members = BTreeMap::new();
     members.insert(uid, Member::new(name, false));
     let room = Room {
+        pool: pool.clone(),
         registry_generation: admission.published,
         state,
         members,
@@ -1292,10 +1309,7 @@ async fn open_room_now<R: DealerRoom>(
             .map_err(|e| Commit::Refused(e.into()))?
             .ok_or(Commit::Refused(Error::Code("storage_unavailable")))?;
         if policy.game == crate::game_catalog::BEANS {
-            if !crate::beans::spendable(pool, &mut tx, uid).await.map_err(|e| Commit::Refused(e.into()))? {
-                return Err(Commit::Refused(Error::Code("beans_in_use")));
-            }
-            if wallet.balance < crate::sicbo::MIN_STAKE {
+            if crate::beans::available_on(pool, &mut tx, uid, wallet.balance, None).await.map_err(|e| Commit::Refused(e.into()))? < crate::sicbo::MIN_STAKE {
                 return Err(Commit::Refused(Error::Code("insufficient_beans")));
             }
         }
@@ -1359,6 +1373,7 @@ async fn open_room_now<R: DealerRoom>(
     let mut members = BTreeMap::new();
     members.insert(uid, Member::new(name, joining));
     let room = Room {
+        pool: pool.clone(),
         registry_generation: None,
         state: Arc::new(state),
         members,
@@ -1462,10 +1477,7 @@ async fn join_room_now<R: DealerRoom>(
             .map_err(|e| Commit::Refused(e.into()))?
             .ok_or(Commit::Refused(Error::Code("storage_unavailable")))?;
         if policy.game == crate::game_catalog::BEANS {
-            if !crate::beans::spendable(pool, &mut tx, uid).await.map_err(|e| Commit::Refused(e.into()))? {
-                return Err(Commit::Refused(Error::Code("beans_in_use")));
-            }
-            if wallet.balance < crate::sicbo::MIN_STAKE {
+            if crate::beans::available_on(pool, &mut tx, uid, wallet.balance, None).await.map_err(|e| Commit::Refused(e.into()))? < crate::sicbo::MIN_STAKE {
                 return Err(Commit::Refused(Error::Code("insufficient_beans")));
             }
         }
@@ -1583,28 +1595,12 @@ pub async fn place_bet<R: DealerRoom>(
         // The prior round is durable, and the room lock prevents a new round
         // transition. Read the locked shared wallet rather than an old display
         // projection: daily grants may arrive while a player stays seated.
+        let _beans_mutation = crate::beans_read_memory::mutation(pool, [uid]);
         let mut tx = pool.begin().await?;
         let current = wallet::lock(&mut tx, crate::game_catalog::BEANS, uid)
             .await?
             .ok_or(Error::Code("storage_unavailable"))?;
-        // A recovered legacy practice seat could coexist with a public bean
-        // table before this upgrade. Recheck that obligation under the bean
-        // wallet lock before allowing the recovered room to accept bean bets.
-        let public_seat: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM session_users su JOIN game_sessions gs ON gs.id=su.session_id
-             JOIN public_tables pt ON pt.session_id=gs.id
-             WHERE su.user_id=$1 AND su.left_at IS NULL AND gs.ended_at IS NULL AND pt.beans)",
-        )
-        .bind(uid)
-        .fetch_one(&mut *tx)
-        .await?;
-        if public_seat
-            || crate::beans::holds::outstanding(uid)
-            || crate::local_runtime::beans_held(uid)
-                .map_err(|error| Error::Db(sqlx::Error::Io(error)))?
-        {
-            return Err(Error::Code("beans_in_use"));
-        }
+        let available = crate::beans::available_on(pool, &mut tx, uid, current, Some(code)).await?;
         if !R::settled(&room.state) {
             let collision: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM wallet_ledger WHERE user_id=$1 AND game=$2 AND record_id=$3)",
@@ -1615,9 +1611,12 @@ pub async fn place_bet<R: DealerRoom>(
             }
         }
         wallet::project_session_balance(crate::game_catalog::BEANS, uid, current);
+        if R::bet(&mut next, uid, bet, available, now_ms())? {
+            accept(code, &mut room, next, None)?;
+            room.idle.activity();
+        }
         tx.commit().await?;
-    }
-    if R::bet(&mut next, uid, bet, balance::<R>(uid), now_ms())? {
+    } else if R::bet(&mut next, uid, bet, balance::<R>(uid), now_ms())? {
         accept(code, &mut room, next, None)?;
         room.idle.activity();
     }
