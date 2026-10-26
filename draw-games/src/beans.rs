@@ -511,8 +511,16 @@ pub mod holds {
 
     /// Whether `user` was dealt into a beans hand that has not settled yet.
     pub fn outstanding(user: Uuid) -> bool {
+        outstanding_unless(user, |_| false)
+    }
+
+    /// Memory poker admission may ignore results already included in its
+    /// locked wallet snapshot. Durable-wallet spenders must use `outstanding`.
+    /// The predicate must not acquire the wallet lock (wallet -> holds order).
+    pub(crate) fn outstanding_unless(user: Uuid, mut accounted: impl FnMut(Uuid) -> bool) -> bool {
         let mut open = open_hands();
         open.retain(|_, h| h.alive.strong_count() > 0);
-        open.values().any(|h| h.users.contains(&user))
+        open.iter()
+            .any(|(hand, h)| h.users.contains(&user) && !accounted(*hand))
     }
 }

@@ -444,7 +444,7 @@ impl DealerRoom for SicboRoom {
             return Err(Error::Code("bet_changed"));
         }
         if wager.map_or(0, |w| w.stake) > balance {
-            return Err(Error::Code("insufficient_chips"));
+            return Err(Error::Code("insufficient_beans"));
         }
         match wager {
             Some(w) => state.bets.insert(uid, w),

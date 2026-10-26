@@ -1296,7 +1296,7 @@ async fn open_room_now<R: DealerRoom>(
                 return Err(Commit::Refused(Error::Code("beans_in_use")));
             }
             if wallet.balance < crate::sicbo::MIN_STAKE {
-                return Err(Commit::Refused(Error::Code("insufficient_chips")));
+                return Err(Commit::Refused(Error::Code("insufficient_beans")));
             }
         }
         // Persist the room and its first member in one database round trip.
@@ -1466,7 +1466,7 @@ async fn join_room_now<R: DealerRoom>(
                 return Err(Commit::Refused(Error::Code("beans_in_use")));
             }
             if wallet.balance < crate::sicbo::MIN_STAKE {
-                return Err(Commit::Refused(Error::Code("insufficient_chips")));
+                return Err(Commit::Refused(Error::Code("insufficient_beans")));
             }
         }
         let inserted = sqlx::query(&format!(
