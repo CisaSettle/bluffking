@@ -419,7 +419,7 @@ pub async fn buy_numbers(
         committed?;
         return Ok(stored);
     }
-    require_spendable(&mut tx, user).await?;
+    require_spendable(pool, &mut tx, user).await?;
     // (D) Sales window, caps, balance.
     let now = Utc::now();
     selling = schedule.period_at(now.timestamp_millis());
@@ -605,8 +605,12 @@ pub async fn refill(pool: &PgPool, user: Uuid, request_id: Uuid) -> Result<i64, 
 
 /// Called after locking the shared wallet: poker admission uses this same lock.
 /// A seated stack or unfinished hand is not available for a second game's stake.
-pub(super) async fn require_spendable(conn: &mut PgConnection, user: Uuid) -> Result<(), Error> {
-    if !crate::beans::spendable(conn, user).await? {
+pub(super) async fn require_spendable(
+    pool: &PgPool,
+    conn: &mut PgConnection,
+    user: Uuid,
+) -> Result<(), Error> {
+    if !crate::beans::spendable(pool, conn, user).await? {
         return Err(Error::BeansInUse);
     }
     Ok(())

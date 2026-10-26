@@ -134,7 +134,7 @@ pub async fn buy(pool: &PgPool, user: Uuid, body: &ScratchBuy) -> Result<Purchas
         committed?;
         return Ok(p);
     }
-    store::require_spendable(&mut tx, user).await?;
+    store::require_spendable(pool, &mut tx, user).await?;
     if body.all_in {
         if body.expected_balance != Some(before) {
             return Err(Error::RequestConflict);

@@ -865,6 +865,8 @@ async fn open_room_now<R: DealerRoom>(
     let now = now_ms();
     let mut state = R::new_state(now, bots);
     let policy = R::POLICY;
+    let _beans_mutation = (policy.game == crate::game_catalog::BEANS)
+        .then(|| crate::beans_read_memory::mutation(pool, [uid]));
     wallet::ensure(pool, policy, uid).await?;
     R::set_allow_spectators(&mut state, allow_spectators);
     // Rounds deal from the start, so the session clock does too.
@@ -882,7 +884,7 @@ async fn open_room_now<R: DealerRoom>(
             .map_err(|e| Commit::Refused(e.into()))?
             .ok_or(Commit::Refused(Error::Code("storage_unavailable")))?;
         if policy.game == crate::game_catalog::BEANS {
-            if !crate::beans::spendable(&mut tx, uid).await.map_err(|e| Commit::Refused(e.into()))? {
+            if !crate::beans::spendable(pool, &mut tx, uid).await.map_err(|e| Commit::Refused(e.into()))? {
                 return Err(Commit::Refused(Error::Code("beans_in_use")));
             }
             if wallet.balance < crate::sicbo::MIN_STAKE {
@@ -986,6 +988,8 @@ async fn join_room_now<R: DealerRoom>(
     let registry = R::registry();
     let shared = registry.room(code).ok_or(Error::Code("room_not_found"))?;
     let policy = R::POLICY;
+    let _beans_mutation = (policy.game == crate::game_catalog::BEANS)
+        .then(|| crate::beans_read_memory::mutation(pool, [uid]));
     wallet::ensure(pool, policy, uid).await?;
     match registry.seat(uid) {
         Some(c) if c == code => {
@@ -1024,7 +1028,7 @@ async fn join_room_now<R: DealerRoom>(
             .map_err(|e| Commit::Refused(e.into()))?
             .ok_or(Commit::Refused(Error::Code("storage_unavailable")))?;
         if policy.game == crate::game_catalog::BEANS {
-            if !crate::beans::spendable(&mut tx, uid).await.map_err(|e| Commit::Refused(e.into()))? {
+            if !crate::beans::spendable(pool, &mut tx, uid).await.map_err(|e| Commit::Refused(e.into()))? {
                 return Err(Commit::Refused(Error::Code("beans_in_use")));
             }
             if wallet.balance < crate::sicbo::MIN_STAKE {

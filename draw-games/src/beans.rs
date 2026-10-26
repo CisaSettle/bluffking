@@ -73,15 +73,31 @@ pub async fn sicbo_seated(conn: &mut PgConnection, user: Uuid) -> sqlx::Result<b
         .bind(user).fetch_one(conn).await
 }
 
-pub async fn spendable(conn: &mut PgConnection, user: Uuid) -> sqlx::Result<bool> {
-    let seated: bool = sqlx::query_scalar(
+pub async fn spendable(pool: &PgPool, conn: &mut PgConnection, user: Uuid) -> sqlx::Result<bool> {
+    // Memory admission is visible before its SQL membership is persisted. All
+    // debit callers hold beans_read_memory::Mutation before BEGIN, excluding
+    // another admission until their transaction and publication are complete.
+    let seated = if crate::realtime_mode::enabled() {
+        let directory = crate::live_directory::memory_snapshot(pool)?;
+        let occupied = directory.memberships_for(user).any(|(room, member)| {
+            member.left_at.is_none()
+                && room.ended_at.is_none()
+                && directory
+                    .public_tables
+                    .iter()
+                    .any(|table| table.beans && table.session_id == Some(room.id))
+        });
+        occupied
+    } else {
+        sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM session_users su JOIN game_sessions gs ON gs.id=su.session_id
          JOIN public_tables pt ON pt.session_id=gs.id
          WHERE su.user_id=$1 AND su.left_at IS NULL AND gs.ended_at IS NULL AND pt.beans)",
     )
     .bind(user)
     .fetch_one(&mut *conn)
-    .await?;
+    .await?
+    };
     Ok(!seated
         && !sicbo_seated(conn, user).await?
         && !holds::outstanding(user)
@@ -106,7 +122,10 @@ pub struct Profile {
 }
 
 pub async fn profile(pool: &PgPool, user: Uuid) -> sqlx::Result<Profile> {
-    let (w, daily_available) = crate::beans_read_memory::profile(pool, user)?;
+    let (w, daily_available) = crate::beans_read_memory::read_after_publication(pool, || {
+        crate::beans_read_memory::profile(pool, user)
+    })
+    .await?;
     Ok(Profile {
         balance: w.balance,
         net_won: w.net_won,
@@ -344,6 +363,7 @@ pub async fn credit_purchase_on(
 /// caller computes `beans` from the refunded amount (partial refunds debit
 /// in proportion) and records the provider refund id for idempotency.
 pub async fn debit_refund_on(
+    pool: &PgPool,
     conn: &mut PgConnection,
     user: Uuid,
     purchase_id: Uuid,
@@ -352,7 +372,7 @@ pub async fn debit_refund_on(
     let before = wallet::lock(conn, GAME, user)
         .await?
         .ok_or(sqlx::Error::RowNotFound)?;
-    if !spendable(conn, user).await? {
+    if !spendable(pool, conn, user).await? {
         return Err(sqlx::Error::Protocol(
             "beans_in_use: retry refund after settlement".into(),
         ));

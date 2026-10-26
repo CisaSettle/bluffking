@@ -163,7 +163,7 @@ pub async fn play(pool: &PgPool, user: Uuid, bet: &Bet) -> Result<BetResult, Err
     if crate::sicbo_room::seated(&mut tx, user).await? {
         return Err(Error::InRoom);
     }
-    if !crate::beans::spendable(&mut tx, user).await? {
+    if !crate::beans::spendable(pool, &mut tx, user).await? {
         return Err(Error::BeansInUse);
     }
     // A room settlement uses its round id as the receipt key; a solo roll may
@@ -334,7 +334,7 @@ pub async fn open_session(pool: &PgPool, user: Uuid, session: Uuid) -> Result<i6
     if crate::sicbo_room::seated(&mut tx, user).await? {
         return Err(Error::InRoom);
     }
-    if !crate::beans::spendable(&mut tx, user).await? {
+    if !crate::beans::spendable(pool, &mut tx, user).await? {
         return Err(Error::BeansInUse);
     }
     tx.commit().await?;
