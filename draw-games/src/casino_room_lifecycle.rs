@@ -112,6 +112,11 @@ pub(super) fn install<R: DealerRoom>(
             seats.insert(*uid, code.clone());
         }
         let room = Room {
+            registry_generation: Some(crate::room_registry::publish_committed(
+                pool,
+                R::DEALER,
+                &code,
+            )?),
             state: Arc::new(state),
             members,
             writer: writer::<R>(pool, &code),
@@ -254,44 +259,46 @@ pub(super) fn handoff_room<R: DealerRoom>(
 
 /// Marks an empty room closed under its lock; joins through a stale handle
 /// then refuse.
-pub(super) fn empty_and_closed<R: DealerRoom>(room: &mut Room<R>) -> bool {
+pub(super) fn empty_and_closed<R: DealerRoom>(
+    pool: &PgPool,
+    code: &str,
+    room: &mut Room<R>,
+) -> bool {
     if room.members.is_empty() && !R::open_bets(&room.state) {
         room.closed = true;
     }
     if room.closed {
+        if let Some(generation) = room.registry_generation {
+            crate::room_registry::retire_pending(pool, R::DEALER, code, generation);
+        }
         // Spectators get the same terminal frame every lobby room sends.
         room.spectators.close();
     }
     room.closed
 }
 
-/// Drops a closed room: from the registry first (so nothing new reaches it),
-/// then its row once the writer has committed everything it accepted.
+/// Keep a closed room fenced until its ordered writer and deletion finish.
+/// A failed or unknown DELETE is retried by the same close worker, retaining
+/// the generation tombstone and code claim throughout recovery.
 pub(super) async fn drop_room<R: DealerRoom>(
     pool: &PgPool,
     code: &str,
     shared: &Shared<R>,
 ) -> Result<()> {
-    let mut registration = crate::room_registry::mutation(pool, Some(code));
-    let round = R::round_id(&shared.lock().await.state);
-    {
-        let mut rooms = R::registry().rooms.lock().unwrap();
-        if rooms.get(code).is_some_and(|r| Arc::ptr_eq(r, shared)) {
-            rooms.remove(code);
-        }
-    }
-    flushed(shared).await?;
-    let mut tx = pool.begin().await?;
-    sqlx::query(&format!(
-        "DELETE FROM game_room_checkpoints r WHERE code=$1 AND game='{}' AND state->>'round_id'=$2 \
-         AND NOT EXISTS(SELECT 1 FROM game_room_checkpoint_members m WHERE m.code=$1 AND m.game=r.game)",
-        R::DEALER
-    ))
-    .bind(code)
-    .bind(round.to_string())
-    .execute(&mut *tx)
-    .await?;
-    registration.commit(tx.commit()).await?;
+    let room = shared.lock().await;
+    let closing = Closing {
+        registry_generation: room.registry_generation,
+        require_empty: true,
+        members: Vec::new(),
+        round: R::round_id(&room.state),
+        _held: Vec::new(),
+    };
+    let request = crate::release_handoff::admit_request(true).ok_or(Error::Unavailable)?;
+    let (pool, code, shared) = (pool.clone(), code.to_owned(), shared.clone());
+    tokio::spawn(async move {
+        let _request = request;
+        finish_close::<R>(pool, code, shared, closing).await;
+    });
     Ok(())
 }
 
@@ -354,7 +361,22 @@ pub(super) async fn sweep<R: DealerRoom>(pool: &PgPool) -> Result<()> {
             wallet::retire(R::POLICY.game, *uid, &code);
             registry.release_seat(*uid, &code);
         }
-        let empty = empty_and_closed(&mut room);
+        // A previously unknown create becomes authoritative only once its
+        // durable membership and wallet have both been reconciled.
+        if room.registry_generation.is_none()
+            && !room.members.is_empty()
+            && room
+                .members
+                .values()
+                .all(|member| !member.joining && !member.leaving)
+        {
+            room.registry_generation = Some(crate::room_registry::publish_committed(
+                pool,
+                R::DEALER,
+                &code,
+            )?);
+        }
+        let empty = empty_and_closed(pool, &code, &mut room);
         drop(room);
         drop(held);
         if empty {
@@ -372,7 +394,7 @@ pub(super) async fn sweep<R: DealerRoom>(pool: &PgPool) -> Result<()> {
 /// so the room code frees with the row.
 pub(super) async fn close_idle<R: DealerRoom>(pool: &PgPool, now: i64) {
     for (code, shared) in R::registry().all() {
-        if let Some(closing) = begin_close::<R>(&code, &shared, now).await {
+        if let Some(closing) = begin_close::<R>(pool, &code, &shared, now).await {
             // Off the dealer loop: a stalled writer must not stop other rooms.
             let Some(request) = crate::release_handoff::admit_request(true) else {
                 crate::release_handoff::fail("room close raced frozen barrier");
@@ -389,6 +411,7 @@ pub(super) async fn close_idle<R: DealerRoom>(pool: &PgPool, now: i64) {
 
 /// Decides under the room lock and fences the room (`closed`) when it is due.
 pub(super) async fn begin_close<R: DealerRoom>(
+    pool: &PgPool,
     code: &str,
     shared: &Shared<R>,
     now: i64,
@@ -413,12 +436,17 @@ pub(super) async fn begin_close<R: DealerRoom>(
         }
     }
     room.closed = true;
+    if let Some(generation) = room.registry_generation {
+        crate::room_registry::retire_pending(pool, R::DEALER, code, generation);
+    }
     // Dropping the senders ends the state sockets; clients then read
     // `room_not_found` and return to the lobby.
     room.subscribers.clear();
     room.spectators.close();
     tracing::info!(%code, "{} room closing after inactivity or expiry", R::DEALER);
     Some(Closing {
+        registry_generation: room.registry_generation,
+        require_empty: false,
         members: room.members.keys().copied().collect(),
         round: R::round_id(&room.state),
         _held: held,
@@ -442,17 +470,32 @@ pub(super) async fn finish_close<R: DealerRoom>(
             // Every settlement the wallets saw is durable before the seats go.
             flushed(&shared).await?;
             let mut tx = pool.begin().await?;
-            let ours: Option<i32> = sqlx::query_scalar(&format!(
-                "SELECT 1 FROM game_room_checkpoints WHERE code=$1 AND state->>'round_id'=$2 AND game='{}' FOR UPDATE",
+            let current_round: Option<String> = sqlx::query_scalar(&format!(
+                "SELECT state->>'round_id' FROM game_room_checkpoints WHERE code=$1 AND game='{}' FOR UPDATE",
                 R::DEALER
             ))
             .bind(&code)
-            .bind(closing.round.to_string())
             .fetch_optional(&mut *tx)
             .await?;
-            // Gone already: an earlier attempt committed.
-            if ours.is_none() {
+            // Gone already: an earlier attempt committed. A different room
+            // generation must never be deleted or have its code released.
+            let Some(current_round) = current_round else {
                 return Ok(());
+            };
+            if current_round != closing.round.to_string() {
+                return Err(Error::Unavailable);
+            }
+            if closing.require_empty {
+                let occupied: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM game_room_checkpoint_members WHERE code=$1 AND game=$2)",
+                )
+                .bind(&code)
+                .bind(R::DEALER)
+                .fetch_one(&mut *tx)
+                .await?;
+                if occupied {
+                    return Err(Error::Unavailable);
+                }
             }
             for table in ["game_room_checkpoint_members", "game_room_checkpoints"] {
                 sqlx::query(&format!("DELETE FROM {table} WHERE code=$1 AND game=$2"))
@@ -484,5 +527,8 @@ pub(super) async fn finish_close<R: DealerRoom>(
     for uid in &closing.members {
         wallet::retire(R::POLICY.game, *uid, &code);
         registry.release_seat(*uid, &code);
+    }
+    if let Some(generation) = closing.registry_generation {
+        crate::room_registry::confirm_retired_pending(&pool, R::DEALER, &code, generation).await;
     }
 }

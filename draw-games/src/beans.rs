@@ -223,16 +223,28 @@ pub async fn settle_hand_on(
     hand_id: Uuid,
     players: &[(Uuid, i64)],
     has_bots: bool,
+    memory_accepted: bool,
 ) -> sqlx::Result<()> {
     // Lock wallets in user-id order, like every other multi-wallet settlement,
     // so overlapping settlements can never deadlock on lock order.
     let mut ordered: Vec<&(Uuid, i64)> = players.iter().collect();
     ordered.sort_unstable_by_key(|(user, _)| *user);
     for (user, delta) in ordered {
+        if memory_accepted {
+            // The startup-ready authority can grant a first wallet before its
+            // separate grant writer commits. This idempotent operation keeps
+            // that grant and this hand's receipt ordered under the wallet lock.
+            ensure_on(conn, *user).await?;
+        }
         let Some(balance) = wallet::lock(conn, GAME, *user).await? else {
             tracing::warn!(hand_id = %hand_id, user = %user, "beans_settle_no_wallet");
             continue;
         };
+        if memory_accepted && balance.checked_add(*delta).is_none_or(|after| after < 0) {
+            return Err(sqlx::Error::Protocol(
+                "accepted poker settlement conflicts with durable wallet".into(),
+            ));
+        }
         let applied = if balance + *delta < 0 {
             tracing::error!(
                 hand_id = %hand_id, user = %user, balance, delta,
@@ -424,11 +436,10 @@ pub async fn leaderboard(
 /// Unsettled public-hand liabilities, held per process: the runtime owner
 /// runs every live table, and admission waits for ownership on handover.
 ///
-/// A wallet is debited only when a hand settles, so a player dealt into a
-/// 金豆 hand still owes its result after leaving the table (a folded player
-/// may leave mid-hand). Until that hand settles or is voided, the wallet
-/// balance overstates what they can stake, so no beans table may admit them
-/// against it; otherwise the later debit is clamped and beans are minted.
+/// A player still owes a dealt hand after leaving the table. Accepted poker
+/// settlements update the memory wallet immediately, while other games and
+/// refunds still debit the durable wallet. Retain this hold until COMMIT so
+/// those callers cannot spend a database balance missing an accepted loss.
 pub mod holds {
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::AtomicUsize;

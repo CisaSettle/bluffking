@@ -230,6 +230,7 @@ impl<R: DealerRoom> Clone for Snapshot<R> {
 }
 
 struct Room<R: DealerRoom> {
+    registry_generation: Option<Uuid>,
     state: Arc<R::State>,
     members: BTreeMap<Uuid, Member>,
     writer: Ordered<Option<Snapshot<R>>>,
@@ -858,7 +859,8 @@ async fn open_room_now<R: DealerRoom>(
     let code = crate::room_code::allocate(pool, R::DEALER)
         .await
         .map_err(|e| Error::Code(e.code()))?;
-    let _code_claim = crate::room_registry::allocation_guard(pool, &code);
+    let mut code_claim = crate::room_registry::allocation_guard(pool, &code);
+    code_claim.prepare_created(R::DEALER)?;
     let handoff_guard =
         crate::release_handoff::register(crate::release_handoff::rooms::id(R::DEALER, &code), true)
             .ok_or(Error::Unavailable)?;
@@ -929,7 +931,11 @@ async fn open_room_now<R: DealerRoom>(
         Commit::Refused(e) => return Err(e),
         Commit::Unknown(e) => match member_row::<R>(pool, uid, &code).await {
             Some(false) => return Err(e),
-            Some(true) => (wallet::ensure(pool, policy, uid).await.ok(), false),
+            Some(true) => {
+                // Exact membership proves this creation transaction committed.
+                registration.set_unknown(false);
+                (wallet::ensure(pool, policy, uid).await.ok(), false)
+            }
             None => (None, true),
         },
     };
@@ -941,6 +947,7 @@ async fn open_room_now<R: DealerRoom>(
     let mut members = BTreeMap::new();
     members.insert(uid, Member::new(name, joining));
     let room = Room {
+        registry_generation: None,
         state: Arc::new(state),
         members,
         writer: writer::<R>(pool, &code),
@@ -952,16 +959,25 @@ async fn open_room_now<R: DealerRoom>(
         handoff_guard: Some(handoff_guard),
         release_paused: false,
     };
+    let shared = handoff_room::<R>(pool, &code, room)?;
     registry.seats.lock().unwrap().insert(uid, code.clone());
     registry
         .rooms
         .lock()
         .unwrap()
-        .insert(code.clone(), handoff_room::<R>(pool, &code, room)?);
+        .insert(code.clone(), shared.clone());
     if joining {
         return Err(Error::Unavailable);
     }
-    crate::room_registry::publish(pool, R::DEALER, &code)?;
+    // Financial admission is known committed before the accepted runtime room
+    // becomes discoverable. No persistence refresh follows this publication.
+    let mut room = shared.lock().await;
+    code_claim.publish_created(R::DEALER, &mut registration)?;
+    room.registry_generation = Some(crate::room_registry::publish_committed(
+        pool,
+        R::DEALER,
+        &code,
+    )?);
     Ok(code)
 }
 
@@ -1277,7 +1293,7 @@ async fn leave_room_now<R: DealerRoom>(pool: &PgPool, uid: Uuid) -> Result<()> {
             Commit::Unknown(_) => return Err(Error::Unavailable),
         }
         room.members.remove(&uid);
-        empty_and_closed(&mut room)
+        empty_and_closed(pool, &code, &mut room)
     };
     wallet::retire(R::POLICY.game, uid, &code);
     registry.release_seat(uid, &code);
@@ -1290,6 +1306,8 @@ async fn leave_room_now<R: DealerRoom>(pool: &PgPool, uid: Uuid) -> Result<()> {
 /// A room fenced for closing: its members, and their membership locks so no
 /// join or leave interleaves until the seats are released.
 struct Closing {
+    registry_generation: Option<Uuid>,
+    require_empty: bool,
     members: Vec<Uuid>,
     /// The open round when fenced. A fenced room opens no new round, and every
     /// room starts with a fresh id, so it tells this room's row from a later
