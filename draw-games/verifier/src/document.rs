@@ -59,9 +59,7 @@ fn match_receipt(proof: &Value, receipt: &Value) -> Result<(), String> {
                     .ok_or("Missing or invalid ALL-IN balance")?;
                 let copies = balance / game.unit();
                 let groups = selections.len() as i64;
-                if groups != copies.min(crate::lottery::MAX_TICKETS_PER_PURCHASE as i64)
-                    || groups == 0
-                {
+                if groups != copies.min(crate::lottery::MAX_ALL_IN_GROUPS as i64) || groups == 0 {
                     return Err("Invalid ALL-IN selection count".into());
                 }
                 for selection in selections {

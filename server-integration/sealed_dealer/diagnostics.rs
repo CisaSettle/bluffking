@@ -60,6 +60,7 @@ struct Event {
     phase_ms: f64,
     action_delivery_ms: Option<[f64; 11]>,
     encode_cpu_ms: Option<f64>,
+    response_message_seq: Option<u64>,
 }
 
 struct Recent {
@@ -164,6 +165,7 @@ pub(crate) fn attach_recent(metadata: &mut serde_json::Value) {
                     "phase_ms": event.phase_ms,
                     "action_delivery_ms": event.action_delivery_ms,
                     "encode_cpu_ms": event.encode_cpu_ms,
+                    "response_message_seq": event.response_message_seq,
                 })
             })
             .collect();
@@ -201,20 +203,31 @@ pub(super) fn record(
         phase_ms,
         action_delivery_ms: None,
         encode_cpu_ms: None,
+        response_message_seq: None,
     });
 }
 
 pub(crate) fn record_probe(trace: Uuid, phase: &'static str, elapsed_ms: f64) {
+    record_probe_delivery(trace, phase, elapsed_ms, None);
+}
+
+pub(crate) fn record_probe_delivery(
+    trace: Uuid,
+    phase: &'static str,
+    elapsed_ms: f64,
+    ordinal: Option<(Uuid, u64)>,
+) {
     record_event(Event {
         sequence: 0,
         source: "ws_probe",
-        connection: Uuid::nil(),
+        connection: ordinal.map_or(Uuid::nil(), |(id, _)| id),
         trace: Some(trace),
         phase,
         elapsed_ms,
         phase_ms: 0.0,
         action_delivery_ms: None,
         encode_cpu_ms: None,
+        response_message_seq: ordinal.map(|(_, seq)| seq),
     });
 }
 
@@ -231,6 +244,7 @@ pub(crate) fn record_action(trace: Uuid, phase: &'static str, elapsed_ms: f64) {
         phase_ms: 0.0,
         action_delivery_ms: None,
         encode_cpu_ms: None,
+        response_message_seq: None,
     });
 }
 
@@ -253,6 +267,7 @@ pub(crate) fn record_action_delivery(
         phase_ms: 0.0,
         action_delivery_ms: Some(milestones),
         encode_cpu_ms,
+        response_message_seq: None,
     });
 }
 
@@ -295,6 +310,7 @@ fn record_event(mut event: Event) {
                         phase_ms = event.phase_ms,
                         action_delivery_ms = ?event.action_delivery_ms,
                         encode_cpu_ms = ?event.encode_cpu_ms,
+                        response_message_seq = ?event.response_message_seq,
                         evidence_dropped = dropped,
                         "optional socket delivery evidence; flush completion is not a client acknowledgement"
                     );
