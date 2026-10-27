@@ -18,7 +18,7 @@ pub const TICKET_COLUMNS: &str =
     "id, purchase_id, period, bought_at, entry, stakes, multiplier, cost, revealed, prize, tier, settled_at, proof_plan";
 const PERIOD_COLUMNS: &str =
     "period, status, numbers, bonus, bonus_numbers, drawn_at, tickets, stakes, players, sales, paid, winners, proof_plan, draw_proof";
-/// Tickets scanned for the hall feed (a purchase holds at most 10).
+/// Bounded ticket scan for the hall feed.
 const FEED_SCAN: i64 = 100;
 const FEED_LEN: usize = 10;
 const WINNERS_BOARD: i64 = 20;
@@ -461,7 +461,7 @@ pub async fn buy_numbers(
             return Err(Error::InsufficientBalance);
         }
         let groups = entries.len() as i64;
-        if groups != copies.min(rules::MAX_TICKETS_PER_PURCHASE as i64) {
+        if groups != copies.min(rules::MAX_ALL_IN_GROUPS as i64) {
             return Err(Error::InvalidEntry);
         }
         let base = copies / groups;

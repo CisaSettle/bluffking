@@ -11,8 +11,10 @@ pub const MAX_STAKES: i64 = 100;
 pub const MAX_MULTIPLIER: i64 = 10;
 /// Current ALL-IN compresses repeated basic stakes into bounded smallint rows.
 pub const MAX_ALL_IN_MULTIPLIER: i64 = i16::MAX as i64;
-pub const MAX_TICKETS_PER_PURCHASE: usize = 10;
-pub const MAX_TICKETS_PER_PERIOD: i64 = 50;
+/// ALL-IN keeps its existing receipt grouping independently of manual purchases.
+pub const MAX_ALL_IN_GROUPS: usize = 10;
+pub const MAX_TICKETS_PER_PURCHASE: usize = 100;
+pub const MAX_TICKETS_PER_PERIOD: i64 = 100;
 pub const MAX_STAKES_PER_PERIOD: i64 = 1_000;
 
 pub const SSQ_RED_MAX: u8 = 33;
