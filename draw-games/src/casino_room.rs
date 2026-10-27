@@ -1308,10 +1308,13 @@ async fn open_room_now<R: DealerRoom>(
             .await
             .map_err(|e| Commit::Refused(e.into()))?
             .ok_or(Commit::Refused(Error::Code("storage_unavailable")))?;
-        if policy.game == crate::game_catalog::BEANS {
-            if crate::beans::available_on(pool, &mut tx, uid, wallet.balance, None).await.map_err(|e| Commit::Refused(e.into()))? < crate::sicbo::MIN_STAKE {
-                return Err(Commit::Refused(Error::Code("insufficient_beans")));
-            }
+        if policy.game == crate::game_catalog::BEANS
+            && crate::beans::available_on(pool, &mut tx, uid, wallet.balance, None)
+                .await
+                .map_err(|e| Commit::Refused(e.into()))?
+                < crate::sicbo::MIN_STAKE
+        {
+            return Err(Commit::Refused(Error::Code("insufficient_beans")));
         }
         // Persist the room and its first member in one database round trip.
         // A membership conflict still refuses admission and rolls back this
@@ -1476,10 +1479,13 @@ async fn join_room_now<R: DealerRoom>(
             .await
             .map_err(|e| Commit::Refused(e.into()))?
             .ok_or(Commit::Refused(Error::Code("storage_unavailable")))?;
-        if policy.game == crate::game_catalog::BEANS {
-            if crate::beans::available_on(pool, &mut tx, uid, wallet.balance, None).await.map_err(|e| Commit::Refused(e.into()))? < crate::sicbo::MIN_STAKE {
-                return Err(Commit::Refused(Error::Code("insufficient_beans")));
-            }
+        if policy.game == crate::game_catalog::BEANS
+            && crate::beans::available_on(pool, &mut tx, uid, wallet.balance, None)
+                .await
+                .map_err(|e| Commit::Refused(e.into()))?
+                < crate::sicbo::MIN_STAKE
+        {
+            return Err(Commit::Refused(Error::Code("insufficient_beans")));
         }
         let inserted = sqlx::query(&format!(
             "INSERT INTO game_room_checkpoint_members(game,user_id,code,name) VALUES('{}',$1,$2,$3) ON CONFLICT(game,user_id) DO NOTHING",

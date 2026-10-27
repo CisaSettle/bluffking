@@ -182,6 +182,8 @@ pub async fn profile(pool: &PgPool, user: Uuid) -> sqlx::Result<Profile> {
     .await?;
     let available_balance =
         crate::beans_read_memory::available(pool, user, w.balance, false, None)?;
+    let _phase = crate::request_timing::http_phase(crate::request_timing::HttpPhase::Processing)
+        .operation("beans_profile_assemble");
     Ok(Profile {
         balance: w.balance,
         available_balance,
