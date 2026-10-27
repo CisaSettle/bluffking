@@ -216,7 +216,32 @@ pub enum DailyOutcome {
 /// One extra [`DAILY_REFILL_TO`] grant per Singapore calendar day. The day counter,
 /// the wallet update and the ledger row commit together.
 pub async fn claim_daily(pool: &PgPool, user: Uuid) -> sqlx::Result<DailyOutcome> {
+    if crate::realtime_mode::enabled() {
+        return match crate::lottery::runtime::refill(pool, user) {
+            Ok(balance) => Ok(DailyOutcome::Granted {
+                granted: DAILY_REFILL_TO,
+                balance,
+            }),
+            Err(crate::lottery::handlers::Error::DailyAlreadyClaimed) => {
+                Ok(DailyOutcome::AlreadyClaimed {
+                    balance: crate::beans_read_memory::ensure(pool, user)?.balance,
+                })
+            }
+            Err(crate::lottery::handlers::Error::Db(e)) => Err(e),
+            Err(_) => Err(sqlx::Error::Protocol("beans daily unavailable".into())),
+        };
+    }
+
     let _daily = crate::beans_read_memory::lock_daily(pool, user).await?;
+    if crate::beans_read_memory::daily_claimed(
+        pool,
+        user,
+        crate::lottery::sgt_day(chrono::Utc::now()),
+    ) {
+        return Ok(DailyOutcome::AlreadyClaimed {
+            balance: crate::beans_read_memory::ensure(pool, user)?.balance,
+        });
+    }
     let beans_mutation = crate::beans_read_memory::daily_mutation(pool, user);
     ensure(pool, user).await?;
     let mut tx = pool.begin().await?;

@@ -28,7 +28,7 @@ const PRESENT_WINDOW: Duration = Duration::from_secs(30);
 const PRESENCE_UPSERT_EVERY: Duration = Duration::from_secs(10);
 const CROWD_MEMBERS: i64 = 12;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TicketRow {
     pub id: Uuid,
     pub purchase_id: Uuid,
@@ -118,7 +118,7 @@ pub fn ticket_json(game: Game, t: &TicketRow) -> Value {
     out
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PeriodRow {
     pub period: i64,
     pub status: String,
@@ -126,6 +126,7 @@ pub struct PeriodRow {
     pub bonus: Option<i16>,
     pub bonus_numbers: Vec<i16>,
     pub drawn_at: Option<DateTime<Utc>>,
+    pub settled_at: Option<DateTime<Utc>>,
     pub tickets: i32,
     pub stakes: i32,
     pub players: i32,
@@ -137,7 +138,7 @@ pub struct PeriodRow {
 }
 
 impl PeriodRow {
-    fn from_row(row: &PgRow) -> Self {
+    pub(super) fn from_row(row: &PgRow) -> Self {
         PeriodRow {
             period: row.get("period"),
             status: row.get("status"),
@@ -145,6 +146,7 @@ impl PeriodRow {
             bonus: row.get("bonus"),
             bonus_numbers: row.get("bonus_numbers"),
             drawn_at: row.get("drawn_at"),
+            settled_at: row.try_get("settled_at").unwrap_or(None),
             tickets: row.get("tickets"),
             stakes: row.get("stakes"),
             players: row.get("players"),
@@ -155,7 +157,7 @@ impl PeriodRow {
             draw_proof: row.get("draw_proof"),
         }
     }
-    fn summary(&self, game: Game) -> Value {
+    pub(super) fn summary(&self, game: Game) -> Value {
         let label = period_label(game, self.period, self.proof_plan.as_ref());
         json!({
             "period": self.period, "label": label,
@@ -302,6 +304,9 @@ pub(super) async fn replay_request(
 /// active account lock through the wallet grant and ledger commit, so a purge
 /// claim cannot race a late request into recreating account-owned money rows.
 pub(super) async fn ensure_wallet(pool: &PgPool, user: Uuid) -> sqlx::Result<i64> {
+    if crate::realtime_mode::enabled() {
+        return crate::beans_read_memory::ensure(pool, user).map(|w| w.balance);
+    }
     if let Some(balance) =
         sqlx::query_scalar::<_, i64>("SELECT balance FROM wallets WHERE user_id=$1 AND game=$2")
             .bind(user)
@@ -340,6 +345,9 @@ pub async fn buy_numbers(
     game: Game,
     body: &NumberBuy,
 ) -> Result<Purchase, Error> {
+    if crate::realtime_mode::enabled() {
+        return super::runtime::buy_numbers(pool, user, game, body);
+    }
     let schedule = game.schedule().ok_or(Error::InvalidEntry)?;
     if body.request_id.is_nil()
         || body.multiplier != 1
@@ -594,6 +602,9 @@ pub async fn buy_numbers(
 
 /// Lottery refill shares the single daily beans entitlement.
 pub async fn refill(pool: &PgPool, user: Uuid, request_id: Uuid) -> Result<i64, Error> {
+    if crate::realtime_mode::enabled() {
+        return super::runtime::refill(pool, user);
+    }
     if request_id.is_nil() {
         return Err(Error::InvalidEntry);
     }
@@ -882,6 +893,9 @@ async fn draw_json(
 
 /// `GET /api/lottery/{game}`.
 pub async fn view(pool: &PgPool, user: Uuid, game: Game) -> Result<Value, Error> {
+    if crate::realtime_mode::enabled() {
+        return super::runtime::view(pool, user, game);
+    }
     let balance = ensure_wallet(pool, user).await?;
     let available_balance = crate::beans_read_memory::available(pool, user, balance, false, None)?;
     schedule_presence(pool, game, user);
@@ -946,7 +960,7 @@ pub async fn view(pool: &PgPool, user: Uuid, game: Game) -> Result<Value, Error>
     }))
 }
 
-fn period_json(selling: &Period, row: Option<&PeriodRow>, open: bool) -> Value {
+pub(super) fn period_json(selling: &Period, row: Option<&PeriodRow>, open: bool) -> Value {
     json!({
         "id": selling.id, "label": selling.label,
         "opens_ms": selling.opens_ms, "closes_ms": selling.closes_ms, "draw_ms": selling.draw_ms,
@@ -965,6 +979,9 @@ pub async fn draws(
     limit: i64,
     offset: i64,
 ) -> Result<Vec<Value>, Error> {
+    if crate::realtime_mode::enabled() {
+        return super::runtime::draws(pool, game, limit, offset);
+    }
     let mut conn = pool.acquire().await?;
     let rows = recent_periods(&mut conn, game, limit.clamp(1, 100), offset.max(0)).await?;
     Ok(rows.iter().map(|r| r.summary(game)).collect())
@@ -973,6 +990,9 @@ pub async fn draws(
 /// Public, account-free proof retrieval. No player or private ticket data leaves
 /// this endpoint. The same URL serves the pre-draw plan and the revealed result.
 pub async fn proof(pool: &PgPool, game: Game, period: i64) -> Result<Value, Error> {
+    if crate::realtime_mode::enabled() {
+        return super::runtime::proof(pool, game, period);
+    }
     if game.schedule().is_none() {
         return Err(Error::InvalidEntry);
     }
@@ -1024,6 +1044,9 @@ pub async fn tickets(
     offset: i64,
     filter: TicketFilter,
 ) -> Result<Vec<Value>, Error> {
+    if crate::realtime_mode::enabled() {
+        return super::runtime::tickets(pool, user, game, limit, offset, filter);
+    }
     let rows = sqlx::query(&format!(
         "SELECT t.{} , p.numbers AS result_numbers, p.bonus AS result_bonus, p.bonus_numbers AS result_bonus_numbers, p.draw_proof AS result_proof \
          FROM lottery_tickets t LEFT JOIN lottery_periods p \

@@ -89,6 +89,9 @@ fn prize(entry: &Value, cost: i64) -> Result<(i64, i16), Error> {
 }
 
 pub async fn buy(pool: &PgPool, user: Uuid, body: &ScratchBuy) -> Result<Purchase, Error> {
+    if crate::realtime_mode::enabled() {
+        return super::runtime::buy_scratch(pool, user, body);
+    }
     if body.request_id.is_nil()
         || body.cost != 100
         || (!body.all_in && ![1, 5, 10].contains(&body.count))
@@ -308,6 +311,9 @@ pub async fn reveal(
     ticket: Uuid,
     index: Option<usize>,
 ) -> Result<(Value, i64), Error> {
+    if crate::realtime_mode::enabled() {
+        return super::runtime::reveal(pool, user, ticket, index);
+    }
     reveal_inner(pool, user, ticket, index, false).await
 }
 
@@ -467,7 +473,7 @@ async fn notify_winner(
 
 /// Aggregate a settled batch into one durable notice, including exact grants.
 /// Replay exits before this function, and the purchase key deduplicates it.
-async fn notify_winners(
+pub(super) async fn notify_winners(
     conn: &mut PgConnection,
     user: Uuid,
     cards: &[TicketRow],
@@ -572,6 +578,9 @@ fn emit_paid(user: Uuid, paid: i64) {
 
 /// Bounded expiry work: never delete an unfinished card before its payout.
 pub async fn expire(pool: &PgPool) -> Result<(), Error> {
+    if crate::realtime_mode::enabled() {
+        return Ok(());
+    }
     let rows = sqlx::query("SELECT id,user_id FROM lottery_tickets WHERE game='scratch' AND cost=100 AND entry->'reward_version'='1'::jsonb AND settled_at IS NULL AND bought_at < now()-interval '30 days' ORDER BY bought_at,id LIMIT 20")
         .fetch_all(pool).await?;
     for row in rows {

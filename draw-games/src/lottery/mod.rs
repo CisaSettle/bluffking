@@ -17,6 +17,7 @@ pub mod beacon;
 pub mod draw_loop;
 pub mod handlers;
 pub mod rules;
+pub mod runtime;
 pub mod scratch;
 pub mod store;
 

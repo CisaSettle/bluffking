@@ -14,6 +14,10 @@ use uuid::Uuid;
 
 /// Every backend may run this loop; row locks arbitrate all changes.
 pub async fn run(pool: PgPool) {
+    if crate::runtime_owner::configured() || crate::realtime_mode::enabled() {
+        super::runtime::run(pool).await;
+        return;
+    }
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut retention_due = Instant::now();
@@ -251,7 +255,7 @@ async fn settle_one(pool: &PgPool) -> Result<bool, Error> {
 
 /// A winner's inbox receipt commits atomically with the credited prizes. The
 /// deterministic identity and unique per-user key also make replay harmless.
-async fn notify_winner(
+pub(super) async fn notify_winner(
     conn: &mut sqlx::PgConnection,
     user: Uuid,
     game: Game,
@@ -327,7 +331,7 @@ async fn notify_winner(
     Ok(())
 }
 
-async fn retention(pool: &PgPool) -> Result<(), Error> {
+pub(super) async fn retention(pool: &PgPool) -> Result<(), Error> {
     super::scratch::expire(pool).await?;
     // Each statement removes at most 1,000 rows; winners go before their period.
     for statement in [
