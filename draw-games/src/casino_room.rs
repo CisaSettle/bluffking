@@ -1871,6 +1871,7 @@ pub async fn socket<R: DealerRoom>(
     axum::extract::Query(q): axum::extract::Query<SocketQuery>,
     headers: axum::http::HeaderMap,
     connect_info: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     ws: axum::extract::ws::WebSocketUpgrade,
 ) -> Response {
     if !crate::game_socket::origin_allowed(&headers) {
@@ -1896,6 +1897,7 @@ pub async fn socket<R: DealerRoom>(
         &headers,
         connect_info.map(|ci| ci.0.ip()),
         auth.user_id,
+        raw_query.as_deref(),
     )
     .await
     else {

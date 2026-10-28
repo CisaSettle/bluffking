@@ -948,7 +948,6 @@ async fn refresh_loop(pool: PgPool, state: Arc<State>) {
                 inner
                     .pending
                     .range((after.map_or(Unbounded, Excluded), Unbounded))
-                    .take(64)
                     .filter_map(|id| {
                         if inner.active_users.contains_key(id) {
                             None
@@ -967,19 +966,28 @@ async fn refresh_loop(pool: PgPool, state: Arc<State>) {
                                 })
                         }
                     })
+                    .take(64)
                     .collect(),
             )
         };
         if batch.is_empty() {
-            after = None;
+            // The wake that ended the last backoff may be for a user before
+            // the cursor: rescan from the start before waiting again.
+            if after.take().is_some() {
+                continue;
+            }
             if empty {
                 state.wake.notified().await;
             } else {
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                // Pending users are still inside a write; Mutation::drop wakes
+                // us as soon as it ends, so a fenced GET does not wait a tick.
+                let _ =
+                    tokio::time::timeout(Duration::from_millis(100), state.wake.notified()).await;
             }
             continue;
         }
         after = batch.last().map(|(id, _, _, _)| *id);
+        let mut failed = false;
         for (id, generation, poker, effects) in batch {
             let _loader = state.loader.lock().await;
             let result = read_user(&pool, id, poker, effects).await;
@@ -1001,9 +1009,12 @@ async fn refresh_loop(pool: PgPool, state: Arc<State>) {
                     if replace(&mut inner, id, user).is_ok() {
                         inner.pending.remove(&id);
                         state.published.notify_waiters();
+                    } else {
+                        failed = true;
                     }
                 }
                 Err(_) => {
+                    failed = true;
                     failures = failures.saturating_add(1);
                     if failures.is_power_of_two() {
                         tracing::warn!(failures, "beans_read_refresh_waiting");
@@ -1011,7 +1022,13 @@ async fn refresh_loop(pool: PgPool, state: Arc<State>) {
                 }
             }
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Back off between batches; a new write or a waiting read cuts it
+        // short unless a load or install just failed, so wakes cannot spin.
+        if failed {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        } else {
+            let _ = tokio::time::timeout(Duration::from_millis(100), state.wake.notified()).await;
+        }
     }
 }
 fn active(pool: &PgPool, user: Uuid) -> sqlx::Result<()> {

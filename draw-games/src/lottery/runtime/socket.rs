@@ -52,6 +52,7 @@ pub async fn handler(
     Query(q): Query<Parameters>,
     headers: HeaderMap,
     peer: Option<ConnectInfo<std::net::SocketAddr>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     ws: WebSocketUpgrade,
 ) -> Response {
     if !crate::game_socket::origin_allowed(&headers) {
@@ -63,8 +64,14 @@ pub async fn handler(
     if !ready(&app.pool) || player(&app.pool, user.user_id).is_err() {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
-    let Some(auth) =
-        SocketAuth::capture(&app, &headers, peer.map(|p| p.0.ip()), user.user_id).await
+    let Some(auth) = SocketAuth::capture(
+        &app,
+        &headers,
+        peer.map(|p| p.0.ip()),
+        user.user_id,
+        raw_query.as_deref(),
+    )
+    .await
     else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
