@@ -18,8 +18,10 @@ mod pending_effects;
 #[path = "beans_reservations.rs"]
 mod reservations;
 pub(crate) use pending_effects::{
-    accept_effect, daily_claimed, effect_committed, settlement_balance, PendingEffect,
+    accept_effect, daily_claimed, effect_abandoned, effect_committed, settlement_balance,
+    PendingEffect,
 };
+pub(crate) use reservations::release_poker_session;
 pub use reservations::{
     available, reserve_poker_stack, sicbo_accepted, sicbo_committed, sync_poker_checkpoint,
 };
@@ -837,6 +839,7 @@ pub fn remove_user(pool: &PgPool, id: Uuid) {
         state.published.notify_waiters();
         return;
     }
+    inner.reservations.remove_user(id);
     if let Some(user) = inner.users.remove(&id) {
         if let Some(key) = rank(id, &user) {
             inner.ranks.remove(&key);
@@ -1103,7 +1106,7 @@ pub(crate) fn with_admission_balance<R>(
     ensure(pool, id)?;
     let state = state(pool);
     let inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
-    if !inner.ready || inner.active_writes != 0 {
+    if !inner.ready || inner.active_users.contains_key(&id) {
         return Err(unavailable());
     }
     let user = inner
@@ -1112,7 +1115,7 @@ pub(crate) fn with_admission_balance<R>(
         .filter(|user| user.available)
         .ok_or_else(unavailable)?;
     let balance = user.wallet.as_ref().ok_or_else(unavailable)?.balance;
-    let directory = crate::live_directory::memory_snapshot(pool)?;
+    let directory = crate::live_directory::memory_snapshot_for_user(pool, id)?;
     let reserved = reservations::reserved(&inner, &directory, id, false, None, None)?;
     let unaccounted =
         crate::beans::holds::outstanding_unless(id, |hand| inner.poker.contains_key(&hand));
@@ -1235,4 +1238,43 @@ pub fn latest(pool: &PgPool, id: Uuid, game: &str) -> sqlx::Result<(i64, Option<
 /// Socket refresh notification; waiting performs no SQL.
 pub(crate) fn changed(pool: &PgPool) -> tokio::sync::futures::OwnedNotified {
     state(pool).published.clone().notified_owned()
+}
+
+/// Socket consumers compare only their own wallet generation after a wakeup.
+pub(crate) fn user_generation(pool: &PgPool, user: Uuid) -> Option<u64> {
+    state(pool)
+        .inner
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .users
+        .get(&user)
+        .map(|u| u.generation)
+}
+
+/// Do not enqueue lottery work ahead of a new user's initial wallet grant.
+pub(crate) async fn initial_grant_ready(pool: &PgPool, user: Uuid) -> sqlx::Result<()> {
+    if sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM wallets WHERE user_id=$1 AND game=$2)",
+    )
+    .bind(user)
+    .bind(crate::game_catalog::BEANS)
+    .fetch_one(pool)
+    .await?
+    {
+        return Ok(());
+    }
+    let state = state(pool);
+    let receipt = state
+        .inner
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .writer
+        .as_ref()
+        .ok_or_else(unavailable)?
+        .durable();
+    tokio::time::timeout(Duration::from_secs(2), receipt)
+        .await
+        .map_err(|_| unavailable())?
+        .map_err(|_| unavailable())?;
+    Ok(())
 }

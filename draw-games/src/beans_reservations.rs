@@ -12,7 +12,19 @@ pub(super) struct Reservations {
 }
 
 impl Reservations {
+    pub(super) fn remove_user(&mut self, user: Uuid) {
+        self.poker.retain(|(_, owner, _), _| *owner != user);
+    }
     pub(super) fn checkpoint(&mut self, session: Uuid, checkpoint: &RuntimeCheckpoint) {
+        self.poker.retain(|(room, user, joined), (revision, _)| {
+            *room != session
+                || *revision > checkpoint.revision
+                || checkpoint.seats.values().any(|seat| {
+                    seat.occupant
+                        .as_ref()
+                        .is_some_and(|owner| owner.user_id == *user && owner.joined_at == *joined)
+                })
+        });
         for seat in checkpoint.seats.values() {
             let Some(owner) = &seat.occupant else {
                 continue;
@@ -110,18 +122,30 @@ pub fn sicbo_committed(pool: &PgPool, code: &str, snapshot: &Value) {
 }
 
 pub fn sync_poker_checkpoint(pool: &PgPool, session: Uuid, checkpoint: &RuntimeCheckpoint) {
+    let state = state(pool);
+    let mut inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
     let Ok(directory) = crate::live_directory::memory_snapshot(pool) else {
         return;
     };
-    if !directory.sessions.get(&session).is_some_and(is_beans) {
+    if !directory
+        .sessions
+        .get(&session)
+        .is_some_and(|room| is_beans(room) && room.ended_at.is_none())
+    {
         return;
     }
+    inner.reservations.checkpoint(session, checkpoint);
+}
+
+/// Called after directory closure and after dropping its publication lock.
+pub(crate) fn release_poker_session(pool: &PgPool, session: Uuid) {
     state(pool)
         .inner
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .reservations
-        .checkpoint(session, checkpoint);
+        .poker
+        .retain(|(room, _, _), _| *room != session);
 }
 
 fn is_beans(room: &crate::live_directory::LiveSession) -> bool {
@@ -260,7 +284,7 @@ pub fn available(
     }
     let directory = {
         let _phase = http_phase(HttpPhase::Processing).operation("beans_directory_snapshot");
-        crate::live_directory::memory_snapshot(pool)?
+        crate::live_directory::memory_snapshot_for_user(pool, user)?
     };
     let _phase = http_phase(HttpPhase::Processing).operation("beans_available_compute");
     for (room, member) in directory.memberships_for(user) {
@@ -300,7 +324,7 @@ pub fn reserve_poker_stack(
     ensure(pool, user)?;
     let state = state(pool);
     let mut inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
-    if !inner.ready || inner.active_writes != 0 {
+    if !inner.ready || inner.active_users.contains_key(&user) {
         return Err(unavailable());
     }
     let balance = inner
@@ -310,7 +334,7 @@ pub fn reserve_poker_stack(
         .and_then(|u| u.wallet.as_ref())
         .ok_or_else(unavailable)?
         .balance;
-    let directory = crate::live_directory::memory_snapshot(pool)?;
+    let directory = crate::live_directory::memory_snapshot_for_user(pool, user)?;
     let room = directory.sessions.get(&session).ok_or_else(unavailable)?;
     let member = room
         .members

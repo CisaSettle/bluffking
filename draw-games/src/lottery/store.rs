@@ -276,7 +276,9 @@ pub(super) async fn replay(
         purchased: tickets.iter().map(|t| ticket_json(game, t)).collect(),
         charged: details["charged"].as_i64().unwrap_or_default(),
         balance_before: details["balance_before"].as_i64().unwrap_or_default(),
-        balance_after,
+        balance_after: details["accepted_balance_after"]
+            .as_i64()
+            .unwrap_or(balance_after),
     }))
 }
 
@@ -346,7 +348,7 @@ pub async fn buy_numbers(
     body: &NumberBuy,
 ) -> Result<Purchase, Error> {
     if crate::realtime_mode::enabled() {
-        return super::runtime::buy_numbers(pool, user, game, body);
+        return super::runtime::buy_numbers(pool, user, game, body).await;
     }
     let schedule = game.schedule().ok_or(Error::InvalidEntry)?;
     if body.request_id.is_nil()
@@ -603,7 +605,7 @@ pub async fn buy_numbers(
 /// Lottery refill shares the single daily beans entitlement.
 pub async fn refill(pool: &PgPool, user: Uuid, request_id: Uuid) -> Result<i64, Error> {
     if crate::realtime_mode::enabled() {
-        return super::runtime::refill(pool, user);
+        return super::runtime::refill(pool, user).await;
     }
     if request_id.is_nil() {
         return Err(Error::InvalidEntry);
@@ -894,7 +896,7 @@ async fn draw_json(
 /// `GET /api/lottery/{game}`.
 pub async fn view(pool: &PgPool, user: Uuid, game: Game) -> Result<Value, Error> {
     if crate::realtime_mode::enabled() {
-        return super::runtime::view(pool, user, game);
+        return super::runtime::view(pool, user, game).await;
     }
     let balance = ensure_wallet(pool, user).await?;
     let available_balance = crate::beans_read_memory::available(pool, user, balance, false, None)?;
@@ -979,9 +981,6 @@ pub async fn draws(
     limit: i64,
     offset: i64,
 ) -> Result<Vec<Value>, Error> {
-    if crate::realtime_mode::enabled() {
-        return super::runtime::draws(pool, game, limit, offset);
-    }
     let mut conn = pool.acquire().await?;
     let rows = recent_periods(&mut conn, game, limit.clamp(1, 100), offset.max(0)).await?;
     Ok(rows.iter().map(|r| r.summary(game)).collect())
@@ -990,9 +989,6 @@ pub async fn draws(
 /// Public, account-free proof retrieval. No player or private ticket data leaves
 /// this endpoint. The same URL serves the pre-draw plan and the revealed result.
 pub async fn proof(pool: &PgPool, game: Game, period: i64) -> Result<Value, Error> {
-    if crate::realtime_mode::enabled() {
-        return super::runtime::proof(pool, game, period);
-    }
     if game.schedule().is_none() {
         return Err(Error::InvalidEntry);
     }
@@ -1044,9 +1040,6 @@ pub async fn tickets(
     offset: i64,
     filter: TicketFilter,
 ) -> Result<Vec<Value>, Error> {
-    if crate::realtime_mode::enabled() {
-        return super::runtime::tickets(pool, user, game, limit, offset, filter);
-    }
     let rows = sqlx::query(&format!(
         "SELECT t.{} , p.numbers AS result_numbers, p.bonus AS result_bonus, p.bonus_numbers AS result_bonus_numbers, p.draw_proof AS result_proof \
          FROM lottery_tickets t LEFT JOIN lottery_periods p \
@@ -1082,4 +1075,31 @@ pub async fn tickets(
             ticket
         })
         .collect())
+}
+
+/// History never joins the runtime's resident working set.
+pub(super) async fn decorate_history(
+    pool: &PgPool,
+    user: Uuid,
+    game: Game,
+    view: &mut Value,
+) -> Result<(), Error> {
+    let mut conn = pool.acquire().await?;
+    let scan = feed_scan(&mut conn, game).await?;
+    let mut feed = scan.purchases;
+    if game == Game::Scratch {
+        feed.extend(scan.wins);
+    } else {
+        let recent = recent_periods(&mut conn, game, RECENT_DRAWS, 0).await?;
+        view["recent"] = json!(recent.iter().map(|r| r.summary(game)).collect::<Vec<_>>());
+        if let Some(row) = recent.first() {
+            let draw = draw_json(&mut conn, game, user, row).await?;
+            if let Some(winners) = draw["winners"].as_array() {
+                feed.extend(winners.iter().map(|w| json!({"at_ms":draw["drawn_at_ms"],"user_id":w["user_id"],"name":w["name"],"kind":"won","tier":w["tier"],"prize":w["prize"],"period_label":draw["label"]})));
+            }
+            view["last_draw"] = draw;
+        }
+    }
+    view["feed"] = json!(merge_feed(feed));
+    Ok(())
 }

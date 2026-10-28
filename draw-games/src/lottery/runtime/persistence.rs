@@ -41,129 +41,85 @@ fn bounded(data: &Data) -> sqlx::Result<()> {
     }
 }
 
+/// A deterministic mismatch between the accepted event and SQL. Retrying the
+/// same event cannot succeed, so the writer fences and memory rehydrates.
+const PERMANENT: &str = "lottery_permanent: ";
+fn permanent(what: &str) -> sqlx::Error {
+    sqlx::Error::Protocol(format!("{PERMANENT}{what}"))
+}
+/// Permanent: our own mismatch markers, unique (23505) and foreign-key (23503)
+/// violations. A CHECK violation (23514) stays retryable: bean memory admits a
+/// spend against poker credit whose own writer has not committed yet, and the
+/// retry succeeds once it lands. Timeouts, lock waits, serialization failures
+/// and connection loss stay retryable too.
+pub(super) fn is_permanent(error: &sqlx::Error) -> bool {
+    match error {
+        sqlx::Error::Protocol(message) => message.starts_with(PERMANENT),
+        sqlx::Error::Database(e) => e
+            .code()
+            .is_some_and(|code| code == "23505" || code == "23503"),
+        _ => false,
+    }
+}
+
 pub(super) async fn hydrate(pool: &PgPool) -> sqlx::Result<Data> {
-    crate::live_directory::wait_for_open_transactions(pool).await?;
+    hydrate_missing(pool, &[]).await
+}
+
+pub(super) async fn hydrate_missing(
+    pool: &PgPool,
+    existing: &[(String, i64)],
+) -> sqlx::Result<Data> {
     let mut tx = pool.begin().await?;
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ,READ ONLY")
         .execute(&mut *tx)
         .await?;
-    let games: Vec<_> = Game::ALL.iter().map(|g| g.as_str()).collect();
+    sqlx::query(
+        "SELECT set_config('lock_timeout','500ms',true),set_config('statement_timeout','2s',true)",
+    )
+    .execute(&mut *tx)
+    .await?;
     let mut data = Data::default();
-    let (mut after_game, mut after_period) = (String::new(), i64::MIN);
-    loop {
-        let rows=sqlx::query("SELECT game,period,status,numbers,bonus,bonus_numbers,drawn_at,settled_at,tickets,stakes,players,sales,paid,winners,proof_plan,draw_proof FROM lottery_periods WHERE game=ANY($1) AND (game,period)>($2,$3) ORDER BY game,period LIMIT $4").bind(&games).bind(&after_game).bind(after_period).bind(PAGE).fetch_all(&mut *tx).await?;
-        if rows.is_empty() {
-            break;
+    // Three slots per game, oldest outstanding work first. Never hydrate history.
+    for game in Game::DRAWN {
+        let loaded: Vec<i64> = existing
+            .iter()
+            .filter(|(g, _)| g == game.as_str())
+            .map(|(_, p)| *p)
+            .collect();
+        let remaining = PERIOD_SLOTS.saturating_sub(loaded.len()) as i64;
+        if remaining == 0 {
+            continue;
         }
+        let rows = sqlx::query("SELECT game,period,status,numbers,bonus,bonus_numbers,drawn_at,settled_at,tickets,stakes,players,sales,paid,winners,proof_plan,draw_proof FROM lottery_periods WHERE game=$1 AND status<>'settled' AND NOT(period=ANY($2)) ORDER BY period LIMIT $3")
+            .bind(game.as_str()).bind(&loaded).bind(remaining).fetch_all(&mut *tx).await?;
         for row in rows {
-            after_game = row.get("game");
-            after_period = row.get("period");
             let period = PeriodRow::from_row(&row);
             data.bytes = data.bytes.saturating_add(resident(&period));
             data.periods
-                .insert((after_game.clone(), after_period), period);
+                .insert((game.as_str().into(), period.period), period);
         }
-        bounded(&data)?;
     }
-    let mut after = None::<Uuid>;
-    loop {
-        let rows=sqlx::query(&format!("SELECT user_id,game,{} FROM lottery_tickets WHERE game=ANY($1) AND (game<>'scratch' OR (cost=100 AND entry->'reward_version'='1'::jsonb)) AND ($2::uuid IS NULL OR id>$2) ORDER BY id LIMIT $3",store::TICKET_COLUMNS)).bind(&games).bind(after).bind(PAGE).fetch_all(&mut *tx).await?;
-        if rows.is_empty() {
-            break;
-        }
-        for row in rows {
-            let card = TicketRow::from_row(&row);
-            after = Some(card.id);
-            data.insert(OwnedTicket {
-                user: row.get("user_id"),
-                game: row.get("game"),
-                card,
-            });
-        }
-        bounded(&data)?;
-    }
-    let mut after_id = 0i64;
-    loop {
-        let rows=sqlx::query("SELECT id,user_id,record_id,balance_after,details FROM wallet_ledger WHERE game=$1 AND kind='play' AND details->>'game'=ANY($2) AND details->>'body_sha256' IS NOT NULL AND id>$3 ORDER BY id LIMIT $4").bind(BEANS).bind(&games).bind(after_id).bind(PAGE).fetch_all(&mut *tx).await?;
-        if rows.is_empty() {
-            break;
-        }
-        for row in rows {
-            after_id = row.get("id");
-            let user: Uuid = row.get("user_id");
-            let Some(record) = row.get::<Option<Uuid>, _>("record_id") else {
-                continue;
-            };
-            let d: Value = row.get("details");
-            let ids =
-                serde_json::from_value(d["ticket_ids"].clone()).map_err(|_| db_unavailable())?;
-            data.receipts.insert(
-                (user, record),
-                Receipt {
-                    game: d["game"].as_str().ok_or_else(db_unavailable)?.into(),
-                    record,
-                    hash: d["body_sha256"].as_str().ok_or_else(db_unavailable)?.into(),
-                    tickets: ids,
-                    charged: d["charged"].as_i64().unwrap_or(0),
-                    before: d["balance_before"].as_i64().unwrap_or(0),
-                    after: d["accepted_balance_after"]
-                        .as_i64()
-                        .unwrap_or_else(|| row.get("balance_after")),
-                },
-            );
-            data.bytes = data
-                .bytes
-                .saturating_add(resident(&data.receipts[&(user, record)]));
-        }
-        bounded(&data)?;
-    }
-    let mut after = None::<Uuid>;
-    loop {
-        let rows=sqlx::query("SELECT id,user_id,server_seed FROM draw_commitments WHERE game='scratch' AND ($1::uuid IS NULL OR id>$1) ORDER BY id LIMIT $2").bind(after).bind(PAGE).fetch_all(&mut *tx).await?;
-        if rows.is_empty() {
-            break;
-        }
-        for row in rows {
-            let id = row.get("id");
-            after = Some(id);
-            let user = row.get("user_id");
-            data.offers.insert(
-                user,
-                Offer {
-                    user,
-                    id,
-                    seed: row.get("server_seed"),
-                    fresh: false,
-                    previous: None,
-                },
-            );
-            data.bytes = data.bytes.saturating_add(resident(&data.offers[&user]));
-        }
-        bounded(&data)?;
-    }
-    let mut after = None::<Uuid>;
-    loop {
-        let rows=sqlx::query("SELECT id,game,period,user_id,name,tier,prize FROM lottery_winners WHERE game=ANY($1) AND ($2::uuid IS NULL OR id>$2) ORDER BY id LIMIT $3").bind(&games).bind(after).bind(PAGE).fetch_all(&mut *tx).await?;
-        if rows.is_empty() {
-            break;
-        }
-        for row in rows {
-            after = Some(row.get("id"));
-            let game: String = row.get("game");
-            let period: i64 = row.get("period");
-            let key = (game, period);
-            data.winners.entry(key.clone()).or_default().push(Winner {
-                user: row.get("user_id"),
-                name: row.get("name"),
-                tier: row.get("tier"),
-                prize: row.get("prize"),
-            });
-            let winner = data.winners.get(&key).and_then(|v| v.last());
-            if let Some(winner) = winner {
-                data.bytes = data.bytes.saturating_add(resident(winner));
+    let keys: Vec<_> = data.periods.keys().cloned().collect();
+    for (game, period) in keys {
+        let mut after = None::<Uuid>;
+        loop {
+            let rows = sqlx::query(&format!("SELECT user_id,game,{} FROM lottery_tickets WHERE game=$1 AND period=$2 AND ($3::uuid IS NULL OR id>$3) ORDER BY id LIMIT $4", store::TICKET_COLUMNS))
+                .bind(&game).bind(period).bind(after).bind(PAGE).fetch_all(&mut *tx).await?;
+            if rows.is_empty() {
+                break;
             }
+            for row in rows {
+                let card = TicketRow::from_row(&row);
+                after = Some(card.id);
+                data.insert(OwnedTicket {
+                    user: row.get("user_id"),
+                    game: game.clone(),
+                    card,
+                });
+            }
+            bounded(&data)?;
         }
-        bounded(&data)?;
     }
     tx.commit().await?;
     for ids in data.recent.values_mut() {
@@ -188,15 +144,20 @@ pub(super) async fn persist(
             })?;
         return Ok(vec![]);
     }
-    let game = Game::parse(&event.game).ok_or_else(db_unavailable)?;
+    let game = Game::parse(&event.game).ok_or_else(|| permanent("game"))?;
     let fingerprint =
-        store::body_sha256(&serde_json::to_value(event).map_err(|_| db_unavailable())?);
+        store::body_sha256(&serde_json::to_value(event).map_err(|_| permanent("event json"))?);
     let mut tx = pool.begin().await?;
+    sqlx::query(
+        "SELECT set_config('lock_timeout','500ms',true),set_config('statement_timeout','2s',true)",
+    )
+    .execute(&mut *tx)
+    .await?;
     if let Some(user) = event.owner {
         crate::db::lock_game_participants(&mut tx, &[user]).await?;
         crate::wallet::lock(&mut tx, BEANS, user)
             .await?
-            .ok_or(sqlx::Error::RowNotFound)?;
+            .ok_or_else(|| permanent("wallet row missing"))?;
     }
     if let (Some(user), Some(effect)) = (event.owner, &event.effect) {
         if let Some((delta, details)) = sqlx::query_as::<_, (i64, Option<Value>)>(
@@ -212,7 +173,7 @@ pub(super) async fn persist(
                 || details.as_ref().and_then(|d| d["lottery_event"].as_str())
                     != Some(fingerprint.as_str())
             {
-                return Err(db_unavailable());
+                return Err(permanent("ledger fingerprint mismatch"));
             }
             let grants = read_grants(&mut tx, &event.max_cards).await?;
             tx.commit().await?;
@@ -233,13 +194,13 @@ pub(super) async fn persist(
         .await?
         .rows_affected();
         if removed != 1 {
-            return Err(db_unavailable());
+            return Err(permanent("scratch commitment missing"));
         }
     }
     let mut cards = event.cards.clone();
     let mut grants = vec![];
     for id in &event.max_cards {
-        let user = event.owner.ok_or_else(db_unavailable)?;
+        let user = event.owner.ok_or_else(|| permanent("max card owner"))?;
         let grant = crate::game_rewards::grant_max_on(&mut tx, user, &event.game, *id).await?;
         if let Some(card) = cards.iter_mut().find(|t| t.card.id == *id) {
             card.card.entry["reward_grant"] = json!(grant)
@@ -247,18 +208,23 @@ pub(super) async fn persist(
         grants.push((*id, grant));
     }
     if let Some(row) = &event.period {
-        let plan: draw_games::lottery::Plan =
-            serde_json::from_value(row.proof_plan.clone().ok_or_else(db_unavailable)?)
-                .map_err(|_| db_unavailable())?;
-        let opens = DateTime::from_timestamp_millis(
-            plan.sales_opens_at_ms().map_err(|_| db_unavailable())?,
+        let plan: draw_games::lottery::Plan = serde_json::from_value(
+            row.proof_plan
+                .clone()
+                .ok_or_else(|| permanent("proof plan"))?,
         )
-        .ok_or_else(db_unavailable)?;
-        let draw = DateTime::from_timestamp_millis(plan.draw_at_ms).ok_or_else(db_unavailable)?;
+        .map_err(|_| permanent("proof plan"))?;
+        let opens = DateTime::from_timestamp_millis(
+            plan.sales_opens_at_ms()
+                .map_err(|_| permanent("proof plan"))?,
+        )
+        .ok_or_else(|| permanent("proof plan"))?;
+        let draw = DateTime::from_timestamp_millis(plan.draw_at_ms)
+            .ok_or_else(|| permanent("proof plan"))?;
         let changed = sqlx::query("INSERT INTO lottery_periods(game,period,status,opens_at,draw_at,proof_plan,numbers,bonus,bonus_numbers,drawn_at,tickets,stakes,players,sales,paid,winners,draw_proof,settled_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,CASE WHEN $3='settled' THEN $18::timestamptz ELSE NULL END) ON CONFLICT(game,period) DO UPDATE SET status=EXCLUDED.status,numbers=EXCLUDED.numbers,bonus=EXCLUDED.bonus,bonus_numbers=EXCLUDED.bonus_numbers,drawn_at=EXCLUDED.drawn_at,tickets=EXCLUDED.tickets,stakes=EXCLUDED.stakes,players=EXCLUDED.players,sales=EXCLUDED.sales,paid=EXCLUDED.paid,winners=EXCLUDED.winners,draw_proof=EXCLUDED.draw_proof,settled_at=EXCLUDED.settled_at WHERE lottery_periods.proof_plan=EXCLUDED.proof_plan")
  .bind(&event.game).bind(row.period).bind(&row.status).bind(opens).bind(draw).bind(&row.proof_plan).bind(&row.numbers).bind(row.bonus).bind(&row.bonus_numbers).bind(row.drawn_at).bind(row.tickets).bind(row.stakes).bind(row.players).bind(row.sales).bind(row.paid).bind(row.winners).bind(&row.draw_proof).bind(row.settled_at).execute(&mut *tx).await?.rows_affected();
         if changed != 1 {
-            return Err(db_unavailable());
+            return Err(permanent("period proof plan mismatch"));
         }
     }
     if !cards.is_empty() {
@@ -274,14 +240,14 @@ pub(super) async fn persist(
         let changed = sqlx::query("INSERT INTO lottery_tickets(id,purchase_id,game,period,user_id,bought_at,entry,stakes,multiplier,cost,revealed,prize,tier,settled_at,proof_plan) SELECT id,purchase_id,game,period,user_id,bought_at,entry,stakes,multiplier,cost,revealed,prize,tier,settled_at,proof_plan FROM jsonb_to_recordset($1) AS x(id uuid,purchase_id uuid,game text,period bigint,user_id uuid,bought_at timestamptz,entry jsonb,stakes int,multiplier smallint,cost bigint,revealed boolean[],prize bigint,tier smallint,settled_at timestamptz,proof_plan jsonb) ON CONFLICT(id) DO UPDATE SET revealed=EXCLUDED.revealed,prize=EXCLUDED.prize,tier=EXCLUDED.tier,settled_at=EXCLUDED.settled_at,entry=EXCLUDED.entry WHERE lottery_tickets.user_id=EXCLUDED.user_id AND lottery_tickets.game=EXCLUDED.game")
  .bind(json!(values)).execute(&mut *tx).await?.rows_affected();
         if changed != cards.len() as u64 {
-            return Err(db_unavailable());
+            return Err(permanent("ticket owner mismatch"));
         }
     }
     if let (Some(user), Some(effect)) = (event.owner, &event.effect) {
         if let Some(day) = effect.day {
             let n=sqlx::query("INSERT INTO daily_usage(scope,subject_key,feature,usage_date,count) VALUES('feature_user',$1,'beans_daily_refill',$2,1) ON CONFLICT DO NOTHING").bind(user.to_string()).bind(day).execute(&mut *tx).await?.rows_affected();
             if n != 1 {
-                return Err(db_unavailable());
+                return Err(permanent("daily refill already used"));
             }
         }
         if event.bonus > 0 {

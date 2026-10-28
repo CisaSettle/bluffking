@@ -284,6 +284,35 @@ pub(crate) fn project_session_balance(game: i16, user: Uuid, balance: i64) {
         entry.wallet.balance = balance;
     }
 }
+/// Publish a newly committed external credit without replacing accepted room
+/// effects. Call once on the fresh-commit path, never on receipt replay.
+pub(crate) fn project_external_credit(game: i16, user: Uuid, amount: i64) {
+    if let Some(mut entry) = memory().get_mut(&(game, user)) {
+        if let Some(balance) = entry.wallet.balance.checked_add(amount) {
+            entry.wallet.balance = balance;
+        } else {
+            // The durable credit already succeeded. Fail this display/admission
+            // projection closed rather than wrapping or reporting a failed grant.
+            entry.failed = true;
+            tracing::error!(game, "wallet_external_credit_projection_overflow");
+        }
+    }
+}
+/// Bean room settlements must use the same atomic delta update as external
+/// credits, rather than clone a balance and later overwrite intervening grants.
+pub(crate) fn project_bean_settlement(user: Uuid, delta: i64, completed: bool, won: bool) {
+    if let Some(mut entry) = memory().get_mut(&(crate::game_catalog::BEANS, user)) {
+        if let Some(balance) = entry.wallet.balance.checked_add(delta).filter(|v| *v >= 0) {
+            entry.wallet.balance = balance;
+            entry.wallet.net_won += delta;
+            entry.wallet.hands_played += i32::from(completed);
+            entry.wallet.hands_won += i32::from(completed && won);
+        } else {
+            entry.failed = true;
+            tracing::error!("wallet_bean_settlement_projection_overflow");
+        }
+    }
+}
 pub(crate) fn project_refill(game: i16, user: Uuid, balance: i64) {
     if let Some(mut entry) = memory().get_mut(&(game, user)) {
         entry.wallet.balance = balance;

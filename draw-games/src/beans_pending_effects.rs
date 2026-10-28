@@ -43,7 +43,6 @@ pub(crate) fn accept_effect(
     expected: i64,
     enqueue: impl FnOnce() -> sqlx::Result<()>,
 ) -> sqlx::Result<i64> {
-    let directory = crate::live_directory::memory_snapshot(pool)?;
     let state = state(pool);
     let mut inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
     if !inner.ready || inner.active_users.contains_key(&owner) {
@@ -60,6 +59,8 @@ pub(crate) fn accept_effect(
         }
         return Ok(user.wallet.as_ref().ok_or_else(unavailable)?.balance);
     }
+    // Admission publishes seats while holding this same bean authority lock.
+    let directory = crate::live_directory::memory_snapshot_for_user(pool, owner)?;
     let reserved = reservations::reserved(&inner, &directory, owner, false, None, None)?;
     let mut wallet = user.wallet.clone().ok_or_else(unavailable)?;
     if wallet.balance != expected {
@@ -121,6 +122,27 @@ pub(crate) fn effect_committed(pool: &PgPool, owner: Uuid, record: Uuid) {
             inner.bytes -= 256;
         }
     }
+    state.published.notify_waiters();
+}
+
+/// The lottery writer fenced before this effect committed, so SQL never saw
+/// it. Drop it and reload the wallet from SQL with the remaining effects.
+pub(crate) fn effect_abandoned(pool: &PgPool, owner: Uuid, record: Uuid) {
+    let state = state(pool);
+    let mut inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(user) = inner.users.get_mut(&owner) {
+        if user.effects.remove(&record).is_some() {
+            user.bytes -= 256;
+            if user.effects.is_empty() {
+                user.effect_hold = None;
+            }
+            inner.count -= 1;
+            inner.bytes -= 256;
+        }
+    }
+    invalidate_locked(&mut inner, owner);
+    drop(inner);
+    state.wake.notify_one();
     state.published.notify_waiters();
 }
 

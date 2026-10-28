@@ -632,7 +632,9 @@ fn accept_change<R: DealerRoom>(
     }
     if let Some(round) = round {
         for (uid, delta) in R::projection_deltas(&round) {
-            if let Some(w) = wallet::projected(R::POLICY.game, uid) {
+            if R::POLICY.game == crate::game_catalog::BEANS {
+                wallet::project_bean_settlement(uid, delta, true, delta > 0);
+            } else if let Some(w) = wallet::projected(R::POLICY.game, uid) {
                 wallet::project_play(
                     R::POLICY.game,
                     uid,
@@ -1223,24 +1225,6 @@ async fn leave_room_memory<R: DealerRoom>(pool: &PgPool, uid: Uuid) -> Result<()
     Ok(())
 }
 
-pub async fn open_room<R: DealerRoom>(
-    pool: &PgPool,
-    uid: Uuid,
-    name: String,
-    bots: usize,
-    duration_secs: u32,
-) -> Result<String> {
-    open_room_with::<R>(
-        pool,
-        uid,
-        name,
-        bots,
-        duration_secs,
-        spectators::default_allow(),
-    )
-    .await
-}
-
 /// Opens a room; `allow_spectators` is the host's 允许朋友观战.
 pub async fn open_room_with<R: DealerRoom>(
     pool: &PgPool,
@@ -1617,11 +1601,33 @@ pub async fn place_bet<R: DealerRoom>(
             }
         }
         wallet::project_session_balance(crate::game_catalog::BEANS, uid, current);
-        if R::bet(&mut next, uid, bet, available, now_ms())? {
+        let changed = R::bet(&mut next, uid, bet, available, now_ms())?;
+        if changed {
+            // Publish the wager as a memory reservation before the wallet row
+            // lock is released by the commit: another debit by this user (a
+            // slot spin, a claw or casual bet) reads reservations from memory
+            // right after it takes that row lock, so the window between commit
+            // and acceptance must already count this stake. The revision is
+            // the one acceptance assigns, so an earlier snapshot's commit
+            // cannot clear it. If the commit fails nothing is accepted; the
+            // over-reservation lasts until the room's next committed snapshot.
+            // Apply acceptance's admission checks first so a room that would
+            // refuse the wager does not publish a stake it never accepts.
+            if room.release_paused || !crate::write_behind::accepting() {
+                return Err(Error::Unavailable);
+            }
+            room.writer.health().map_err(|_| Error::Unavailable)?;
+            R::set_revision(&mut next, R::revision(&room.state) + 1);
+            crate::beans_read_memory::sicbo_accepted(pool, code, &json!(&next), || Ok(()))?;
+        }
+        // Finish the read transaction before enqueueing an accepted wager, so
+        // a failed commit never leaves an accepted bet behind an error reply.
+        // The user mutation fence and room lock remain held through acceptance.
+        tx.commit().await?;
+        if changed {
             accept(code, &mut room, next, None)?;
             room.idle.activity();
         }
-        tx.commit().await?;
     } else if R::bet(&mut next, uid, bet, balance::<R>(uid), now_ms())? {
         accept(code, &mut room, next, None)?;
         room.idle.activity();

@@ -116,6 +116,12 @@ pub(crate) fn attach_recent(metadata: &mut serde_json::Value) {
     else {
         return;
     };
+    metadata["server_ws_evidence"] = snapshot(trace);
+}
+
+/// Read the ring owned by THIS process. Cross-process callers use the signed
+/// worker endpoint; the backend ring cannot stand in for dealer evidence.
+pub(super) fn snapshot(trace: Uuid) -> serde_json::Value {
     let mut snapshot = serde_json::json!({
         "wire": 1,
         "state": "missing_or_expired",
@@ -123,6 +129,8 @@ pub(crate) fn attach_recent(metadata: &mut serde_json::Value) {
         "log_dropped_total": LOG_DROPPED_TOTAL.load(Ordering::Relaxed),
         "retention_dropped_total": RETENTION_DROPPED.load(Ordering::Relaxed),
         "retention_evicted_total": 0,
+        "retention_seconds": RETENTION.as_secs(),
+        "trace_matched_expired_events": 0,
         "truncated": false,
         "events": [],
     });
@@ -134,6 +142,13 @@ pub(crate) fn attach_recent(metadata: &mut serde_json::Value) {
         // contending producer discards immediately and increments coverage loss.
         let mut selected = [None; SNAPSHOT_LIMIT];
         let mut count = 0;
+        let expired = recent
+            .events
+            .iter()
+            .flatten()
+            .filter(|(at, event)| event.trace == Some(trace) && now.duration_since(*at) > RETENTION)
+            .count();
+        snapshot["trace_matched_expired_events"] = expired.into();
         for (_, event) in recent.events.iter().flatten().filter(|(at, event)| {
             event.trace == Some(trace) && now.duration_since(*at) <= RETENTION
         }) {
@@ -172,7 +187,7 @@ pub(crate) fn attach_recent(metadata: &mut serde_json::Value) {
     } else {
         snapshot["state"] = "busy".into();
     }
-    metadata["server_ws_evidence"] = snapshot;
+    snapshot
 }
 
 fn log_dropped() {

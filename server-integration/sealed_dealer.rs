@@ -14,6 +14,8 @@
 mod authorization;
 pub use authorization::worker_verifying_key;
 pub(crate) mod diagnostics;
+mod evidence;
+pub(crate) use evidence::attach_dealer_evidence;
 mod metrics;
 
 use crate::auth::constant_time::constant_time_eq;
@@ -968,6 +970,7 @@ fn worker_router(state: WorkerState) -> Router {
     Router::new()
         .route("/internal/readyz", get(internal_ready))
         .route("/internal/performance", get(metrics::snapshot))
+        .route("/internal/evidence", post(evidence::snapshot))
         .route("/internal/hands", post(create_hand))
         .route("/internal/commits", post(commit_hand))
         .route("/internal/hands/:hand_id/bots/:seat", post(bot_hole))

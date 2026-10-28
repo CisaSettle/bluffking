@@ -18,6 +18,7 @@ pub(super) const HTTP_ROUTES: &[(&str, &str)] = &[
     ("POST", "/internal/hands/:hand_id/settle"),
     ("DELETE", "/internal/hands/:hand_id"),
     ("GET", "/internal/performance"),
+    ("POST", "/internal/evidence"),
     ("GET", "/healthz"),
     ("GET", "/ws"),
 ];

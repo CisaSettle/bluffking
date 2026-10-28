@@ -90,7 +90,7 @@ fn prize(entry: &Value, cost: i64) -> Result<(i64, i16), Error> {
 
 pub async fn buy(pool: &PgPool, user: Uuid, body: &ScratchBuy) -> Result<Purchase, Error> {
     if crate::realtime_mode::enabled() {
-        return super::runtime::buy_scratch(pool, user, body);
+        return super::runtime::buy_scratch(pool, user, body).await;
     }
     if body.request_id.is_nil()
         || body.cost != 100
@@ -300,7 +300,7 @@ async fn replay(
 }
 
 pub async fn my_cards(conn: &mut PgConnection, user: Uuid) -> sqlx::Result<Vec<TicketRow>> {
-    let rows = sqlx::query(&format!("SELECT {TICKET_COLUMNS} FROM lottery_tickets WHERE game='scratch' AND period=0 AND user_id=$1 AND cost=100 AND entry->'reward_version'='1'::jsonb AND settled_at IS NULL UNION SELECT {TICKET_COLUMNS} FROM lottery_tickets WHERE purchase_id=(SELECT purchase_id FROM lottery_tickets WHERE game='scratch' AND user_id=$1 AND cost=100 AND entry->'reward_version'='1'::jsonb ORDER BY bought_at DESC,id DESC LIMIT 1) ORDER BY bought_at DESC,id"))
+    let rows = sqlx::query(&format!("SELECT {TICKET_COLUMNS} FROM lottery_tickets WHERE game='scratch' AND period=0 AND user_id=$1 AND cost=100 AND entry->'reward_version'='1'::jsonb AND settled_at IS NULL UNION SELECT {TICKET_COLUMNS} FROM lottery_tickets WHERE purchase_id=(SELECT purchase_id FROM lottery_tickets WHERE game='scratch' AND user_id=$1 AND cost=100 AND entry->'reward_version'='1'::jsonb ORDER BY bought_at DESC,id DESC LIMIT 1) ORDER BY bought_at DESC,id LIMIT 1051"))
         .bind(user).fetch_all(conn).await?;
     Ok(rows.iter().map(TicketRow::from_row).collect())
 }
@@ -312,7 +312,7 @@ pub async fn reveal(
     index: Option<usize>,
 ) -> Result<(Value, i64), Error> {
     if crate::realtime_mode::enabled() {
-        return super::runtime::reveal(pool, user, ticket, index);
+        return super::runtime::reveal(pool, user, ticket, index).await;
     }
     reveal_inner(pool, user, ticket, index, false).await
 }

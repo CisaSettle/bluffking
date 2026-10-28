@@ -38,8 +38,23 @@
 //! secondarily by iteration count. [`solve_spot`] calls the solver's
 //! `memory_usage()` and REJECTS (without allocating) when the estimate exceeds
 //! [`SolveLimits::max_memory_bytes`]. The caller is additionally expected to
-//! impose a wall-clock timeout + a global concurrency cap (a wide-range flop
-//! solve is ~1 GB — U27: measured figures in [`SolveLimits`]).
+//! impose a global concurrency cap (a wide-range flop solve is ~1 GB — U27:
+//! measured figures in [`SolveLimits`]).
+//!
+//! # Wall-clock budget + cooperative cancellation
+//! [`solve_spot_with`] drives the Discounted-CFR loop itself (upstream
+//! `solve_step` / `compute_exploitability` / `finalize`, the same steps the
+//! upstream `solve()` runs) so it can stop between iterations: at a
+//! [`SolveControl::deadline`] it keeps the strategy reached so far, measures its
+//! ACTUAL exploitability and reports [`SolveStop::TimeBudget`] with the real
+//! iteration count; when [`SolveControl::cancel`] is set it abandons the solve
+//! with [`SolveError::Cancelled`] so the caller's worker (and its permits) are
+//! released instead of running to the iteration cap. Granularity is one CFR
+//! iteration (upstream exposes no finer interrupt hook).
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use engine::card::Card;
 use engine::hand::HoleCards;
@@ -47,8 +62,9 @@ use serde::Serialize;
 use thiserror::Error;
 
 use postflop_solver::{
-    card_from_str, flop_from_str, holes_to_strings, solve, Action as PfAction, ActionTree,
-    BetSizeOptions, BoardState, CardConfig, PostFlopGame, Range, TreeConfig, NOT_DEALT,
+    card_from_str, compute_exploitability, finalize, flop_from_str, holes_to_strings, solve_step,
+    Action as PfAction, ActionTree, BetSizeOptions, BoardState, CardConfig, PostFlopGame, Range,
+    TreeConfig, NOT_DEALT,
 };
 
 /// Honesty badge for a solve result — the structural twin of the engine's
@@ -121,14 +137,51 @@ pub struct SolveCost {
     /// Estimated uncompressed memory the solve allocated, in bytes (from the
     /// solver's `memory_usage()` BEFORE allocation — the gate value).
     pub memory_bytes: u64,
-    /// The iteration CAP the solve ran under (NOT the count actually run). F5
-    /// (codex MED): the upstream `solve()` returns only the achieved
-    /// exploitability, never the iteration count, so the actual count is not
-    /// available without `solve_step` instrumentation. This is the bound — the
-    /// equilibrium is typically reached in far fewer iterations — so the field
-    /// is named `iteration_cap` to be honest about what it is. (The wire DTO
-    /// surfaces it as `max_iterations`, matching this meaning.)
+    /// The iteration CAP the solve ran under. (The wire DTO surfaces it as
+    /// `max_iterations`.)
     pub iteration_cap: u32,
+    /// CFR iterations ACTUALLY run (this crate drives the loop via
+    /// `solve_step`, so the real count is known — see [`SolveOutput::stop`]).
+    pub iterations: u32,
+}
+
+/// Why the CFR loop stopped. Disclosed with every result so a time-limited
+/// approximation is never presented as a converged one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SolveStop {
+    /// The measured exploitability reached the requested target.
+    Converged,
+    /// The iteration cap ran out before the target was reached.
+    IterationCap,
+    /// The wall-clock budget ([`SolveControl::deadline`]) ran out first: the
+    /// result is the best strategy reached so far, with its own measured
+    /// exploitability — a rougher approximation than a converged solve.
+    TimeBudget,
+}
+
+/// Cooperative stop controls for [`solve_spot_with`].
+#[derive(Debug, Clone, Default)]
+pub struct SolveControl {
+    /// Wall-clock point by which the solve should RETURN. Before each CFR
+    /// iteration the loop checks that the next iteration plus the closing
+    /// exploitability measurement and `finalize` (both estimated from measured
+    /// costs) still fit; otherwise it stops with [`SolveStop::TimeBudget`]. The
+    /// first iteration always runs (a zero-iteration strategy is uniform noise).
+    pub deadline: Option<Instant>,
+    /// Set by the caller when nobody will read the result any more (the request
+    /// timed out or the client went away). Checked between iterations; the
+    /// solve then returns [`SolveError::Cancelled`] promptly.
+    pub cancel: Option<Arc<AtomicBool>>,
+}
+
+impl SolveControl {
+    fn check_cancel(&self) -> Result<(), SolveError> {
+        match &self.cancel {
+            Some(flag) if flag.load(Ordering::Relaxed) => Err(SolveError::Cancelled),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// The full solve result — all numbers derived from the SAME equilibrium so the
@@ -171,6 +224,8 @@ pub struct SolveOutput {
     pub hands: Vec<HandStrategy>,
     /// Solve-cost disclosure (memory + iterations).
     pub cost: SolveCost,
+    /// Why the CFR loop stopped (converged / iteration cap / time budget).
+    pub stop: SolveStop,
 }
 
 /// Select one hero hand's [`HandStrategy`] out of a previously-solved per-hand
@@ -300,6 +355,9 @@ pub enum SolveError {
     /// The upstream crate returned an error while building the game tree.
     #[error("solver build error: {0}")]
     Internal(String),
+    /// The caller set [`SolveControl::cancel`]; the solve was abandoned.
+    #[error("solve cancelled by the caller")]
+    Cancelled,
 }
 
 /// CHEAP, solve-free validation of a [`SolveRequest`]: board legality + street
@@ -514,11 +572,20 @@ fn validate_stakes(req: &SolveRequest) -> Result<(), SolveError> {
 /// Solve one fully-described postflop spot to an approximate Nash equilibrium.
 ///
 /// SYNCHRONOUS and CPU/RAM-heavy (a wide-range flop solve is ~1 GB / single-digit
-/// seconds). The server MUST call this inside `spawn_blocking` with a wall-clock
-/// timeout + a global concurrency cap. Validates every input and applies the
-/// [`SolveLimits`] memory cap BEFORE allocating; never panics on caller input
-/// (the upstream `unsafe`/SIMD paths are reached only after full validation).
+/// seconds). The server MUST call this inside `spawn_blocking` with a global
+/// concurrency cap. Validates every input and applies the [`SolveLimits`] memory
+/// cap BEFORE allocating; never panics on caller input (the upstream
+/// `unsafe`/SIMD paths are reached only after full validation). No wall-clock
+/// budget: use [`solve_spot_with`] for a deadline / cancellation.
 pub fn solve_spot(req: &SolveRequest) -> Result<SolveOutput, SolveError> {
+    solve_spot_with(req, &SolveControl::default())
+}
+
+/// [`solve_spot`] under cooperative [`SolveControl`]: stops at the deadline with
+/// the best-so-far strategy (honestly labeled [`SolveStop::TimeBudget`] with its
+/// measured exploitability and real iteration count), or abandons the solve with
+/// [`SolveError::Cancelled`] once the cancel flag is set.
+pub fn solve_spot_with(req: &SolveRequest, ctl: &SolveControl) -> Result<SolveOutput, SolveError> {
     // --- Cheap, solve-free validation (single source of truth) --------------
     // N2 (codex MED): run the FULL `validate_request` first so EVERY input is
     // validated before a game is constructed — honoring this crate's documented
@@ -600,23 +667,108 @@ pub fn solve_spot(req: &SolveRequest) -> Result<SolveOutput, SolveError> {
     }
 
     // --- Allocate + solve ---------------------------------------------------
+    ctl.check_cancel()?;
     game.allocate_memory(false);
 
     let target = req.limits.target_exploitability_pct_of_pot * req.starting_pot as f32;
-    let exploitability = solve(&mut game, req.limits.max_iterations, target, false);
+    let run = run_cfr(&mut game, req.limits.max_iterations, target, ctl)?;
 
     // Required before reading equity/EV/strategy at the (root) node.
     game.cache_normalized_weights();
 
-    project_output(&game, req, exploitability)
+    project_output(&game, req, run)
+}
+
+/// Outcome of [`run_cfr`].
+struct CfrRun {
+    exploitability: f32,
+    iterations: u32,
+    stop: SolveStop,
+}
+
+/// Safety factor on the measured per-pass costs when deciding whether one more
+/// iteration still fits before the deadline (iteration times jitter on a shared
+/// box; the closing exploitability pass + `finalize` must fit too).
+const DEADLINE_SAFETY_NUM: u32 = 5;
+const DEADLINE_SAFETY_DEN: u32 = 4;
+
+/// The upstream `solve()` loop (Discounted CFR, exploitability measured every
+/// 10 iterations and at the end, then `finalize`), made deadline-aware and
+/// cancellable between iterations. Returns the ACHIEVED exploitability of the
+/// final average strategy, the real iteration count, and why it stopped.
+fn run_cfr(
+    game: &mut PostFlopGame,
+    max_iterations: u32,
+    target: f32,
+    ctl: &SolveControl,
+) -> Result<CfrRun, SolveError> {
+    let mut iterations: u32 = 0;
+    let mut exploitability = f32::INFINITY;
+    let mut measured_at: Option<u32> = None;
+    // Max observed costs of one CFR iteration and one exploitability pass.
+    // `finalize` is one counterfactual-value pass per player, comparable to an
+    // iteration, so it is estimated with the iteration cost.
+    let mut iter_cost = Duration::ZERO;
+    let mut exploit_cost: Option<Duration> = None;
+    let mut stop = SolveStop::IterationCap;
+
+    while iterations < max_iterations {
+        ctl.check_cancel()?;
+        if iterations > 0 {
+            if let Some(deadline) = ctl.deadline {
+                let closing = iter_cost + exploit_cost.unwrap_or(iter_cost) + iter_cost;
+                let need = closing * DEADLINE_SAFETY_NUM / DEADLINE_SAFETY_DEN;
+                if Instant::now() + need > deadline {
+                    stop = SolveStop::TimeBudget;
+                    break;
+                }
+            }
+        }
+        let started = Instant::now();
+        solve_step(&*game, iterations);
+        iter_cost = iter_cost.max(started.elapsed());
+        iterations += 1;
+
+        if iterations.is_multiple_of(10) {
+            ctl.check_cancel()?;
+            let started = Instant::now();
+            exploitability = compute_exploitability(&*game);
+            let cost = started.elapsed();
+            exploit_cost = Some(exploit_cost.map_or(cost, |c| c.max(cost)));
+            measured_at = Some(iterations);
+            if exploitability <= target {
+                stop = SolveStop::Converged;
+                break;
+            }
+        }
+    }
+
+    // Always report the exploitability of the strategy actually returned.
+    if measured_at != Some(iterations) {
+        ctl.check_cancel()?;
+        exploitability = compute_exploitability(&*game);
+        if exploitability <= target {
+            stop = SolveStop::Converged;
+        }
+    }
+
+    ctl.check_cancel()?;
+    finalize(game);
+
+    Ok(CfrRun {
+        exploitability,
+        iterations,
+        stop,
+    })
 }
 
 /// Build the [`SolveOutput`] from a solved game at the root node.
 fn project_output(
     game: &PostFlopGame,
     req: &SolveRequest,
-    exploitability: f32,
+    run: CfrRun,
 ) -> Result<SolveOutput, SolveError> {
+    let exploitability = run.exploitability;
     let player = req.solving_player;
     let p = player.index();
 
@@ -721,12 +873,10 @@ fn project_output(
         hands,
         cost: SolveCost {
             memory_bytes: uncompressed,
-            // F5: the upstream `solve` does not return the iteration count, so we
-            // report the CAP, not the actual count — the field name
-            // (`iteration_cap`) and its doc say exactly that, so the disclosure
-            // is never misleadingly presented as "iterations actually run".
             iteration_cap: req.limits.max_iterations,
+            iterations: run.iterations,
         },
+        stop: run.stop,
     })
 }
 
