@@ -28,7 +28,7 @@ pub async fn recover<R: DealerRoom>(pool: &PgPool) -> sqlx::Result<()> {
                 let mut after_user: Option<Uuid> = None;
                 loop {
                     let members = sqlx::query(
-                        "SELECT m.user_id,m.code,COALESCE(m.name,c.state->'member_names'->>m.user_id::text,'') AS name \
+                        "SELECT m.user_id,m.code,COALESCE(m.name,'') AS name \
                          FROM game_room_checkpoint_members m JOIN game_room_checkpoints c ON c.game=m.game AND c.code=m.code \
                          WHERE m.game=$1 AND m.code=ANY($2) AND ($3::uuid IS NULL OR m.user_id>$3) \
                          ORDER BY m.user_id LIMIT $4",
@@ -101,14 +101,6 @@ pub(super) fn install<R: DealerRoom>(
         // it is not a recovery failure for this process.
         if crate::local_runtime::owned_by_another_backend(id) {
             tracing::info!(%code, "{} room owned by another local backend", R::DEALER);
-            if memory_lifecycle::<R>() {
-                R::registry().nonresident.lock().unwrap().extend(
-                    by_room
-                        .get(&code)
-                        .into_iter()
-                        .flat_map(|members| members.keys().copied()),
-                );
-            }
             continue;
         }
         let mut state: R::State = crate::game_checkpoint::decode(row.get("state"))?;
@@ -116,38 +108,11 @@ pub(super) fn install<R: DealerRoom>(
         R::clock_mut(&mut state).start(now_ms());
         let handoff_guard = crate::release_handoff::register(id, true)
             .ok_or_else(|| sqlx::Error::Protocol("release room registration refused".into()))?;
-        let mut members = by_room.remove(&code).unwrap_or_default();
-        let mut memberships = Vec::new();
-        for (uid, member) in &mut members {
-            if memory_lifecycle::<R>() {
-                let owner = memory_membership::current(R::DEALER, &code, *uid)
-                    .map(Ok)
-                    .unwrap_or_else(|| memory_membership::claim(R::DEALER, &code, *uid))
-                    .map_err(sqlx::Error::Protocol)?;
-                owner.accepted();
-                owner.admitted();
-                memberships.push(owner);
-                if member.name.is_empty() {
-                    member.name = crate::player_directory::lookup(pool, *uid)?
-                        .and_then(|player| player.display_name.clone())
-                        .unwrap_or_else(|| crate::display_name::fallback_display_name(*uid));
-                }
-            }
+        let members = by_room.remove(&code).unwrap_or_default();
+        for uid in members.keys() {
             seats.insert(*uid, code.clone());
         }
         let state = Arc::new(state);
-        let initial = memory_lifecycle::<R>().then(|| Snapshot {
-            users: members.keys().copied().collect(),
-            names: members
-                .iter()
-                .map(|(user, member)| (*user, member.name.clone()))
-                .collect(),
-            revision: R::revision(&state),
-            state: state.clone(),
-            round: None,
-            buy_in: None,
-            memberships,
-        });
         let room = Room {
             pool: pool.clone(),
             registry_generation: Some(crate::room_registry::publish_committed(
@@ -157,7 +122,7 @@ pub(super) fn install<R: DealerRoom>(
             )?),
             state,
             members,
-            writer: writer::<R>(pool, &code, initial),
+            writer: writer::<R>(pool, &code, None),
             touched: Instant::now(),
             idle: IdleWatch::new(),
             closed: false,
@@ -216,18 +181,7 @@ pub(super) fn handoff_room<R: DealerRoom>(
                     crate::release_handoff::fail(&error);
                 }
                 let frozen = crate::release_handoff::rooms::Frozen {
-                    checkpoint: if memory_lifecycle::<R>() {
-                        checkpoint_value::<R>(
-                            &room.state,
-                            &room
-                                .members
-                                .iter()
-                                .map(|(user, member)| (*user, member.name.clone()))
-                                .collect(),
-                        )
-                    } else {
-                        json!(room.state.as_ref())
-                    },
+                    checkpoint: json!(room.state.as_ref()),
                     members: room.members.keys().copied().collect(),
                     online: room
                         .subscribers
@@ -358,11 +312,6 @@ pub(super) async fn drop_room<R: DealerRoom>(
 /// underneath (account deletion cascades) leave idle rooms. An emptied room
 /// closes.
 pub(super) async fn sweep<R: DealerRoom>(pool: &PgPool) -> Result<()> {
-    // Accepted membership epochs are authoritative. Reading a lagging SQL
-    // projection here could evict a seat whose admission is queued correctly.
-    if memory_lifecycle::<R>() {
-        return Ok(());
-    }
     let registry = R::registry();
     for (code, shared) in registry.all() {
         let mut room = shared.lock().await;
@@ -403,7 +352,7 @@ pub(super) async fn sweep<R: DealerRoom>(pool: &PgPool) -> Result<()> {
             }
         }
         for uid in finish_join {
-            let w = committed_admission_wallet::<R>(pool, uid, &code).await?;
+            let w = wallet::ensure(pool, R::POLICY, uid).await?;
             wallet::activate(R::POLICY.game, uid, &code, w);
             if let Some(m) = room.members.get_mut(&uid) {
                 m.joining = false;
@@ -579,12 +528,6 @@ pub(super) async fn finish_close<R: DealerRoom>(
         }
     }
     for uid in &closing.members {
-        if memory_lifecycle::<R>() {
-            if let Some(owner) = memory_membership::current(R::DEALER, &code, *uid) {
-                owner.depart();
-                owner.complete(Ok(()));
-            }
-        }
         wallet::retire(R::POLICY.game, *uid, &code);
         registry.release_seat(*uid, &code);
     }

@@ -408,6 +408,17 @@ impl DealerRoom for SicboRoom {
     fn open_bets(state: &State) -> bool {
         state.result.is_none() && !state.bets.is_empty()
     }
+    fn close_when_all_bet(state: &mut State, seated: &[Uuid], now: i64) -> bool {
+        // Includes the final lock second: no wager can join then anyway.
+        if state.result.is_some()
+            || seated.is_empty()
+            || !seated.iter().all(|uid| state.bets.contains_key(uid))
+        {
+            return false;
+        }
+        state.deadline_ms = now;
+        true
+    }
     /// Replace the caller's whole wager atomically; `None` cancels it.
     fn bet(state: &mut State, uid: Uuid, req: BetRequest, balance: i64, now: i64) -> Result<bool> {
         let wager = req.bet;

@@ -271,7 +271,13 @@ pub async fn load_history_page_filtered<'e>(
          page.session_id, page.played_at, page.delta, ",
     );
     if sessions {
-        query.push("jsonb_build_object('hands', CASE WHEN page.game=5 THEN COALESCE((SELECT jsonb_array_length(r.detail->'results') FROM filtered_records r WHERE r.game=5 AND r.user_id=$1 AND r.record_id=page.record_id),page.hands) ELSE page.hands END, 'started_at', page.started_at)");
+        // A baccarat session is all practice-chip room rounds or all solo
+        // gold-bean hands; its first record tells which.
+        query.push("jsonb_build_object('hands', CASE WHEN page.game=5 THEN COALESCE((SELECT jsonb_array_length(r.detail->'results') FROM filtered_records r WHERE r.game=5 AND r.user_id=$1 AND r.record_id=page.record_id),page.hands) ELSE page.hands END, 'started_at', page.started_at, \
+             'unit', CASE WHEN page.game=8 THEN (SELECT CASE WHEN EXISTS (SELECT 1 FROM wallet_ledger l WHERE l.game=10 AND l.record_id=f.record_id AND l.user_id=$1 \
+             AND l.kind='play' AND l.details->>'game'='baccarat') \
+             THEN 'beans' ELSE 'practice' END FROM (SELECT r.record_id FROM game_records r WHERE r.user_id=$1 AND r.game=8 \
+             AND COALESCE(r.session_id,r.record_id)=page.session_id LIMIT 1) f) END)");
     } else {
         query.push(PAGE_DETAIL_SQL);
     }
@@ -377,7 +383,8 @@ WHEN 7 THEN (SELECT jsonb_build_object(
                   WHEN (m.winner='red' AND m.red_user_id=$1) OR (m.winner='black' AND m.black_user_id=$1) THEN 'win' ELSE 'loss' END,
     'has_bots', (m.red_user_id IS NULL OR m.black_user_id IS NULL))
     FROM (SELECT id,room_code,started_at,ended_at,(detail->>'stake')::bigint AS stake,(detail->>'red_user_id')::uuid AS red_user_id,(detail->>'black_user_id')::uuid AS black_user_id,detail->>'red_name' AS red_name,detail->>'black_name' AS black_name,detail->>'winner' AS winner,detail->>'reason' AS reason,detail->'moves' AS moves FROM game_rounds WHERE game=7) m WHERE m.id=page.record_id)
-WHEN 8 THEN (SELECT details FROM wallet_ledger WHERE game=8 AND user_id=$1 AND record_id=page.record_id ORDER BY id DESC LIMIT 1)
+WHEN 8 THEN (SELECT COALESCE(details,'{}'::jsonb) || jsonb_build_object('unit', CASE WHEN game=8 THEN 'practice' ELSE 'beans' END)
+    FROM wallet_ledger WHERE (game=8 OR (game=10 AND kind='play' AND details->>'game'='baccarat')) AND user_id=$1 AND record_id=page.record_id ORDER BY id DESC LIMIT 1)
 WHEN 11 THEN (SELECT COALESCE(details,'{}'::jsonb) || jsonb_build_object('unit', CASE WHEN game=11 THEN 'practice' ELSE 'beans' END)
     FROM wallet_ledger WHERE (game=11 OR (game=10 AND details->>'game'='sicbo')) AND kind='play' AND user_id=$1 AND record_id=page.record_id ORDER BY id ASC LIMIT 1)
 ELSE NULL END END

@@ -62,8 +62,8 @@ async fn fetch_once(round: u64) -> Result<Option<Beacon>, String> {
     let client = CLIENT
         .get_or_init(|| {
             reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(2))
-            .timeout(Duration::from_secs(4))
+                .connect_timeout(Duration::from_secs(2))
+                .timeout(Duration::from_secs(4))
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .map_err(|error| error.to_string())

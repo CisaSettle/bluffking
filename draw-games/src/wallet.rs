@@ -164,7 +164,6 @@ const MEMORY_GAMES: &[i16] = &[
     crate::game_catalog::NIUNIU,
     crate::game_catalog::SANGONG,
     crate::game_catalog::BLACKJACK,
-    crate::game_catalog::BACCARAT,
     crate::game_catalog::XIANGQI,
 ];
 fn memory_authoritative(game: i16) -> bool {
@@ -717,7 +716,6 @@ pub(crate) fn room_policy(name: &str) -> Option<Policy> {
         "niuniu" => Some(crate::niuniu::store::POLICY),
         "sangong" => Some(crate::sangong::store::POLICY),
         "blackjack" => Some(crate::blackjack::store::POLICY),
-        "baccarat" => Some(crate::baccarat::store::POLICY),
         "xiangqi" => Some(crate::xiangqi::store::POLICY),
         _ => None,
     }
