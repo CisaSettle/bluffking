@@ -32,15 +32,19 @@
 //!    = 1.5 GB): the solve is REJECTED with an honest 400 before allocating if the
 //!    estimated tree exceeds the cap. Memory is dominated by range-width ×
 //!    bet-size-count, so the public tier caps the FLOP to ONE bet size.
-//! 2. **Hard wall-clock timeout** (`SOLVE_TIMEOUT`): bounds CALLER LATENCY — the
-//!    handler returns `solve_timeout` (503) promptly. NOTE (F3): upstream
-//!    `solve()` is a synchronous, non-cancellable loop, so the `spawn_blocking`
-//!    task keeps running and HOLDS its concurrency permit until it finishes
-//!    naturally; the timeout does NOT free solver capacity. The solve still
-//!    terminates (bounded by the iteration cap + memory gate), so this is
-//!    finite, but slow in-budget solves can keep permits busy and make new
-//!    callers see `solver_busy` until they complete. A cancellable /
-//!    out-of-process worker would be the structural fix (deferred).
+//! 2. **Wall-clock budget + cooperative cancellation** (`SOLVE_BUDGET`,
+//!    `SOLVE_TIMEOUT`): `gto-solver` drives the CFR loop itself and stops
+//!    between iterations once the next iteration plus the closing
+//!    exploitability pass and `finalize` would overrun `SOLVE_BUDGET`. The
+//!    caller then gets the best strategy reached so far, labeled
+//!    `stop_reason: "time_budget"` with its measured exploitability and real
+//!    iteration count, instead of an error (2026-10-27 prod: a deep-stack flop
+//!    ran past 6 s and the user got `solve_timeout`). Such results are cached
+//!    only as PROVISIONAL entries (`PROVISIONAL_CACHE_TTL`) that never
+//!    overwrite a final one and yield to a better solve. `SOLVE_TIMEOUT` stays as
+//!    the hard backstop; when it fires, or the client disconnects, a cancel
+//!    flag stops the worker at its next iteration boundary, so it releases its
+//!    global + per-IP permits instead of running on to the iteration cap.
 //! 3. **Global concurrency semaphore** (`SOLVE_PERMITS`): at most N solves run at
 //!    once box-wide, so N simultaneous flop solves can't stack 1.5 GB × N and OOM
 //!    the shared container.
@@ -63,8 +67,9 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::{
     extract::{rejection::JsonRejection, ConnectInfo, State},
@@ -79,18 +84,38 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use engine::card::{parse_card, Card};
 use engine::hand::HoleCards;
 use gto_solver::{
-    hero_strategy, solve_spot, HandStrategy, Player, SolveError, SolveLimits, SolveOutput,
-    SolveRequest, SolveStreet,
+    hero_strategy, solve_spot_with, HandStrategy, Player, SolveControl, SolveError, SolveLimits,
+    SolveOutput, SolveRequest, SolveStop, SolveStreet,
 };
 
 use crate::app_state::AppState;
 use crate::auth::middleware::OptionalAuthUser;
 use crate::entitlement::{self, Tier};
 
-/// Bound solve time within the API's nine-second handler deadline, leaving
-/// room for authentication and admission. A timed-out solve retains its CPU
-/// permit until the non-cancellable worker exits.
+/// Hard backstop on solve time, within the API's nine-second handler deadline
+/// (leaving room for authentication and admission). Normally never reached:
+/// the solver stops itself at [`SOLVE_BUDGET`]. When it does fire, the worker
+/// is cancelled at its next CFR iteration boundary and releases its permits.
 const SOLVE_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// Wall-clock budget the CFR loop plans against (measured from the moment the
+/// blocking worker starts). The loop stops before an iteration that would not
+/// leave room for the closing exploitability pass + `finalize`, and returns the
+/// best-so-far strategy honestly labeled `time_budget`. 1.5 s below
+/// [`SOLVE_TIMEOUT`] absorbs per-iteration jitter on the shared 2-vCPU host.
+pub(crate) const SOLVE_BUDGET: Duration = Duration::from_millis(4500);
+
+/// Sets the solve's cancel flag when dropped — i.e. when the handler future
+/// ends for ANY reason: hard timeout, client disconnect (axum drops the future)
+/// or normal completion (where the flag is no longer read). The blocking worker
+/// checks the flag between CFR iterations and exits, freeing its permits.
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
 
 /// The wall-clock timeout the handler applies: always the `SOLVE_TIMEOUT` const.
 fn effective_solve_timeout() -> Duration {
@@ -122,11 +147,9 @@ fn max_concurrent_solves() -> usize {
 
 /// Max in-flight solves a SINGLE source IP may hold at once (F1). The global
 /// `MAX_CONCURRENT_SOLVES` semaphore caps box-wide concurrency, but without a
-/// per-IP guard ONE IP could grab BOTH global permits — and because the solve is
-/// non-cancellable (F3), a wall-clock timeout does NOT free them. A single source
-/// could then keep both global permits busy back-to-back and make the public
-/// solver return `solver_busy` to everyone else, all within its 15/window rate
-/// bucket. Capping each IP to ONE concurrent solve means that WHENEVER
+/// per-IP guard ONE IP could grab BOTH global permits back-to-back (each solve
+/// may legitimately run up to `SOLVE_BUDGET`) and make the public solver return
+/// `solver_busy` to everyone else, all within its 15/window rate bucket. Capping each IP to ONE concurrent solve means that WHENEVER
 /// `max_concurrent_solves() > 1` a second IP always has a free global permit —
 /// strictly BELOW the global cap so the per-IP guard can never alone monopolize
 /// global capacity.
@@ -136,9 +159,10 @@ fn max_concurrent_solves() -> usize {
 /// anti-monopoly property cannot hold — one IP holding the sole slot makes others
 /// get `solver_busy` until it finishes. That is bounded and acceptable: a solve
 /// is iteration-capped (`PUBLIC_MAX_ITERATIONS`) and memory-gated, results are
-/// cached, and each IP is limited to 15/window (U71: the occupancy bound is the
-/// iteration cap + memory gate, not a fixed wall-clock), so no IP can sit on the
-/// slot indefinitely and no data is exposed.
+/// cached, and each IP is limited to 15/window (the occupancy bound is
+/// `SOLVE_BUDGET`, enforced by the solver's own deadline, with `SOLVE_TIMEOUT` +
+/// cooperative cancellation as the backstop), so no IP can sit on the slot
+/// indefinitely and no data is exposed.
 /// A fair per-IP queue is a future enhancement if single-slot contention ever
 /// becomes real in practice.
 const MAX_INFLIGHT_PER_IP: usize = 1;
@@ -237,7 +261,7 @@ fn solve_semaphore() -> Arc<Semaphore> {
 /// Per-IP in-flight registry (F1): `IpAddr → Semaphore(MAX_INFLIGHT_PER_IP)`. A
 /// solve from a given source IP must hold one of THAT IP's permits for its whole
 /// duration, in ADDITION to a global permit. This bounds how much of the scarce
-/// (memory-gated, non-cancellable) global pool any single source can occupy, so
+/// (memory-gated, multi-second) global pool any single source can occupy, so
 /// one IP can never sit on every global permit and deny the public solver to
 /// everyone else. DashMap = concurrent, no global lock; entries persist (one tiny
 /// `Arc<Semaphore>` per distinct IP that ever solved — the working set is small,
@@ -329,6 +353,54 @@ struct CachedSpot {
     /// equilibrium for a different spot — a mismatch is treated as a miss (U11,
     /// dual-AI OSS review).
     key_repr: String,
+    /// `Some(expiry)` for a PROVISIONAL entry — a result the solver stopped at
+    /// its wall-clock budget (`stop_reason: "time_budget"`). Its quality depends
+    /// on the CPU that solve got, so it is served (labelled approximate) only
+    /// until `expiry`; afterwards the next request re-solves the spot. This
+    /// bounds a repeated expensive spot to about one solve per
+    /// [`PROVISIONAL_CACHE_TTL`] instead of one per request, without pinning a
+    /// rough answer forever. `None` = final (converged / iteration cap).
+    provisional_until: Option<Instant>,
+}
+
+/// How long a provisional (time-budget) cache entry is served before the spot
+/// is re-solved. See [`CachedSpot::provisional_until`].
+const PROVISIONAL_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
+
+impl CachedSpot {
+    /// Whether this entry may be served now (final, or provisional and fresh).
+    fn servable(&self, now: Instant) -> bool {
+        self.provisional_until.is_none_or(|until| now < until)
+    }
+}
+
+/// What [`cache_insert`] does with a new entry when the same spot is cached.
+enum Supersede {
+    /// Store the new entry (replacing any existing one).
+    Replace,
+    /// Keep the existing entry untouched (a provisional result never
+    /// overwrites a final one).
+    KeepExisting,
+    /// Keep the existing provisional entry (it is the better approximation)
+    /// but restart its cooldown, so the spot is not re-solved on every request.
+    RefreshExisting(Instant),
+}
+
+/// Precedence between an existing entry and a new one for the SAME spot:
+/// final beats provisional; among provisional entries the lower exploitability
+/// wins and the cooldown restarts; a new final entry always replaces.
+fn supersede(existing: &CachedSpot, new: &CachedSpot) -> Supersede {
+    match (existing.provisional_until, new.provisional_until) {
+        (_, None) => Supersede::Replace,
+        (None, Some(_)) => Supersede::KeepExisting,
+        (Some(_), Some(new_until)) => {
+            if new.response.exploitability < existing.response.exploitability {
+                Supersede::Replace
+            } else {
+                Supersede::RefreshExisting(new_until)
+            }
+        }
+    }
 }
 
 /// Estimated in-memory footprint of a `Vec<f32>` action-frequency row: the heap
@@ -446,6 +518,27 @@ fn cache_insert(key: u64, spot: CachedSpot) -> usize {
     // evict everything and still be over). Skip it; the solve still returns.
     if bytes > MAX_CACHE_BYTES {
         return bytes;
+    }
+
+    // Same spot already cached: apply the final-beats-provisional precedence.
+    // (A different `key_repr` under the same key is a hash collision; the new
+    // entry replaces it as before.) The shard guard is dropped before any
+    // `remove` below.
+    let decision = cache.get_mut(&key).and_then(|mut existing| {
+        if existing.key_repr != spot.key_repr {
+            return None;
+        }
+        match supersede(&existing, &spot) {
+            Supersede::Replace => None,
+            Supersede::KeepExisting => Some(existing.bytes),
+            Supersede::RefreshExisting(until) => {
+                existing.provisional_until = Some(until);
+                Some(existing.bytes)
+            }
+        }
+    });
+    if let Some(existing_bytes) = decision {
+        return existing_bytes;
     }
 
     // If this key already has an entry (a benign re-solve race), drop the old one
@@ -598,6 +691,12 @@ pub struct SolveResponse {
     pub raise_sizes: String,
     /// Iteration cap the solve ran under (echoed for the honesty badge).
     pub max_iterations: u32,
+    /// CFR iterations actually run.
+    pub iterations: u32,
+    /// Why the solve stopped: `"converged"` (exploitability target reached),
+    /// `"iteration_cap"`, or `"time_budget"` (best-so-far strategy at the
+    /// wall-clock budget — a rougher approximation the UI must flag).
+    pub stop_reason: &'static str,
     /// `true` when this response was served from the solved-spot cache.
     pub cached: bool,
     /// AGPL §13 Corresponding-Source link for the exact deployed solver version
@@ -911,14 +1010,21 @@ fn to_response_no_hero(
         hero: None,
         bet_sizes: bet_sizes.into(),
         raise_sizes: raise_sizes.into(),
-        // The wire field is `max_iterations` — it carries the iteration CAP the
-        // solve ran under (F5: the upstream solver never returns the actual
-        // count), which the crate now names `iteration_cap` to match.
         max_iterations: out.cost.iteration_cap,
+        iterations: out.cost.iterations,
+        stop_reason: stop_reason_str(out.stop),
         cached,
         // F4: the §13 source link is echoed in every response so the UI can
         // render the network-user "Source code (AGPL-3.0)" offer.
         source_url: source_url(),
+    }
+}
+
+fn stop_reason_str(stop: SolveStop) -> &'static str {
+    match stop {
+        SolveStop::Converged => "converged",
+        SolveStop::IterationCap => "iteration_cap",
+        SolveStop::TimeBudget => "time_budget",
     }
 }
 
@@ -955,6 +1061,8 @@ struct CachedSolveView<'a> {
     bet_sizes: &'a str,
     raise_sizes: &'a str,
     max_iterations: u32,
+    iterations: u32,
+    stop_reason: &'static str,
     cached: bool,
     source_url: &'a Option<String>,
 }
@@ -973,6 +1081,8 @@ impl<'a> CachedSolveView<'a> {
             bet_sizes: &body.bet_sizes,
             raise_sizes: &body.raise_sizes,
             max_iterations: body.max_iterations,
+            iterations: body.iterations,
+            stop_reason: body.stop_reason,
             cached,
             source_url: &body.source_url,
         }
@@ -1035,6 +1145,13 @@ fn map_solve_error(e: SolveError) -> axum::response::Response {
                 cap / 1_000_000
             ),
         ),
+        // Only reachable after the handler stopped waiting (hard timeout or
+        // client gone), so nobody reads this; keep the timeout shape.
+        SolveError::Cancelled => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "solve_timeout",
+            Some("this spot took too long to solve on the free tier — try a narrower range"),
+        ),
         SolveError::Internal(m) => {
             tracing::error!("gto_solve internal solver error: {m}");
             // N1: the §13 source offer rides on the error too (no reason — never
@@ -1052,7 +1169,8 @@ fn map_solve_error(e: SolveError) -> axum::response::Response {
 ///
 /// PUBLIC, no-login. Validates everything, checks the solved-spot cache, then
 /// (on a miss) acquires a global concurrency permit and runs the solve inside
-/// `spawn_blocking` under a hard wall-clock timeout. The pre-allocation memory
+/// `spawn_blocking` under a wall-clock budget (best-so-far result at
+/// `SOLVE_BUDGET`) with a cancelling hard timeout. The pre-allocation memory
 /// gate inside `gto-solver` rejects oversized spots before allocating.
 pub async fn solve_handler(
     // ADR-085: tier resolution needs the pool. State is FromRequestParts, so it
@@ -1300,7 +1418,9 @@ pub async fn solve_handler(
         // U11: verify the stored canonical spot matches before serving — a u64
         // hash collision otherwise serves a different spot's equilibrium. On
         // mismatch, fall through and solve this spot fresh.
-        (cached.key_repr == spot_repr(&req)).then(|| {
+        // A provisional (time-budget) entry past its cooldown is a miss: the
+        // spot is re-solved and the result supersedes it per `supersede`.
+        (cached.key_repr == spot_repr(&req) && cached.servable(Instant::now())).then(|| {
             (
                 Arc::clone(&cached.response),
                 hero_row_from_cached_spot(&cached, req.hero),
@@ -1312,7 +1432,7 @@ pub async fn solve_handler(
     }
 
     // --- per-IP in-flight guard (F1) — BEFORE the global permit so one source
-    //     cannot occupy every scarce (non-cancellable) global solve permit and
+    //     cannot occupy every scarce (multi-second) global solve permit and
     //     starve the public solver. Held for the whole solve via the RAII guard;
     //     released (and the registry entry reclaimed) on drop. ---
     let client_ip = client_ip(connect_info.as_ref());
@@ -1347,18 +1467,25 @@ pub async fn solve_handler(
         }
     };
 
-    // --- solve on the blocking pool under a hard timeout ---
+    // --- solve on the blocking pool under a wall-clock budget ---
+    let cancel = Arc::new(AtomicBool::new(false));
+    // Dropped when this handler future ends (hard timeout, client disconnect or
+    // completion) → the worker stops at its next iteration boundary.
+    let _cancel_on_drop = CancelOnDrop(Arc::clone(&cancel));
     let req_for_solve = req.clone();
     let solve_fut = tokio::task::spawn_blocking(move || {
         // Hold BOTH the global permit AND the per-IP in-flight guard for the whole
         // solve, then drop them. F1+F3: moving `ip_guard` INTO the blocking task
         // (not the handler scope) means the per-IP slot is released only when the
-        // non-cancellable solve actually FINISHES — not when a caller-side timeout
-        // returns early. So a timed-out solve still counts against its IP's
-        // in-flight cap until it truly completes, exactly like the global permit.
+        // worker actually EXITS — after a hard timeout that is the next CFR
+        // iteration boundary (cancel flag), exactly like the global permit.
         let _permit = permit;
         let _ip_guard = ip_guard;
-        solver_pool().install(|| solve_spot(&req_for_solve))
+        let ctl = SolveControl {
+            deadline: Some(Instant::now() + SOLVE_BUDGET),
+            cancel: Some(cancel),
+        };
+        solver_pool().install(|| solve_spot_with(&req_for_solve, &ctl))
     });
 
     let timeout = effective_solve_timeout();
@@ -1370,19 +1497,11 @@ pub async fn solve_handler(
             return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", None);
         }
         Err(_elapsed) => {
-            // Timed out from the CALLER's perspective only. F3 (codex HIGH):
-            // upstream `solve()` is a synchronous, non-cancellable
-            // `for t in 0..max_iterations` loop with no interrupt hook, and the
-            // spawn_blocking closure holds its concurrency permit (`let _permit =
-            // permit`) until it finishes NATURALLY. So this timeout bounds caller
-            // LATENCY, NOT solver CAPACITY: the blocking task keeps running and
-            // its permit stays consumed until the solve completes on its own (it
-            // DOES terminate — bounded by the iteration cap + memory gate, so
-            // this is finite, not "forever"). With MAX_CONCURRENT_SOLVES permits,
-            // a few slow in-budget solves can keep all permits while new callers
-            // get `solver_busy` (503). The per-IP rate limit + memory gate +
-            // iteration cap bound the blast radius; a fully cancellable /
-            // out-of-process worker would be the structural fix (deferred).
+            // Backstop only: the solver normally stops itself at SOLVE_BUDGET
+            // with a best-so-far result. Reaching here means a single CFR pass
+            // overran the remaining time (e.g. a starved CPU). Returning drops
+            // `_cancel_on_drop`, so the worker stops at its next iteration
+            // boundary and releases its global + per-IP permits.
             tracing::warn!("gto_solve exceeded {timeout:?} — returning solve_timeout");
             // N1: carries the §13 source offer too.
             return error_response(
@@ -1397,6 +1516,14 @@ pub async fn solve_handler(
         Ok(out) => out,
         Err(e) => return map_solve_error(e),
     };
+    if out.stop == SolveStop::TimeBudget {
+        tracing::info!(
+            iterations = out.cost.iterations,
+            exploitability_pct_of_pot = out.exploitability_pct_of_pot,
+            memory_bytes = out.cost.memory_bytes,
+            "gto_solve stopped at the time budget — returning best-so-far strategy"
+        );
+    }
 
     // F3: build the HERO-INDEPENDENT cached body + per-hand table, then cache it
     // under the hero-independent `spot_key`. The per-request response (with THIS
@@ -1409,6 +1536,8 @@ pub async fn solve_handler(
         // Filled in by `cache_insert` from `cached_spot_bytes`; 0 until then.
         bytes: 0,
         key_repr: spot_repr(&req),
+        provisional_until: (out.stop == SolveStop::TimeBudget)
+            .then(|| Instant::now() + PROVISIONAL_CACHE_TTL),
     };
     let body = Arc::clone(&spot.response);
     let resp = CachedSolveView::new(&body, hero_row_from_cached_spot(&spot, req.hero), false);
@@ -1418,6 +1547,10 @@ pub async fn solve_handler(
     // stays under `MAX_CACHE_BYTES` regardless of per-entry size — a wide spot's
     // ~135 KB per-hand table can no longer let a 2048-entry cap reach ~275 MB.
     let response = Json(resp).into_response();
+    // A time-budget result is cached as PROVISIONAL (see
+    // `CachedSpot::provisional_until`): served, labelled approximate, for
+    // `PROVISIONAL_CACHE_TTL`, never overwriting a final entry, and replaced by
+    // a final or lower-exploitability solve.
     cache_insert(key, spot);
 
     response
