@@ -2,6 +2,7 @@
 //! balance admission or closing-clock checks run again after memory acceptance.
 use super::*;
 use crate::game_catalog::BEANS;
+use sqlx::Connection as _;
 
 pub(super) fn weight(data: &Data) -> sqlx::Result<usize> {
     let mut n = 0usize;
@@ -131,28 +132,33 @@ pub(super) async fn hydrate_missing(
     Ok(data)
 }
 
+/// The periodic retention job: its own pool transactions, no writer connection.
+pub(super) async fn retention(pool: &PgPool) -> sqlx::Result<()> {
+    super::super::draw_loop::retention(pool)
+        .await
+        .map_err(|e| match e {
+            Error::Db(e) => e,
+            _ => db_unavailable(),
+        })
+}
+
 pub(super) async fn persist(
     pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
     event: &Event,
 ) -> sqlx::Result<Vec<(Uuid, crate::game_rewards::Grant)>> {
     if event.kind == "retention" {
-        super::super::draw_loop::retention(pool)
-            .await
-            .map_err(|e| match e {
-                Error::Db(e) => e,
-                _ => db_unavailable(),
-            })?;
+        retention(pool).await?;
         return Ok(vec![]);
     }
     let game = Game::parse(&event.game).ok_or_else(|| permanent("game"))?;
     let fingerprint =
         store::body_sha256(&serde_json::to_value(event).map_err(|_| permanent("event json"))?);
-    let mut tx = pool.begin().await?;
-    sqlx::query(
-        "SELECT set_config('lock_timeout','500ms',true),set_config('statement_timeout','2s',true)",
-    )
-    .execute(&mut *tx)
-    .await?;
+    // One round trip opens the transaction with its local timeouts (same
+    // values as the former separate `set_config(..., true)` statement).
+    let mut tx = conn
+        .begin_with("BEGIN; SET LOCAL lock_timeout = '500ms'; SET LOCAL statement_timeout = '2s'")
+        .await?;
     if let Some(user) = event.owner {
         crate::db::lock_game_participants(&mut tx, &[user]).await?;
         crate::wallet::lock(&mut tx, BEANS, user)

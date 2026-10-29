@@ -1280,6 +1280,13 @@ pub(crate) async fn initial_grant_ready(pool: &PgPool, user: Uuid) -> sqlx::Resu
     {
         return Ok(());
     }
+    initial_grant_durable(pool).await
+}
+
+/// The rest of [`initial_grant_ready`] for a caller that already read the
+/// wallet row's absence (in its own statement): wait until every accepted
+/// beans write, including this user's initial grant, is committed.
+pub(crate) async fn initial_grant_durable(pool: &PgPool) -> sqlx::Result<()> {
     let state = state(pool);
     let receipt = state
         .inner

@@ -96,7 +96,13 @@ fn match_receipt(proof: &Value, receipt: &Value) -> Result<(), String> {
         {
             return Err("Revealed seed differs from saved commitment".into());
         }
-        if kind != "sicbo-room" && receipt["client_seed"] != reveal.client_seed {
+        if kind == "zjh" {
+            let (hand_id, _) = crate::zjh::parse_draw_id(&reveal.commitment.draw_id)?;
+            if terms["hand_id"].as_str() != Some(hand_id) {
+                return Err("Saved receipt hand differs from the committed hand".into());
+            }
+        }
+        if !matches!(kind, "sicbo-room" | "zjh") && receipt["client_seed"] != reveal.client_seed {
             return Err("Client seed differs from saved challenge".into());
         }
         if kind == "scratch" {

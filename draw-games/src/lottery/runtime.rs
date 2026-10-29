@@ -500,21 +500,26 @@ pub async fn hydrate(pool: &PgPool) -> sqlx::Result<()> {
         "lottery_ring_hydrated"
     );
     let (worker_pool, worker_state) = (pool.clone(), state.clone());
+    let worker_conn = Arc::new(tokio::sync::Mutex::new(None::<WriterConnection>));
     let writer = Ordered::new(None::<Arc<Job>>, move |_old, next: Option<Arc<Job>>| {
         let (pool, state) = (worker_pool.clone(), worker_state.clone());
+        let worker_conn = worker_conn.clone();
         async move {
             if let Some(job) = &next {
-                let grants = persistence::persist(&pool, &job.event).await.map_err(|e| {
-                    let error = format!(
-                        "lottery event={} game={} kind={}: {e}",
-                        job.event.id, job.event.game, job.event.kind
-                    );
-                    if persistence::is_permanent(&e) {
-                        crate::write_behind::fenced(&error)
-                    } else {
-                        error
-                    }
-                })?;
+                let mut held = worker_conn.lock().await;
+                let grants = persist_on_held(&pool, &mut held, &job.event)
+                    .await
+                    .map_err(|e| {
+                        let error = format!(
+                            "lottery event={} game={} kind={}: {e}",
+                            job.event.id, job.event.game, job.event.kind
+                        );
+                        if persistence::is_permanent(&e) {
+                            crate::write_behind::fenced(&error)
+                        } else {
+                            error
+                        }
+                    })?;
                 accepted(&state).retain(|queued| !Arc::ptr_eq(queued, job));
                 if let Some(owner) = job.event.owner {
                     if job.event.effect.is_some() {
@@ -558,6 +563,70 @@ pub async fn hydrate(pool: &PgPool) -> sqlx::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The ordered writer's own pooled connection, kept between writes.
+///
+/// Perf (2026-10-30): purchases are rare, so a fresh `pool.begin()` per write
+/// usually landed on a backend that had never prepared these statements nor
+/// compiled the ticket/ledger triggers (prod `POST /api/lottery/buy` 19.5 ms
+/// server time, most of it the durable write it waits for). The writer runs
+/// one job at a time, every few minutes at least (period rows), so one held
+/// connection stays warm. Any failed write drops it (a retry starts on a
+/// fresh one), and it is closed one pool connection lifetime after it was
+/// taken, or at its next write after a schema upgrade by another process is
+/// observed (`db::predates_schema_change`), so a schema change cannot pin a
+/// stale statement cache.
+struct WriterConnection {
+    conn: sqlx::pool::PoolConnection<sqlx::Postgres>,
+    since: std::time::Instant,
+}
+
+/// Below this pool size the writer does not keep a connection between writes:
+/// a tiny pool (`DB_MAX_CONNECTIONS` 1-3) must not lose one to an idle writer.
+/// There each write closes its connection afterwards (see `persist_on_held`).
+const HOLD_MIN_POOL_CONNECTIONS: u32 = 4;
+
+async fn persist_on_held(
+    pool: &PgPool,
+    held: &mut Option<WriterConnection>,
+    event: &Event,
+) -> sqlx::Result<Vec<(Uuid, crate::game_rewards::Grant)>> {
+    if event.kind == "retention" {
+        // Runs on its own pool transactions; taking the writer connection too
+        // would only cost the pool a second one meanwhile.
+        persistence::retention(pool).await?;
+        return Ok(vec![]);
+    }
+    let hold = pool.options().get_max_connections() >= HOLD_MIN_POOL_CONNECTIONS;
+    if held.as_ref().is_some_and(|held| {
+        let age = held.since.elapsed();
+        age >= crate::db::CONNECTION_MAX_LIFETIME || crate::db::predates_schema_change(age)
+    }) {
+        *held = None;
+    }
+    // Taken out for the write: only a successful write puts it back, so an
+    // error or a cancelled write never leaves a connection in doubt held.
+    // It never returns to the shared pool either: a write that failed between
+    // `BEGIN` and the transaction guard (e.g. a cancelled `SET LOCAL` in the
+    // opening batch) could leave it inside an aborted transaction, so every
+    // drop (error, cancellation, panic, retirement) closes it instead.
+    let mut writer = match held.take() {
+        Some(writer) => writer,
+        None => {
+            // Taken before checkout: a schema upgrade observed while the
+            // checkout was in progress must still retire this connection.
+            let since = std::time::Instant::now();
+            let mut conn = pool.acquire().await?;
+            conn.close_on_drop();
+            WriterConnection { conn, since }
+        }
+    };
+    let result = persistence::persist(pool, &mut writer.conn, event).await;
+    if result.is_ok() && hold {
+        *held = Some(writer);
+    }
+    result
 }
 
 fn accepted(state: &State) -> std::sync::MutexGuard<'_, VecDeque<Arc<Job>>> {
@@ -780,6 +849,16 @@ async fn wallet_ready(pool: &PgPool, user: Uuid) -> Result<(), Error> {
     Ok(())
 }
 
+/// [`wallet_ready`] when the purchase preflight statement already read
+/// whether the wallet row exists (`wallet_durable`).
+async fn wallet_ready_after(pool: &PgPool, user: Uuid, wallet_durable: bool) -> Result<(), Error> {
+    beans_read_memory::ensure(pool, user)?;
+    if !wallet_durable {
+        beans_read_memory::initial_grant_durable(pool).await?;
+    }
+    Ok(())
+}
+
 async fn prepare_scratch(pool: &PgPool, user: Uuid, ticket: Option<Uuid>) -> Result<(), Error> {
     durable(pool).await?;
     let mut conn = pool.acquire().await?;
@@ -894,7 +973,7 @@ pub async fn buy_numbers(
     let hash = store::body_sha256(&identity);
     let state = state(pool);
     let command = state.commands.lock().await;
-    let replay = store::replay_request(
+    let (replay, wallet) = store::replay_request_and_wallet(
         &mut *pool.acquire().await?,
         game,
         user,
@@ -905,7 +984,7 @@ pub async fn buy_numbers(
     let purchase = if let Some(p) = replay {
         p
     } else {
-        wallet_ready(pool, user).await?;
+        wallet_ready_after(pool, user, wallet).await?;
         accept_numbers(pool, user, game, body)?
     };
     drop(command);
@@ -928,7 +1007,7 @@ pub async fn buy_scratch(
     let state = state(pool);
     let command = state.commands.lock().await;
     prepare_scratch(pool, user, None).await?;
-    let replay = store::replay_request(
+    let (replay, wallet) = store::replay_request_and_wallet(
         &mut *pool.acquire().await?,
         Game::Scratch,
         user,
@@ -939,7 +1018,7 @@ pub async fn buy_scratch(
     let purchase = if let Some(p) = replay {
         p
     } else {
-        wallet_ready(pool, user).await?;
+        wallet_ready_after(pool, user, wallet).await?;
         accept_scratch(pool, user, body)?
     };
     drop(command);

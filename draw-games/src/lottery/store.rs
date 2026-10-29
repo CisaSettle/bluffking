@@ -257,6 +257,19 @@ pub(super) async fn replay(
     let Some((details, balance_after)) = stored_play(conn, user, record_id).await? else {
         return Ok(None);
     };
+    replay_stored(conn, game, record_id, details, balance_after, body_hash)
+        .await
+        .map(Some)
+}
+
+async fn replay_stored(
+    conn: &mut PgConnection,
+    game: Game,
+    record_id: Uuid,
+    details: Value,
+    balance_after: i64,
+    body_hash: &str,
+) -> Result<Purchase, Error> {
     if details["body_sha256"].as_str() != Some(body_hash) {
         return Err(Error::RequestConflict);
     }
@@ -272,14 +285,60 @@ pub(super) async fn replay(
         return Err(Error::RequestConflict);
     }
     tickets.sort_by_key(|t| ids.iter().position(|id| *id == t.id).unwrap_or(usize::MAX));
-    Ok(Some(Purchase {
+    Ok(Purchase {
         purchased: tickets.iter().map(|t| ticket_json(game, t)).collect(),
         charged: details["charged"].as_i64().unwrap_or_default(),
         balance_before: details["balance_before"].as_i64().unwrap_or_default(),
         balance_after: details["accepted_balance_after"]
             .as_i64()
             .unwrap_or(balance_after),
-    }))
+    })
+}
+
+/// Realtime purchase preflight in one statement: [`replay_request`] (the
+/// first stored record in namespace order decides, as there) plus whether the
+/// beans wallet row is already durable (`initial_grant_ready`'s check).
+/// Perf (2026-10-30): was three sequential statements before every purchase.
+pub(super) async fn replay_request_and_wallet(
+    conn: &mut PgConnection,
+    game: Game,
+    user: Uuid,
+    request_id: Uuid,
+    body_hash: &str,
+) -> Result<(Option<Purchase>, bool), Error> {
+    let ids = [
+        super::purchase_id(user, request_id),
+        super::scratch_batch_id(user, request_id),
+    ];
+    let row = sqlx::query(
+        "SELECT EXISTS(SELECT 1 FROM wallets WHERE user_id=$3 AND game=$4) AS wallet, \
+                l.record_id, l.details, l.balance_after \
+           FROM (SELECT 1) one \
+           LEFT JOIN LATERAL ( \
+                SELECT record_id, details, balance_after FROM wallet_ledger \
+                 WHERE game IN ($1, 23) AND record_id = ANY($2) AND user_id=$3 \
+                 ORDER BY array_position($2, record_id) LIMIT 1) l ON TRUE",
+    )
+    .bind(POLICY.game)
+    .bind(&ids[..])
+    .bind(user)
+    .bind(crate::game_catalog::BEANS)
+    .fetch_one(&mut *conn)
+    .await?;
+    let wallet: bool = row.get("wallet");
+    let Some(record_id) = row.get::<Option<Uuid>, _>("record_id") else {
+        return Ok((None, wallet));
+    };
+    let purchase = replay_stored(
+        conn,
+        game,
+        record_id,
+        row.get("details"),
+        row.get("balance_after"),
+        body_hash,
+    )
+    .await?;
+    Ok((Some(purchase), wallet))
 }
 
 /// A request id is shared across purchase kinds; switching to/from a scratch
@@ -661,30 +720,46 @@ pub fn public_name(user: Uuid, display_name: Option<String>) -> String {
     crate::content_moderation::public_display_name(&name, user)
 }
 
-async fn names_of(
-    conn: &mut PgConnection,
-    ids: &[Uuid],
-) -> sqlx::Result<std::collections::HashMap<Uuid, String>> {
-    if ids.is_empty() {
-        return Ok(Default::default());
+/// One feed ticket with its buyer's account row (if it still exists).
+#[derive(serde::Deserialize)]
+struct FeedRow {
+    purchase_id: Uuid,
+    user_id: Uuid,
+    bought_at: DateTime<Utc>,
+    stakes: i32,
+    multiplier: i16,
+    prize: Option<i64>,
+    tier: Option<i16>,
+    settled_at: Option<DateTime<Utc>>,
+    user_found: bool,
+    display_name: Option<String>,
+}
+
+impl FeedRow {
+    fn from_row(row: &PgRow) -> Self {
+        FeedRow {
+            purchase_id: row.get("purchase_id"),
+            user_id: row.get("user_id"),
+            bought_at: row.get("bought_at"),
+            stakes: row.get("stakes"),
+            multiplier: row.get("multiplier"),
+            prize: row.get("prize"),
+            tier: row.get("tier"),
+            settled_at: row.get("settled_at"),
+            user_found: row.get("user_found"),
+            display_name: row.get("display_name"),
+        }
     }
-    let rows = sqlx::query("SELECT id, display_name FROM users WHERE id = ANY($1)")
-        .bind(ids)
-        .fetch_all(conn)
-        .await?;
-    let mut names: std::collections::HashMap<Uuid, String> = rows
-        .into_iter()
-        .map(|r| {
-            let id: Uuid = r.get("id");
-            (id, public_name(id, r.get("display_name")))
-        })
-        .collect();
-    for id in ids {
-        names
-            .entry(*id)
-            .or_insert_with(|| crate::display_name::fallback_display_name(*id));
+
+    /// An existing account shows its public name; a missing one the opaque
+    /// fallback (the former separate `users` lookup's rule).
+    fn name(&self) -> String {
+        if self.user_found {
+            public_name(self.user_id, self.display_name.clone())
+        } else {
+            crate::display_name::fallback_display_name(self.user_id)
+        }
     }
-    Ok(names)
 }
 
 struct FeedScan {
@@ -693,71 +768,63 @@ struct FeedScan {
     wins: Vec<Value>,
 }
 
+/// Newest tickets of a game from the feed index, buyer names joined in.
+const FEED_SQL: &str = "SELECT t.purchase_id, t.user_id, t.bought_at, t.stakes, t.multiplier, t.prize, t.tier, t.settled_at, \
+        u.id IS NOT NULL AS user_found, u.display_name \
+   FROM (SELECT purchase_id, user_id, bought_at, stakes, multiplier, prize, tier, settled_at FROM lottery_tickets \
+          WHERE game=$1 AND (game<>'scratch' OR (cost=100 AND entry->'reward_version'='1'::jsonb)) \
+          ORDER BY bought_at DESC LIMIT $2) t \
+   LEFT JOIN users u ON u.id = t.user_id \
+  ORDER BY t.bought_at DESC";
+
 /// The newest purchases of a game (grouped by purchase) from the feed index.
 async fn feed_scan(conn: &mut PgConnection, game: Game) -> sqlx::Result<FeedScan> {
-    let rows = sqlx::query(
-        "SELECT purchase_id, user_id, bought_at, stakes, multiplier, prize, tier, settled_at FROM lottery_tickets \
-         WHERE game=$1 AND (game<>'scratch' OR (cost=100 AND entry->'reward_version'='1'::jsonb)) ORDER BY bought_at DESC LIMIT $2",
-    )
-    .bind(game.as_str())
-    .bind(FEED_SCAN)
-    .fetch_all(&mut *conn)
-    .await?;
-    let mut purchases: Vec<(Uuid, Uuid, DateTime<Utc>, i64, i64)> = Vec::new();
-    let mut wins: Vec<(Uuid, DateTime<Utc>, i16, i64)> = Vec::new();
-    for row in &rows {
-        let purchase: Uuid = row.get("purchase_id");
-        let user: Uuid = row.get("user_id");
-        let at: DateTime<Utc> = row.get("bought_at");
-        let stakes =
-            i64::from(row.get::<i32, _>("stakes")) * i64::from(row.get::<i16, _>("multiplier"));
-        if let Some(p) = purchases.iter_mut().find(|p| p.0 == purchase) {
-            p.3 += 1;
-            p.4 += stakes;
+    let rows = sqlx::query(FEED_SQL)
+        .bind(game.as_str())
+        .bind(FEED_SCAN)
+        .fetch_all(&mut *conn)
+        .await?;
+    Ok(feed_from_rows(
+        game,
+        &rows.iter().map(FeedRow::from_row).collect::<Vec<_>>(),
+    ))
+}
+
+fn feed_from_rows(game: Game, rows: &[FeedRow]) -> FeedScan {
+    let mut purchases: Vec<(Uuid, &FeedRow, i64, i64)> = Vec::new();
+    let mut wins: Vec<(&FeedRow, DateTime<Utc>, i16, i64)> = Vec::new();
+    for row in rows {
+        let stakes = i64::from(row.stakes) * i64::from(row.multiplier);
+        if let Some(p) = purchases.iter_mut().find(|p| p.0 == row.purchase_id) {
+            p.2 += 1;
+            p.3 += stakes;
         } else if purchases.len() < FEED_LEN {
-            purchases.push((purchase, user, at, 1, stakes));
+            purchases.push((row.purchase_id, row, 1, stakes));
         }
         if game == Game::Scratch && wins.len() < FEED_LEN {
-            if let (Some(prize), Some(settled)) = (
-                row.get::<Option<i64>, _>("prize"),
-                row.get::<Option<DateTime<Utc>>, _>("settled_at"),
-            ) {
+            if let (Some(prize), Some(settled)) = (row.prize, row.settled_at) {
                 if prize > 0 {
-                    wins.push((
-                        user,
-                        settled,
-                        row.get::<Option<i16>, _>("tier").unwrap_or(0),
-                        prize,
-                    ));
+                    wins.push((row, settled, row.tier.unwrap_or(0), prize));
                 }
             }
         }
     }
-    let mut ids: Vec<Uuid> = purchases
-        .iter()
-        .map(|p| p.1)
-        .chain(wins.iter().map(|w| w.0))
-        .collect();
-    ids.sort_unstable();
-    ids.dedup();
-    let names = names_of(conn, &ids).await?;
-    let name = |id: Uuid| names.get(&id).cloned().unwrap_or_default();
-    Ok(FeedScan {
+    FeedScan {
         purchases: purchases
             .iter()
-            .map(|(_, user, at, count, stakes)| {
-                json!({ "at_ms": at.timestamp_millis(), "user_id": user, "name": name(*user),
+            .map(|(_, row, count, stakes)| {
+                json!({ "at_ms": row.bought_at.timestamp_millis(), "user_id": row.user_id, "name": row.name(),
                         "kind": "bought", "stakes": stakes, "count": count })
             })
             .collect(),
         wins: wins
             .iter()
-            .map(|(user, at, tier, prize)| {
-                json!({ "at_ms": at.timestamp_millis(), "user_id": user, "name": name(*user),
+            .map(|(row, at, tier, prize)| {
+                json!({ "at_ms": at.timestamp_millis(), "user_id": row.user_id, "name": row.name(),
                         "kind": "won", "tier": tier, "prize": prize })
             })
             .collect(),
-    })
+    }
 }
 
 fn merge_feed(mut events: Vec<Value>) -> Vec<Value> {
@@ -856,6 +923,25 @@ async fn crowd(conn: &mut PgConnection, game: Game, now: DateTime<Utc>) -> sqlx:
     Ok(json!({ "present": present, "members": members }))
 }
 
+#[derive(serde::Deserialize)]
+struct WinnerRow {
+    user_id: Option<Uuid>,
+    name: String,
+    tier: i16,
+    prize: i64,
+}
+
+impl WinnerRow {
+    fn from_row(row: &PgRow) -> Self {
+        WinnerRow {
+            user_id: row.get("user_id"),
+            name: row.get("name"),
+            tier: row.get("tier"),
+            prize: row.get("prize"),
+        }
+    }
+}
+
 async fn draw_json(
     conn: &mut PgConnection,
     game: Game,
@@ -871,16 +957,18 @@ async fn draw_json(
     .bind(WINNERS_BOARD)
     .fetch_all(&mut *conn)
     .await?;
+    let winners: Vec<WinnerRow> = winners.iter().map(WinnerRow::from_row).collect();
+    let mine = tickets_of(conn, game, row.period, user).await?;
+    Ok(draw_value(game, row, &winners, &mine))
+}
+
+fn draw_value(game: Game, row: &PeriodRow, winners: &[WinnerRow], mine: &[TicketRow]) -> Value {
     let winners: Vec<Value> = winners
         .iter()
-        .map(|w| {
-            json!({ "user_id": w.get::<Option<Uuid>, _>("user_id"), "name": w.get::<String, _>("name"),
-                    "tier": w.get::<i16, _>("tier"), "prize": w.get::<i64, _>("prize") })
-        })
+        .map(|w| json!({ "user_id": w.user_id, "name": w.name, "tier": w.tier, "prize": w.prize }))
         .collect();
-    let mine = tickets_of(conn, game, row.period, user).await?;
     let label = period_label(game, row.period, row.proof_plan.as_ref());
-    Ok(json!({
+    json!({
         "period": row.period, "label": label,
         "drawn_at_ms": row.drawn_at.map(|d| d.timestamp_millis()).unwrap_or_default(),
         "status": row.status, "numbers": row.numbers.clone().unwrap_or_default(), "bonus": row.bonus,
@@ -890,7 +978,7 @@ async fn draw_json(
         "proof_plan": row.proof_plan, "draw_proof": row.draw_proof,
         "proof_status": proof_status(row.proof_plan.as_ref(), row.draw_proof.as_ref()),
         "mine": mine.iter().map(|t| ticket_json(game, t)).collect::<Vec<_>>(),
-    }))
+    })
 }
 
 /// `GET /api/lottery/{game}`.
@@ -1077,6 +1165,43 @@ pub async fn tickets(
         .collect())
 }
 
+/// The hall's history in one statement: feed tickets with buyer names, the
+/// recent draws, and the newest draw's winners board and the viewer's own
+/// tickets in it (each part as one JSON array, decoded by the same row types).
+///
+/// Perf (2026-10-30): this was five sequential statements on one connection.
+/// The hall view is rarely polled, so it usually lands on a pooled backend
+/// that has not prepared them (prod 12 ms server time); one prepare, one plan.
+fn history_sql() -> &'static str {
+    static SQL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SQL.get_or_init(|| {
+        format!(
+            "WITH feed AS ({FEED_SQL}),
+             recent AS (
+                SELECT {PERIOD_COLUMNS} FROM lottery_periods
+                 WHERE game=$1 AND status <> 'open'
+                 ORDER BY drawn_at DESC, period DESC LIMIT $3
+             ), latest AS (
+                SELECT period FROM recent ORDER BY drawn_at DESC, period DESC LIMIT 1
+             )
+             SELECT
+               COALESCE((SELECT jsonb_agg(to_jsonb(f) ORDER BY f.bought_at DESC) FROM feed f), '[]'::jsonb) AS feed,
+               COALESCE((SELECT jsonb_agg(to_jsonb(r) ORDER BY r.drawn_at DESC, r.period DESC) FROM recent r), '[]'::jsonb) AS recent,
+               COALESCE((SELECT jsonb_agg(to_jsonb(w) ORDER BY w.prize DESC)
+                           FROM (SELECT user_id, name, tier, prize FROM lottery_winners
+                                  WHERE game=$1 AND period=(SELECT period FROM latest)
+                                  ORDER BY prize DESC LIMIT $4) w), '[]'::jsonb) AS winners,
+               COALESCE((SELECT jsonb_agg(to_jsonb(t) ORDER BY t.bought_at DESC, t.id)
+                           FROM (SELECT {TICKET_COLUMNS} FROM lottery_tickets
+                                  WHERE game=$1 AND period=(SELECT period FROM latest) AND user_id=$5) t), '[]'::jsonb) AS mine"
+        )
+    })
+}
+
+fn decode<T: serde::de::DeserializeOwned>(value: Value) -> sqlx::Result<T> {
+    serde_json::from_value(value).map_err(|error| sqlx::Error::Decode(Box::new(error)))
+}
+
 /// History never joins the runtime's resident working set.
 pub(super) async fn decorate_history(
     pool: &PgPool,
@@ -1084,16 +1209,32 @@ pub(super) async fn decorate_history(
     game: Game,
     view: &mut Value,
 ) -> Result<(), Error> {
-    let mut conn = pool.acquire().await?;
-    let scan = feed_scan(&mut conn, game).await?;
+    // Scratch has no draws: a zero limit keeps the period parts empty.
+    let recent_limit = if game == Game::Scratch {
+        0
+    } else {
+        RECENT_DRAWS
+    };
+    let row = sqlx::query(history_sql())
+        .bind(game.as_str())
+        .bind(FEED_SCAN)
+        .bind(recent_limit)
+        .bind(WINNERS_BOARD)
+        .bind(user)
+        .fetch_one(pool)
+        .await?;
+    let rows: Vec<FeedRow> = decode(row.get("feed"))?;
+    let scan = feed_from_rows(game, &rows);
     let mut feed = scan.purchases;
     if game == Game::Scratch {
         feed.extend(scan.wins);
     } else {
-        let recent = recent_periods(&mut conn, game, RECENT_DRAWS, 0).await?;
+        let recent: Vec<PeriodRow> = decode(row.get("recent"))?;
         view["recent"] = json!(recent.iter().map(|r| r.summary(game)).collect::<Vec<_>>());
-        if let Some(row) = recent.first() {
-            let draw = draw_json(&mut conn, game, user, row).await?;
+        if let Some(last) = recent.first() {
+            let winners: Vec<WinnerRow> = decode(row.get("winners"))?;
+            let mine: Vec<TicketRow> = decode(row.get("mine"))?;
+            let draw = draw_value(game, last, &winners, &mine);
             if let Some(winners) = draw["winners"].as_array() {
                 feed.extend(winners.iter().map(|w| json!({"at_ms":draw["drawn_at_ms"],"user_id":w["user_id"],"name":w["name"],"kind":"won","tier":w["tier"],"prize":w["prize"],"period_label":draw["label"]})));
             }
