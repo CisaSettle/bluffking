@@ -23,9 +23,11 @@ use uuid::Uuid;
 use crate::game_catalog::BEANS as GAME;
 use crate::wallet::{self, Policy, Wallet};
 
-/// First-use grant and the extra daily grant (owner: 默认每人一万金豆).
+/// First-use grant (owner: 默认每人一万金豆).
 pub const GRANT: i64 = 10_000;
-pub const DAILY_REFILL_TO: i64 = 10_000;
+/// Extra beans ADDED by the once-per-Singapore-day claim (not a refill-to
+/// target; owner 2026-10-29: 10,000 → 2,000).
+pub const DAILY_REFILL_TO: i64 = 2_000;
 /// Public beans table shape. One stake keeps the thin player pool together.
 pub const STAKE_KEY: &str = "10/20";
 pub const SB: u32 = 10;

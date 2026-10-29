@@ -13,22 +13,32 @@ use serde_json::{json, Value};
 
 pub const DEFAULT_DURATION_SECS: u32 = 3_600;
 
-/// A room that has gone this long with no hand/match in progress closes
-/// itself (owner 2026-09-25) — the non-poker counterpart of poker's ADR-058
-/// one-hour no-start close. It covers a room nobody ever started, one whose
-/// session clock ran out, and one everybody stopped playing in.
-pub const IDLE_CLOSE_SECS: u64 = 3_600;
-
-/// Human-versus-bot rooms close after ten minutes without human input.
-pub const BOT_IDLE_CLOSE_SECS: u64 = 600;
+/// Owner 2026-10-29: every room, in every game, bot or human, is reclaimed
+/// after ten minutes without human input (a seated player's command, chat or
+/// joining); an empty room has none. Only the shared
+/// [`crate::room_code::spawn_room_cleanup`] tick reclaims rooms.
+pub const EMPTY_RECLAIM_SECS: u64 = 600;
 
 /// Leave the final result visible before an expired room disappears.
 const RESULT_DISPLAY_SECS: u64 = 10;
 
-/// How long a loaded room has gone without a hand in progress. Kept in memory
-/// by the room task (a restart grants a fresh window); rooms nobody is
-/// connected to are unloaded and then swept from storage by
-/// [`crate::room_code::spawn_room_cleanup`] on the same threshold.
+static CLEANUP_TICK: std::sync::LazyLock<tokio::sync::watch::Sender<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::watch::channel(()).0);
+
+/// The shared room cleanup tick, for room tasks that hold rooms in memory.
+pub fn subscribe_cleanup() -> tokio::sync::watch::Receiver<()> {
+    CLEANUP_TICK.subscribe()
+}
+
+/// Called only by [`crate::room_code::spawn_room_cleanup`].
+pub(crate) fn notify_cleanup() {
+    CLEANUP_TICK.send_modify(|_| {});
+}
+
+/// A loaded room's inactivity. Kept in memory by the room task (a restart
+/// grants a fresh window); rooms nobody is connected to are unloaded and then
+/// swept from storage by [`crate::room_code::spawn_room_cleanup`] on
+/// [`EMPTY_RECLAIM_SECS`].
 #[derive(Debug, Clone, Copy)]
 pub struct IdleWatch {
     since: Option<tokio::time::Instant>,
@@ -44,41 +54,41 @@ impl Default for IdleWatch {
 impl IdleWatch {
     /// Opening a room counts as the start of its idleness.
     pub fn new() -> Self {
+        let now = tokio::time::Instant::now();
         Self {
-            since: Some(tokio::time::Instant::now()),
-            last_activity: tokio::time::Instant::now(),
+            since: Some(now),
+            last_activity: now,
         }
     }
 
-    /// Accepted human input, never socket pings or automatic bot turns.
+    /// Accepted human input or a join, never socket pings or automatic bot
+    /// turns.
     pub fn activity(&mut self) {
         self.last_activity = tokio::time::Instant::now();
     }
 
-    /// Finish the current hand before closing. Expiry does not grant an extra
-    /// idle hour, and bot turns do not extend the human inactivity window.
-    pub fn should_close(&mut self, in_play: bool, bot_room: bool, expired: bool) -> bool {
-        let idle = self.idle_expired(in_play);
-        let result_visible = self
-            .since
-            .is_some_and(|at| at.elapsed().as_secs() >= RESULT_DISPLAY_SECS);
-        !in_play
-            && ((expired && result_visible)
-                || idle
-                || (bot_room && self.last_activity.elapsed().as_secs() >= BOT_IDLE_CLOSE_SECS))
-    }
-
-    /// Feeds whether a hand is in progress right now; true once the room has
-    /// been without one for [`IDLE_CLOSE_SECS`]. A hand in progress is never
-    /// interrupted and restarts the window when it ends.
-    pub fn idle_expired(&mut self, in_play: bool) -> bool {
-        let now = tokio::time::Instant::now();
+    /// Fed by the room task on every pass: whether a hand is in progress.
+    pub fn observe(&mut self, in_play: bool) {
         if in_play {
             self.since = None;
-            return false;
+        } else {
+            self.since.get_or_insert_with(tokio::time::Instant::now);
         }
-        let since = *self.since.get_or_insert(now);
-        now.duration_since(since) >= std::time::Duration::from_secs(IDLE_CLOSE_SECS)
+    }
+
+    /// The session clock ran out, the hand finished and its result has shown.
+    pub fn expiry_due(&self, in_play: bool, expired: bool) -> bool {
+        !in_play
+            && expired
+            && self
+                .since
+                .is_some_and(|at| at.elapsed().as_secs() >= RESULT_DISPLAY_SECS)
+    }
+
+    /// Checked only on the shared cleanup tick. A hand in progress is never
+    /// interrupted; bot turns do not extend the human inactivity window.
+    pub fn reclaim_due(&self, in_play: bool) -> bool {
+        !in_play && self.last_activity.elapsed().as_secs() >= EMPTY_RECLAIM_SECS
     }
 }
 

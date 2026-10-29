@@ -280,6 +280,10 @@ impl<R: DealerRoom> Registry<R> {
         let rooms = self.rooms.lock().unwrap();
         rooms.iter().map(|(c, r)| (c.clone(), r.clone())).collect()
     }
+    /// Codes of the rooms this process holds; the idle sweep skips them.
+    pub(crate) fn codes(&self) -> Vec<String> {
+        self.rooms.lock().unwrap().keys().cloned().collect()
+    }
     /// The room the player is seated in (or joining), from memory.
     pub fn seat(&self, uid: Uuid) -> Option<String> {
         self.seats.lock().unwrap().get(&uid).cloned()
@@ -1836,13 +1840,18 @@ pub async fn run_dealer<R: DealerRoom>(pool: PgPool) {
     let mut tick_every = tokio::time::interval(Duration::from_secs(1));
     tick_every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_sweep = Instant::now();
+    let mut cleanup = crate::room_clock::subscribe_cleanup();
     loop {
         tick_every.tick().await;
         let Some(_request) = crate::release_handoff::admit_request(false) else {
             continue;
         };
         settle_due::<R>(now_ms()).await;
-        close_idle::<R>(&pool, now_ms()).await;
+        let reclaim = cleanup.has_changed().unwrap_or(false);
+        if reclaim {
+            cleanup.borrow_and_update();
+        }
+        close_idle::<R>(&pool, now_ms(), reclaim).await;
         if last_sweep.elapsed() >= Duration::from_secs(60) {
             last_sweep = Instant::now();
             if let Err(error) = sweep::<R>(&pool).await {

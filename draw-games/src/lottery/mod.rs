@@ -6,8 +6,9 @@
 //! backend draws each due period exactly once (database-arbitrated) and
 //! settles it one user per transaction. 刮刮乐 `scratch` cards are generated
 //! at purchase and revealed spot by spot. One shared practice wallet
-//! (`game_catalog::BEANS`, grant 10,000) backs all six games; every ledger
-//! record id is derived here, so retries never debit or credit twice.
+//! (`game_catalog::BEANS`, first-use grant 10,000, daily claim +2,000) backs all
+//! six games; every ledger record id is derived here, so retries never debit
+//! or credit twice.
 //!
 //! Module map: [`rules`] entry validation, stakes and prizes; [`store`]
 //! purchases, views, refills; [`scratch`] cards; [`draw_loop`] draws,

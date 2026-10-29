@@ -389,15 +389,14 @@ pub(super) async fn sweep<R: DealerRoom>(pool: &PgPool) -> Result<()> {
     Ok(())
 }
 
-/// Closes rooms nobody plays in, on the rules every other game room follows
-/// (`crate::room_clock::IdleWatch`, owner 2026-09-25): ten minutes without a
-/// human wager when one player sits with AI co-bettors, an hour otherwise,
-/// and once the session clock has run out and the last result has shown. A
-/// round holding human wagers always settles first. Every seat is released,
-/// so the room code frees with the row.
-pub(super) async fn close_idle<R: DealerRoom>(pool: &PgPool, now: i64) {
+/// Closes rooms on the rules every other game room follows
+/// (`crate::room_clock::IdleWatch`): once the session clock has run out and
+/// the last result has shown, and — only on the shared cleanup tick
+/// (`reclaim`) — once no member has joined or wagered for ten minutes. A round holding human wagers always settles first.
+/// Every seat is released, so the room code frees with the row.
+pub(super) async fn close_idle<R: DealerRoom>(pool: &PgPool, now: i64, reclaim: bool) {
     for (code, shared) in R::registry().all() {
-        if let Some(closing) = begin_close::<R>(pool, &code, &shared, now).await {
+        if let Some(closing) = begin_close::<R>(pool, &code, &shared, now, reclaim).await {
             // Off the dealer loop: a stalled writer must not stop other rooms.
             let Some(request) = crate::release_handoff::admit_request(true) else {
                 crate::release_handoff::fail("room close raced frozen barrier");
@@ -418,16 +417,17 @@ pub(super) async fn begin_close<R: DealerRoom>(
     code: &str,
     shared: &Shared<R>,
     now: i64,
+    reclaim: bool,
 ) -> Option<Closing> {
     let registry = R::registry();
     let mut room = shared.lock().await;
     if room.closed || room.release_paused || crate::release_handoff::draining() {
         return None;
     }
-    let bot_room = room.members.len() <= 1 && R::bots(&room.state) > 0;
     let expired = R::clock(&room.state).expired(now);
     let in_play = R::open_bets(&room.state);
-    if !room.idle.should_close(in_play, bot_room, expired) {
+    room.idle.observe(in_play);
+    if !room.idle.expiry_due(in_play, expired) && !(reclaim && room.idle.reclaim_due(in_play)) {
         return None;
     }
     // A join or leave in flight finishes first; the next pass retries.
