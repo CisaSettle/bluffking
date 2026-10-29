@@ -36,7 +36,7 @@ pub struct Commitment {
 }
 
 pub fn commit(game: &str, draw_id: &str, server_seed: &str) -> Result<Commitment, String> {
-    if !matches!(game, "scratch" | "sicbo" | "sicbo-room")
+    if !matches!(game, "scratch" | "sicbo" | "sicbo-room" | "zjh")
         || draw_id.is_empty()
         || draw_id.len() > 128
         || !draw_id.is_ascii()
@@ -76,7 +76,7 @@ impl Reveal {
             return Err("Commitment does not match the revealed seed and context".into());
         }
         let server = seed_bytes(&self.server_seed)?;
-        let client = if self.commitment.game == "sicbo-room" {
+        let client = if matches!(self.commitment.game.as_str(), "sicbo-room" | "zjh") {
             if !self.client_seed.is_empty() {
                 return Err("Room protocol does not accept a client seed".into());
             }

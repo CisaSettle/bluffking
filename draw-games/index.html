@@ -38,6 +38,7 @@
           <thead><tr><th>游戏</th><th>开奖前</th><th>开奖后及边界</th></tr></thead>
           <tbody>
             <tr><td>骰宝房间</td><td>每轮固定服务器种子承诺，持久化后才能接受投注；投注请求绑定该承诺。成功的 HTTP 投注确认等待该投注持久化。</td><td>公布种子并重算三颗骰子。WebSocket 展示可能早于持久化确认；确认超时表示结果未知，不能当作撤销。房间没有玩家种子，运营方预先知道结果，且承诺本身不能阻止事先筛选种子或中止一轮。</td></tr>
+            <tr><td>炸金花</td><td>每手开局前对新的服务器种子作承诺，承诺绑定本手编号并在任何行动前推送给全桌。</td><td>本手结束后，参与者可从手牌记录取得种子与各座位（自己与摊牌可见的牌）并重算整副牌。没有玩家种子，服务器在牌局进行中知道发牌；承诺只能发现事后换牌，不能阻止事先筛选种子。早于此功能的牌局没有证明。</td></tr>
             <tr><td>刮刮乐、单人骰宝</td><td>先取得持久化的服务器种子承诺，再由浏览器安全随机生成 32 字节玩家种子。请求绑定承诺、玩家种子和购买／投注条件，浏览器在请求前保存回执。</td><td>公布服务器种子后，可重算结果及兑奖。刮刮乐单张全部揭示后才公开完整种子；5／10 张批量购买直接揭示。服务器收到玩家种子后能够计算结果，承诺不能强制其继续服务或支付。</td></tr>
             <tr><td>双色球及其他定期开奖</td><td>游戏、期号、协议版本、封盘时间、drand 链和未来轮次组成固定计划。购买请求须回传已看到的计划承诺，票据保存同一计划。</td><td>验证指定轮次的 BLS 签名，按公开算法生成号码。没有可选择的服务器种子；只等待已选轮次，不因服务异常换轮次或改用系统随机数。即使运营方不提供结果，持有相应公共信标仍可自行重算。</td></tr>
           </tbody>
@@ -54,6 +55,7 @@
           <thead><tr><th>游戏</th><th>确定性抽样与兑奖</th></tr></thead>
           <tbody>
             <tr><td>骰宝</td><td>三颗独立的 1–6 骰子；4–10 为小，11–17 为大，围骰使大小投注均输。单人及房间共用<a href="verifier/src/sicbo.rs">骰宝规则</a>。</td></tr>
+            <tr><td>炸金花</td><td>一副 52 张牌按公开随机流做 Fisher-Yates 洗牌，按座位号从小到大每人连续发三张，见<a href="verifier/src/zjh.rs">炸金花发牌</a>。</td></tr>
             <tr><td>刮刮乐</td><td>六个号码和一个幸运号分别从 1–30 抽取，位置倍率为 1、1、2、2、5、10，命中位置相加。每张固定 100 金豆，并额外抽取最多一项奖励：10,000 金豆（0.2%）、100,000 金豆（0.01%）、1,000 金豆（0.1%）或 Max 30 天（0.01%）。只支持当前福利卡规则。购票时保存结果，号码和额外奖励在完整揭示前按规则隐藏；完整规则见 <a href="verifier/src/scratch.rs">scratch.rs</a>。</td></tr>
             <tr><td>双色球</td><td>1–33 无放回取 6 个红球，独立抽取 1–16 蓝球。</td></tr>
             <tr><td>快乐8</td><td>1–80 无放回取 20 个号码。</td></tr>
@@ -107,6 +109,7 @@
           <thead><tr><th>Game</th><th>Before the draw</th><th>Afterwards and limitations</th></tr></thead>
           <tbody>
             <tr><td>Sicbo rooms</td><td>Each round fixes a server-seed commitment. It must be durable before a wager is accepted; the wager binds that commitment. A successful HTTP wager acknowledgement waits for that wager to become durable.</td><td>The seed is revealed to replay all three dice. WebSocket updates may precede durable acknowledgement; a timeout means unknown acknowledgement, not rollback. There is no player seed in rooms, so the operator knows the outcome beforehand; commitment alone cannot prevent choosing among seeds beforehand or aborting a round.</td></tr>
+            <tr><td>Zha Jin Hua</td><td>Before each hand the server commits to a fresh seed, bound to the hand id and pushed to the table before any action.</td><td>After the hand, participants get the seed and every dealt seat (cards shown only for their own seat and showdown) from the hand record and replay the whole deck. There is no player seed and the server knows the deal while the hand is played; the commitment detects a deck swapped afterwards but cannot prevent prior seed selection. Hands dealt before this feature have no proof.</td></tr>
             <tr><td>Scratch cards and solo Sicbo</td><td>Obtain a durable server-seed commitment first, then generate a 32-byte player seed with browser cryptographic randomness. The request binds the commitment, player seed and purchase/wager terms. The browser saves a receipt before sending it.</td><td>The revealed server seed reproduces the result and prize. A single scratch card reveals its full seed only after every spot is open; batches of 5/10 reveal immediately. The server can compute the outcome after receiving the player seed. A commitment cannot compel continued service or payment.</td></tr>
             <tr><td>SSQ and other scheduled lotteries</td><td>A fixed plan binds the game, period, protocol version, sales cutoff, drand chain and future round. A purchase must echo the observed plan commitment; its ticket retains that plan.</td><td>Verify the selected round's BLS signature and derive numbers using the published algorithm. There is no selectable server seed. An outage waits for that exact round, with no substitute round or OS-random fallback. Anyone with its public beacon can reconstruct the result even if the operator withholds it.</td></tr>
           </tbody>
@@ -123,6 +126,7 @@
           <thead><tr><th>Game</th><th>Deterministic sampling and prizes</th></tr></thead>
           <tbody>
             <tr><td>Sicbo</td><td>Three independent dice in 1–6. Small is 4–10, big is 11–17, and triples lose both bets. Solo and rooms share <a href="verifier/src/sicbo.rs">the same rules</a>.</td></tr>
+            <tr><td>Zha Jin Hua</td><td>One 52-card deck is Fisher-Yates shuffled from the public random stream, and each dealt seat in ascending seat order takes three consecutive cards; see <a href="verifier/src/zjh.rs">the Zha Jin Hua deal</a>.</td></tr>
             <tr><td>Scratch cards</td><td>Six numbers and one lucky number independently drawn from 1–30; matching positions pay multipliers 1, 1, 2, 2, 5, 10, added together. Each card costs 100 beans and draws at most one extra reward: 10,000 beans (0.2%), 100,000 beans (0.01%), 1,000 beans (0.1%), or Max for 30 days (0.01%). Only the current reward-card rules are supported. Results are stored at purchase; unopened numbers and the bonus remain hidden until their reveal. See <a href="verifier/src/scratch.rs">scratch.rs</a>.</td></tr>
             <tr><td>SSQ</td><td>Six distinct red balls from 1–33 and one independent blue ball from 1–16.</td></tr>
             <tr><td>Happy8</td><td>Twenty distinct numbers from 1–80.</td></tr>
