@@ -90,3 +90,23 @@ pub const HUB_GAMES: [&str; 26] = [
     "fucai3d",
     "2048",
 ];
+
+/// Hub games in the 金豆专区 tab, in hub order: the client's `BEAN_GAME_IDS`
+/// (client-game/src/lib/gameCatalog.ts) minus its two tools, which have no
+/// game route. Keep the two lists in step.
+pub const BEAN_HUB_GAMES: [&str; 12] = [
+    "poker", "baccarat", "sicbo", "scratch", "claw", "slots", "toto", "ssq", "dlt", "happy8",
+    "fucai3d", "2048",
+];
+
+/// Singapore release day of recently shipped hub games, mirroring the client's
+/// `GAME_LAUNCH_DATES`; the hub lists a game under 新游戏 for
+/// `NEW_GAME_WINDOW_DAYS` days. Add each new game in both places.
+pub const GAME_LAUNCH_DATES: [(&str, &str); 5] = [
+    ("ssq", "2026-10-16"),
+    ("dlt", "2026-10-23"),
+    ("happy8", "2026-10-16"),
+    ("fucai3d", "2026-10-16"),
+    ("shortdeck", "2026-10-21"),
+];
+pub const NEW_GAME_WINDOW_DAYS: i64 = 30;
