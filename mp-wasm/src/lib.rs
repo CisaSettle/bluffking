@@ -1,5 +1,6 @@
-//! mp-wasm — Phase-4 server-blind WEB crypto core (ADR-063), PROTOTYPE pending
-//! external audit. A thin wasm-bindgen surface over `mental_poker::crypto_real`
+//! mp-wasm — browser crypto core for engine-blind dealing (ADR-063). Live under
+//! ADR-101's trusted-single-operator scope; no external audit has been done and
+//! no trustless claim is made. A thin wasm-bindgen surface over `mental_poker::crypto_real`
 //! so the browser runs the real threshold-ElGamal / DKG / Chaum–Pedersen path
 //! locally. The server never receives plaintext cards.
 //!
