@@ -5,6 +5,7 @@
 use crate::request_timing::{http_phase, HttpPhase};
 use crate::{beans, wallet::Wallet};
 use chrono::NaiveDate;
+use futures::TryStreamExt;
 use serde_json::Value;
 use sqlx::{PgPool, Row};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -598,26 +599,21 @@ pub async fn hydrate(pool: &PgPool) -> sqlx::Result<()> {
     };
     let mut loaded = tokio::time::timeout(Duration::from_secs(60), async {
         crate::live_directory::wait_for_open_transactions(pool).await?;
-        let mut tx = pool.begin().await?;
-        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY").execute(&mut *tx).await?;
+        let mut tx = crate::live_directory::begin_read_snapshot(pool).await?;
         let mut loaded = Inner::default();
-        let query = format!("SELECT w.user_id,w.balance,w.net_won,w.hands_played,w.hands_won,w.refills,({}) AS eligible FROM wallets w JOIN users u ON u.id=w.user_id WHERE w.game=$1 AND u.deleted_at IS DISTINCT FROM 'epoch'::timestamptz AND ($2::uuid IS NULL OR w.user_id>$2) ORDER BY w.user_id LIMIT $3", crate::internal_accounts::not_qa_flags("u."));
-        let mut after = None::<Uuid>;
-        loop {
-            let rows = sqlx::query(&query).bind(crate::game_catalog::BEANS).bind(after).bind(PAGE).fetch_all(&mut *tx).await?;
-            if rows.is_empty() { break; }
-            for row in rows {
-                let id = row.get("user_id"); after = Some(id);
+        // One streamed statement per source (one plan, one scan) in the snapshot.
+        let query = format!("SELECT w.user_id,w.balance,w.net_won,w.hands_played,w.hands_won,w.refills,({}) AS eligible FROM wallets w JOIN users u ON u.id=w.user_id WHERE w.game=$1 AND u.deleted_at IS DISTINCT FROM 'epoch'::timestamptz ORDER BY w.user_id", crate::internal_accounts::not_qa_flags("u."));
+        {
+            let mut rows = sqlx::query(&query).bind(crate::game_catalog::BEANS).fetch(&mut *tx);
+            while let Some(row) = rows.try_next().await? {
+                let id = row.get("user_id");
                 replace(&mut loaded, id, User { wallet: Some(wallet(&row)), eligible: row.get("eligible"), available: true, bytes: 512, ..User::default() })?;
             }
         }
-        let mut after = None::<(String, NaiveDate)>;
-        loop {
-            let rows: Vec<(String, NaiveDate)> = sqlx::query_as("SELECT subject_key,usage_date FROM daily_usage WHERE scope='feature_user' AND feature=$1 AND ($2::text IS NULL OR (subject_key,usage_date)>($2,$3)) ORDER BY subject_key,usage_date LIMIT $4")
-                .bind(DAILY).bind(after.as_ref().map(|v| v.0.as_str())).bind(after.as_ref().map(|v| v.1)).bind(PAGE).fetch_all(&mut *tx).await?;
-            if rows.is_empty() { break; }
-            after = rows.last().cloned();
-            for (id, day) in rows {
+        {
+            let mut rows = sqlx::query_as::<_, (String, NaiveDate)>("SELECT subject_key,usage_date FROM daily_usage WHERE scope='feature_user' AND feature=$1 ORDER BY subject_key,usage_date")
+                .bind(DAILY).fetch(&mut *tx);
+            while let Some((id, day)) = rows.try_next().await? {
                 let id = Uuid::parse_str(&id).map_err(|_| unavailable())?;
                 if let Some(user) = loaded.users.get_mut(&id) {
                     if user.days.insert(day) { user.bytes += 64; loaded.bytes += 64; loaded.count += 1; }
@@ -625,13 +621,10 @@ pub async fn hydrate(pool: &PgPool) -> sqlx::Result<()> {
                 if loaded.count > MAX_ROWS || loaded.bytes > MAX_BYTES { return Err(unavailable()); }
             }
         }
-        let mut after = 0i64;
-        loop {
-            let rows: Vec<(i64, Uuid, Option<Uuid>, i64, Value)> = sqlx::query_as("SELECT id,user_id,record_id,balance_after,details FROM wallet_ledger WHERE game=$1 AND (details->>'purpose'='casual_entry' OR (kind='play' AND (details->>'purpose'='claw_grab' OR details->>'game'='slots'))) AND id>$2 ORDER BY id LIMIT $3")
-                .bind(crate::game_catalog::BEANS).bind(after).bind(PAGE).fetch_all(&mut *tx).await?;
-            if rows.is_empty() { break; }
-            for (id, owner, record, balance, details) in rows {
-                after = id;
+        {
+            let mut rows = sqlx::query_as::<_, (i64, Uuid, Option<Uuid>, i64, Value)>("SELECT id,user_id,record_id,balance_after,details FROM wallet_ledger WHERE game=$1 AND (details->>'purpose'='casual_entry' OR (kind='play' AND (details->>'purpose'='claw_grab' OR details->>'game'='slots'))) AND id>0 ORDER BY id")
+                .bind(crate::game_catalog::BEANS).fetch(&mut *tx);
+            while let Some((_, owner, record, balance, details)) = rows.try_next().await? {
                 if let Some(user) = loaded.users.get_mut(&owner) {
                     let before = user.bytes;
                     let previous_count = count(user);
@@ -858,8 +851,7 @@ async fn read_user(
 ) -> sqlx::Result<User> {
     tokio::time::timeout(Duration::from_secs(10), async {
         crate::live_directory::wait_for_open_transactions(pool).await?;
-        let mut tx = pool.begin().await?;
-        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY").execute(&mut *tx).await?;
+        let mut tx = crate::live_directory::begin_read_snapshot(pool).await?;
         let query = format!("SELECT w.balance,w.net_won,w.hands_played,w.hands_won,w.refills,({}) AS eligible FROM wallets w JOIN users u ON u.id=w.user_id WHERE w.game=$1 AND w.user_id=$2 AND u.deleted_at IS DISTINCT FROM 'epoch'::timestamptz", crate::internal_accounts::not_qa_flags("u."));
         let row = sqlx::query(&query).bind(crate::game_catalog::BEANS).bind(id).fetch_optional(&mut *tx).await?;
         let mut user = User { wallet: row.as_ref().map(wallet), eligible: row.as_ref().is_some_and(|r| r.get("eligible")), available: true, bytes: 512, ..User::default() };

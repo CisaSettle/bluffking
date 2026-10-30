@@ -112,10 +112,7 @@ pub async fn hydrate_step(
         ));
     }
     step.snapshot_order(pool).await?;
-    let mut tx = pool.begin().await?;
-    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
-        .execute(&mut *tx)
-        .await?;
+    let mut tx = crate::live_directory::begin_read_snapshot(pool).await?;
     let mut after: Option<(Uuid, i16)> = None;
     let mut loaded = Vec::new();
     loop {
