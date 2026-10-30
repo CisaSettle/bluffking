@@ -93,6 +93,14 @@ pub fn ready(pool: &PgPool) -> bool {
 /// never refresh from SQL; recovery explicitly reconciles any replayed receipts.
 /// Exceeding the memory ceiling fails readiness rather than truncating balances.
 pub async fn hydrate(pool: &PgPool) -> sqlx::Result<()> {
+    hydrate_step(pool, crate::runtime_hydration::Step::standalone()).await
+}
+
+/// [`hydrate`] as one stage of an ordered takeover round.
+pub async fn hydrate_step(
+    pool: &PgPool,
+    mut step: crate::runtime_hydration::Step,
+) -> sqlx::Result<()> {
     let baseline = baseline_state(pool)?;
     let _loader = baseline.loader.lock().await;
     if baseline.ready.load(Ordering::Acquire) {
@@ -103,6 +111,7 @@ pub async fn hydrate(pool: &PgPool) -> sqlx::Result<()> {
             "wallet hydration must precede runtime activity".into(),
         ));
     }
+    step.snapshot_order(pool).await?;
     let mut tx = pool.begin().await?;
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
         .execute(&mut *tx)
@@ -140,6 +149,12 @@ pub async fn hydrate(pool: &PgPool) -> sqlx::Result<()> {
         }
     }
     tx.commit().await?;
+    step.publish_turn().await?;
+    if !memory().is_empty() {
+        return Err(sqlx::Error::Protocol(
+            "wallet hydration must precede runtime activity".into(),
+        ));
+    }
     for (key, wallet) in loaded {
         memory().insert(
             key,
