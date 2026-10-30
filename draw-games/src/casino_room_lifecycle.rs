@@ -30,7 +30,7 @@ pub async fn recover<R: DealerRoom>(pool: &PgPool) -> sqlx::Result<()> {
                     let members = sqlx::query(
                         "SELECT m.user_id,m.code,COALESCE(m.name,'') AS name \
                          FROM game_room_checkpoint_members m JOIN game_room_checkpoints c ON c.game=m.game AND c.code=m.code \
-                         WHERE m.game=$1 AND m.code=ANY($2) AND ($3::uuid IS NULL OR m.user_id>$3) \
+                         WHERE m.game=$1 AND m.code=ANY($2) AND m.user_id>COALESCE($3,'00000000-0000-0000-0000-000000000000'::uuid) \
                          ORDER BY m.user_id LIMIT $4",
                     )
                     .bind(R::DEALER)

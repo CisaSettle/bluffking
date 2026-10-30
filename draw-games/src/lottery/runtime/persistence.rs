@@ -105,7 +105,7 @@ pub(super) async fn hydrate_missing(
     for (game, period) in keys {
         let mut after = None::<Uuid>;
         loop {
-            let rows = sqlx::query(&format!("SELECT user_id,game,{} FROM lottery_tickets WHERE game=$1 AND period=$2 AND ($3::uuid IS NULL OR id>$3) ORDER BY id LIMIT $4", store::TICKET_COLUMNS))
+            let rows = sqlx::query(&format!("SELECT user_id,game,{} FROM lottery_tickets WHERE game=$1 AND period=$2 AND id>COALESCE($3,'00000000-0000-0000-0000-000000000000'::uuid) ORDER BY id LIMIT $4", store::TICKET_COLUMNS))
                 .bind(&game).bind(period).bind(after).bind(PAGE).fetch_all(&mut *tx).await?;
             if rows.is_empty() {
                 break;

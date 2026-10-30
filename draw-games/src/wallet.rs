@@ -118,7 +118,7 @@ pub async fn hydrate_step(
     loop {
         let rows = sqlx::query(
             "SELECT user_id,game,balance,hands_played,hands_won,net_won,refills FROM wallets \
-             WHERE ($1::uuid IS NULL OR (user_id,game)>($1,$2)) AND game=ANY($4) \
+             WHERE (user_id,game)>(COALESCE($1,'00000000-0000-0000-0000-000000000000'::uuid),COALESCE($2,(-32768)::smallint)) AND game=ANY($4) \
              ORDER BY user_id,game LIMIT $3",
         )
         .bind(after.map(|(user, _)| user))

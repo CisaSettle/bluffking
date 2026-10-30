@@ -46,6 +46,7 @@ pub mod events;
 pub mod hash;
 pub mod mental;
 pub mod pf;
+pub mod pf2;
 pub mod provider;
 pub mod signing;
 pub mod state;
