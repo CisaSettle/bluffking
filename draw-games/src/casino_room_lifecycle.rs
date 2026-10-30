@@ -246,7 +246,7 @@ pub(super) fn handoff_room<R: DealerRoom>(
                 if accept(&code, &mut room, next, None).is_ok() && room.writer.drain().await.is_ok()
                 {
                     room.touched = Instant::now();
-                    room.idle = IdleWatch::new();
+                    room.idle.reset_idle();
                     break;
                 }
                 room.release_paused = true;

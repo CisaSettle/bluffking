@@ -322,6 +322,7 @@ pub(crate) async fn admin_activity<R: DealerRoom>() -> Vec<crate::game_hub::acti
         }
         views.push(crate::game_hub::activity::RoomActivity {
             expires_at_ms: R::clock(&room.state).expires_at_ms,
+            last_human_input_at_ms: room.idle.last_human_input_at_ms(),
             game: R::DEALER,
             id,
             started: true,

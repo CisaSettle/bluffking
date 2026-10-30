@@ -43,6 +43,7 @@ pub(crate) fn notify_cleanup() {
 pub struct IdleWatch {
     since: Option<tokio::time::Instant>,
     last_activity: tokio::time::Instant,
+    last_human_input_at_ms: Option<i64>,
 }
 
 impl Default for IdleWatch {
@@ -58,6 +59,7 @@ impl IdleWatch {
         Self {
             since: Some(now),
             last_activity: now,
+            last_human_input_at_ms: None,
         }
     }
 
@@ -65,6 +67,20 @@ impl IdleWatch {
     /// turns.
     pub fn activity(&mut self) {
         self.last_activity = tokio::time::Instant::now();
+        self.last_human_input_at_ms = Some(now_ms());
+    }
+
+    /// None until a human input is observed in this runtime; loading is not input.
+    pub fn last_human_input_at_ms(&self) -> Option<i64> {
+        self.last_human_input_at_ms
+    }
+
+    /// Resume cleanup's grace window without forgetting an observed human input.
+    pub fn reset_idle(&mut self) {
+        *self = Self {
+            last_human_input_at_ms: self.last_human_input_at_ms,
+            ..Self::new()
+        };
     }
 
     /// Fed by the room task on every pass: whether a hand is in progress.
