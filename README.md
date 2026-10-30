@@ -24,7 +24,7 @@ English · [中文](#中文)
 | Crate | What it is |
 |---|---|
 | [`engine/`](engine) | Pure poker-logic crate. `GameHand` plays one complete hand end-to-end (blinds → flop/turn/river → side pots → result). Also hosts a Monte-Carlo **equity** estimator and a local **post-hand solver/coach**. No IO, no async, no DB — the same ruleset drives live play and deterministic replay. |
-| [`mental-poker/`](mental-poker) | Verifiable, commit–reveal dealing: a commit–reveal scheme plus a signed, append-only hash-chain transcript and **offline verifiers** (`pf_verify`, `mp-verify`). Also includes the real **server-blind** crypto path (n-of-n re-encryption-mixnet shuffle + threshold decryption) that powers the live *engine-blind* tables (cross-vendor AI-audited; open-source + independently verifiable). Depends on `engine` only for the `Card` type. |
+| [`mental-poker/`](mental-poker) | Verifiable dealing: the default Hold'em scheme (`pf2`, `pf-shuffle-v2`) — the dealer locks an encrypted, verifiably shuffled standard deck and commits to it before the deal, player seeds decide the public order, and shown cards are opened with decryption proofs while unshown cards stay encrypted — plus a signed, append-only hash-chain transcript and **offline verifiers** (`pf_verify`, `mp-verify`). Also includes the real **server-blind** crypto path (n-of-n re-encryption-mixnet shuffle + threshold decryption) that powers the live *engine-blind* tables (cross-vendor AI-audited; open-source + independently verifiable). Depends on `engine` only for the `Card` type. |
 | [`mp-wasm/`](mp-wasm) | A `wasm-bindgen` surface over `mental_poker::crypto_real` (the real server-blind path) so a browser can run the verifiable dealing locally. A detached crate with its own workspace. |
 | [`gto-solver/`](gto-solver) | Wraps the open-source **AGPL-3.0** `postflop-solver` (Discounted-CFR) behind BluffKing engine types (ADR-012); powers the free public `POST /api/tools/poker/solve` study tool. Its AGPL dependency is why this repo is AGPL-3.0. |
 | [`draw-games/verifier/`](draw-games/verifier) | Shared deterministic lottery, scratch-card and Sicbo rules, pinned drand verification, and the network-free `draw-verify` CLI. Detached workspace; used by the backend code in this snapshot. Public scheduled-draw proofs were verified available on 2026-10-25; see the dated evidence below. |
@@ -68,9 +68,10 @@ cargo deny check                         # supply-chain gate (advisories + licen
 `mental-poker` ships a few binaries — `pf_verify`, `mp-verify`, `pf_demo_hand`
 (`cargo run -p mental-poker --bin pf_verify -- --help`). `mp-wasm` targets `wasm32-unknown-unknown` — build it from inside the crate (see its `Cargo.toml`).
 
-The offline transcript verifiers (`pf_verify`, `mp-verify`) are the runnable
-fairness check: anyone can replay a published hand record and confirm the
-dealing. They need no database. The crates carry no unit or integration test
+The offline verifiers (`pf_verify`, `mp-verify`) are the runnable fairness
+check: `pf_verify` checks a Hold'em hand's verification bundle (shuffle proof,
+player seeds, decryption proofs) and prints the proven cards; `mp-verify`
+replays a published transcript. They need no database. The crates carry no unit or integration test
 suite; the upstream project verifies behavior with one end-to-end suite
 against the running game.
 
@@ -108,7 +109,7 @@ section) and [`SECURITY.md`](SECURITY.md).
 | Crate | 说明 |
 |---|---|
 | [`engine/`](engine) | 纯逻辑扑克引擎。`GameHand` 端到端打完一手牌(盲注 → 翻牌/转牌/河牌 → 边池 → 结算)。内含蒙特卡洛 **胜率(equity)** 估算与本地 **牌后求解器/教练**。无 IO、无 async、无数据库——同一套规则驱动实战与确定性回放。 |
-| [`mental-poker/`](mental-poker) | 可验证发牌(commit–reveal):commit–reveal 承诺-揭示方案 + 签名的只追加哈希链 transcript + **离线验证器**(`pf_verify`、`mp-verify`)。另含真实的**服务端盲发**路径(n-of-n 重加密混洗 + 门限解密),驱动线上 *engine-blind* 牌桌(经 AI 跨厂商审计;开源且可独立验证)。仅依赖 `engine` 的 `Card` 类型。 |
+| [`mental-poker/`](mental-poker) | 可验证发牌:默认德州方案(`pf2`,`pf-shuffle-v2`)——发牌前发牌方锁定一副逐张加密、可验证洗牌的标准牌并公布承诺,玩家种子决定公开的发牌顺序,亮出的牌用解密证明打开,未亮出的牌保持加密;另含签名的只追加哈希链 transcript + **离线验证器**(`pf_verify`、`mp-verify`)。另含真实的**服务端盲发**路径(n-of-n 重加密混洗 + 门限解密),驱动线上 *engine-blind* 牌桌(经 AI 跨厂商审计;开源且可独立验证)。仅依赖 `engine` 的 `Card` 类型。 |
 | [`mp-wasm/`](mp-wasm) | 对 `mental_poker::crypto_real`(真实服务端盲发路径)的 `wasm-bindgen` 封装,让浏览器本地运行可验证发牌。独立 crate,自带 workspace。 |
 | [`gto-solver/`](gto-solver) | 封装开源 **AGPL-3.0** 的 `postflop-solver`(Discounted-CFR),隐藏在 BluffKing engine 类型之后(ADR-012);为免费公开的 `POST /api/tools/poker/solve` 学习工具提供支持。它的 AGPL 依赖是本仓库采用 AGPL 的原因。 |
 | [`draw-games/verifier/`](draw-games/verifier) | 彩票、刮刮乐与骰宝共用的确定性规则、固定 drand 签名验证和不联网的 `draw-verify` 命令行。自带工作区,由本版本后台代码直接引用。2026-10-25 已核实定期开奖公开证明可用，证据见下文。 |
@@ -144,8 +145,9 @@ cargo fmt --all -- --check
 cargo deny check                         # 供应链门禁(漏洞 + 许可证)
 ```
 
-离线 transcript 验证器(`pf_verify`、`mp-verify`)是可运行的公平性核验:任何人都能
-回放公开的手牌记录并确认发牌过程,无需数据库。各 crate 不带单元/集成测试套件;
+离线验证器(`pf_verify`、`mp-verify`)是可运行的公平性核验:`pf_verify` 核对一手德州的
+验证包(洗牌证明、玩家种子、解密证明)并打印被证明的牌;`mp-verify` 回放公开的 transcript。
+都无需数据库。各 crate 不带单元/集成测试套件;
 上游项目只用一套针对运行中游戏的端到端测试来验证行为。
 
 **跨厂商 AI 审计 + 如何自己核:** [`audits/cross-vendor-ai-audit.html`](audits/cross-vendor-ai-audit.html) —— 公平信任模型(开源 + 跨厂商 AI 双审 + 可运行验证器),事实可溯源到 ADR。

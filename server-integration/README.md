@@ -13,8 +13,10 @@ just the library.
   network.
 - `sealed_dealer.rs` — the **sealed dealer** as deployed: the separate process
   that deals every default (non-mental-poker) Hold'em hand. It is published for
-  transparency so anyone can read exactly what it does: it shuffles with the
-  open-source `engine` deck, commits to the deck before the hand, sends each
+  transparency so anyone can read exactly what it does: it locks an encrypted,
+  verifiably shuffled standard deck (`mental-poker` `pf2`, `pf-shuffle-v2`) and
+  commits to it before the hand, lets the players' seeds decide the final
+  order, never publishes its seed, sends each
   human player's hole cards straight to that player's browser over its own
   WebSocket (they never pass through the game-server process), releases board
   and contested showdown cards only when the game reaches those stages, and
@@ -26,7 +28,7 @@ just the library.
   `session_registry`, `runtime_checkpoint`, `outbound`). Its submodules under
   `sealed_dealer/` are published with it: `authorization.rs` (the game-process signature
   every internal game-server-to-dealer request must carry),
-  `metrics.rs` and `diagnostics.rs`.
+  `metrics.rs`, `diagnostics.rs` and `evidence.rs`.
 - `texas-h5-Cargo.lock` (U47) — the **deployed server binary's exact dependency
   resolution**, i.e. the §13 reproduce artifact. It pins every version — including
   the git-pinned `postflop-solver` commit — as actually built and deployed. Use

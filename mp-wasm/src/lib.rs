@@ -552,3 +552,19 @@ pub fn selftest_roundtrip() -> String {
         Err(e) => format!("ERR:open:{e:?}"),
     }
 }
+
+/// Verifiable Hold'em dealing v2 (`mental_poker::pf2`): verify a hand's bundle
+/// (shuffle proof against the standard deck, the commitment, the player-seed
+/// order and every opened card). Returns `{"ok":true,"verified":{…}}` with the
+/// proven cards, or `{"ok":false,"error":"…"}`. The caller still compares the
+/// result with what its own device witnessed during the hand.
+#[wasm_bindgen]
+pub fn pf2_verify(bundle_json: String) -> String {
+    let result = serde_json::from_str::<mental_poker::pf2::Bundle>(&bundle_json)
+        .map_err(|_| "malformed bundle".to_string())
+        .and_then(|bundle| mental_poker::pf2::verify(&bundle).map_err(|e| e.to_string()));
+    match result {
+        Ok(verified) => serde_json::json!({"ok": true, "verified": verified}).to_string(),
+        Err(error) => serde_json::json!({"ok": false, "error": error}).to_string(),
+    }
+}

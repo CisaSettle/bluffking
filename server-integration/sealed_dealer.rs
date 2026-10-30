@@ -68,9 +68,10 @@ pub struct SeatTicket {
     pub ticket: String,
 }
 
-/// Phase one of a verifiable deal (ADR-064 on the sealed dealer): the worker
-/// draws `server_seed` and publishes only its hash before any player entropy
-/// exists, so it cannot pick a deck after seeing the client seeds.
+/// Phase one of a verifiable deal (ADR-064 v2 on the sealed dealer): the
+/// worker draws a master seed, locks its encrypted shuffled deck
+/// (`pf2::LockedDeck`) and publishes only the deck commitment before any player
+/// entropy exists, so it cannot pick a deck after seeing the client seeds.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CommitHandRequest {
     pub hand_id: Uuid,
@@ -88,8 +89,9 @@ pub struct CreateHandRequest {
     #[serde(default)]
     pub bot_seats: Vec<u8>,
     /// Fresh per-hand player seeds collected after the commit, by seat. When a
-    /// commit exists the deck is `Deck::new(from_seed_bytes(derive_deck_seed(
-    /// server_seed, client_seeds, hand_id)))`, reproducible by players.
+    /// commit exists the deck is the locked deck in the public order those
+    /// seeds select: `LockedDeck::new(master, hand_id).final_card_ids(
+    /// client_seeds)`.
     #[serde(default)]
     pub client_seeds: BTreeMap<u8, [u8; 32]>,
     /// The commitment the game server obtained for this hand. When set, the
@@ -144,7 +146,8 @@ pub struct FinalDeckResponse {
     pub cards: Vec<u8>,
     pub seed: [u8; 32],
     pub nonce: [u8; 32],
-    /// Committed seed, released only at settlement. `None` for an uncommitted
+    /// Committed master seed, released to the game server only at settlement
+    /// (worker-internal; never sent to a client). `None` for an uncommitted
     /// (test-pinned) deal.
     #[serde(default)]
     pub server_seed: Option<[u8; 32]>,
@@ -160,16 +163,6 @@ fn final_deck(hand: &SealedHand) -> FinalDeckResponse {
         server_seed: hand.server_seed,
         client_seeds: hand.client_seeds.clone(),
     }
-}
-
-/// Canonical card ids of the deck a seed shuffles to.
-pub fn deck_ids(seed: [u8; 32]) -> Vec<u8> {
-    Deck::new(&mut PokerRng::from_seed_bytes(seed))
-        .cards()
-        .iter()
-        .copied()
-        .map(mental_poker::card_id::card_to_id)
-        .collect()
 }
 
 /// Settlement guard: every card the engine settled with (board and showdown
@@ -204,31 +197,42 @@ pub fn check_settled_cards(
     Ok(())
 }
 
-/// The material players check after a verifiable hand. Validates the commit,
-/// the seed derivation and the deck before anything is revealed or persisted.
-pub fn verified_reveal(
+/// The verified secrets of a committed (v2) hand. Rebuilds the locked deck from
+/// the released master seed and checks the commit, the final order and the
+/// engine seed before anything is revealed or persisted. Rebuilding the locked
+/// deck costs milliseconds of CPU, so it runs on the blocking pool.
+pub async fn verified_reveal(
     hand_id: Uuid,
     seed_commit: [u8; 32],
     deck: &FinalDeckResponse,
 ) -> Result<crate::pf_dealing::PfSecrets, String> {
-    use crate::pf_dealing::{derive_deck_seed, seed_commit as commit_of, PfSecrets};
-    let server_seed = deck.server_seed.ok_or("sealed deal was not committed")?;
-    if commit_of(&server_seed) != seed_commit {
-        return Err("sealed server seed does not match its commit".into());
-    }
-    let deck_seed = derive_deck_seed(&server_seed, &deck.client_seeds, hand_id);
-    if deck_seed != deck.seed || deck_ids(deck_seed) != deck.cards {
-        return Err("sealed deck does not follow from the revealed seeds".into());
-    }
-    Ok(PfSecrets {
-        hand_id,
-        server_seed,
-        seed_commit,
-        client_seeds: deck.client_seeds.clone(),
-        deck_seed,
-        dealt_seats: Vec::new(),
-        withheld_seats: Vec::new(),
+    let master = deck.server_seed.ok_or("sealed deal was not committed")?;
+    let client_seeds = deck.client_seeds.clone();
+    let cards = deck.cards.clone();
+    let seed = deck.seed;
+    tokio::task::spawn_blocking(move || {
+        use mental_poker::pf2;
+        let locked = pf2::LockedDeck::new(&master, hand_id);
+        if locked.commit() != seed_commit {
+            return Err("sealed master seed does not match its commit".to_string());
+        }
+        let engine_seed = pf2::engine_seed(&master, &client_seeds, hand_id);
+        if engine_seed != seed || locked.final_card_ids(&client_seeds) != cards {
+            return Err("sealed deck does not follow from the committed deck and seeds".into());
+        }
+        Ok(crate::pf_dealing::PfSecrets {
+            hand_id,
+            server_seed: master,
+            seed_commit,
+            client_seeds,
+            deck_seed: engine_seed,
+            final_deck: cards,
+            dealt_seats: Vec::new(),
+            withheld_seats: Vec::new(),
+        })
     })
+    .await
+    .map_err(|error| format!("sealed reveal check failed: {error}"))?
 }
 
 pub fn validate_final_deck(
@@ -284,7 +288,10 @@ struct SealedHand {
     deck: Vec<u8>,
     seed: [u8; 32],
     nonce: [u8; 32],
+    /// Master seed of a committed hand's locked deck.
     server_seed: Option<[u8; 32]>,
+    /// That locked deck's published commit.
+    seed_commit: Option<[u8; 32]>,
     client_seeds: BTreeMap<u8, [u8; 32]>,
     commitment: String,
     tickets: HashMap<String, u8>,
@@ -312,40 +319,50 @@ impl SealedHand {
         }
     }
 
+    /// An uncommitted deal: an OS-random shuffle.
     fn new(hand_id: Uuid, seats: Vec<u8>) -> Result<(Self, Vec<SeatTicket>), &'static str> {
-        Self::new_with_rng(hand_id, seats, PokerRng::from_os())
+        let mut rng = PokerRng::from_os();
+        let seed = rng.seed();
+        let deck = Deck::new(&mut rng)
+            .cards()
+            .iter()
+            .copied()
+            .map(mental_poker::card_id::card_to_id)
+            .collect();
+        Self::with_deck(hand_id, seats, deck, seed)
     }
 
+    /// A committed (v2) deal: the locked deck in the order the player seeds
+    /// select. `seed` is the secret engine seed, not a deck seed.
     fn new_committed(
         hand_id: Uuid,
         seats: Vec<u8>,
-        server_seed: [u8; 32],
+        pending: PendingCommit,
         client_seeds: BTreeMap<u8, [u8; 32]>,
     ) -> Result<(Self, Vec<SeatTicket>), &'static str> {
-        let deck_seed = crate::pf_dealing::derive_deck_seed(&server_seed, &client_seeds, hand_id);
-        let (mut hand, tickets) =
-            Self::new_with_rng(hand_id, seats, PokerRng::from_seed_bytes(deck_seed))?;
-        hand.server_seed = Some(server_seed);
+        let deck = pending.locked.final_card_ids(&client_seeds);
+        let seed = mental_poker::pf2::engine_seed(&pending.master, &client_seeds, hand_id);
+        let (mut hand, tickets) = Self::with_deck(hand_id, seats, deck, seed)?;
+        hand.server_seed = Some(pending.master);
+        hand.seed_commit = Some(pending.locked.commit());
         hand.client_seeds = client_seeds;
         Ok((hand, tickets))
     }
-    fn new_with_rng(
+
+    fn with_deck(
         hand_id: Uuid,
         mut seats: Vec<u8>,
-        mut rng: PokerRng,
+        deck: Vec<u8>,
+        seed: [u8; 32],
     ) -> Result<(Self, Vec<SeatTicket>), &'static str> {
         seats.sort_unstable();
         seats.dedup();
         if seats.len() < 2 || seats.len() > 9 {
             return Err("sealed dealer requires 2..=9 distinct seats");
         }
-        let seed = rng.seed();
-        let deck: Vec<u8> = Deck::new(&mut rng)
-            .cards()
-            .iter()
-            .copied()
-            .map(mental_poker::card_id::card_to_id)
-            .collect();
+        if deck.len() != 52 {
+            return Err("sealed dealer requires a 52-card deck");
+        }
         let mut nonce = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut nonce);
         let mut commit = Sha256::new();
@@ -373,6 +390,7 @@ impl SealedHand {
                 seed,
                 nonce,
                 server_seed: None,
+                seed_commit: None,
                 client_seeds: BTreeMap::new(),
                 commitment,
                 tickets,
@@ -436,8 +454,12 @@ impl SealedHand {
     }
 }
 
-/// A worker-held server seed and when it was drawn.
-type PendingCommit = ([u8; 32], tokio::time::Instant);
+/// A worker-held master seed, its locked deck and when it was drawn.
+struct PendingCommit {
+    master: [u8; 32],
+    locked: mental_poker::pf2::LockedDeck,
+    at: tokio::time::Instant,
+}
 
 /// Commits older than this without a deal are dropped (the game server voided
 /// or crashed between the two phases).
@@ -497,11 +519,9 @@ async fn create_hand(
         if existing.seats != seats
             || existing.bot_seats != bot_seats
             || existing.client_seeds != request.client_seeds
-            || request.seed_commit.is_some_and(|expected| {
-                existing
-                    .server_seed
-                    .is_none_or(|seed| crate::pf_dealing::seed_commit(&seed) != expected)
-            })
+            || request
+                .seed_commit
+                .is_some_and(|expected| existing.seed_commit != Some(expected))
         {
             return (
                 StatusCode::CONFLICT,
@@ -512,15 +532,10 @@ async fn create_hand(
         return (StatusCode::OK, Json(existing.create_response())).into_response();
     }
 
-    // A committed hand must be dealt from its committed seed. Without a commit
+    // A committed hand must be dealt from its locked deck. Without a commit
     // there is no player entropy to mix, so seeds are refused rather than
     // silently ignored.
-    let committed = state
-        .commits
-        .write()
-        .await
-        .remove(&request.hand_id)
-        .map(|(seed, _)| seed);
+    let committed = state.commits.write().await.remove(&request.hand_id);
     if committed.is_none() && !request.client_seeds.is_empty() {
         return (
             StatusCode::CONFLICT,
@@ -532,7 +547,10 @@ async fn create_hand(
     // one it announced to the players, not missing (worker restarted after the
     // commit) and not another hand's.
     if let Some(expected) = request.seed_commit {
-        if committed.is_none_or(|seed| crate::pf_dealing::seed_commit(&seed) != expected) {
+        if committed
+            .as_ref()
+            .is_none_or(|pending| pending.locked.commit() != expected)
+        {
             return (
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({"error":"hand_not_committed"})),
@@ -547,16 +565,12 @@ async fn create_hand(
     {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    let fresh = |seats| match committed {
-        Some(server_seed) => SealedHand::new_committed(
-            request.hand_id,
-            seats,
-            server_seed,
-            request.client_seeds.clone(),
-        ),
+    let created = match committed {
+        Some(pending) => {
+            SealedHand::new_committed(request.hand_id, seats, pending, request.client_seeds)
+        }
         None => SealedHand::new(request.hand_id, seats),
     };
-    let created = fresh(seats);
     let Ok((mut hand, _)) = created else {
         return StatusCode::BAD_REQUEST.into_response();
     };
@@ -582,14 +596,36 @@ async fn commit_hand(
             .into_response();
     }
     let now = tokio::time::Instant::now();
+    {
+        let mut commits = state.commits.write().await;
+        commits.retain(|_, pending| now.duration_since(pending.at) < COMMIT_TTL);
+        // A lost response is replayed with the same commit, never a new seed.
+        if let Some(pending) = commits.get(&request.hand_id) {
+            return Json(CommitHandResponse {
+                seed_commit: pending.locked.commit(),
+            })
+            .into_response();
+        }
+    }
+    // Locking the deck costs milliseconds of CPU: build it off the async
+    // workers and without holding the commit map.
+    let master = crate::pf_dealing::os_random_32();
+    let hand_id = request.hand_id;
+    let Ok(locked) =
+        tokio::task::spawn_blocking(move || mental_poker::pf2::LockedDeck::new(&master, hand_id))
+            .await
+    else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    // A concurrent replay may have locked first; every caller gets that one.
     let mut commits = state.commits.write().await;
-    commits.retain(|_, (_, at)| now.duration_since(*at) < COMMIT_TTL);
-    // A lost response is replayed with the same commit, never a new seed.
-    let (server_seed, _) = *commits
-        .entry(request.hand_id)
-        .or_insert_with(|| (crate::pf_dealing::os_random_32(), now));
+    let pending = commits.entry(hand_id).or_insert(PendingCommit {
+        master,
+        locked,
+        at: now,
+    });
     Json(CommitHandResponse {
-        seed_commit: crate::pf_dealing::seed_commit(&server_seed),
+        seed_commit: pending.locked.commit(),
     })
     .into_response()
 }
@@ -1511,8 +1547,8 @@ impl ActiveHand {
         Ok(())
     }
 
-    /// Settle the hand. Also returns the verified commit-reveal secrets that
-    /// players use to recompute the deck (`None` for a pinned test deck).
+    /// Settle the hand. Also returns the verified dealing secrets of the
+    /// committed hand (`None` for a pinned test deck).
     pub async fn finish(
         &self,
         hand: &mut engine::GameHand,
@@ -1557,7 +1593,7 @@ impl ActiveHand {
         })?;
         let pf = match &self.commit {
             Some(commit) => {
-                let mut pf = verified_reveal(self.hand_id, commit.seed_commit, &deck)?;
+                let mut pf = verified_reveal(self.hand_id, commit.seed_commit, &deck).await?;
                 if pf.client_seeds != commit.client_seeds {
                     return Err("sealed dealer mixed different player seeds".into());
                 }
@@ -1592,6 +1628,15 @@ impl ActiveHand {
     pub async fn delete(&self) {
         self.client.delete_hand(self.hand_id).await;
     }
+}
+
+/// The cards of a dealer deck given as `mental_poker::card_id` ids, in deal
+/// order. `None` if any id is invalid.
+pub fn deck_cards(ids: &[u8]) -> Option<Vec<engine::Card>> {
+    ids.iter()
+        .copied()
+        .map(mental_poker::card_id::id_to_card)
+        .collect()
 }
 
 fn decode_hole(ids: [u8; 2]) -> Result<engine::HoleCards, String> {

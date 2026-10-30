@@ -54,6 +54,9 @@ curve25519-dalek = { version = "4.1.3", features = ["digest", "rand_core", "zero
 merlin = "3"
 rand_core = "0.6"
 rand = "0.8"
+# pf2 (verifiable dealing v2): the locked deck is rebuilt deterministically from
+# the stored master seed.
+rand_chacha = "0.3"
 
 # WASM (Phase-4 web client, ADR-063): on wasm32-unknown-unknown the `rand 0.8 →
 # getrandom 0.2` chain needs the "js" backend (browser crypto.getRandomValues).
