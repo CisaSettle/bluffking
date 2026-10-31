@@ -14,7 +14,10 @@ use uuid::Uuid;
 
 const BET_MS: i64 = 8_000;
 const BET_LOCK_MS: i64 = 1_000;
-const RESULT_MS: i64 = 6_000;
+// Match SicboTableView/useDiceRoll: reveal, then only the chip stages needed.
+const REVEAL_MS: i64 = 2_800;
+const COLLECT_MS: i64 = 480;
+const PAYOUT_MS: i64 = 620;
 /// Seats per room, humans and AI co-bettors together.
 const MAX_MEMBERS: usize = 8;
 const HISTORY: usize = 60;
@@ -299,7 +302,14 @@ fn settle_round(state: &mut State, now: i64) -> Option<Round> {
         state.history.remove(0);
     }
     state.result = Some(result);
-    state.deadline_ms = now + RESULT_MS;
+    let mut collect = false;
+    let mut payout = false;
+    for delta in state.deltas.values().chain(state.bot_deltas.values()) {
+        collect |= *delta < 0;
+        payout |= *delta > 0;
+    }
+    state.deadline_ms =
+        now + REVEAL_MS + if collect { COLLECT_MS } else { 0 } + if payout { PAYOUT_MS } else { 0 };
     Some(Round {
         wallet_unit: state.wallet_unit,
         session_id: state.history_session_id,

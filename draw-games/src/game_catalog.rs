@@ -94,9 +94,22 @@ pub const HUB_GAMES: [&str; 26] = [
 /// Hub games in the 金豆专区 tab, in hub order: the client's `BEAN_GAME_IDS`
 /// (client-game/src/lib/gameCatalog.ts) minus its two tools, which have no
 /// game route. Keep the two lists in step.
-pub const BEAN_HUB_GAMES: [&str; 12] = [
-    "poker", "baccarat", "sicbo", "scratch", "claw", "slots", "toto", "ssq", "dlt", "happy8",
-    "fucai3d", "2048",
+pub const BEAN_HUB_GAMES: [&str; 15] = [
+    "poker",
+    "shortdeck",
+    "niuniu",
+    "zjh",
+    "baccarat",
+    "sicbo",
+    "scratch",
+    "claw",
+    "slots",
+    "toto",
+    "ssq",
+    "dlt",
+    "happy8",
+    "fucai3d",
+    "2048",
 ];
 
 /// Singapore release day of recently shipped hub games, mirroring the client's

@@ -39,7 +39,7 @@ impl Opponent {
 pub struct GameSummary {
     pub game: &'static str,
     pub played: i64,
-    pub net: i64,
+    pub net: Option<i64>,
     pub last_played_at: DateTime<Utc>,
 }
 
@@ -266,7 +266,7 @@ pub async fn load_history_page_filtered(
          NULL::uuid AS record_id, NULL::uuid AS session_id, \
          t.last_played_at AS played_at, NULL::bigint AS delta, NULL::jsonb AS detail, \
          t.played, t.net FROM (SELECT game, max(played_at) AS last_played_at, count(*) AS played, \
-         sum(delta)::bigint AS net FROM filtered_records WHERE user_id=$1 GROUP BY game) t \
+         CASE WHEN game IN (1,9,22) THEN NULL::bigint ELSE sum(delta)::bigint END AS net FROM filtered_records WHERE user_id=$1 GROUP BY game) t \
          UNION ALL SELECT 1::smallint, NULL::smallint, page.game, page.record_id, \
          page.session_id, page.played_at, page.delta, ",
     );
@@ -274,9 +274,9 @@ pub async fn load_history_page_filtered(
         // A baccarat session is all practice-chip room rounds or all solo
         // gold-bean hands; its first record tells which.
         query.push("jsonb_build_object('hands', CASE WHEN page.game=5 THEN COALESCE((SELECT jsonb_array_length(r.detail->'results') FROM filtered_records r WHERE r.game=5 AND r.user_id=$1 AND r.record_id=page.record_id),page.hands) ELSE page.hands END, 'started_at', page.started_at, \
-             'unit', CASE WHEN page.game=8 THEN (SELECT CASE WHEN EXISTS (SELECT 1 FROM wallet_ledger l WHERE l.game=10 AND l.record_id=f.record_id AND l.user_id=$1 \
-             AND l.kind='play' AND l.details->>'game'='baccarat') \
-             THEN 'beans' ELSE 'practice' END FROM (SELECT r.record_id FROM game_records r WHERE r.user_id=$1 AND r.game=8 \
+             'unit', CASE WHEN page.game IN (1,8,9,22) THEN (SELECT CASE WHEN EXISTS (SELECT 1 FROM wallet_ledger l WHERE l.game=10 AND l.record_id=f.record_id AND l.user_id=$1 \
+             AND l.kind='play' AND (l.details->>'unit'='beans' OR l.details->>'game'='baccarat')) \
+             THEN 'beans' ELSE 'practice' END FROM (SELECT r.record_id FROM game_records r WHERE r.user_id=$1 AND r.game=page.game \
              AND COALESCE(r.session_id,r.record_id)=page.session_id LIMIT 1) f) END)");
     } else {
         // Hydrated below by a statement planned only for this page's games.
@@ -369,6 +369,7 @@ const DETAIL_ARMS: &[(&[i16], &str)] = &[
         &[1, 2, 9, 12, 13, 22],
         r#"(SELECT jsonb_build_object(
     'room_code', h.room_code, 'pot', h.pot, 'ante', h.ante, 'showdown', h.showdown,
+    'unit', CASE WHEN EXISTS(SELECT 1 FROM wallet_ledger l WHERE l.game=10 AND l.user_id=$1 AND l.record_id=h.id AND l.details->>'unit'='beans') THEN 'beans' ELSE 'practice' END,
     'players', jsonb_array_length(h.players),
     'cards', (SELECT p->'cards' FROM jsonb_array_elements(h.players) p WHERE p->>'user_id'=$1::text LIMIT 1),
     'has_bots', (SELECT bool_or(p->'user_id'='null'::jsonb) FROM jsonb_array_elements(h.players) p))

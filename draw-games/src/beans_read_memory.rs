@@ -14,10 +14,16 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 use uuid::Uuid;
 
+#[path = "beans_card_rooms.rs"]
+mod card_rooms;
 #[path = "beans_pending_effects.rs"]
 mod pending_effects;
 #[path = "beans_reservations.rs"]
 mod reservations;
+pub(crate) use card_rooms::{
+    accept_card_snapshot, card_hand_committed, card_snapshot_committed, fence_card_room,
+    reconcile_card_room, release_card_room, reserve_card_stack, restore_card_room,
+};
 pub(crate) use pending_effects::{
     accept_effect, daily_claimed, effect_abandoned, effect_committed, settlement_balance,
     PendingEffect,
@@ -70,6 +76,7 @@ pub struct Recent {
 }
 #[derive(Default)]
 struct Inner {
+    cards: card_rooms::CardRooms,
     reservations: reservations::Reservations,
     ready: bool,
     epoch: u64,
@@ -638,6 +645,8 @@ pub async fn hydrate(pool: &PgPool) -> sqlx::Result<()> {
         let rooms: Vec<(String, Value)> = sqlx::query_as("SELECT code,state FROM game_room_checkpoints WHERE game='sicbo'")
             .fetch_all(&mut *tx).await?;
         for (code, snapshot) in rooms { loaded.reservations.sicbo_commit(&code, &snapshot); }
+        let cards: Vec<(String, String, i64, Value)> = sqlx::query_as("SELECT game,code,revision,state FROM game_room_checkpoints WHERE game IN ('zjh','niuniu','shortdeck') AND state->'opts'->>'beans'='true'").fetch_all(&mut *tx).await?;
+        for (game, code, revision, snapshot) in cards { loaded.cards.hydrate(&game, &code, revision as u64, &snapshot)?; }
         tx.commit().await?;
         Ok::<_, sqlx::Error>(loaded)
     }).await.map_err(|_| sqlx::Error::PoolTimedOut)??;

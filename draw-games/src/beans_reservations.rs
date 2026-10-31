@@ -221,7 +221,7 @@ pub(super) fn reserved(
         let entry = poker.entry(room.id).or_default();
         *entry = (*entry).max(amount);
     }
-    let mut total = 0i64;
+    let mut total = inner.cards.reserved(user, None)?;
     for (session, amount) in poker {
         if Some(session) != excluding_poker {
             total = total.checked_add(amount).ok_or_else(unavailable)?;

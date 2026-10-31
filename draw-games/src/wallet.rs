@@ -737,6 +737,9 @@ pub(crate) fn session_policy(
     name: &str,
     state: &serde_json::Value,
 ) -> sqlx::Result<Option<Policy>> {
+    if crate::card_beans::is_beans(name, state) {
+        return Ok(None);
+    }
     let Some(mut policy) = room_policy(name) else {
         return Ok(None);
     };
