@@ -58,23 +58,13 @@ opt-level = 3
 # integer-bounds-check cost is negligible. Turns an unreachable-but-catastrophic
 # wrap into a loud panic instead.
 overflow-checks = true
-# ThinLTO (not fat `lto = true`). Fat LTO merges every crate's LLVM IR into ONE
-# whole-program module for the final link, and that single optimizer/codegen
-# pass is a large, single-threaded memory SPIKE — on a memory-constrained Docker
-# build VM (the local prod-parity gate runs on a ~3.8 GiB colima VM) rustc got
-# OOM-killed mid-link (`signal: 9, SIGKILL`) during exactly that step, so the
-# `server/Dockerfile` image never built (BUG-107). ThinLTO keeps modules
-# separate and optimizes via cross-module function summaries in bounded, parallel
-# partitions, so peak RSS stays low enough to build inside that VM. ThinLTO still
-# performs cross-module inlining via per-module function summaries, so the runtime
-# cost vs fat LTO on our CPU-bound hot paths (the Monte-Carlo equity/coach solver
-# in `engine`, argon2 login) is small — typically low-single-digit %, sometimes
-# zero or faster — a tradeoff we deliberately accept here for a release build that
-# fits the constrained parity VM, and it usually links faster too. (NOTE: do not
-# read "thin" as "perf-neutral because the server is IO-bound" — the game server
-# is NOT purely IO-bound; the solver/auth paths are genuinely CPU-bound. The
-# justification is the small-and-acceptable delta, not perf-equivalence.) The
-# prod-parity guarantee holds because CI and the local gate build from the SAME
-# Dockerfile, so both get the identical ThinLTO binary. Regression-guarded by
-# scripts/guards/release-profile-memory-guard.sh — do NOT revert to `lto = true`.
-lto = "thin"
+# Owner 2026-11-01: prioritize runtime optimization over build time and memory.
+# Fat LTO optimizes across the dependency graph; one codegen unit gives LLVM
+# the largest per-crate optimization scope. Build on a sufficiently provisioned
+# host instead of silently lowering optimization for the old small Docker VM.
+# Actual speedups remain workload-dependent; these flags are not a benchmark.
+lto = "fat"
+codegen-units = 1
+incremental = false
+# Preserve task-level panic isolation; abort would change runtime recovery.
+panic = "unwind"
