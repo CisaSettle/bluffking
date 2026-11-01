@@ -6,11 +6,12 @@
 use super::handlers::Error;
 use super::rules::{self, Entry};
 use super::{Game, Period, POLICY};
+use crate::db_writer::{PgConnection, PgPool};
 use crate::wallet;
 use chrono::{DateTime, Utc};
 use draw_games::lottery::Plan;
 use serde_json::{json, Value};
-use sqlx::{postgres::PgRow, PgConnection, PgPool, Row};
+use sqlx::{postgres::PgRow, Row};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -219,7 +220,7 @@ pub(super) async fn ensure_period(
         .bind(game.as_str()).bind(selling.id)
         .bind(DateTime::from_timestamp_millis(selling.opens_ms).ok_or(Error::InvalidEntry)?)
         .bind(DateTime::from_timestamp_millis(selling.draw_ms).ok_or(Error::InvalidEntry)?)
-        .bind(json!(plan)).execute(conn).await?;
+        .bind(json!(plan)).execute(conn.writer()).await?;
     Ok(())
 }
 

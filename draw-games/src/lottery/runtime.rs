@@ -6,6 +6,7 @@ use super::{
     store::{self, NumberBuy, PeriodRow, Purchase, TicketRow},
     Game,
 };
+use crate::db_writer::PgPool;
 use crate::{
     beans_read_memory::{self, PendingEffect},
     write_behind::Ordered,
@@ -14,7 +15,7 @@ use chrono::{DateTime, Utc};
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sqlx::{PgPool, Row};
+use sqlx::Row;
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     sync::{
@@ -578,7 +579,7 @@ pub async fn hydrate(pool: &PgPool) -> sqlx::Result<()> {
 /// observed (`db::predates_schema_change`), so a schema change cannot pin a
 /// stale statement cache.
 struct WriterConnection {
-    conn: sqlx::pool::PoolConnection<sqlx::Postgres>,
+    conn: crate::db_writer::PoolConnection<sqlx::Postgres>,
     since: std::time::Instant,
 }
 

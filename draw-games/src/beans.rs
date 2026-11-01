@@ -16,8 +16,8 @@
 //! above the durable hand-start stack and earlier pending top-ups; they apply
 //! at the next hand boundary without changing the current pot or wallet.
 
+use crate::db_writer::{PgConnection, PgPool};
 use serde::Serialize;
-use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 use crate::game_catalog::BEANS as GAME;
@@ -356,7 +356,7 @@ pub async fn ensure_on(conn: &mut PgConnection, user: Uuid) -> sqlx::Result<()> 
     .bind(user)
     .bind(GAME)
     .bind(GRANT)
-    .execute(&mut *conn)
+    .execute(conn.writer())
     .await?
     .rows_affected();
     if inserted == 1 {
@@ -364,7 +364,7 @@ pub async fn ensure_on(conn: &mut PgConnection, user: Uuid) -> sqlx::Result<()> 
             .bind(user)
             .bind(GAME)
             .bind(GRANT)
-            .execute(&mut *conn)
+            .execute(conn.writer())
             .await?;
     }
     Ok(())
@@ -402,12 +402,12 @@ pub(crate) async fn credit_tournament_on(
         .bind(user)
         .bind(GAME)
         .bind(after)
-        .execute(&mut *conn)
+        .execute(conn.writer())
         .await?;
     sqlx::query("INSERT INTO wallet_ledger(user_id,game,kind,delta,balance_after,details) VALUES($1,$2,'bonus',$3,$4,$5)")
         .bind(user).bind(GAME).bind(amount).bind(after)
         .bind(serde_json::json!({"reason":format!("tournament_{reward_kind}"),"reward_kind":reward_kind,"edition_id":edition,"tournament_reward_id":reward}))
-        .execute(&mut *conn).await?;
+        .execute(conn.writer()).await?;
     Ok(after)
 }
 
@@ -428,7 +428,7 @@ pub async fn credit_purchase_on(
         .bind(user)
         .bind(GAME)
         .bind(after)
-        .execute(&mut *conn)
+        .execute(conn.writer())
         .await?;
     sqlx::query(
         "INSERT INTO wallet_ledger (user_id, game, kind, delta, balance_after, details) \
@@ -439,7 +439,7 @@ pub async fn credit_purchase_on(
     .bind(beans)
     .bind(after)
     .bind(serde_json::json!({ "purchase_id": purchase_id }))
-    .execute(&mut *conn)
+    .execute(conn.writer())
     .await?;
     wallet::project_session_balance(GAME, user, after);
     Ok(after)
@@ -472,7 +472,7 @@ pub async fn debit_refund_on(
     .bind(user)
     .bind(GAME)
     .bind(after)
-    .execute(&mut *conn)
+    .execute(conn.writer())
     .await?;
     sqlx::query(
         "INSERT INTO wallet_ledger (user_id, game, kind, delta, balance_after, details) \
@@ -483,7 +483,7 @@ pub async fn debit_refund_on(
     .bind(-debit)
     .bind(after)
     .bind(serde_json::json!({ "purchase_id": purchase_id, "requested": beans }))
-    .execute(&mut *conn)
+    .execute(conn.writer())
     .await?;
     wallet::project_session_balance(GAME, user, after);
     Ok(after)

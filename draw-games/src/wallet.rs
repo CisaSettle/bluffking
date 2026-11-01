@@ -8,6 +8,7 @@
 //! share each entry and their accepted writes keep ordered ledger persistence.
 //! Legacy domains retain durable idle reads and their active-seat projections.
 
+use crate::db_writer::{PgConnection, PgPool};
 use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicBool, AtomicI64, Ordering},
@@ -22,7 +23,7 @@ use futures::{
 use chrono::{DateTime, Utc};
 use md5::{Digest, Md5};
 use serde::Serialize;
-use sqlx::{PgConnection, PgPool, Row};
+use sqlx::Row;
 use uuid::Uuid;
 
 /// The game's initial session chip grant. Table admission may choose its own size.
@@ -379,10 +380,10 @@ pub(crate) async fn refill_snapshot_on(
         return Err(sqlx::Error::Protocol("buy-in wallet changed".into()));
     }
     sqlx::query("UPDATE wallets SET balance=$3,refills=refills+1,updated_at=now() WHERE game=$1 AND user_id=$2")
-        .bind(game).bind(user).bind(after).execute(&mut *conn).await?;
+        .bind(game).bind(user).bind(after).execute(conn.writer()).await?;
     sqlx::query("INSERT INTO wallet_ledger(user_id,game,kind,delta,balance_after,room_code,revision,details) VALUES($1,$2,'refill',$3,$4,$5,$6,$7)")
         .bind(user).bind(game).bind(after-before).bind(after).bind(code).bind(revision)
-        .bind(serde_json::json!({"buy_in_id": receipt})).execute(&mut *conn).await?;
+        .bind(serde_json::json!({"buy_in_id": receipt})).execute(conn.writer()).await?;
     Ok(())
 }
 
@@ -684,7 +685,7 @@ pub(crate) async fn start_session_on(
     .bind(policy.game)
     .bind(policy.grant)
     .bind(room)
-    .execute(&mut *conn)
+    .execute(conn.writer())
     .await?
     .rows_affected();
     if written == 1 {
@@ -699,7 +700,7 @@ pub(crate) async fn start_session_on(
     )
     .bind(user)
     .bind(policy.game)
-    .fetch_one(&mut *conn)
+    .fetch_one(conn.writer())
     .await?;
     // The reset and its ledger row in one statement; the row is locked above,
     // so the update always matches and exactly one ledger row is written.
@@ -713,7 +714,7 @@ pub(crate) async fn start_session_on(
     .bind(policy.grant)
     .bind(policy.grant - before)
     .bind(room)
-    .execute(conn)
+    .execute(conn.writer())
     .await?
     .rows_affected();
     if written != 1 {
@@ -795,7 +796,7 @@ pub async fn lock(conn: &mut PgConnection, game: i16, user_id: Uuid) -> sqlx::Re
     sqlx::query_scalar("SELECT balance FROM wallets WHERE user_id = $1 AND game = $2 FOR UPDATE")
         .bind(user_id)
         .bind(game)
-        .fetch_optional(conn)
+        .fetch_optional(conn.writer())
         .await
 }
 
@@ -870,7 +871,7 @@ pub async fn settle(
     .bind(&play.details)
     .bind(play.hand_completed)
     .bind(play.has_bots)
-    .fetch_one(conn)
+    .fetch_one(conn.writer())
     .await
 }
 

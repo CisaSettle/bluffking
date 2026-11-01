@@ -2,12 +2,13 @@
 //! other money writers fence and refresh only the affected user's baseline.
 //! First-use grants are accepted in memory and persisted by an ordered worker.
 
+use crate::db_writer::PgPool;
 use crate::request_timing::{http_phase, HttpPhase};
 use crate::{beans, wallet::Wallet};
 use chrono::NaiveDate;
 use futures::TryStreamExt;
 use serde_json::Value;
-use sqlx::{PgPool, Row};
+use sqlx::Row;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::Bound::{Excluded, Unbounded};
 use std::sync::{Arc, Mutex, OnceLock, Weak};

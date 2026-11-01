@@ -19,6 +19,7 @@
 //! live here once.
 
 use crate::api_resources::OperationPath as Path;
+use crate::db_writer::{PgConnection, PgPool};
 use crate::game_hub::standings::{Finish, RoomStandings};
 use crate::handlers::respond::error_code;
 use std::collections::{BTreeMap, HashMap};
@@ -34,7 +35,7 @@ use chrono::Utc;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sqlx::{PgConnection, PgPool, Row};
+use sqlx::Row;
 use uuid::Uuid;
 
 use crate::app_state::AppState;
@@ -794,7 +795,7 @@ async fn lock_wallet(
     )
     .bind(uid)
     .bind(game)
-    .fetch_optional(conn)
+    .fetch_optional(conn.writer())
     .await?;
     Ok(row.map(|r| wallet::Wallet {
         balance: r.get("balance"),
@@ -1293,7 +1294,7 @@ async fn leave_room_now<R: DealerRoom>(pool: &PgPool, uid: Uuid) -> Result<()> {
         ))
         .bind(uid)
         .bind(&code)
-        .execute(pool)
+        .execute(pool.writer())
         .await;
         match result {
             Ok(_) => Commit::Done(()),

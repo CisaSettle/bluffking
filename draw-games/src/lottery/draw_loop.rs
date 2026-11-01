@@ -5,10 +5,11 @@ use super::{
     store::{self, TicketRow, TICKET_COLUMNS},
     Game, POLICY,
 };
+use crate::db_writer::PgPool;
 use crate::wallet;
 use chrono::Utc;
 use serde_json::json;
-use sqlx::{PgPool, Row};
+use sqlx::Row;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -256,7 +257,7 @@ async fn settle_one(pool: &PgPool) -> Result<bool, Error> {
 /// A winner's inbox receipt commits atomically with the credited prizes. The
 /// deterministic identity and unique per-user key also make replay harmless.
 pub(super) async fn notify_winner(
-    conn: &mut sqlx::PgConnection,
+    conn: &mut crate::db_writer::PgConnection,
     user: Uuid,
     game: Game,
     period: i64,
@@ -326,7 +327,7 @@ pub(super) async fn notify_winner(
         "i18n": {"zh": {"title": zh_title, "body": zh_body}, "en": {"title": en_title, "body": en_body}},
     }))
     .bind(key)
-    .execute(conn)
+    .execute(conn.writer())
     .await?;
     Ok(())
 }

@@ -2,7 +2,6 @@
 //! balance admission or closing-clock checks run again after memory acceptance.
 use super::*;
 use crate::game_catalog::BEANS;
-use sqlx::Connection as _;
 
 pub(super) fn weight(data: &Data) -> sqlx::Result<usize> {
     let mut n = 0usize;
@@ -71,7 +70,7 @@ pub(super) async fn hydrate_missing(
     pool: &PgPool,
     existing: &[(String, i64)],
 ) -> sqlx::Result<Data> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_read().await?;
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ,READ ONLY")
         .execute(&mut *tx)
         .await?;
@@ -144,7 +143,7 @@ pub(super) async fn retention(pool: &PgPool) -> sqlx::Result<()> {
 
 pub(super) async fn persist(
     pool: &PgPool,
-    conn: &mut sqlx::PgConnection,
+    conn: &mut crate::db_writer::PgConnection,
     event: &Event,
 ) -> sqlx::Result<Vec<(Uuid, crate::game_rewards::Grant)>> {
     if event.kind == "retention" {
@@ -157,7 +156,7 @@ pub(super) async fn persist(
     // One round trip opens the transaction with its local timeouts (same
     // values as the former separate `set_config(..., true)` statement).
     let mut tx = conn
-        .begin_with("BEGIN; SET LOCAL lock_timeout = '500ms'; SET LOCAL statement_timeout = '2s'")
+        .begin_with("BEGIN READ WRITE; SET LOCAL lock_timeout = '500ms'; SET LOCAL statement_timeout = '2s'")
         .await?;
     if let Some(user) = event.owner {
         crate::db::lock_game_participants(&mut tx, &[user]).await?;
@@ -351,7 +350,7 @@ pub(super) async fn persist(
     Ok(grants)
 }
 async fn read_grants(
-    conn: &mut sqlx::PgConnection,
+    conn: &mut crate::db_writer::PgConnection,
     ids: &[Uuid],
 ) -> sqlx::Result<Vec<(Uuid, crate::game_rewards::Grant)>> {
     if ids.is_empty() {

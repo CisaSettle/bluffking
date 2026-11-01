@@ -1,5 +1,6 @@
 use crate::casino_bots::{self, Bot};
 use crate::casino_room::{DealerRoom, Registry};
+use crate::db_writer::PgConnection;
 use crate::room_clock::RoomClock;
 use crate::sicbo::{Side, MAX_STAKE, MIN_STAKE, POLICY};
 use crate::wallet;
@@ -8,7 +9,6 @@ use draw_games::proof::{commit, Reveal};
 use rand::{rngs::OsRng, Rng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sqlx::PgConnection;
 use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 

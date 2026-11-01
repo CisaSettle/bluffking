@@ -1,10 +1,11 @@
 //! Cross-game record repository: transactional writes and bounded, user-scoped reads.
 //! Replay payloads and game rules belong to their game modules.
+use crate::db_writer::{PgConnection, PgPool};
 use crate::game_catalog as game;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
-use sqlx::{PgConnection, PgPool, Row};
+use sqlx::Row;
 use uuid::Uuid;
 
 /// Match only affirmative historical evidence; absent legacy metadata stays unknown.
@@ -96,7 +97,7 @@ pub async fn record(
     .bind(played_at)
     .bind(&users)
     .bind(&amounts)
-    .execute(conn)
+    .execute(conn.writer())
     .await?
     .rows_affected();
     // ON CONFLICT DO NOTHING: a replay that inserted nothing counts nothing.
@@ -456,7 +457,7 @@ const DETAIL_ARMS: &[(&[i16], &str)] = &[
 /// for every request cost more than executing the page (prod 2026-10-30:
 /// 1.4 ms warm / 6.8 ms cold plan against ~1.8 ms execution).
 async fn load_page_details(
-    conn: &mut sqlx::PgConnection,
+    conn: &mut crate::db_writer::PgConnection,
     user_id: Uuid,
     keys: &[(i16, Uuid)],
 ) -> sqlx::Result<std::collections::HashMap<(i16, Uuid), Option<Value>>> {

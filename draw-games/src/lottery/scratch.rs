@@ -4,11 +4,12 @@ use super::{
     store::{self, Purchase, TicketRow, TICKET_COLUMNS},
     Game, POLICY,
 };
+use crate::db_writer::{PgConnection, PgPool};
 use crate::{draw_fairness, wallet};
 use chrono::Utc;
 use draw_games::scratch;
 use serde_json::{json, Value};
-use sqlx::{PgConnection, PgPool, Row};
+use sqlx::Row;
 use uuid::Uuid;
 
 #[derive(serde::Deserialize)]
@@ -446,7 +447,7 @@ async fn grant_reward(
                  SELECT $1,$2,'bonus',$3,balance,$4 FROM updated"
             ).bind(user).bind(POLICY.game).bind(amount)
                 .bind(json!({"purpose":"scratch_reward","ticket_id":card.id,"reward_version":1}))
-                .execute(&mut *conn).await?;
+                .execute(conn.writer()).await?;
             Ok(false)
         }
         Some(scratch::Reward::Membership { tier, days }) => {
@@ -562,7 +563,7 @@ pub(super) async fn notify_winners(
         "i18n": {"zh": {"title": zh_title, "body": zh_body}, "en": {"title": en_title, "body": en_body}},
     }))
     .bind(key)
-    .execute(conn)
+    .execute(conn.writer())
     .await?;
     Ok(true)
 }

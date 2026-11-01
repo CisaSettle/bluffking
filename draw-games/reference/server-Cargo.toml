@@ -150,6 +150,7 @@ dashmap = "5"
 # jemalloc runs stock defaults). See ADR-052.
 tikv-jemallocator = "0.6"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
+async-stream = "0.3.6"
 
 [dev-dependencies]
 # ONLY for the offline ops example `examples/generate_bnb_hd_xpub.rs` (ADR-086

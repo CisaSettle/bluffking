@@ -1,5 +1,6 @@
 //! Solo three-dice game. The shared gold-bean wallet row serializes wagers;
 //! the ledger receipt is committed together with the balance and record.
+use crate::db_writer::PgPool;
 use crate::handlers::respond::error_code;
 use crate::{app_state::AppState, auth::middleware::AuthUser, wallet};
 use axum::{
@@ -11,7 +12,7 @@ use axum::{
 pub use draw_games::sicbo::{wins, Side, MAX_STAKE, MIN_STAKE};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sqlx::{PgPool, Row};
+use sqlx::Row;
 use uuid::Uuid;
 
 pub const POLICY: wallet::Policy = crate::beans::POLICY;
@@ -93,7 +94,7 @@ impl IntoResponse for Error {
     }
 }
 async fn saved(
-    conn: &mut sqlx::PgConnection,
+    conn: &mut crate::db_writer::PgConnection,
     user: Uuid,
     bet: &Bet,
     balance: i64,

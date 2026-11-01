@@ -1,9 +1,9 @@
 //! Durable offers for immediate draws. A claimed seed is moved into the game's
 //! receipt in the same transaction as the debit, so retries never choose a seed.
+use crate::db_writer::{PgConnection, PgPool};
 use draw_games::proof::{commit, seed_bytes, Commitment, Reveal};
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
-use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,7 +80,7 @@ pub async fn claim(
     seed_bytes(&challenge.commitment).map_err(|_| ClaimError::Invalid)?;
     let seed: Option<String> = sqlx::query_scalar(
         "SELECT server_seed FROM draw_commitments WHERE id=$1 AND user_id=$2 AND game=$3 FOR UPDATE",
-    ).bind(challenge.offer_id).bind(user).bind(game).fetch_optional(&mut *conn).await?;
+    ).bind(challenge.offer_id).bind(user).bind(game).fetch_optional(conn.writer()).await?;
     let seed = seed.ok_or(ClaimError::Conflict)?;
     let offer = commitment(game, challenge.offer_id, &seed)?;
     if challenge.commitment != offer.commitment {
@@ -88,7 +88,7 @@ pub async fn claim(
     }
     sqlx::query("DELETE FROM draw_commitments WHERE id=$1")
         .bind(challenge.offer_id)
-        .execute(conn)
+        .execute(conn.writer())
         .await?;
     Ok(Reveal {
         commitment: offer,
