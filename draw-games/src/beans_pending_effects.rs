@@ -170,3 +170,33 @@ pub(crate) fn settlement_balance(pool: &PgPool, owner: Uuid) -> sqlx::Result<i64
         .map(|w| w.balance)
         .ok_or_else(unavailable)
 }
+
+/// Lottery readers hold their committed projection lock before entering here.
+/// Keep pending effects in the spend authority, but hide them in the displayed
+/// balance until their lottery projection has been published. Other games keep
+/// their existing accepted-result semantics.
+pub(crate) fn lottery_read_balance(pool: &PgPool, owner: Uuid) -> sqlx::Result<(i64, i64)> {
+    let state = state(pool);
+    let inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
+    if !inner.ready || inner.active_users.contains_key(&owner) {
+        return Err(unavailable());
+    }
+    let user = inner
+        .users
+        .get(&owner)
+        .filter(|u| u.available && !u.retired)
+        .ok_or_else(unavailable)?;
+    let pending = user.effects.values().try_fold(0i64, |sum, effect| {
+        sum.checked_add(effect.balance).ok_or_else(unavailable)
+    })?;
+    let balance = user
+        .wallet
+        .as_ref()
+        .ok_or_else(unavailable)?
+        .balance
+        .checked_sub(pending)
+        .filter(|v| *v >= 0)
+        .ok_or_else(unavailable)?;
+    let available = reservations::available_locked(pool, &inner, owner, balance, false, None)?;
+    Ok((balance, available))
+}

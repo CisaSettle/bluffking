@@ -384,7 +384,7 @@ pub(crate) async fn credit_tournament_on(
     if !(1..=1_000_000).contains(&amount)
         || !matches!(
             reward_kind,
-            "champion" | "runner_up" | "third" | "participation"
+            "champion" | "runner_up" | "third" | "participation" | "final_table"
         )
     {
         return Err(sqlx::Error::Protocol(

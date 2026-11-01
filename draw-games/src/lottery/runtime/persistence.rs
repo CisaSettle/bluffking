@@ -186,9 +186,6 @@ pub(super) async fn persist(
             return Ok(grants);
         }
     }
-    if let Some(offer) = &event.offer {
-        sqlx::query("INSERT INTO draw_commitments(id,user_id,game,server_seed) VALUES($1,$2,'scratch',$3) ON CONFLICT(user_id,game) DO UPDATE SET id=EXCLUDED.id,server_seed=EXCLUDED.server_seed WHERE draw_commitments.id=EXCLUDED.id OR draw_commitments.id=$4").bind(offer.id).bind(offer.user).bind(&offer.seed).bind(offer.previous).execute(&mut *tx).await?;
-    }
     if let (Some(user), Some(id)) = (event.owner, event.claim) {
         let removed = sqlx::query(
             "DELETE FROM draw_commitments WHERE id=$1 AND user_id=$2 AND game='scratch'",
@@ -200,6 +197,12 @@ pub(super) async fn persist(
         .rows_affected();
         if removed != 1 {
             return Err(permanent("scratch commitment missing"));
+        }
+    }
+    if let Some(offer) = &event.offer {
+        let changed = sqlx::query("INSERT INTO draw_commitments(id,user_id,game,server_seed) VALUES($1,$2,'scratch',$3) ON CONFLICT(user_id,game) DO UPDATE SET id=EXCLUDED.id,server_seed=EXCLUDED.server_seed WHERE draw_commitments.id=EXCLUDED.id OR draw_commitments.id=$4").bind(offer.id).bind(offer.user).bind(&offer.seed).bind(offer.previous).execute(&mut *tx).await?.rows_affected();
+        if changed != 1 {
+            return Err(permanent("scratch commitment replaced"));
         }
     }
     let mut cards = event.cards.clone();

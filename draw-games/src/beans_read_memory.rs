@@ -26,8 +26,8 @@ pub(crate) use card_rooms::{
     reconcile_card_room, release_card_room, reserve_card_stack, restore_card_room,
 };
 pub(crate) use pending_effects::{
-    accept_effect, daily_claimed, effect_abandoned, effect_committed, settlement_balance,
-    PendingEffect,
+    accept_effect, daily_claimed, effect_abandoned, effect_committed, lottery_read_balance,
+    settlement_balance, PendingEffect,
 };
 pub(crate) use reservations::release_poker_session;
 pub use reservations::{

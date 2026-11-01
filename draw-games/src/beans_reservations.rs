@@ -279,6 +279,17 @@ pub fn available(
         let _phase = http_phase(HttpPhase::Processing).operation("beans_available_mutex");
         state.inner.lock().unwrap_or_else(|e| e.into_inner())
     };
+    available_locked(pool, &inner, user, balance, sql_balance, excluding_sicbo)
+}
+
+pub(super) fn available_locked(
+    pool: &PgPool,
+    inner: &Inner,
+    user: Uuid,
+    balance: i64,
+    sql_balance: bool,
+    excluding_sicbo: Option<&str>,
+) -> sqlx::Result<i64> {
     if !inner.ready {
         return Err(unavailable());
     }
@@ -303,7 +314,7 @@ pub fn available(
     }
     Ok(balance
         .saturating_sub(reserved(
-            &inner,
+            inner,
             &directory,
             user,
             sql_balance,

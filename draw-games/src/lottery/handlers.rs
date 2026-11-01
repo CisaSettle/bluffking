@@ -15,6 +15,7 @@ use uuid::Uuid;
 #[derive(Debug)]
 pub enum Error {
     InvalidEntry,
+    PreparationRequired,
     SalesClosed,
     TooManyTickets,
     InsufficientBalance,
@@ -34,6 +35,7 @@ impl From<sqlx::Error> for Error {
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
         let (status, code) = match self {
+            Self::PreparationRequired => (StatusCode::CONFLICT, "lottery_prepare_required"),
             Self::InvalidEntry => (StatusCode::BAD_REQUEST, "invalid_entry"),
             Self::SalesClosed => (StatusCode::CONFLICT, "sales_closed"),
             Self::TooManyTickets => (StatusCode::CONFLICT, "too_many_tickets"),
@@ -67,6 +69,34 @@ pub async fn view(
         store::view(&state.pool, auth.user_id, game(&name)?).await?,
     ))
 }
+/// Cold scratch hydration and creation of a durable fairness commitment are
+/// explicit commands; ordinary view/sync never execute these database writes.
+pub async fn prepare(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, Error> {
+    let game = game(&name)?;
+    if crate::realtime_mode::enabled() {
+        Ok(Json(
+            super::runtime::prepare(&state.pool, auth.user_id, game).await?,
+        ))
+    } else {
+        Ok(Json(store::view(&state.pool, auth.user_id, game).await?))
+    }
+}
+
+/// Ancillary SQL history is fetched independently of the current memory view.
+pub async fn history(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, Error> {
+    let mut history = json!({"last_draw":null,"recent":[],"feed":[]});
+    store::decorate_history(&state.pool, auth.user_id, game(&name)?, &mut history).await?;
+    Ok(Json(history))
+}
+
 #[derive(Default, Deserialize)]
 pub struct BuyQuery {
     #[serde(default)]
@@ -92,9 +122,21 @@ pub async fn buy(
         // The transaction has committed. Hall crowd/feed/history reads must not
         // delay its receipt or turn their failure into a failed purchase.
         // A replay's balance_after is historical; read the current wallet once.
-        let balance = store::ensure_wallet(&state.pool, auth.user_id).await?;
-        let available_balance =
-            crate::beans_read_memory::available(&state.pool, auth.user_id, balance, false, None)?;
+        let (balance, available_balance) = if crate::realtime_mode::enabled() {
+            super::runtime::balance(&state.pool, auth.user_id)?
+        } else {
+            let balance = store::ensure_wallet(&state.pool, auth.user_id).await?;
+            (
+                balance,
+                crate::beans_read_memory::available(
+                    &state.pool,
+                    auth.user_id,
+                    balance,
+                    false,
+                    None,
+                )?,
+            )
+        };
         return Ok(Json(json!({
             "purchased": purchase.purchased, "charged": purchase.charged,
             "balance_before": purchase.balance_before, "balance_after": purchase.balance_after,

@@ -27,10 +27,13 @@ use std::{
 use uuid::Uuid;
 #[path = "runtime/persistence.rs"]
 mod persistence;
+#[path = "runtime/published.rs"]
+mod published;
 #[path = "runtime/socket.rs"]
 pub mod socket;
 const MAX_ROWS: usize = 2_000_000;
-const MAX_BYTES: usize = 512 * 1024 * 1024;
+// Accepted and published projections each get half the former 512 MiB budget.
+const MAX_BYTES: usize = 256 * 1024 * 1024;
 const MAX_QUEUED_BYTES: usize = 64 * 1024 * 1024;
 const PAGE: i64 = 500;
 const PERIOD_SLOTS: usize = 3;
@@ -107,14 +110,43 @@ struct Job {
     event: Event,
     work: Option<crate::account_purge::RequiredWork>,
     bytes: usize,
+    committed: tokio::sync::watch::Sender<Option<Arc<Vec<OwnedTicket>>>>,
 }
+
+struct CommitReceipt(tokio::sync::watch::Receiver<Option<Arc<Vec<OwnedTicket>>>>);
+impl CommitReceipt {
+    async fn wait(mut self) -> Result<Arc<Vec<OwnedTicket>>, Error> {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(cards) = self.0.borrow_and_update().clone() {
+                    return Ok(cards);
+                }
+                self.0.changed().await.map_err(|_| unavailable())?;
+            }
+        })
+        .await
+        .map_err(|_| unavailable())?
+    }
+    fn complete() -> Self {
+        Self(tokio::sync::watch::channel(Some(Arc::new(Vec::new()))).1)
+    }
+}
+
+fn pending_receipt(state: &State, id: Uuid) -> CommitReceipt {
+    accepted(state)
+        .iter()
+        .find(|job| job.event.id == id)
+        .map(|job| CommitReceipt(job.committed.subscribe()))
+        .unwrap_or_else(CommitReceipt::complete)
+}
+
 #[derive(Clone)]
 pub(super) struct Notice {
     pub(super) owner: Option<Uuid>,
     pub(super) game: String,
     pub(super) revision: u64,
 }
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Data {
     revision: u64,
     durable: u64,
@@ -128,10 +160,12 @@ struct Data {
     offers: HashMap<Uuid, Offer>,
     winners: HashMap<(String, i64), Vec<Winner>>,
     presence: HashMap<(String, Uuid), DateTime<Utc>>,
+    scratch_owner: Option<Uuid>,
 }
 
 struct State {
     data: Mutex<Option<Data>>,
+    published: Mutex<Option<published::Published>>,
     writer: Mutex<Option<Ordered<Option<Arc<Job>>>>>,
     loader: tokio::sync::Mutex<()>,
     commands: tokio::sync::Mutex<()>,
@@ -158,6 +192,7 @@ fn state(pool: &PgPool) -> Arc<State> {
                 Arc::downgrade(&pool.connect_options()),
                 Arc::new(State {
                     data: Mutex::new(None),
+                    published: Mutex::new(None),
                     writer: Mutex::new(None),
                     loader: tokio::sync::Mutex::new(()),
                     commands: tokio::sync::Mutex::new(()),
@@ -240,7 +275,8 @@ impl Data {
         self.tickets.retain(|_, t| {
             t.game == "scratch" || self.periods.contains_key(&(t.game.clone(), t.card.period))
         });
-        self.receipts.clear();
+        // Scratch replay windows are retired only by serialized cold preparation.
+        self.receipts.retain(|_, receipt| receipt.game == "scratch");
         // Compaction re-serializes the whole working set under the data lock;
         // the idle tick calls this every second, so only pay when a row left.
         if before != (self.periods.len(), self.tickets.len(), self.receipts.len()) {
@@ -289,17 +325,17 @@ impl Data {
             self.receipts.insert(key, receipt.clone());
         }
         if let Some(user) = event.owner {
+            if event.claim.is_some() {
+                if let Some(offer) = self.offers.remove(&user) {
+                    self.bytes = self.bytes.saturating_sub(resident(&offer));
+                }
+            }
             if let Some(offer) = &event.offer {
                 self.bytes = self
                     .bytes
                     .saturating_sub(self.offers.get(&user).map_or(0, resident))
                     .saturating_add(resident(offer));
                 self.offers.insert(user, offer.clone());
-            }
-            if event.claim.is_some() {
-                if let Some(offer) = self.offers.remove(&user) {
-                    self.bytes = self.bytes.saturating_sub(resident(&offer));
-                }
             }
         }
         if event.kind == "settle" {
@@ -336,12 +372,12 @@ impl Data {
     }
     fn own(&self, user: Uuid, game: Game, period: i64) -> Vec<&TicketRow> {
         let mut rows = self
-            .by_period
-            .get(&(game.as_str().into(), period))
+            .by_user
+            .get(&(user, game.as_str().into()))
             .into_iter()
             .flatten()
             .filter_map(|id| self.tickets.get(id))
-            .filter(|t| t.user == user)
+            .filter(|t| t.card.period == period)
             .map(|t| &t.card)
             .collect::<Vec<_>>();
         rows.sort_by(|a, b| b.bought_at.cmp(&a.bought_at).then(a.id.cmp(&b.id)));
@@ -384,12 +420,13 @@ fn admit(
     data: &mut Data,
     event: Event,
     spend: i64,
-) -> Result<(), Error> {
+) -> Result<CommitReceipt, Error> {
     check_owner()?;
     let bytes = serde_json::to_vec(&event)
         .map_err(|_| Error::InvalidEntry)?
         .len()
-        .saturating_mul(4);
+        .saturating_mul(4)
+        .saturating_add((event.cards.len() + 4).saturating_mul(256));
     // Keep half the capacity for payouts, grants and finishing accepted work.
     if matches!(event.kind.as_str(), "purchase" | "scratch_batch")
         && data.bytes.saturating_add(bytes) > MAX_BYTES / 2
@@ -401,6 +438,23 @@ fn admit(
             > MAX_ROWS
             || data.bytes.saturating_add(bytes) > MAX_BYTES))
         || state.queued.load(Ordering::Acquire).saturating_add(bytes) > MAX_QUEUED_BYTES
+    {
+        return Err(unavailable());
+    }
+    // Reserve read-side space before accepting a write. Pending events retain
+    // their own payload until publication, so they cannot overfill the view.
+    if state
+        .published
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|p| {
+            p.data
+                .bytes
+                .saturating_add(state.queued.load(Ordering::Acquire))
+                .saturating_add(bytes)
+                > MAX_BYTES
+        })
     {
         return Err(unavailable());
     }
@@ -431,7 +485,9 @@ fn admit(
         event: event.clone(),
         work,
         bytes,
+        committed: tokio::sync::watch::channel(None).0,
     });
+    let receipt = CommitReceipt(job.committed.subscribe());
     state.queued.fetch_add(bytes, Ordering::AcqRel);
     if let (Some(owner), Some(effect)) = (event.owner, event.effect.clone()) {
         if let Err(e) = beans_read_memory::accept_effect(
@@ -467,12 +523,7 @@ fn admit(
     if event.kind == "retention" {
         data.bytes = persistence::weight(data).expect("runtime values serialize");
     }
-    let _ = state.changed.send(Notice {
-        owner: event.owner,
-        game: event.game,
-        revision: data.revision,
-    });
-    Ok(())
+    Ok(receipt)
 }
 
 pub async fn hydrate(pool: &PgPool) -> sqlx::Result<()> {
@@ -521,28 +572,40 @@ pub async fn hydrate(pool: &PgPool) -> sqlx::Result<()> {
                             error
                         }
                     })?;
-                accepted(&state).retain(|queued| !Arc::ptr_eq(queued, job));
-                if let Some(owner) = job.event.owner {
-                    if job.event.effect.is_some() {
-                        beans_read_memory::effect_committed(&pool, owner, job.event.id)
-                    }
-                }
                 {
+                    // Same lock order as acceptance/cold preparation. Lottery
+                    // reads take only published -> bean authority, never data.
                     let mut inner = state.data.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(data) = inner.as_mut() {
-                        for (id, grant) in grants {
-                            if let Some(mut t) = data.tickets.get(&id).cloned() {
+                    let mut public = state.published.lock().unwrap_or_else(|e| e.into_inner());
+                    if let (Some(data), Some(public)) = (inner.as_mut(), public.as_mut()) {
+                        for (id, grant) in &grants {
+                            if let Some(mut t) = data.tickets.get(id).cloned() {
                                 t.card.entry["reward_grant"] = json!(grant);
                                 data.insert(t);
                             }
                         }
                         data.durable += 1;
+                        public.commit(&job.event, &grants);
+                        if let Some(owner) = job.event.owner {
+                            if job.event.effect.is_some() {
+                                beans_read_memory::effect_committed(&pool, owner, job.event.id);
+                            }
+                        }
                         let _ = state.changed.send(Notice {
                             owner: job.event.owner,
                             game: job.event.game.clone(),
-                            revision: data.revision,
+                            revision: public.data.revision,
                         });
                     }
+                    // Replay may stop waiting only after the projection is visible.
+                    let mut cards = job.event.cards.clone();
+                    for (id, grant) in &grants {
+                        if let Some(card) = cards.iter_mut().find(|t| t.card.id == *id) {
+                            card.card.entry["reward_grant"] = json!(grant);
+                        }
+                    }
+                    job.committed.send_replace(Some(Arc::new(cards)));
+                    accepted(&state).retain(|queued| !Arc::ptr_eq(queued, job));
                 }
                 if let Some(work) = &job.work {
                     work.complete()
@@ -553,6 +616,8 @@ pub async fn hydrate(pool: &PgPool) -> sqlx::Result<()> {
         }
     });
     *state.writer.lock().unwrap_or_else(|e| e.into_inner()) = Some(writer);
+    *state.published.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some(published::Published::new(data.clone()));
     *state.data.lock().unwrap_or_else(|e| e.into_inner()) = Some(data);
     if floor > 0 {
         for game in Game::ALL {
@@ -665,6 +730,7 @@ async fn discard_fenced(pool: &PgPool) -> bool {
         .unwrap_or_else(|e| e.into_inner())
         .take()
         .map_or(0, |data| data.revision);
+    *state.published.lock().unwrap_or_else(|e| e.into_inner()) = None;
     state.floor.store(revision + 1, Ordering::Release);
     let abandoned: Vec<_> = accepted(&state).drain(..).collect();
     for job in &abandoned {
@@ -736,7 +802,7 @@ fn ensure_period(
         super::record_id(&format!("period:{}:{}", game.as_str(), selling.id)),
     );
     event.period = Some(row);
-    admit(pool, state, data, event, 0)
+    admit(pool, state, data, event, 0).map(|_| ())
 }
 fn offer(
     pool: &PgPool,
@@ -765,11 +831,15 @@ fn offer(
 
 fn current_view(pool: &PgPool, user: Uuid, game: Game) -> Result<Value, Error> {
     player(pool, user)?;
-    let wallet = beans_read_memory::ensure(pool, user)?;
-    let available = beans_read_memory::available(pool, user, wallet.balance, false, None)?;
+    beans_read_memory::ensure(pool, user)?;
     let state = state(pool);
-    let mut lock = state.data.lock().unwrap_or_else(|e| e.into_inner());
-    let data = lock.as_mut().ok_or_else(unavailable)?;
+    let mut lock = state.published.lock().unwrap_or_else(|e| e.into_inner());
+    let public = lock.as_mut().ok_or_else(unavailable)?;
+    if game == Game::Scratch && !public.touch(user) {
+        return Err(Error::PreparationRequired);
+    }
+    let (balance, available) = beans_read_memory::lottery_read_balance(pool, user)?;
+    let data = &mut public.data;
     let now = Utc::now();
     data.presence
         .retain(|_, at| now.signed_duration_since(*at).num_seconds() < 30);
@@ -777,9 +847,17 @@ fn current_view(pool: &PgPool, user: Uuid, game: Game) -> Result<Value, Error> {
         data.presence.insert((game.as_str().into(), user), now);
     }
     let fairness = if game == Game::Scratch {
-        Some(offer(pool, &state, data, user)?)
+        data.offers
+            .get(&user)
+            .filter(|offer| offer.fresh)
+            .map(|offer| {
+                draw_games::proof::commit("scratch", &offer.id.to_string(), &offer.seed)
+                    .map_err(|_| Error::InvalidEntry)
+            })
+            .transpose()?
+            .ok_or(Error::PreparationRequired)
+            .map(Some)?
     } else {
-        ensure_period(pool, &state, data, game)?;
         None
     };
     let (period, my) = if let Some(schedule) = game.schedule() {
@@ -823,25 +901,8 @@ fn current_view(pool: &PgPool, user: Uuid, game: Game) -> Result<Value, Error> {
     let present = members.len();
     members.truncate(12);
     Ok(
-        json!({"game":game.as_str(),"runtime_epoch":crate::server_performance::process_instance_id(),"revision":data.revision,"durable_revision":data.durable,"now_ms":super::now_ms(),"balance":wallet.balance,"available_balance":available,"unit":game.unit(),"period":period,"my_tickets":my,"last_draw":null,"recent":[],"crowd":{"present":present,"members":members.iter().map(|((_,u),at)|json!({"user_id":u,"name":name(pool,*u),"seen_at_ms":at.timestamp_millis()})).collect::<Vec<_>>()},"feed":[],"fairness_offer":fairness}),
+        json!({"game":game.as_str(),"runtime_epoch":crate::server_performance::process_instance_id(),"revision":data.revision,"durable_revision":data.durable,"now_ms":super::now_ms(),"balance":balance,"available_balance":available,"unit":game.unit(),"period":period,"my_tickets":my,"last_draw":null,"recent":[],"crowd":{"present":present,"members":members.iter().map(|((_,u),at)|json!({"user_id":u,"name":name(pool,*u),"seen_at_ms":at.timestamp_millis()})).collect::<Vec<_>>()},"feed":[],"fairness_offer":fairness}),
     )
-}
-
-// SQL history and replay are read outside the synchronous runtime lock. The
-// command gate prevents eviction or rollover between preflight and acceptance.
-async fn durable(pool: &PgPool) -> Result<(), Error> {
-    let state = state(pool);
-    let receipt = state
-        .writer
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .ok_or_else(unavailable)?
-        .durable();
-    tokio::time::timeout(Duration::from_secs(2), receipt)
-        .await
-        .map_err(|_| unavailable())?
-        .map_err(|_| unavailable())
 }
 
 async fn wallet_ready(pool: &PgPool, user: Uuid) -> Result<(), Error> {
@@ -861,7 +922,37 @@ async fn wallet_ready_after(pool: &PgPool, user: Uuid, wallet_durable: bool) -> 
 }
 
 async fn prepare_scratch(pool: &PgPool, user: Uuid, ticket: Option<Uuid>) -> Result<(), Error> {
-    durable(pool).await?;
+    let state = state(pool);
+    {
+        let lock = state.data.lock().unwrap_or_else(|e| e.into_inner());
+        let data = lock.as_ref().ok_or_else(unavailable)?;
+        let mut public = state.published.lock().unwrap_or_else(|e| e.into_inner());
+        // Retain only a small replay window in the command working set. Its
+        // replacement happens under commands, before the next SQL replay
+        // lookup, so a concurrent commit cannot erase an in-flight replay.
+        let scratch_receipts = data
+            .receipts
+            .values()
+            .filter(|r| r.game == "scratch")
+            .count();
+        if data.scratch_owner == Some(user)
+            && scratch_receipts < 8
+            && ticket.is_none_or(|id| data.tickets.contains_key(&id))
+            && public.as_mut().is_some_and(|p| p.touch(user))
+        {
+            return Ok(());
+        }
+    }
+    // Replace only the scratch working set. Capture its last accepted job,
+    // not the global writer tail; later/unrelated work cannot extend this wait.
+    let pending = accepted(&state)
+        .iter()
+        .rev()
+        .find(|job| job.event.game == "scratch")
+        .map(|job| CommitReceipt(job.committed.subscribe()));
+    if let Some(receipt) = pending {
+        receipt.wait().await?;
+    }
     let mut conn = pool.acquire().await?;
     let mut cards = super::scratch::my_cards(&mut conn, user).await?;
     if let Some(id) = ticket {
@@ -878,47 +969,16 @@ async fn prepare_scratch(pool: &PgPool, user: Uuid, ticket: Option<Uuid>) -> Res
     .bind(user)
     .fetch_optional(&mut *conn)
     .await?;
-    let state = state(pool);
-    let mut lock = state.data.lock().unwrap_or_else(|e| e.into_inner());
-    let data = lock.as_mut().ok_or_else(unavailable)?;
-    // No accepted writes remain, so every evicted card/receipt is queryable.
-    let retained = data
-        .tickets
-        .values()
-        .filter(|t| t.game != "scratch")
-        .map(resident)
-        .sum::<usize>()
-        + data.periods.values().map(resident).sum::<usize>();
-    let incoming = cards
-        .iter()
-        .map(|card| {
-            resident(&OwnedTicket {
-                user,
-                game: "scratch".into(),
-                card: card.clone(),
-            })
-        })
-        .sum::<usize>();
-    if retained.saturating_add(incoming).saturating_add(4096) > MAX_BYTES {
-        return Err(unavailable());
-    }
-    data.tickets.retain(|_, t| t.game != "scratch");
-    // Drop the evicted cards' index entries too: `insert` re-indexes any id
-    // missing from `tickets`, so stale ids would duplicate on every view.
-    data.by_user.retain(|(_, g), _| g != "scratch");
-    data.by_period.retain(|(g, _), _| g != "scratch");
-    data.recent.remove("scratch");
-    data.receipts.clear();
-    data.offers.clear();
+    let mut loaded = Data::default();
     for card in cards {
-        data.insert(OwnedTicket {
+        loaded.insert(OwnedTicket {
             user,
             game: "scratch".into(),
             card,
         });
     }
     if let Some(row) = offer {
-        data.offers.insert(
+        loaded.offers.insert(
             user,
             Offer {
                 user,
@@ -929,29 +989,85 @@ async fn prepare_scratch(pool: &PgPool, user: Uuid, ticket: Option<Uuid>) -> Res
             },
         );
     }
-    data.compact();
-    if data.bytes > MAX_BYTES {
+    loaded.bytes = persistence::weight(&loaded)?;
+    let mut lock = state.data.lock().unwrap_or_else(|e| e.into_inner());
+    let data = lock.as_mut().ok_or_else(unavailable)?;
+    // Scratch jobs are durable; unrelated drawn-game jobs/receipts stay intact.
+    // Admit BOTH replacements before changing either working state or marker.
+    let retained = data
+        .tickets
+        .values()
+        .filter(|t| t.game != "scratch")
+        .map(resident)
+        .sum::<usize>()
+        + data.periods.values().map(resident).sum::<usize>()
+        + data
+            .receipts
+            .values()
+            .filter(|r| r.game != "scratch")
+            .map(resident)
+            .sum::<usize>()
+        + data.winners.values().flatten().map(resident).sum::<usize>();
+    if retained.saturating_add(loaded.bytes) > MAX_BYTES {
         return Err(unavailable());
     }
+    let mut public = state.published.lock().unwrap_or_else(|e| e.into_inner());
+    public.as_mut().ok_or_else(unavailable)?.load_scratch(
+        &loaded,
+        user,
+        state.queued.load(Ordering::Acquire),
+    )?;
+    data.tickets.retain(|_, t| t.game != "scratch");
+    data.by_user.retain(|(_, g), _| g != "scratch");
+    data.by_period.retain(|(g, _), _| g != "scratch");
+    data.recent.remove("scratch");
+    data.receipts.retain(|_, receipt| receipt.game != "scratch");
+    data.offers = loaded.offers;
+    for card in loaded.tickets.into_values() {
+        data.insert(card);
+    }
+    data.bytes = retained + loaded.bytes;
+    data.scratch_owner = Some(user);
     Ok(())
 }
 
+/// Only committed memory, including on WebSocket sync/heartbeat. Cold scratch
+/// hydration and fairness commitment creation are explicit prepare commands.
 pub async fn view(pool: &PgPool, user: Uuid, game: Game) -> Result<Value, Error> {
+    current_view(pool, user, game)
+}
+
+pub async fn prepare(pool: &PgPool, user: Uuid, game: Game) -> Result<Value, Error> {
+    player(pool, user)?;
     let state = state(pool);
     let command = state.commands.lock().await;
-    if game == Game::Scratch {
-        // The scratch view admits a fairness offer whose persistence locks the
-        // wallet row; a user whose wallet row is not durable yet would wedge
-        // the single ordered writer with RowNotFound retries.
-        wallet_ready(pool, user).await?;
+    wallet_ready(pool, user).await?;
+    let receipt = if game == Game::Scratch {
         prepare_scratch(pool, user, None).await?;
-    }
-    let mut view = current_view(pool, user, game)?;
+        let mut lock = state.data.lock().unwrap_or_else(|e| e.into_inner());
+        let data = lock.as_mut().ok_or_else(unavailable)?;
+        let offer = offer(pool, &state, data, user)?;
+        pending_receipt(
+            &state,
+            Uuid::parse_str(&offer.draw_id).map_err(|_| Error::InvalidEntry)?,
+        )
+    } else {
+        let mut lock = state.data.lock().unwrap_or_else(|e| e.into_inner());
+        let data = lock.as_mut().ok_or_else(unavailable)?;
+        ensure_period(pool, &state, data, game)?;
+        // Period creation is driven by the background owner as well.
+        let selling = game
+            .schedule()
+            .ok_or(Error::InvalidEntry)?
+            .period_at(super::now_ms());
+        pending_receipt(
+            &state,
+            super::record_id(&format!("period:{}:{}", game.as_str(), selling.id)),
+        )
+    };
     drop(command);
-    // A state push must not expose an accepted purchase before its commit either.
-    durable(pool).await?;
-    store::decorate_history(pool, user, game, &mut view).await?;
-    Ok(view)
+    receipt.wait().await?;
+    current_view(pool, user, game)
 }
 
 pub async fn buy_numbers(
@@ -982,15 +1098,37 @@ pub async fn buy_numbers(
         &hash,
     )
     .await?;
-    let purchase = if let Some(p) = replay {
-        p
+    let (purchase, receipt) = if let Some(p) = replay {
+        (
+            p,
+            pending_receipt(&state, super::purchase_id(user, body.request_id)),
+        )
     } else {
         wallet_ready_after(pool, user, wallet).await?;
         accept_numbers(pool, user, game, body)?
     };
     drop(command);
-    durable(pool).await?;
+    receipt.wait().await?;
     Ok(purchase)
+}
+
+fn committed_purchase(mut purchase: Purchase, cards: &[OwnedTicket]) -> Purchase {
+    for wire in &mut purchase.purchased {
+        if let Some(id) = wire["id"].as_str().and_then(|id| Uuid::parse_str(id).ok()) {
+            if let Some(ticket) = cards.iter().find(|t| t.card.id == id) {
+                *wire = store::ticket_json(Game::Scratch, &ticket.card);
+            }
+        }
+    }
+    purchase
+}
+
+/// Pair wallet visibility with lottery publication for compact purchase replies.
+pub(super) fn balance(pool: &PgPool, user: Uuid) -> Result<(i64, i64), Error> {
+    let state = state(pool);
+    let public = state.published.lock().unwrap_or_else(|e| e.into_inner());
+    public.as_ref().ok_or_else(unavailable)?;
+    Ok(beans_read_memory::lottery_read_balance(pool, user)?)
 }
 
 pub async fn buy_scratch(
@@ -1016,15 +1154,20 @@ pub async fn buy_scratch(
         &hash,
     )
     .await?;
-    let purchase = if let Some(p) = replay {
-        p
+    let (purchase, receipt) = if let Some(p) = replay {
+        let id = if body.count > 1 || body.all_in {
+            super::scratch_batch_id(user, body.request_id)
+        } else {
+            super::purchase_id(user, body.request_id)
+        };
+        (p, pending_receipt(&state, id))
     } else {
         wallet_ready_after(pool, user, wallet).await?;
         accept_scratch(pool, user, body)?
     };
     drop(command);
-    durable(pool).await?;
-    Ok(purchase)
+    let cards = receipt.wait().await?;
+    Ok(committed_purchase(purchase, &cards))
 }
 
 pub async fn reveal(
@@ -1038,10 +1181,15 @@ pub async fn reveal(
     let command = state.commands.lock().await;
     prepare_scratch(pool, user, Some(ticket)).await?;
     wallet_ready(pool, user).await?;
-    let result = accept_reveal(pool, user, ticket, index)?;
+    let (wire, balance, receipt) = accept_reveal(pool, user, ticket, index)?;
     drop(command);
-    durable(pool).await?;
-    Ok(result)
+    let cards = receipt.wait().await?;
+    let wire = cards
+        .iter()
+        .find(|t| t.card.id == ticket)
+        .map(|t| store::ticket_json(Game::Scratch, &t.card))
+        .unwrap_or(wire);
+    Ok((wire, balance))
 }
 
 pub async fn refill(pool: &PgPool, user: Uuid) -> Result<i64, Error> {
@@ -1056,7 +1204,7 @@ fn accept_numbers(
     user: Uuid,
     game: Game,
     body: &NumberBuy,
-) -> Result<Purchase, Error> {
+) -> Result<(Purchase, CommitReceipt), Error> {
     player(pool, user)?;
     if body.request_id.is_nil()
         || body.multiplier != 1
@@ -1082,7 +1230,8 @@ fn accept_numbers(
     let mut lock = state.data.lock().unwrap_or_else(|e| e.into_inner());
     let data = lock.as_mut().ok_or_else(unavailable)?;
     if let Some(p) = data.replay(user, game, body.request_id, &hash)? {
-        return Ok(p);
+        let id = super::purchase_id(user, body.request_id);
+        return Ok((p, pending_receipt(&state, id)));
     }
     ensure_period(pool, &state, data, game)?;
     let selling = game
@@ -1227,13 +1376,16 @@ fn accept_numbers(
         .iter()
         .map(|t| store::ticket_json(game, &t.card))
         .collect();
-    admit(pool, &state, data, event, charged)?;
-    Ok(Purchase {
-        purchased,
-        charged,
-        balance_before: before,
-        balance_after: receipt.after,
-    })
+    let commit = admit(pool, &state, data, event, charged)?;
+    Ok((
+        Purchase {
+            purchased,
+            charged,
+            balance_before: before,
+            balance_after: receipt.after,
+        },
+        commit,
+    ))
 }
 
 fn scratch_reward(card: &TicketRow) -> Result<(i64, bool), Error> {
@@ -1254,7 +1406,7 @@ fn accept_scratch(
     pool: &PgPool,
     user: Uuid,
     body: &super::scratch::ScratchBuy,
-) -> Result<Purchase, Error> {
+) -> Result<(Purchase, CommitReceipt), Error> {
     player(pool, user)?;
     if body.request_id.is_nil()
         || body.cost != 100
@@ -1278,7 +1430,12 @@ fn accept_scratch(
     let mut lock = state.data.lock().unwrap_or_else(|e| e.into_inner());
     let data = lock.as_mut().ok_or_else(unavailable)?;
     if let Some(p) = data.replay(user, Game::Scratch, body.request_id, &hash)? {
-        return Ok(p);
+        let id = if body.count > 1 || body.all_in {
+            super::scratch_batch_id(user, body.request_id)
+        } else {
+            super::purchase_id(user, body.request_id)
+        };
+        return Ok((p, pending_receipt(&state, id)));
     }
     let before = beans_read_memory::ensure(pool, user)?.balance;
     let available = beans_read_memory::available(pool, user, before, false, None)?;
@@ -1343,6 +1500,16 @@ fn accept_scratch(
     );
     event.before = before;
     event.claim = Some(old.id);
+    let mut seed = [0u8; 32];
+    OsRng.fill_bytes(&mut seed);
+    // Freeze the next offer in the same transaction as consuming the old one.
+    event.offer = Some(Offer {
+        user,
+        id: Uuid::new_v4(),
+        seed: hex::encode(seed),
+        fresh: true,
+        previous: None,
+    });
     let mut paid = 0i64;
     for (i, card) in generated.into_iter().enumerate() {
         let entry = json!({"cost":body.cost,"lucky":card.lucky,"numbers":card.numbers,"fairness":{"kind":"scratch","reveal":reveal,"cost":body.cost,"count":body.count,"index":i,"numbers":card.numbers,"lucky":card.lucky,"prize":card.prize,"hits":card.hits},"reward_version":1,"reward":rewards[i]});
@@ -1402,13 +1569,16 @@ fn accept_scratch(
         .iter()
         .map(|t| store::ticket_json(Game::Scratch, &t.card))
         .collect();
-    admit(pool, &state, data, event, charged)?;
-    Ok(Purchase {
-        purchased,
-        charged,
-        balance_before: before,
-        balance_after: after,
-    })
+    let receipt = admit(pool, &state, data, event, charged)?;
+    Ok((
+        Purchase {
+            purchased,
+            charged,
+            balance_before: before,
+            balance_after: after,
+        },
+        receipt,
+    ))
 }
 
 fn accept_reveal(
@@ -1416,7 +1586,7 @@ fn accept_reveal(
     user: Uuid,
     ticket: Uuid,
     index: Option<usize>,
-) -> Result<(Value, i64), Error> {
+) -> Result<(Value, i64, CommitReceipt), Error> {
     player(pool, user)?;
     reveal_card(pool, user, ticket, index, false)
 }
@@ -1426,7 +1596,7 @@ fn reveal_card(
     ticket: Uuid,
     index: Option<usize>,
     expiry: bool,
-) -> Result<(Value, i64), Error> {
+) -> Result<(Value, i64, CommitReceipt), Error> {
     if index.is_some_and(|i| i >= 6) {
         return Err(Error::InvalidEntry);
     }
@@ -1445,6 +1615,23 @@ fn reveal_card(
         .cloned()
         .ok_or(Error::TicketNotFound)?;
     if owned.card.settled_at.is_some() {
+        // A retry may see an accepted final reveal before it commits. Await
+        // that same frozen result instead of acknowledging settlement early.
+        if let Some(job) = accepted(&state)
+            .iter()
+            .find(|job| job.event.id == super::scratch_credit_id(ticket))
+        {
+            let balance = job
+                .event
+                .before
+                .checked_add(job.event.effect.as_ref().map_or(0, |e| e.balance))
+                .ok_or(Error::InvalidEntry)?;
+            return Ok((
+                store::ticket_json(Game::Scratch, &owned.card),
+                balance,
+                CommitReceipt(job.committed.subscribe()),
+            ));
+        }
         return Err(Error::AlreadySettled);
     }
     let before = if expiry {
@@ -1464,7 +1651,20 @@ fn reveal_card(
         shown.fill(true)
     }
     if owned.card.revealed.as_ref() == Some(&shown) {
-        return Ok((store::ticket_json(Game::Scratch, &owned.card), before));
+        let id = super::record_id(&format!(
+            "reveal:{ticket}:{}",
+            shown
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| **v)
+                .map(|(i, _)| 1u8 << i)
+                .sum::<u8>()
+        ));
+        return Ok((
+            store::ticket_json(Game::Scratch, &owned.card),
+            before,
+            pending_receipt(&state, id),
+        ));
     }
     let all = shown.iter().all(|v| *v);
     let id = if all {
@@ -1515,8 +1715,8 @@ fn reveal_card(
     }
     let wire = store::ticket_json(Game::Scratch, &owned.card);
     event.cards.push(owned);
-    admit(pool, &state, data, event, 0)?;
-    Ok((wire, after))
+    let receipt = admit(pool, &state, data, event, 0)?;
+    Ok((wire, after, receipt))
 }
 
 pub async fn run(pool: PgPool) {
@@ -1630,6 +1830,14 @@ async fn recover_slots(pool: &PgPool) -> Result<(), Error> {
             return Ok(());
         }
         data.retire_durable_periods();
+        if let Some(public) = state
+            .published
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
+            public.data.retire_durable_periods();
+        }
         data.periods.keys().cloned().collect::<Vec<_>>()
     };
     let recovered = persistence::hydrate_missing(pool, &keys).await?;
@@ -1639,6 +1847,17 @@ async fn recover_slots(pool: &PgPool) -> Result<(), Error> {
         return Err(unavailable());
     }
     if !recovered.periods.is_empty() || !recovered.tickets.is_empty() {
+        let mut public = state.published.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(public) = public.as_mut() {
+            if public.data.bytes.saturating_add(recovered.bytes) > MAX_BYTES {
+                return Err(unavailable());
+            }
+            public.data.periods.extend(recovered.periods.clone());
+            for ticket in recovered.tickets.values() {
+                public.data.insert(ticket.clone());
+            }
+            public.data.compact();
+        }
         data.periods.extend(recovered.periods);
         for ticket in recovered.tickets.into_values() {
             data.insert(ticket);
@@ -1713,7 +1932,7 @@ async fn advance(pool: &PgPool, game: Game) -> Result<(), Error> {
         super::record_id(&format!("draw:{}:{}", game.as_str(), plan.period)),
     );
     event.period = Some(row);
-    admit(pool, &state, data, event, 0)
+    admit(pool, &state, data, event, 0).map(|_| ())
 }
 fn settle(pool: &PgPool) -> Result<bool, Error> {
     let state = state(pool);
@@ -1810,6 +2029,9 @@ fn settle(pool: &PgPool) -> Result<bool, Error> {
     Ok(false)
 }
 fn forget(data: &mut Data, user: Uuid) {
+    if data.scratch_owner == Some(user) {
+        data.scratch_owner = None;
+    }
     data.tickets.retain(|_, t| t.user != user);
     data.receipts.retain(|(u, _), _| *u != user);
     data.offers.remove(&user);
@@ -1827,6 +2049,9 @@ pub(crate) fn remove_user(pool: &PgPool, user: Uuid) {
     let state = state(pool);
     let mut lock = state.data.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(data) = lock.as_mut() {
+        if data.scratch_owner == Some(user) {
+            data.scratch_owner = None;
+        }
         data.tickets.retain(|_, t| t.user != user);
         data.receipts.retain(|(u, _), _| *u != user);
         data.offers.remove(&user);
@@ -1846,6 +2071,16 @@ pub(crate) fn remove_user(pool: &PgPool, user: Uuid) {
         data.presence.retain(|(_, u), _| *u != user);
         data.revision += 1;
         data.durable += 1; // Purge is already durable; it enqueues no lottery job.
+        if let Some(public) = state
+            .published
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
+            public.remove_user(user);
+            public.data.revision += 1;
+            public.data.durable += 1;
+        }
         data.compact();
         for game in Game::ALL {
             let _ = state.changed.send(Notice {
