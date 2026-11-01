@@ -610,7 +610,7 @@ pub async fn hydrate(pool: &PgPool) -> sqlx::Result<()> {
         let mut tx = crate::live_directory::begin_read_snapshot(pool).await?;
         let mut loaded = Inner::default();
         // One streamed statement per source (one plan, one scan) in the snapshot.
-        let query = format!("SELECT w.user_id,w.balance,w.net_won,w.hands_played,w.hands_won,w.refills,({}) AS eligible FROM wallets w JOIN users u ON u.id=w.user_id WHERE w.game=$1 AND u.deleted_at IS DISTINCT FROM 'epoch'::timestamptz ORDER BY w.user_id", crate::internal_accounts::not_qa_flags("u."));
+        let query = String::from("SELECT w.user_id,w.balance,w.net_won,w.hands_played,w.hands_won,w.refills,TRUE AS eligible FROM wallets w JOIN users u ON u.id=w.user_id WHERE w.game=$1 AND u.deleted_at IS DISTINCT FROM 'epoch'::timestamptz ORDER BY w.user_id");
         {
             let mut rows = sqlx::query(&query).bind(crate::game_catalog::BEANS).fetch(&mut *tx);
             while let Some(row) = rows.try_next().await? {
@@ -862,7 +862,7 @@ async fn read_user(
     tokio::time::timeout(Duration::from_secs(10), async {
         crate::live_directory::wait_for_open_transactions(pool).await?;
         let mut tx = crate::live_directory::begin_read_snapshot(pool).await?;
-        let query = format!("SELECT w.balance,w.net_won,w.hands_played,w.hands_won,w.refills,({}) AS eligible FROM wallets w JOIN users u ON u.id=w.user_id WHERE w.game=$1 AND w.user_id=$2 AND u.deleted_at IS DISTINCT FROM 'epoch'::timestamptz", crate::internal_accounts::not_qa_flags("u."));
+        let query = String::from("SELECT w.balance,w.net_won,w.hands_played,w.hands_won,w.refills,TRUE AS eligible FROM wallets w JOIN users u ON u.id=w.user_id WHERE w.game=$1 AND w.user_id=$2 AND u.deleted_at IS DISTINCT FROM 'epoch'::timestamptz");
         let row = sqlx::query(&query).bind(crate::game_catalog::BEANS).bind(id).fetch_optional(&mut *tx).await?;
         let mut user = User { wallet: row.as_ref().map(wallet), eligible: row.as_ref().is_some_and(|r| r.get("eligible")), available: true, bytes: 512, ..User::default() };
         let mut after = None::<NaiveDate>;

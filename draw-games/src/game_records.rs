@@ -182,6 +182,8 @@ pub async fn load_history_page_filtered(
     session_id: Option<Uuid>,
     opponent: Opponent,
 ) -> sqlx::Result<RecordsResponse> {
+    use crate::request_timing::{http_phase, HttpPhase};
+    let prepare = http_phase(HttpPhase::Processing).operation("records_query_prepare");
     // Group only this player's indexed records; hydrate details after paging.
     // `game_records.has_bots` holds the per-game opponent evidence (schema
     // 0006, maintained with the record and its sources); NULL is unknown and
@@ -289,8 +291,14 @@ pub async fn load_history_page_filtered(
     );
     // The page and its detail statement are sequential: one pooled connection
     // serves both instead of an acquire (and idle-connection ping) each.
+    drop(prepare);
+    let acquire = http_phase(HttpPhase::DbPool).operation("records_pool_acquire");
     let mut conn = pool.acquire().await?;
+    drop(acquire);
+    let page = http_phase(HttpPhase::DbQuery).operation("records_page_query");
     let rows = query.build().fetch_all(&mut *conn).await?;
+    drop(page);
+    let decode = http_phase(HttpPhase::Processing).operation("records_page_decode");
     let summary = rows
         .iter()
         .filter(|r| r.get::<i16, _>("row_kind") == 0)
@@ -309,14 +317,17 @@ pub async fn load_history_page_filtered(
     let has_more = page_rows.len() as i64 > limit;
     let page_rows: Vec<_> = page_rows.into_iter().take(limit as usize).collect();
     let mut details = if sessions {
+        drop(decode);
         std::collections::HashMap::new()
     } else {
         let keys: Vec<(i16, Uuid)> = page_rows
             .iter()
             .map(|r| (r.get("game"), r.get("record_id")))
             .collect();
+        drop(decode);
         load_page_details(&mut conn, user_id, &keys).await?
     };
+    let _assemble = http_phase(HttpPhase::Processing).operation("records_response_assemble");
     let entries: Vec<RecordEntry> = page_rows
         .into_iter()
         .map(|r| {
@@ -461,6 +472,8 @@ async fn load_page_details(
     user_id: Uuid,
     keys: &[(i16, Uuid)],
 ) -> sqlx::Result<std::collections::HashMap<(i16, Uuid), Option<Value>>> {
+    use crate::request_timing::{http_phase, HttpPhase};
+    let prepare = http_phase(HttpPhase::Processing).operation("records_details_prepare");
     let arms: Vec<_> = DETAIL_ARMS
         .iter()
         .filter(|(games, _)| keys.iter().any(|(code, _)| games.contains(code)))
@@ -480,12 +493,16 @@ async fn load_page_details(
         " ELSE NULL END AS detail FROM unnest($2::smallint[], $3::uuid[]) AS page(game, record_id)",
     );
     let (games, ids): (Vec<i16>, Vec<Uuid>) = keys.iter().copied().unzip();
+    drop(prepare);
+    let query = http_phase(HttpPhase::DbQuery).operation("records_details_query");
     let rows = sqlx::query(&sql)
         .bind(user_id)
         .bind(games)
         .bind(ids)
         .fetch_all(conn)
         .await?;
+    drop(query);
+    let _decode = http_phase(HttpPhase::Processing).operation("records_details_decode");
     Ok(rows
         .into_iter()
         .map(|row| {
