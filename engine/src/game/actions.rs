@@ -162,6 +162,22 @@ impl GameHand {
         player_id: PlayerId,
         action: PlayerAction,
     ) -> Result<(GameSnapshot, bool), ActionError> {
+        self.apply_action_inner(player_id, action, false)
+    }
+
+    /// Server lifecycle fold, including out-of-turn or all-in retirement.
+    /// Committed chips stay in the pots; the caller must authorize the retirement.
+    pub fn forfeit_player(&mut self, player_id: PlayerId) -> Result<GameSnapshot, ActionError> {
+        self.apply_action_inner(player_id, PlayerAction::Fold, true)
+            .map(|(snapshot, _)| snapshot)
+    }
+
+    fn apply_action_inner(
+        &mut self,
+        player_id: PlayerId,
+        action: PlayerAction,
+        forfeit: bool,
+    ) -> Result<(GameSnapshot, bool), ActionError> {
         match &self.phase {
             Phase::NotStarted => return Err(ActionError::HandNotStarted),
             Phase::Done => return Err(ActionError::HandFinished),
@@ -211,7 +227,11 @@ impl GameHand {
             .betting_round
             .as_mut()
             .ok_or(ActionError::HandFinished)?;
-        let chips_moved = round.apply_action(player_id, &action)?;
+        let chips_moved = if forfeit {
+            round.forfeit_player(player_id)?
+        } else {
+            round.apply_action(player_id, &action)?
+        };
 
         let stack_after = Chips(stack_before.0.saturating_sub(chips_moved.0));
         let pot_after = Chips(pot_before.0 + chips_moved.0);
