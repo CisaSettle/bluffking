@@ -43,7 +43,31 @@ const RECENT_POKER_ACKS: usize = 4096;
 const DAILY: &str = "beans_daily_refill";
 const READ_PUBLICATION_WAIT: Duration = Duration::from_secs(2);
 static READ_WAITERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(256);
-type Rank = (std::cmp::Reverse<i64>, std::cmp::Reverse<i32>, Uuid);
+type RankKey = (std::cmp::Reverse<i64>, std::cmp::Reverse<i32>, Uuid);
+struct Rank {
+    profit: RankKey,
+    balance: RankKey,
+}
+
+/// Update both indexes through every existing wallet publication/invalidation path.
+/// Balance includes wallets with no completed hands; profit keeps its played-only rule.
+#[derive(Default)]
+struct Rankings {
+    profit: BTreeSet<RankKey>,
+    balance: BTreeSet<RankKey>,
+}
+impl Rankings {
+    fn insert(&mut self, rank: Rank) {
+        if rank.profit.1 .0 > 0 {
+            self.profit.insert(rank.profit);
+        }
+        self.balance.insert(rank.balance);
+    }
+    fn remove(&mut self, rank: &Rank) {
+        self.profit.remove(&rank.profit);
+        self.balance.remove(&rank.balance);
+    }
+}
 #[derive(Default)]
 struct User {
     wallet: Option<Wallet>,
@@ -84,7 +108,7 @@ struct Inner {
     active_writes: usize,
     active_users: HashMap<Uuid, usize>,
     users: HashMap<Uuid, User>,
-    ranks: BTreeSet<Rank>,
+    ranks: Rankings,
     pending: BTreeSet<Uuid>,
     count: usize,
     bytes: usize,
@@ -345,13 +369,18 @@ pub async fn read_after_publication<T>(
 fn rank(id: Uuid, user: &User) -> Option<Rank> {
     user.wallet
         .as_ref()
-        .filter(|w| user.available && user.eligible && w.hands_played > 0)
-        .map(|w| {
-            (
+        .filter(|_| user.available && user.eligible)
+        .map(|w| Rank {
+            profit: (
                 std::cmp::Reverse(w.net_won),
                 std::cmp::Reverse(w.hands_played),
                 id,
-            )
+            ),
+            balance: (
+                std::cmp::Reverse(w.balance),
+                std::cmp::Reverse(w.hands_played),
+                id,
+            ),
         })
 }
 fn wallet(row: &sqlx::postgres::PgRow) -> Wallet {
@@ -1192,6 +1221,7 @@ pub fn leaderboard(
     pool: &PgPool,
     limit: i64,
     offset: i64,
+    sort: beans::LeaderboardSort,
 ) -> sqlx::Result<Vec<beans::LeaderboardRow>> {
     let state = state(pool);
     let inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -1207,7 +1237,11 @@ pub fn leaderboard(
     let mut skipped = 0usize;
     let limit = crate::pagination::limit(Some(limit)) as usize;
     let offset = crate::pagination::offset(Some(offset)) as usize;
-    for (net, hands, id) in &inner.ranks {
+    let ranks = match sort {
+        beans::LeaderboardSort::Profit => &inner.ranks.profit,
+        beans::LeaderboardSort::Balance => &inner.ranks.balance,
+    };
+    for (_, _, id) in ranks {
         let Some(player) = crate::player_directory::lookup(pool, *id)? else {
             continue;
         };
@@ -1218,6 +1252,11 @@ pub fn leaderboard(
             skipped += 1;
             continue;
         }
+        let wallet = inner
+            .users
+            .get(id)
+            .and_then(|user| user.wallet.as_ref())
+            .ok_or_else(unavailable)?;
         rows.push(beans::LeaderboardRow {
             user_id: *id,
             display_name: crate::content_moderation::public_name_or_fallback(
@@ -1228,8 +1267,9 @@ pub fn leaderboard(
                     .filter(|s| !s.is_empty()),
                 *id,
             ),
-            net_won: net.0,
-            hands_played: hands.0,
+            balance: wallet.balance,
+            net_won: wallet.net_won,
+            hands_played: wallet.hands_played,
         });
         if rows.len() == limit {
             break;

@@ -491,23 +491,31 @@ pub async fn debit_refund_on(
     Ok(after)
 }
 
+#[derive(Debug, Clone, Copy, Default, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeaderboardSort {
+    #[default]
+    Profit,
+    Balance,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct LeaderboardRow {
+    pub balance: i64,
     pub user_id: Uuid,
     pub display_name: String,
     pub net_won: i64,
     pub hands_played: i32,
 }
 
-/// Top beans winners (lifetime net). Only QA identities are excluded: this
-/// is a player-facing board, not a growth metric, so staff accounts that play
-/// rank like everyone else.
+/// Rank active players by lifetime profit or current total wallet balance.
 pub async fn leaderboard(
     pool: &PgPool,
     limit: i64,
     offset: i64,
+    sort: LeaderboardSort,
 ) -> sqlx::Result<Vec<LeaderboardRow>> {
-    crate::beans_read_memory::leaderboard(pool, limit, offset)
+    crate::beans_read_memory::leaderboard(pool, limit, offset, sort)
 }
 
 /// Unsettled public-hand liabilities, held per process: the runtime owner
