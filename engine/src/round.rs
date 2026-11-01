@@ -555,6 +555,36 @@ impl BettingRound {
         Ok(chips_moved)
     }
 
+    /// Retire a player immediately without consuming another player's turn.
+    /// This lifecycle operation also permits forfeiting an all-in player's claim.
+    pub(crate) fn forfeit_player(&mut self, player_id: PlayerId) -> Result<Chips, ActionError> {
+        let idx = self
+            .players
+            .iter()
+            .position(|p| p.player_id == player_id)
+            .ok_or(ActionError::NotInHand)?;
+        let player = &self.players[idx];
+        if player.folded {
+            return Err(ActionError::AlreadyFolded);
+        }
+        if self.players.iter().filter(|p| !p.folded).count() <= 1 {
+            return Err(ActionError::HandFinished);
+        }
+        if !player.all_in {
+            self.n_can_act = self.n_can_act.saturating_sub(1);
+            if !player.has_acted || player.contributed.0 < self.current_bet.0 {
+                self.actions_remaining = self.actions_remaining.saturating_sub(1);
+            }
+        }
+        self.players[idx].folded = true;
+        self.players[idx].has_acted = true;
+        if idx == self.current {
+            self.advance();
+        }
+        self.check_done();
+        Ok(Chips::ZERO)
+    }
+
     /// Compute side pots from contributions this round.
     pub fn side_pots(&self) -> Vec<SidePot> {
         let eligible: Vec<(PlayerId, u32)> = self
