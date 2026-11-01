@@ -272,6 +272,18 @@ pub fn verify_and_open(
     party_pubkeys: &[(String, RistrettoPoint)],
     proof: &ThresholdDecryptionProof,
 ) -> Result<u8, OpenError> {
+    let point = verify_and_open_point(deck_index, ct, party_pubkeys, proof)?;
+    card_id_from_point(&point).ok_or(OpenError::NotACard)
+}
+
+/// Verify the same authenticated decryption, leaving the caller to check its
+/// pinned message alphabet. Legacy Hold'em retains its 52-card recovery gate.
+pub fn verify_and_open_point(
+    deck_index: u32,
+    ct: &Ct,
+    party_pubkeys: &[(String, RistrettoPoint)],
+    proof: &ThresholdDecryptionProof,
+) -> Result<RistrettoPoint, OpenError> {
     if proof.scheme != SCHEME {
         return Err(OpenError::BadProof("scheme".into()));
     }
@@ -363,8 +375,7 @@ pub fn verify_and_open(
         // Unreachable unless the batch and the per-share path disagree.
         return Err(OpenError::BadProof("batch".into()));
     }
-    let m = ct.c2 - sum_d;
-    card_id_from_point(&m).ok_or(OpenError::NotACard)
+    Ok(ct.c2 - sum_d)
 }
 
 /// Combine raw partial-decryption points (no proof check) — for the owner's

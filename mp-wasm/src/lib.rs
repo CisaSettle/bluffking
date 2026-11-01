@@ -568,3 +568,32 @@ pub fn pf2_verify(bundle_json: String) -> String {
         Err(error) => serde_json::json!({"ok": false, "error": error}).to_string(),
     }
 }
+
+/// Zha Jin Hua's three-card layout over the same encrypted-deck verifier.
+#[wasm_bindgen]
+pub fn zjh_pf2_verify(bundle_json: String) -> String {
+    let result = serde_json::from_str::<mental_poker::pf2_zjh::Bundle>(&bundle_json)
+        .map_err(|_| "malformed bundle".to_string())
+        .and_then(|bundle| mental_poker::pf2_zjh::verify(&bundle).map_err(|e| e.to_string()));
+    match result {
+        Ok(verified) => serde_json::json!({"ok": true, "verified": verified}).to_string(),
+        Err(error) => serde_json::json!({"ok": false, "error": error}).to_string(),
+    }
+}
+
+/// Generic physical-card manifest and selective-decryption verifier.
+#[wasm_bindgen]
+pub fn cards_verify(bundle_json: String) -> String {
+    use mental_poker::card_proof;
+    let result = if bundle_json.len() > card_proof::MAX_BUNDLE_BYTES {
+        Err("card bundle too large".to_string())
+    } else {
+        serde_json::from_str::<card_proof::Bundle>(&bundle_json)
+            .map_err(|_| "malformed card bundle".to_string())
+            .and_then(|bundle| card_proof::verify(&bundle).map_err(|e| e.to_string()))
+    };
+    match result {
+        Ok(verified) => serde_json::json!({"ok": true, "verified": verified}).to_string(),
+        Err(error) => serde_json::json!({"ok": false, "error": error}).to_string(),
+    }
+}
