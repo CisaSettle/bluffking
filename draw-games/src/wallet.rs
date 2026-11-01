@@ -300,7 +300,7 @@ pub(crate) fn project_session_balance(game: i16, user: Uuid, balance: i64) {
 /// effects. Call once on the fresh-commit path, never on receipt replay.
 pub(crate) fn project_external_credit(game: i16, user: Uuid, amount: i64) {
     if let Some(mut entry) = memory().get_mut(&(game, user)) {
-        if let Some(balance) = entry.wallet.balance.checked_add(amount) {
+        if let Some(balance) = entry.wallet.balance.checked_add(amount).filter(|v| *v >= 0) {
             entry.wallet.balance = balance;
         } else {
             // The durable credit already succeeded. Fail this display/admission

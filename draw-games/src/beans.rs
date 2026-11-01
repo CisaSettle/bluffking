@@ -23,11 +23,11 @@ use uuid::Uuid;
 use crate::game_catalog::BEANS as GAME;
 use crate::wallet::{self, Policy, Wallet};
 
-/// First-use grant (owner: 默认每人一万金豆).
-pub const GRANT: i64 = 10_000;
+/// First-use grant; existing balances are preserved.
+pub const GRANT: i64 = 2_000;
 /// Extra beans ADDED by the once-per-Singapore-day claim (not a refill-to
-/// target; owner 2026-10-29: 10,000 → 2,000).
-pub const DAILY_REFILL_TO: i64 = 2_000;
+/// target). Reduced alongside the deterministic membership exchange.
+pub const DAILY_REFILL_TO: i64 = 200;
 /// Public beans table shape. One stake keeps the thin player pool together.
 pub const STAKE_KEY: &str = "10/20";
 pub const SB: u32 = 10;
@@ -169,6 +169,7 @@ pub struct Profile {
     pub buy_in: u32,
     pub stake: &'static str,
     pub daily_refill_to: i64,
+    pub initial_grant: i64,
     /// True when today's free refill has not been claimed yet regardless of the current balance.
     pub daily_available: bool,
     pub pack_beans: i64,
@@ -196,6 +197,7 @@ pub async fn profile(pool: &PgPool, user: Uuid) -> sqlx::Result<Profile> {
         buy_in: BUY_IN,
         stake: STAKE_KEY,
         daily_refill_to: DAILY_REFILL_TO,
+        initial_grant: GRANT,
         daily_available,
         pack_beans: PACK_BEANS,
         pack_usd_cents: pack_usd_cents(),

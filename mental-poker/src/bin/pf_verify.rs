@@ -101,6 +101,22 @@ fn verify_json(json: &str) -> i32 {
             return 2;
         }
     };
+    let value = value.get("proof").cloned().unwrap_or(value);
+    if value["scheme"] == mental_poker::pf2_zjh::SCHEME {
+        let result = serde_json::from_value::<mental_poker::pf2_zjh::Bundle>(value)
+            .map_err(|e| e.to_string())
+            .and_then(|b| mental_poker::pf2_zjh::verify(&b).map_err(|e| e.to_string()));
+        return match result {
+            Ok(v) => {
+                println!("OK {}", serde_json::to_string(&v).unwrap());
+                0
+            }
+            Err(e) => {
+                eprintln!("FAIL {e}");
+                1
+            }
+        };
+    }
     if value.get("scheme").is_some() {
         verify_v2(value)
     } else {

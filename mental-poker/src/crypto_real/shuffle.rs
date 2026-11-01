@@ -136,6 +136,19 @@ use super::ec::{batch_weight, pedersen_h};
 /// `v1` proof is structurally non-verifiable under `v2` (fail-closed) — the weaker
 /// `v1` scheme is retired.
 pub const SCHEME: &str = "reenc-shuffle-ristretto-v2";
+/// Generic-card scheme: binds the size-derived repetition count into the transcript.
+pub const CARD_SCHEME: &str = "reenc-shuffle-ristretto-v3";
+/// Bounded by the largest supported shoe (eight standard decks).
+pub const MAX_CARD_DECK: usize = 416;
+
+/// Conservative integer upper bound on log2(N!); no floating-point consensus.
+/// Since l > 2^252, N!/l^r <= 2^-128 at this repetition count.
+fn card_repetitions(n: usize) -> usize {
+    let bits: usize = (2..=n)
+        .map(|k| (usize::BITS - (k - 1).leading_zeros()) as usize)
+        .sum();
+    ((bits + 128).div_ceil(252)).max(CHAL_REPS)
+}
 
 /// Number of **independent** Fiat–Shamir challenge-weight vectors the card-integrity
 /// (Part A) argument is repeated under, all bound to a SINGLE committed permutation
@@ -488,20 +501,54 @@ impl Shuffle {
         round: u32,
         rng: &mut R,
     ) -> ShuffleProof {
+        self.prove_scheme(party, round, rng, SCHEME, CHAL_REPS)
+    }
+
+    /// Generic decks have their own version and size-derived soundness parameters.
+    pub fn prove_cards<R: RngCore + CryptoRng>(
+        &self,
+        party: &str,
+        round: u32,
+        rng: &mut R,
+    ) -> Option<ShuffleProof> {
+        if self.input.is_empty() || self.input.len() > MAX_CARD_DECK {
+            return None;
+        }
+        Some(self.prove_scheme(
+            party,
+            round,
+            rng,
+            CARD_SCHEME,
+            card_repetitions(self.input.len()),
+        ))
+    }
+
+    fn prove_scheme<R: RngCore + CryptoRng>(
+        &self,
+        party: &str,
+        round: u32,
+        rng: &mut R,
+        scheme: &str,
+        repetitions: usize,
+    ) -> ShuffleProof {
         let n = self.input.len();
         let h = *pedersen_h();
         let q = self.joint_key;
 
         let mut t = statement_transcript(party, round, &q, &self.input, &self.output);
+        if scheme == CARD_SCHEME {
+            t.append_message(b"scheme", CARD_SCHEME.as_bytes());
+            t.append_u64(b"repetitions", repetitions as u64);
+        }
 
         // Per independent challenge-weight vector: commit f^(i) and prove Part A.
         // The permuted weights f^(i)_j = e^(i)_{π⁻¹(j)}, blinds b^(i), and their
         // commitments are retained so the shared permutation argument below can
         // β-combine them (all under the SAME π).
-        let mut reenc_rounds = Vec::with_capacity(CHAL_REPS);
-        let mut f_all: Vec<Vec<Scalar>> = Vec::with_capacity(CHAL_REPS);
-        let mut b_all: Vec<Vec<Scalar>> = Vec::with_capacity(CHAL_REPS);
-        for rep in 0..CHAL_REPS {
+        let mut reenc_rounds = Vec::with_capacity(repetitions);
+        let mut f_all: Vec<Vec<Scalar>> = Vec::with_capacity(repetitions);
+        let mut b_all: Vec<Vec<Scalar>> = Vec::with_capacity(repetitions);
+        for rep in 0..repetitions {
             t.append_u64(b"rep", rep as u64);
             let e = challenge_weights(&mut t, n);
 
@@ -546,7 +593,7 @@ impl Shuffle {
         let perm = prove_permutation(&mut t, &g, &g_blind, &x, &h, rng);
 
         ShuffleProof {
-            scheme: SCHEME.to_string(),
+            scheme: scheme.to_string(),
             input_deck_hash: hex_hash(&deck_hash(&self.input)),
             output_deck_hash: hex_hash(&deck_hash(&self.output)),
             attestation: serialize_argument(&ShuffleArgument {
@@ -740,7 +787,7 @@ fn verify_argument(
     expected_joint_key: Option<&str>,
     proof: &ShuffleProof,
 ) -> bool {
-    if proof.scheme != SCHEME {
+    if proof.scheme != SCHEME && proof.scheme != CARD_SCHEME {
         return false;
     }
     let arg: ShuffleArgument = match deserialize_argument(&proof.attestation) {
@@ -786,7 +833,7 @@ fn verify_argument(
         }
     }
     let n = d_in.len();
-    if n == 0 || d_out.len() != n {
+    if n == 0 || d_out.len() != n || n > MAX_CARD_DECK || (proof.scheme == SCHEME && n > 52) {
         return false;
     }
     // The proof must be ABOUT the decks bound by the trait's hashes (T6 — the
@@ -816,17 +863,26 @@ fn verify_argument(
         &out_hash,
     );
 
+    let repetitions = if proof.scheme == CARD_SCHEME {
+        let count = card_repetitions(n);
+        t.append_message(b"scheme", CARD_SCHEME.as_bytes());
+        t.append_u64(b"repetitions", count as u64);
+        count
+    } else {
+        CHAL_REPS
+    };
+
     // SOUNDNESS-CRITICAL (BUG-125): a valid proof MUST carry exactly CHAL_REPS
     // independent card-integrity rounds. Accepting fewer (e.g. a single-round
     // `v1`-shaped proof) would drop the bound back to N!/ℓ ≈ 2⁻²⁶. The scheme id
     // (`v2`) + this length gate + the strict deserialize all reject the weak shape.
-    if arg.reenc_rounds.len() != CHAL_REPS {
+    if arg.reenc_rounds.len() != repetitions {
         return false;
     }
 
     // ---- Part A: one instance per independent challenge-weight vector. ----
-    let mut e_all: Vec<Vec<Scalar>> = Vec::with_capacity(CHAL_REPS);
-    let mut cf_all: Vec<Vec<RistrettoPoint>> = Vec::with_capacity(CHAL_REPS);
+    let mut e_all: Vec<Vec<Scalar>> = Vec::with_capacity(repetitions);
+    let mut cf_all: Vec<Vec<RistrettoPoint>> = Vec::with_capacity(repetitions);
     for (rep, rr) in arg.reenc_rounds.iter().enumerate() {
         t.append_u64(b"rep", rep as u64);
         let e = challenge_weights(&mut t, n);
@@ -860,9 +916,9 @@ fn verify_argument(
     // The combined commitment Cg_j = Σ_i β^i·Cf^(i)_j enters only the final
     // linear batch of `verify_permutation`, so it is never materialised: that
     // batch takes each Cf^(i)_j with coefficient β^i·(its Cg_j coefficient).
-    let mut beta_pows = Vec::with_capacity(CHAL_REPS);
+    let mut beta_pows = Vec::with_capacity(repetitions);
     let mut pw = Scalar::ONE;
-    for _ in 0..CHAL_REPS {
+    for _ in 0..repetitions {
         beta_pows.push(pw);
         pw *= beta;
     }
@@ -1209,7 +1265,7 @@ fn deserialize_argument(att: &str) -> Option<ShuffleArgument> {
 /// a ciphertext it never committed to). Returns `None` for a non-real / malformed
 /// attestation.
 pub fn output_deck_from_proof(proof: &ShuffleProof) -> Option<Vec<Ct>> {
-    if proof.scheme != SCHEME {
+    if proof.scheme != SCHEME && proof.scheme != CARD_SCHEME {
         return None;
     }
     let arg = deserialize_argument(&proof.attestation)?;

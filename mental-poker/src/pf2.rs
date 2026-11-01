@@ -332,6 +332,11 @@ fn hex32(s: &str, what: &'static str) -> Result<[u8; 32], Pf2Error> {
 /// deck; the key is the committed one; every opened ciphertext is taken from the
 /// self-recomputed final deck at a position the verifier derives itself.
 pub fn verify(bundle: &Bundle) -> Result<Verified, Pf2Error> {
+    verify_deck(bundle, 9)
+}
+
+/// Shared encrypted-deck verifier; game adapters impose their own deal layout.
+pub(crate) fn verify_deck(bundle: &Bundle, max_seats: usize) -> Result<Verified, Pf2Error> {
     if bundle.scheme != SCHEME {
         return Err(Pf2Error::Scheme);
     }
@@ -346,7 +351,7 @@ pub fn verify(bundle: &Bundle) -> Result<Verified, Pf2Error> {
         return Err(Pf2Error::Malformed("public_key"));
     }
     let seats = &bundle.dealt_seats;
-    if !(2..=9).contains(&seats.len()) || seats.windows(2).any(|w| w[0] >= w[1]) {
+    if !(2..=max_seats).contains(&seats.len()) || seats.windows(2).any(|w| w[0] >= w[1]) {
         return Err(Pf2Error::Seats);
     }
     let mut client_seeds = BTreeMap::new();

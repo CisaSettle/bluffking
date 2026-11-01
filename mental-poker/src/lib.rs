@@ -29,6 +29,7 @@
 #![forbid(unsafe_code)]
 
 pub mod card_id;
+pub mod card_proof;
 pub mod crypto;
 /// Real cryptography (ADR-063 primitives) — **GA'd for the engine-blind table
 /// class by ADR-070 (2026-06-23); cross-vendor AI-audited (ADR-076/077/078),
@@ -47,6 +48,7 @@ pub mod hash;
 pub mod mental;
 pub mod pf;
 pub mod pf2;
+pub mod pf2_zjh;
 pub mod provider;
 pub mod signing;
 pub mod state;
