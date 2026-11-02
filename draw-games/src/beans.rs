@@ -25,6 +25,15 @@ use crate::wallet::{self, Policy, Wallet};
 
 /// First-use grant; existing balances are preserved.
 pub const GRANT: i64 = 2_000;
+/// Keeps payouts and JSON integers bounded even for the largest solo multiplier.
+pub const MAX_ALL_IN: i64 = 1_000_000_000_000;
+pub fn solo_stake(base: i64, expected: Option<i64>) -> Option<i64> {
+    match expected {
+        None => Some(base),
+        Some(n) if (1..=MAX_ALL_IN).contains(&n) => Some(n),
+        _ => None,
+    }
+}
 /// Extra beans ADDED by the once-per-Singapore-day claim (not a refill-to
 /// target). Reduced alongside the deterministic membership exchange.
 pub const DAILY_REFILL_TO: i64 = 200;

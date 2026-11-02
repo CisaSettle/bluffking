@@ -191,6 +191,10 @@ pub struct LockedDeck {
     public_key: RistrettoPoint,
     shuffle: Shuffle,
     commit: [u8; 32],
+    // Baccarat never restricts its eight-deck shoe during rebind. Retain the
+    // ciphertext digest prepared off-thread instead of compressing 832 points
+    // again on the HTTP task for every offer. Context binding remains fresh.
+    baccarat_deck_hash: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -269,12 +273,19 @@ fn restrict(shuffle: &mut Shuffle, context: &Context) {
     shuffle.pi = chosen.iter().map(|(_, index)| *index).collect();
 }
 fn commit_of(context: &Context, public_key: &RistrettoPoint, deck: &[Ct]) -> [u8; 32] {
+    commit_of_deck_hash(context, public_key, &deck_hash(deck))
+}
+fn commit_of_deck_hash(
+    context: &Context,
+    public_key: &RistrettoPoint,
+    deck_hash: &[u8; 32],
+) -> [u8; 32] {
     ds_hash(
         "cards:commit:v1",
         &[
             &context.binding(),
             public_key.compress().as_bytes(),
-            &deck_hash(deck),
+            deck_hash,
         ],
     )
 }
@@ -319,13 +330,19 @@ impl LockedDeck {
             &mut random("cards:shuffle:v1", master, &context),
         );
         restrict(&mut shuffle, &context);
-        let commit = commit_of(&context, &public_key, &shuffle.output);
+        let baccarat_deck_hash =
+            (context.game == Game::Baccarat).then(|| deck_hash(&shuffle.output));
+        let commit = match &baccarat_deck_hash {
+            Some(hash) => commit_of_deck_hash(&context, &public_key, hash),
+            None => commit_of(&context, &public_key, &shuffle.output),
+        };
         Ok(Self {
             context,
             key,
             public_key,
             shuffle,
             commit,
+            baccarat_deck_hash,
         })
     }
     /// Bind a precomputed deck to its actual hand and original roster. The key
@@ -336,7 +353,10 @@ impl LockedDeck {
             return Err(Error::Context);
         }
         restrict(&mut self.shuffle, &context);
-        self.commit = commit_of(&context, &self.public_key, &self.shuffle.output);
+        self.commit = match &self.baccarat_deck_hash {
+            Some(hash) => commit_of_deck_hash(&context, &self.public_key, hash),
+            None => commit_of(&context, &self.public_key, &self.shuffle.output),
+        };
         self.context = context;
         Ok(())
     }

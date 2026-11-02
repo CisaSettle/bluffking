@@ -50,7 +50,7 @@ struct Rank {
 }
 
 /// Update both indexes through every existing wallet publication/invalidation path.
-/// Balance includes wallets with no completed hands; profit keeps its played-only rule.
+/// Both rankings include only wallets with completed gold-bean games.
 #[derive(Default)]
 struct Rankings {
     profit: BTreeSet<RankKey>,
@@ -60,8 +60,8 @@ impl Rankings {
     fn insert(&mut self, rank: Rank) {
         if rank.profit.1 .0 > 0 {
             self.profit.insert(rank.profit);
+            self.balance.insert(rank.balance);
         }
-        self.balance.insert(rank.balance);
     }
     fn remove(&mut self, rank: &Rank) {
         self.profit.remove(&rank.profit);
@@ -574,6 +574,8 @@ fn add_ledger(
     } else {
         let game = if details["purpose"] == "claw_grab" {
             "claw"
+        } else if details["game"] == "roulette" {
+            "roulette"
         } else {
             "slots"
         };
@@ -659,7 +661,7 @@ pub async fn hydrate(pool: &PgPool) -> sqlx::Result<()> {
             }
         }
         {
-            let mut rows = sqlx::query_as::<_, (i64, Uuid, Option<Uuid>, i64, Value)>("SELECT id,user_id,record_id,balance_after,details FROM wallet_ledger WHERE game=$1 AND (details->>'purpose'='casual_entry' OR (kind='play' AND (details->>'purpose'='claw_grab' OR details->>'game'='slots'))) AND id>0 ORDER BY id")
+            let mut rows = sqlx::query_as::<_, (i64, Uuid, Option<Uuid>, i64, Value)>("SELECT id,user_id,record_id,balance_after,details FROM wallet_ledger WHERE game=$1 AND (details->>'purpose'='casual_entry' OR (kind='play' AND (details->>'purpose'='claw_grab' OR details->>'game' IN ('slots','roulette')))) AND id>0 ORDER BY id")
                 .bind(crate::game_catalog::BEANS).fetch(&mut *tx);
             while let Some((_, owner, record, balance, details)) = rows.try_next().await? {
                 if let Some(user) = loaded.users.get_mut(&owner) {
@@ -905,7 +907,7 @@ async fn read_user(
         }
         let mut after = 0i64;
         loop {
-            let rows: Vec<(i64, Option<Uuid>, i64, Value)> = sqlx::query_as("SELECT id,record_id,balance_after,details FROM wallet_ledger WHERE user_id=$1 AND game=$2 AND (details->>'purpose'='casual_entry' OR (kind='play' AND (details->>'purpose'='claw_grab' OR details->>'game'='slots'))) AND id>$3 ORDER BY id LIMIT $4")
+            let rows: Vec<(i64, Option<Uuid>, i64, Value)> = sqlx::query_as("SELECT id,record_id,balance_after,details FROM wallet_ledger WHERE user_id=$1 AND game=$2 AND (details->>'purpose'='casual_entry' OR (kind='play' AND (details->>'purpose'='claw_grab' OR details->>'game' IN ('slots','roulette')))) AND id>$3 ORDER BY id LIMIT $4")
                 .bind(id).bind(crate::game_catalog::BEANS).bind(after).bind(PAGE).fetch_all(&mut *tx).await?;
             if rows.is_empty() { break; }
             for (cursor, record, balance, details) in rows { after = cursor; add_ledger(&mut user, record, balance, details)?; }

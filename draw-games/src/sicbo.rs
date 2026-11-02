@@ -37,6 +37,8 @@ pub struct Bet {
     pub request_id: Uuid,
     pub side: Side,
     pub stake: i64,
+    #[serde(default)]
+    pub expected_balance: Option<i64>,
     pub session_id: Uuid,
     pub fairness: crate::draw_fairness::Challenge,
 }
@@ -66,6 +68,7 @@ pub enum Error {
     Invalid,
     Conflict,
     Balance,
+    BalanceChanged,
     /// Seated in a shared sicbo room: solo rolls and refills wait until the
     /// player leaves it, so a pending room wager is always covered.
     InRoom,
@@ -82,6 +85,7 @@ impl IntoResponse for Error {
         let (status, code) = match self {
             Self::Invalid => (StatusCode::BAD_REQUEST, "invalid_bet"),
             Self::Conflict => (StatusCode::CONFLICT, "request_conflict"),
+            Self::BalanceChanged => (StatusCode::CONFLICT, "balance_changed"),
             Self::Balance => (StatusCode::BAD_REQUEST, "insufficient_balance"),
             Self::InRoom => (StatusCode::CONFLICT, "in_room"),
             Self::BeansInUse => (StatusCode::CONFLICT, "beans_in_use"),
@@ -131,7 +135,7 @@ async fn saved(
     }))
 }
 pub async fn play(pool: &PgPool, user: Uuid, bet: &Bet) -> Result<BetResult, Error> {
-    if !(MIN_STAKE..=MAX_STAKE).contains(&bet.stake)
+    if Some(bet.stake) != crate::beans::solo_stake(MIN_STAKE, bet.expected_balance)
         || bet.request_id.is_nil()
         || bet.session_id.is_nil()
     {
@@ -166,7 +170,14 @@ pub async fn play(pool: &PgPool, user: Uuid, bet: &Bet) -> Result<BetResult, Err
     if round_in_play {
         return Err(Error::Conflict);
     }
-    if bet.stake > crate::beans::available_on(pool, &mut tx, user, balance, None).await? {
+    let available = crate::beans::available_on(pool, &mut tx, user, balance, None).await?;
+    if bet
+        .expected_balance
+        .is_some_and(|expected| expected != available)
+    {
+        return Err(Error::BalanceChanged);
+    }
+    if bet.stake > available {
         return Err(Error::Balance);
     }
     let challenge = &bet.fairness;
