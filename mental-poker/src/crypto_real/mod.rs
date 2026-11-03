@@ -27,6 +27,7 @@ pub mod decrypt;
 pub mod dkg;
 pub mod ec;
 pub mod ed25519_signer;
+pub mod recovery;
 pub mod shuffle;
 
 pub use ed25519_signer::Ed25519SignatureProvider;

@@ -176,7 +176,10 @@ pub struct DecryptionShare {
     /// `D_i = x_i·C1` as 64-hex point.
     pub d_i: String,
     /// Chaum–Pedersen proof that `D_i` is correct.
-    pub dleq: DleqProof,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dleq: Option<DleqProof>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<Box<super::recovery::RecoveryEvidence>>,
 }
 
 /// The full opening proof for one card: one share per party (spec §4.5).
@@ -208,7 +211,8 @@ pub fn partial_decrypt<R: RngCore + CryptoRng>(
     DecryptionShare {
         party_id: party.party_id.clone(),
         d_i: point_to_hex(&d_i),
-        dleq,
+        dleq: Some(dleq),
+        recovery: None,
     }
 }
 
@@ -254,7 +258,28 @@ pub fn verify_decryption_share(
     }
     let d_i =
         point_from_hex(&share.d_i).ok_or_else(|| OpenError::Malformed(share.party_id.clone()))?;
-    if !dleq_verify(&share.party_id, deck_index, &q_i, ct, &d_i, &share.dleq) {
+    if let Some(evidence) = &share.recovery {
+        if share.dleq.is_some()
+            || evidence.core.dealer != share.party_id
+            || evidence.core.deck_index != deck_index
+            || evidence.core.ct != ct.to_wire()
+            || evidence.core.keys.len() != party_pubkeys.len()
+            || !evidence.core.keys.iter().all(|key| {
+                party_pubkeys
+                    .iter()
+                    .any(|(id, q)| key.party_id == *id && key.q_i == point_to_hex(q))
+            })
+            || super::recovery::reconstruct(evidence).ok() != Some(d_i)
+        {
+            return Err(OpenError::BadProof(share.party_id.clone()));
+        }
+        return Ok(());
+    }
+    let dleq = share
+        .dleq
+        .as_ref()
+        .ok_or_else(|| OpenError::BadProof(share.party_id.clone()))?;
+    if !dleq_verify(&share.party_id, deck_index, &q_i, ct, &d_i, dleq) {
         return Err(OpenError::BadProof(share.party_id.clone()));
     }
     Ok(())
@@ -329,13 +354,22 @@ pub fn verify_and_open_point(
         }
         let d_i = point_from_hex(&share.d_i)
             .ok_or_else(|| OpenError::Malformed(share.party_id.clone()))?;
+        if share.recovery.is_some() {
+            verify_decryption_share(deck_index, ct, party_pubkeys, share)?;
+            sum_d += d_i;
+            continue;
+        }
+        let dleq = share
+            .dleq
+            .as_ref()
+            .ok_or_else(|| OpenError::BadProof(share.party_id.clone()))?;
         // A malformed DLEQ field is a `false` from `dleq_verify`, i.e. BadProof.
-        let a = point_from_hex(&share.dleq.a)
-            .ok_or_else(|| OpenError::BadProof(share.party_id.clone()))?;
-        let b = point_from_hex(&share.dleq.b)
-            .ok_or_else(|| OpenError::BadProof(share.party_id.clone()))?;
-        let s = scalar_from_hex(&share.dleq.s)
-            .ok_or_else(|| OpenError::BadProof(share.party_id.clone()))?;
+        let a =
+            point_from_hex(&dleq.a).ok_or_else(|| OpenError::BadProof(share.party_id.clone()))?;
+        let b =
+            point_from_hex(&dleq.b).ok_or_else(|| OpenError::BadProof(share.party_id.clone()))?;
+        let s =
+            scalar_from_hex(&dleq.s).ok_or_else(|| OpenError::BadProof(share.party_id.clone()))?;
         let c = dleq_challenge(
             &share.party_id,
             deck_index,
