@@ -7,6 +7,7 @@ use super::{
     Game,
 };
 use crate::db_writer::PgPool;
+use crate::request_timing::{lottery_span, LotteryStage};
 use crate::{
     beans_read_memory::{self, PendingEffect},
     write_behind::Ordered,
@@ -1076,6 +1077,7 @@ pub async fn buy_numbers(
     game: Game,
     body: &NumberBuy,
 ) -> Result<Purchase, Error> {
+    let validation = lottery_span(LotteryStage::Validate);
     player(pool, user)?;
     let entries = body
         .tickets
@@ -1089,26 +1091,37 @@ pub async fn buy_numbers(
     }
     let hash = store::body_sha256(&identity);
     let state = state(pool);
-    let command = state.commands.lock().await;
-    let (replay, wallet) = store::replay_request_and_wallet(
-        &mut *pool.acquire().await?,
-        game,
-        user,
-        body.request_id,
-        &hash,
-    )
-    .await?;
+    drop(validation);
+    let command = {
+        let _span = lottery_span(LotteryStage::CommandWait);
+        state.commands.lock().await
+    };
+    let (replay, wallet) = {
+        let mut conn = {
+            let _span = lottery_span(LotteryStage::ReplayPool);
+            pool.acquire().await?
+        };
+        let _span = lottery_span(LotteryStage::ReplayQuery);
+        store::replay_request_and_wallet(&mut conn, game, user, body.request_id, &hash).await?
+    };
     let (purchase, receipt) = if let Some(p) = replay {
         (
             p,
             pending_receipt(&state, super::purchase_id(user, body.request_id)),
         )
     } else {
-        wallet_ready_after(pool, user, wallet).await?;
+        {
+            let _span = lottery_span(LotteryStage::WalletReady);
+            wallet_ready_after(pool, user, wallet).await?;
+        }
+        let _span = lottery_span(LotteryStage::Accept);
         accept_numbers(pool, user, game, body)?
     };
     drop(command);
-    receipt.wait().await?;
+    {
+        let _span = lottery_span(LotteryStage::CommitWait);
+        receipt.wait().await?;
+    }
     Ok(purchase)
 }
 
@@ -1136,6 +1149,7 @@ pub async fn buy_scratch(
     user: Uuid,
     body: &super::scratch::ScratchBuy,
 ) -> Result<Purchase, Error> {
+    let validation = lottery_span(LotteryStage::Validate);
     player(pool, user)?;
     let mut identity = json!({"game":"scratch","cost":body.cost,"count":body.count,"fairness":{"offer_id":body.fairness.offer_id,"commitment":body.fairness.commitment,"client_seed":body.fairness.client_seed}});
     if body.all_in {
@@ -1144,16 +1158,24 @@ pub async fn buy_scratch(
     }
     let hash = store::body_sha256(&identity);
     let state = state(pool);
-    let command = state.commands.lock().await;
-    prepare_scratch(pool, user, None).await?;
-    let (replay, wallet) = store::replay_request_and_wallet(
-        &mut *pool.acquire().await?,
-        Game::Scratch,
-        user,
-        body.request_id,
-        &hash,
-    )
-    .await?;
+    drop(validation);
+    let command = {
+        let _span = lottery_span(LotteryStage::CommandWait);
+        state.commands.lock().await
+    };
+    {
+        let _span = lottery_span(LotteryStage::ScratchPrepare);
+        prepare_scratch(pool, user, None).await?;
+    }
+    let (replay, wallet) = {
+        let mut conn = {
+            let _span = lottery_span(LotteryStage::ReplayPool);
+            pool.acquire().await?
+        };
+        let _span = lottery_span(LotteryStage::ReplayQuery);
+        store::replay_request_and_wallet(&mut conn, Game::Scratch, user, body.request_id, &hash)
+            .await?
+    };
     let (purchase, receipt) = if let Some(p) = replay {
         let id = if body.count > 1 || body.all_in {
             super::scratch_batch_id(user, body.request_id)
@@ -1162,11 +1184,19 @@ pub async fn buy_scratch(
         };
         (p, pending_receipt(&state, id))
     } else {
-        wallet_ready_after(pool, user, wallet).await?;
+        {
+            let _span = lottery_span(LotteryStage::WalletReady);
+            wallet_ready_after(pool, user, wallet).await?;
+        }
+        let _span = lottery_span(LotteryStage::Accept);
         accept_scratch(pool, user, body)?
     };
     drop(command);
-    let cards = receipt.wait().await?;
+    let cards = {
+        let _span = lottery_span(LotteryStage::CommitWait);
+        receipt.wait().await?
+    };
+    let _span = lottery_span(LotteryStage::Reply);
     Ok(committed_purchase(purchase, &cards))
 }
 

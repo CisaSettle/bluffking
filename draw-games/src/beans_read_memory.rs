@@ -81,16 +81,19 @@ struct User {
     /// accounting obligations. This wallet cannot be read or admitted again.
     retired: bool,
     generation: u64,
+    publication_observation: Option<Uuid>,
     bytes: usize,
     /// Accepted poker deltas not yet acknowledged by their durable writer.
-    poker: HashMap<Uuid, i64>,
+    poker: HashMap<Uuid, beans::PokerEffect>,
     effects: HashMap<Uuid, PendingEffect>,
     effect_hold: Option<std::fs::File>,
 }
 #[derive(Clone)]
 struct PokerReceipt {
-    players: Vec<(Uuid, i64)>,
+    players: Vec<(Uuid, beans::PokerEffect)>,
     committed: bool,
+    session: Option<Uuid>,
+    departures: Vec<(Uuid, chrono::DateTime<chrono::Utc>, u64)>,
 }
 #[derive(Clone)]
 pub struct Recent {
@@ -314,6 +317,37 @@ fn unavailable() -> sqlx::Error {
     sqlx::Error::Protocol("beans read memory unavailable".into())
 }
 
+/// Slow profile completion captures the last attempt even when its read timed
+/// out before publication notified it. Never invoke the arbitrary read closure
+/// again for diagnostics. Fast profiles add no state lookup or lock.
+pub struct ProfilePublicationObservation<'a> {
+    pool: &'a PgPool,
+    user: Uuid,
+    started: std::time::Instant,
+}
+pub fn observe_profile_publication(pool: &PgPool, user: Uuid) -> ProfilePublicationObservation<'_> {
+    ProfilePublicationObservation {
+        pool,
+        user,
+        started: std::time::Instant::now(),
+    }
+}
+impl Drop for ProfilePublicationObservation<'_> {
+    fn drop(&mut self) {
+        if self.started.elapsed() < Duration::from_millis(100) {
+            return;
+        }
+        let state = state(self.pool);
+        let inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
+        crate::request_timing::record_beans_publication_observation(
+            inner
+                .users
+                .get(&self.user)
+                .and_then(|user| user.publication_observation),
+        );
+    }
+}
+
 /// An acknowledged money write can precede its complete read projection.
 /// Wait only for the existing background publisher: GETs never query SQL or
 /// serve the fenced balance. Cancellation releases the bounded waiter slot;
@@ -396,8 +430,8 @@ fn count(user: &User) -> usize {
     user.days.len() + user.receipts.len() + user.latest.len() + user.effects.len() + 1
 }
 
-fn apply_poker(wallet: &mut Wallet, delta: i64) -> sqlx::Result<()> {
-    apply_poker_totals(wallet, delta, 1, i32::from(delta > 0))
+fn apply_poker(wallet: &mut Wallet, effect: beans::PokerEffect) -> sqlx::Result<()> {
+    apply_poker_totals(wallet, effect.delta, effect.played, effect.won)
 }
 
 fn apply_poker_totals(wallet: &mut Wallet, delta: i64, played: i32, won: i32) -> sqlx::Result<()> {
@@ -430,17 +464,30 @@ pub fn accept_poker_hand_with(
     checkpoint: Option<&crate::runtime_checkpoint::RuntimeCheckpoint>,
     enqueue: impl FnOnce() -> sqlx::Result<()>,
 ) -> sqlx::Result<()> {
+    accept_poker_effects_with(
+        pool,
+        hand.id,
+        beans::hand_effects(hand)?,
+        hand.session_id.zip(checkpoint),
+        Some(hand),
+        enqueue,
+    )
+}
+
+pub(crate) fn accept_poker_effects_with<T>(
+    pool: &PgPool,
+    record: Uuid,
+    players: Vec<(Uuid, beans::PokerEffect)>,
+    checkpoint: Option<(Uuid, &crate::runtime_checkpoint::RuntimeCheckpoint)>,
+    departed_hand: Option<&crate::persist::HandRecord>,
+    enqueue: impl FnOnce() -> sqlx::Result<T>,
+) -> sqlx::Result<T> {
     let state = state(pool);
     let mut inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
-    if !inner.ready || hand.players.is_empty() || hand.players.len() > 10 {
+    if !inner.ready || players.is_empty() || players.len() > 10 {
         return Err(unavailable());
     }
-    let players: Vec<_> = hand
-        .players
-        .iter()
-        .map(|p| (p.user_id, i64::from(p.delta)))
-        .collect();
-    if let Some(existing) = inner.poker.get(&hand.id) {
+    if let Some(existing) = inner.poker.get(&record) {
         if existing.players != players {
             return Err(sqlx::Error::Protocol(
                 "poker settlement identity changed".into(),
@@ -462,8 +509,12 @@ pub fn accept_poker_hand_with(
         apply_poker(&mut wallet, *delta)?;
         updated.push((*id, *delta, wallet));
     }
-    enqueue()?;
-    if let (Some(session), Some(checkpoint)) = (hand.session_id, checkpoint) {
+    let (result, departures) = if let Some(hand) = departed_hand {
+        crate::live_directory::settle_departed_beans_with(pool, hand, enqueue)?
+    } else {
+        (enqueue()?, Vec::new())
+    };
+    if let Some((session, checkpoint)) = checkpoint {
         inner.reservations.checkpoint(session, checkpoint);
     }
     inner.epoch = inner.epoch.wrapping_add(1);
@@ -474,21 +525,23 @@ pub fn accept_poker_hand_with(
         }
         let user = inner.users.get_mut(&id).expect("validated poker wallet");
         user.wallet = Some(wallet);
-        user.poker.insert(hand.id, delta);
+        user.poker.insert(record, delta);
         user.generation = generation;
         if let Some(key) = rank(id, user) {
             inner.ranks.insert(key);
         }
     }
     inner.poker.insert(
-        hand.id,
+        record,
         PokerReceipt {
             players,
             committed: false,
+            session: departed_hand.and_then(|hand| hand.session_id),
+            departures,
         },
     );
     state.published.notify_waiters();
-    Ok(())
+    Ok(result)
 }
 
 pub fn poker_accepted(pool: &PgPool, hand: Uuid) -> bool {
@@ -512,6 +565,9 @@ pub fn poker_committed(pool: &PgPool, hand: Uuid) {
         return;
     }
     receipt.committed = true;
+    if let Some(session) = receipt.session {
+        crate::live_directory::acknowledge_members(pool, session, &receipt.departures);
+    }
     let players = receipt.players.clone();
     inner.epoch = inner.epoch.wrapping_add(1);
     let generation = inner.epoch;
@@ -677,7 +733,7 @@ pub async fn hydrate(pool: &PgPool) -> sqlx::Result<()> {
         let rooms: Vec<(String, Value)> = sqlx::query_as("SELECT code,state FROM game_room_checkpoints WHERE game='sicbo'")
             .fetch_all(&mut *tx).await?;
         for (code, snapshot) in rooms { loaded.reservations.sicbo_commit(&code, &snapshot); }
-        let cards: Vec<(String, String, i64, Value)> = sqlx::query_as("SELECT game,code,revision,state FROM game_room_checkpoints WHERE game IN ('zjh','niuniu','shortdeck') AND state->'opts'->>'beans'='true'").fetch_all(&mut *tx).await?;
+        let cards: Vec<(String, String, i64, Value)> = sqlx::query_as("SELECT game,code,revision,state FROM game_room_checkpoints WHERE game IN ('zjh','niuniu','shortdeck','sangong','ddz','blackjack','gomoku','checkers','colorcards','zhuoji','chengdu','guandan','xiangqi','kwx') AND (state->'opts'->>'beans'='true' OR state->'bean_match'->>'enabled'='true')").fetch_all(&mut *tx).await?;
         for (game, code, revision, snapshot) in cards { loaded.cards.hydrate(&game, &code, revision as u64, &snapshot)?; }
         tx.commit().await?;
         Ok::<_, sqlx::Error>(loaded)
@@ -759,6 +815,7 @@ fn invalidate_locked(inner: &mut Inner, id: Uuid) {
     let user = inner.users.get_mut(&id).expect("beans user installed");
     user.generation = generation;
     user.available = false;
+    user.publication_observation = None;
     user.retired = false;
     inner.pending.insert(id);
 }
@@ -887,15 +944,24 @@ pub fn remove_user(pool: &PgPool, id: Uuid) {
 async fn read_user(
     pool: &PgPool,
     id: Uuid,
-    poker: HashMap<Uuid, i64>,
+    poker: HashMap<Uuid, beans::PokerEffect>,
     effects: HashMap<Uuid, PendingEffect>,
+    evidence: &mut publication_evidence::Observation,
 ) -> sqlx::Result<User> {
     tokio::time::timeout(Duration::from_secs(10), async {
-        crate::live_directory::wait_for_open_transactions(pool).await?;
+        evidence.stage("fence_sample");
+        let fence = crate::live_directory::OpenTransactions::sample(pool).await?;
+        evidence.transactions = fence.diagnostic_transactions();
+        evidence.transaction_count = fence.transaction_count();
+        evidence.stage("fence_wait");
+        fence.wait(pool, Duration::from_millis(20)).await?;
+        evidence.stage("snapshot_begin");
         let mut tx = crate::live_directory::begin_read_snapshot(pool).await?;
+        evidence.stage("wallet");
         let query = String::from("SELECT w.balance,w.net_won,w.hands_played,w.hands_won,w.refills,TRUE AS eligible FROM wallets w JOIN users u ON u.id=w.user_id WHERE w.game=$1 AND w.user_id=$2 AND u.deleted_at IS DISTINCT FROM 'epoch'::timestamptz");
         let row = sqlx::query(&query).bind(crate::game_catalog::BEANS).bind(id).fetch_optional(&mut *tx).await?;
         let mut user = User { wallet: row.as_ref().map(wallet), eligible: row.as_ref().is_some_and(|r| r.get("eligible")), available: true, bytes: 512, ..User::default() };
+        evidence.stage("daily_history");
         let mut after = None::<NaiveDate>;
         loop {
             let rows: Vec<NaiveDate> = sqlx::query_scalar("SELECT usage_date FROM daily_usage WHERE scope='feature_user' AND subject_key=$1 AND feature=$2 AND ($3::date IS NULL OR usage_date>$3) ORDER BY usage_date LIMIT $4")
@@ -905,6 +971,7 @@ async fn read_user(
             for day in rows { user.days.insert(day); user.bytes += 64; }
             if count(&user) > MAX_ROWS || user.bytes > MAX_BYTES { return Err(unavailable()); }
         }
+        evidence.stage("ledger_history");
         let mut after = 0i64;
         loop {
             let rows: Vec<(i64, Option<Uuid>, i64, Value)> = sqlx::query_as("SELECT id,record_id,balance_after,details FROM wallet_ledger WHERE user_id=$1 AND game=$2 AND (details->>'purpose'='casual_entry' OR (kind='play' AND (details->>'purpose'='claw_grab' OR details->>'game' IN ('slots','roulette')))) AND id>$3 ORDER BY id LIMIT $4")
@@ -916,13 +983,14 @@ async fn read_user(
         // The wallet and receipt membership come from this same MVCC snapshot.
         // A lost acknowledgement may already be present in SQL; overlay only
         // the accepted hands that this snapshot has not committed yet.
+        evidence.stage("poker_receipts");
         if !poker.is_empty() {
             let ids: Vec<_> = poker.keys().copied().collect();
             let applied: Vec<(Uuid, i64)> = sqlx::query_as("SELECT record_id,delta FROM wallet_ledger WHERE game=$1 AND user_id=$2 AND kind='play' AND record_id=ANY($3)")
                 .bind(crate::game_catalog::BEANS).bind(id).bind(&ids).fetch_all(&mut *tx).await?;
             let mut seen = HashSet::new();
             for (hand, delta) in applied {
-                if poker.get(&hand) != Some(&delta) || !seen.insert(hand) {
+                if poker.get(&hand).map(|effect| effect.delta) != Some(delta) || !seen.insert(hand) {
                     return Err(sqlx::Error::Protocol("poker receipt does not match accepted settlement".into()));
                 }
             }
@@ -932,15 +1000,16 @@ async fn read_user(
             let (mut delta_total, mut played, mut won) = (0i64, 0i32, 0i32);
             for (hand, delta) in &poker {
                 if !seen.contains(hand) {
-                    delta_total = delta_total.checked_add(*delta).ok_or_else(unavailable)?;
-                    played = played.checked_add(1).ok_or_else(unavailable)?;
-                    won = won.checked_add(i32::from(*delta > 0)).ok_or_else(unavailable)?;
+                    delta_total = delta_total.checked_add(delta.delta).ok_or_else(unavailable)?;
+                    played = played.checked_add(delta.played).ok_or_else(unavailable)?;
+                    won = won.checked_add(delta.won).ok_or_else(unavailable)?;
                 }
             }
             let wallet = user.wallet.as_mut().ok_or_else(unavailable)?;
             apply_poker_totals(wallet, delta_total, played, won)?;
             user.poker = poker;
         }
+        evidence.stage("effect_receipts");
         if !effects.is_empty() {
             let ids: Vec<_> = effects.keys().copied().collect();
             let applied: Vec<(Uuid,i64)> = sqlx::query_as("SELECT record_id,delta FROM wallet_ledger WHERE game=$1 AND user_id=$2 AND record_id=ANY($3)")
@@ -963,6 +1032,7 @@ async fn read_user(
             user.bytes += effects.len()*256;
             user.effects=effects;
         }
+        evidence.stage("snapshot_commit");
         tx.commit().await?;
         Ok::<_, sqlx::Error>(user)
     }).await.map_err(|_| sqlx::Error::PoolTimedOut)?
@@ -1022,8 +1092,20 @@ async fn refresh_loop(pool: PgPool, state: Arc<State>) {
         after = batch.last().map(|(id, _, _, _)| *id);
         let mut failed = false;
         for (id, generation, poker, effects) in batch {
+            let mut evidence = publication_evidence::Observation::new();
+            {
+                let mut inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(user) = inner
+                    .users
+                    .get_mut(&id)
+                    .filter(|u| u.generation == generation)
+                {
+                    user.publication_observation = Some(evidence.id);
+                }
+            }
             let _loader = state.loader.lock().await;
-            let result = read_user(&pool, id, poker, effects).await;
+            let result = read_user(&pool, id, poker, effects, &mut evidence).await;
+            evidence.stage("install");
             match result {
                 Ok(mut user) => {
                     let mut inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -1033,20 +1115,25 @@ async fn refresh_loop(pool: PgPool, state: Arc<State>) {
                             .get(&id)
                             .is_some_and(|current| current.generation == generation)
                     {
+                        evidence.outcome = "generation_changed";
                         continue;
                     }
                     if let Some(current) = inner.users.get_mut(&id) {
                         user.effect_hold = current.effect_hold.take();
                     }
                     user.generation = generation;
+                    user.publication_observation = Some(evidence.id);
                     if replace(&mut inner, id, user).is_ok() {
+                        evidence.outcome = "published";
                         inner.pending.remove(&id);
                         state.published.notify_waiters();
                     } else {
+                        evidence.outcome = "capacity_rejected";
                         failed = true;
                     }
                 }
                 Err(_) => {
+                    evidence.outcome = "load_error_or_timeout";
                     failed = true;
                     failures = failures.saturating_add(1);
                     if failures.is_power_of_two() {
@@ -1346,3 +1433,6 @@ pub(crate) async fn initial_grant_durable(pool: &PgPool) -> sqlx::Result<()> {
         .map_err(|_| unavailable())?;
     Ok(())
 }
+
+#[path = "beans_publication_evidence.rs"]
+mod publication_evidence;

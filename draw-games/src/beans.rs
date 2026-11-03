@@ -42,7 +42,31 @@ pub const STAKE_KEY: &str = "10/20";
 pub const SB: u32 = 10;
 pub const BB: u32 = 20;
 pub const BUY_IN: u32 = 2_000;
-pub const SEATS: i16 = 6;
+
+/// A departed member must bring back the same stack in this room generation.
+/// A NULL stack (legacy departures that recorded none, terminal departures)
+/// is no resumable stack: the member re-enters exactly like a new one, with a
+/// fresh default buy-in. Malformed or oversized stored stacks stay rejected.
+pub(crate) fn reentry_chips(
+    value: Option<&serde_json::Value>,
+) -> Result<Option<crate::runtime_checkpoint::StandingChips>, &'static str> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let saved: crate::runtime_checkpoint::StandingChips =
+        serde_json::from_value(value.clone()).map_err(|_| "room_unavailable")?;
+    if saved
+        .stack
+        .checked_add(saved.pending_chips)
+        .is_none_or(|total| total > u64::from(u32::MAX))
+    {
+        return Err("room_unavailable");
+    }
+    Ok(Some(saved))
+}
+pub const SEATS: i16 = 9;
+/// New public tables run for 24 hours from the first deal.
+pub const PUBLIC_TABLE_DURATION_SECS: i64 = 86_400;
 /// Paid pack (owner anchor ¥100 ≈ US$13.99 for 10,000).
 pub const PACK_BEANS: i64 = 10_000;
 pub const PACK_USD_CENTS_DEFAULT: i64 = 1_399;
@@ -93,17 +117,17 @@ pub async fn spendable(pool: &PgPool, conn: &mut PgConnection, user: Uuid) -> sq
         let occupied = directory.memberships_for(user).any(|(room, member)| {
             member.left_at.is_none()
                 && room.ended_at.is_none()
-                && directory
-                    .public_tables
-                    .iter()
-                    .any(|table| table.beans && table.session_id == Some(room.id))
+                && room
+                    .session_config
+                    .as_ref()
+                    .is_some_and(|c| c["beans"] == true)
         });
         occupied
     } else {
         sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM session_users su JOIN game_sessions gs ON gs.id=su.session_id
-         JOIN public_tables pt ON pt.session_id=gs.id
-         WHERE su.user_id=$1 AND su.left_at IS NULL AND gs.ended_at IS NULL AND pt.beans)",
+         LEFT JOIN public_tables pt ON pt.session_id=gs.id
+         WHERE su.user_id=$1 AND su.left_at IS NULL AND gs.ended_at IS NULL AND (pt.beans OR gs.session_config->>'beans'='true'))",
     )
     .bind(user)
     .fetch_one(&mut *conn)
@@ -128,7 +152,7 @@ pub async fn available_on(
     if !crate::realtime_mode::enabled() {
         if excluding_sicbo.is_some() {
             let poker_seated: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM session_users su JOIN game_sessions gs ON gs.id=su.session_id JOIN public_tables pt ON pt.session_id=gs.id WHERE su.user_id=$1 AND su.left_at IS NULL AND gs.ended_at IS NULL AND pt.beans)",
+                "SELECT EXISTS(SELECT 1 FROM session_users su JOIN game_sessions gs ON gs.id=su.session_id LEFT JOIN public_tables pt ON pt.session_id=gs.id WHERE su.user_id=$1 AND su.left_at IS NULL AND gs.ended_at IS NULL AND (pt.beans OR gs.session_config->>'beans'='true'))",
             ).bind(user).fetch_one(&mut *conn).await?;
             return Ok(
                 if poker_seated
@@ -188,6 +212,8 @@ pub struct Profile {
 }
 
 pub async fn profile(pool: &PgPool, user: Uuid) -> sqlx::Result<Profile> {
+    let _publication_observation =
+        crate::beans_read_memory::observe_profile_publication(pool, user);
     let (w, daily_available) = crate::beans_read_memory::read_after_publication(pool, || {
         crate::beans_read_memory::profile(pool, user)
     })
@@ -206,7 +232,7 @@ pub async fn profile(pool: &PgPool, user: Uuid) -> sqlx::Result<Profile> {
         buy_in: BUY_IN,
         stake: STAKE_KEY,
         daily_refill_to: DAILY_REFILL_TO,
-        initial_grant: GRANT,
+        initial_grant: crate::auth::registration_reward::BEANS,
         daily_available,
         pack_beans: PACK_BEANS,
         pack_usd_cents: pack_usd_cents(),
@@ -297,6 +323,70 @@ pub async fn claim_daily(pool: &PgPool, user: Uuid) -> sqlx::Result<DailyOutcome
     })
 }
 
+/// One wallet effect, also used by the accepted-memory overlay and replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PokerEffect {
+    pub delta: i64,
+    pub played: i32,
+    pub won: i32,
+    pub squid_delta: i64,
+}
+
+impl PokerEffect {
+    pub fn hand(delta: i64) -> Self {
+        Self {
+            delta,
+            played: 1,
+            won: i32::from(delta > 0),
+            squid_delta: 0,
+        }
+    }
+}
+
+pub fn hand_effects(hand: &crate::persist::HandRecord) -> sqlx::Result<Vec<(Uuid, PokerEffect)>> {
+    let mut effects = std::collections::BTreeMap::new();
+    for player in &hand.players {
+        if effects
+            .insert(
+                player.user_id,
+                PokerEffect {
+                    delta: i64::from(player.delta),
+                    played: 1,
+                    won: i32::from(player.delta > 0),
+                    squid_delta: 0,
+                },
+            )
+            .is_some()
+        {
+            return Err(sqlx::Error::Protocol("duplicate poker wallet owner".into()));
+        }
+    }
+    if !hand.squid_rounds.is_empty() {
+        if hand.squid_rounds.iter().any(|round| {
+            Some(round.session_id) != hand.session_id
+                || round.total_amount != round.loser_stack_debit
+        }) {
+            return Err(sqlx::Error::Protocol(
+                "invalid bean squid hand settlement".into(),
+            ));
+        }
+        for (user, delta) in crate::squid_ledger::bean_deltas(&hand.squid_rounds)? {
+            let effect = effects.entry(user).or_insert(PokerEffect {
+                delta: 0,
+                played: 0,
+                won: 0,
+                squid_delta: 0,
+            });
+            effect.delta = effect
+                .delta
+                .checked_add(delta)
+                .ok_or_else(|| sqlx::Error::Protocol("squid delta overflow".into()))?;
+            effect.squid_delta = delta;
+        }
+    }
+    Ok(effects.into_iter().collect())
+}
+
 /// Settles one completed public-table hand into every human's beans wallet
 /// on the caller's transaction (the hand write). Idempotency comes from the
 /// `(game, record_id, user_id)` unique ledger index: the caller only invokes
@@ -307,16 +397,17 @@ pub async fn claim_daily(pool: &PgPool, user: Uuid) -> sqlx::Result<DailyOutcome
 pub async fn settle_hand_on(
     conn: &mut PgConnection,
     hand_id: Uuid,
-    players: &[(Uuid, i64)],
+    players: &[(Uuid, PokerEffect)],
     has_bots: bool,
     memory_accepted: bool,
 ) -> sqlx::Result<()> {
     // Lock wallets in user-id order, like every other multi-wallet settlement,
     // so overlapping settlements can never deadlock on lock order.
-    let mut ordered: Vec<&(Uuid, i64)> = players.iter().collect();
+    let mut ordered: Vec<_> = players.iter().collect();
     ordered.sort_unstable_by_key(|(user, _)| *user);
-    for (user, delta) in ordered {
-        if memory_accepted {
+    for (user, effect) in ordered {
+        let delta = &effect.delta;
+        if memory_accepted || effect.squid_delta != 0 {
             // The startup-ready authority can grant a first wallet before its
             // separate grant writer commits. This idempotent operation keeps
             // that grant and this hand's receipt ordered under the wallet lock.
@@ -326,7 +417,9 @@ pub async fn settle_hand_on(
             tracing::warn!(hand_id = %hand_id, user = %user, "beans_settle_no_wallet");
             continue;
         };
-        if memory_accepted && balance.checked_add(*delta).is_none_or(|after| after < 0) {
+        if (memory_accepted || effect.squid_delta != 0)
+            && balance.checked_add(*delta).is_none_or(|after| after < 0)
+        {
             return Err(sqlx::Error::Protocol(
                 "accepted poker settlement conflicts with durable wallet".into(),
             ));
@@ -343,12 +436,14 @@ pub async fn settle_hand_on(
         let play = wallet::Play {
             record_id: hand_id,
             delta: applied,
-            completes_hand: true,
-            won: applied > 0,
+            completes_hand: effect.played > 0,
+            won: effect.won > 0,
             room_code: None,
             revision: None,
-            details: Some(serde_json::json!({ "table": "public" })),
-            hand_completed: Some(true),
+            details: Some(
+                serde_json::json!({ "table": "public", "squid_delta": effect.squid_delta }),
+            ),
+            hand_completed: Some(effect.played > 0),
             has_bots: Some(has_bots),
         };
         let after = wallet::settle(conn, GAME, *user, &play).await?;
@@ -592,6 +687,17 @@ pub mod holds {
             },
         );
         Ok(())
+    }
+
+    /// The hand completed and its settlement is queued.
+    pub(crate) fn active_hand(session: Uuid, user: Uuid) -> Option<Uuid> {
+        open_hands().iter().find_map(|(id, hand)| {
+            (hand.session == session
+                && !hand.settling
+                && hand.users.contains(&user)
+                && hand.alive.strong_count() > 0)
+                .then_some(*id)
+        })
     }
 
     /// The hand completed and its settlement is queued.

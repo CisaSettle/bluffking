@@ -321,6 +321,13 @@ pub struct ActionTransitionPreview {
 pub struct StreetActionFact {
     pub player_id: PlayerId,
     pub action: PlayerAction,
+    /// Public chip context at the instant of this action. `amount` is the
+    /// added contribution; `committed_to` includes earlier street wagers.
+    pub amount: Chips,
+    pub committed_to: Chips,
+    /// Outstanding wager before the action (not capped to the actor's stack).
+    pub to_call_before: Chips,
+    pub pot_before: Chips,
     /// The action raised the street's wager above the previous `current_bet`.
     /// A short all-in raise is `true`; an all-in call/under-call is `false`.
     pub increased_bet: bool,

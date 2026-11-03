@@ -203,7 +203,19 @@ pub(super) fn reserved(
                         .is_some_and(|o| o.user_id == user && o.joined_at == member.joined_at)
                 })
             });
-            let base = seat.map_or(i64::from(room.starting_stack), |s| {
+            // Admission publishes the restored stack before WS binding creates
+            // its checkpoint seat. Reserve that full amount during this gap.
+            let admitted_stack = member
+                .standing_chips
+                .as_ref()
+                .map(|value| crate::beans::reentry_chips(Some(value)))
+                .transpose()
+                .map_err(|code| sqlx::Error::Protocol(code.into()))?
+                .flatten()
+                .map_or(i64::from(room.starting_stack), |saved| {
+                    (saved.stack + saved.pending_chips) as i64
+                });
+            let base = seat.map_or(admitted_stack, |s| {
                 s.stack.saturating_add(s.pending_chips).min(i64::MAX as u64) as i64
             });
             inner
@@ -213,9 +225,9 @@ pub(super) fn reserved(
                 .filter(|(rev, _)| *rev >= checkpoint.as_ref().map_or(0, |c| c.revision))
                 .map_or(base, |(_, amount)| *amount)
         } else {
-            // Bean-table rejoin creates a fresh stack and discards standing
-            // chips. Departed seats reserve only actual unsettled hand holds,
-            // already included in `poker` above.
+            // Departure releases the wallet reservation, but retains the
+            // required reentry stack. Admission checks it against available
+            // beans again. Unsettled hand holds are included in `poker` above.
             0
         };
         let entry = poker.entry(room.id).or_default();
@@ -254,7 +266,7 @@ pub(super) fn reserved(
             .flat_map(|u| u.poker.values())
         {
             total = total
-                .checked_add(delta.saturating_neg().max(0))
+                .checked_add(delta.delta.saturating_neg().max(0))
                 .ok_or_else(unavailable)?;
         }
     }

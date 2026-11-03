@@ -93,6 +93,8 @@ pub async fn buy(pool: &PgPool, user: Uuid, body: &ScratchBuy) -> Result<Purchas
     if crate::realtime_mode::enabled() {
         return super::runtime::buy_scratch(pool, user, body).await;
     }
+    let _span =
+        crate::request_timing::lottery_span(crate::request_timing::LotteryStage::SqlPurchase);
     if body.request_id.is_nil()
         || body.cost != 100
         || (!body.all_in && ![1, 5, 10].contains(&body.count))

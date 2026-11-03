@@ -14,8 +14,20 @@ use futures::FutureExt;
 use tokio::sync::watch;
 
 static QUIESCING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SHUTDOWN_STARTED: tokio::sync::Notify = tokio::sync::Notify::const_new();
 pub fn begin_shutdown() {
     QUIESCING.store(true, Ordering::Release);
+    SHUTDOWN_STARTED.notify_waiters();
+}
+/// Latched wakeup for optional long-lived response bodies; they must finish
+/// before graceful HTTP shutdown can drain the authoritative writers.
+pub(crate) async fn shutdown_started() {
+    let changed = SHUTDOWN_STARTED.notified();
+    tokio::pin!(changed);
+    changed.as_mut().enable();
+    if accepting() {
+        changed.await;
+    }
 }
 pub(crate) fn accepting() -> bool {
     !QUIESCING.load(Ordering::Acquire)

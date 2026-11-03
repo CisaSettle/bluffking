@@ -1,6 +1,7 @@
 //! Authenticated lottery HTTP endpoints; rule failures have stable wire codes.
 use super::{scratch, store, Game};
 use crate::api_resources::OperationPath as Path;
+use crate::request_timing::{lottery_span, mark_lottery, LotteryStage};
 use crate::{app_state::AppState, auth::middleware::AuthUser, handlers::respond::error_code};
 use axum::{
     extract::{rejection::JsonRejection, Query, State},
@@ -108,16 +109,21 @@ pub async fn buy(
     Path(name): Path<String>,
     Query(query): Query<BuyQuery>,
     body: Result<Json<Value>, JsonRejection>,
-) -> Result<Json<Value>, Error> {
+) -> Result<Response, Error> {
     let game = game(&name)?;
+    mark_lottery(game.as_str(), crate::realtime_mode::enabled());
+    let decoding = lottery_span(LotteryStage::Decode);
     let Json(body) = body.map_err(|_| Error::InvalidEntry)?;
     let purchase = if game == Game::Scratch {
         let body = serde_json::from_value(body).map_err(|_| Error::InvalidEntry)?;
+        drop(decoding);
         scratch::buy(&state.pool, auth.user_id, &body).await?
     } else {
         let body = serde_json::from_value(body).map_err(|_| Error::InvalidEntry)?;
+        drop(decoding);
         store::buy_numbers(&state.pool, auth.user_id, game, &body).await?
     };
+    let _reply = lottery_span(LotteryStage::Reply);
     if query.receipt_only && game != Game::Scratch {
         // The transaction has committed. Hall crowd/feed/history reads must not
         // delay its receipt or turn their failure into a failed purchase.
@@ -141,12 +147,13 @@ pub async fn buy(
             "purchased": purchase.purchased, "charged": purchase.charged,
             "balance_before": purchase.balance_before, "balance_after": purchase.balance_after,
             "balance": balance, "available_balance": available_balance,
-        })));
+        }))
+        .into_response());
     }
     let view = store::view(&state.pool, auth.user_id, game).await?;
     Ok(Json(
         json!({"view":view,"purchased":purchase.purchased,"charged":purchase.charged,"balance_before":purchase.balance_before,"balance_after":purchase.balance_after}),
-    ))
+    ).into_response())
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

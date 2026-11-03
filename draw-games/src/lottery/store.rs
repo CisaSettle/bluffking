@@ -410,6 +410,8 @@ pub async fn buy_numbers(
     if crate::realtime_mode::enabled() {
         return super::runtime::buy_numbers(pool, user, game, body).await;
     }
+    let _span =
+        crate::request_timing::lottery_span(crate::request_timing::LotteryStage::SqlPurchase);
     let schedule = game.schedule().ok_or(Error::InvalidEntry)?;
     if body.request_id.is_nil()
         || body.multiplier != 1

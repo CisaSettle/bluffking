@@ -455,6 +455,7 @@ impl GameHand {
             let committed = committed_by_player
                 .entry(record.player_id.inner())
                 .or_default();
+            let to_call_before = current_bet.saturating_sub(*committed);
             *committed = committed
                 .checked_add(record.amount.0)
                 .expect("one player's street commitment cannot exceed u32");
@@ -481,6 +482,10 @@ impl GameHand {
             facts.push(StreetActionFact {
                 player_id: record.player_id,
                 action: record.action.clone(),
+                amount: record.amount,
+                committed_to: Chips(*committed),
+                to_call_before: Chips(to_call_before),
+                pot_before: record.pot_before,
                 increased_bet,
                 full_raise,
             });
