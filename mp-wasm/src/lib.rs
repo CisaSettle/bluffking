@@ -76,6 +76,9 @@ fn parse_pks(pks_json: &str) -> Result<Vec<(String, RistrettoPoint)>, String> {
 #[wasm_bindgen]
 pub struct WasmParty {
     inner: DkgParty,
+    recovery_prepared: Option<(String, String)>,
+    recovery_masks: BTreeMap<String, mental_poker::crypto_real::recovery::RecoveryMask>,
+    recovery_evaluations: BTreeMap<String, mental_poker::crypto_real::recovery::RecoveryEvaluation>,
 }
 
 #[wasm_bindgen]
@@ -85,6 +88,9 @@ impl WasmParty {
         let mut rng = OsRng;
         WasmParty {
             inner: DkgParty::generate(party_id, &mut rng),
+            recovery_prepared: None,
+            recovery_masks: BTreeMap::new(),
+            recovery_evaluations: BTreeMap::new(),
         }
     }
 
@@ -146,6 +152,90 @@ impl WasmParty {
         let ct = Ct::from_wire(&w).ok_or("bad ciphertext")?;
         let share = partial_decrypt(&self.inner, idx, &ct, &mut rng);
         serde_json::to_string(&share).map_err(|e| e.to_string())
+    }
+
+    /// Prepare immutable card-scoped backups. Masks stay in this WASM party.
+    pub fn recovery_prepare(
+        &mut self,
+        binding: String,
+        deck_json: String,
+        keys_json: String,
+    ) -> Result<String, String> {
+        use mental_poker::crypto_real::recovery as r;
+        if let Some((old, payload)) = &self.recovery_prepared {
+            return if old == &binding {
+                Ok(payload.clone())
+            } else {
+                Err("recovery_reprepare".into())
+            };
+        }
+        let keys: Vec<r::RecoveryKey> =
+            serde_json::from_str(&keys_json).map_err(|_| "recovery_keys")?;
+        let deck: Vec<CtWire> = serde_json::from_str(&deck_json).map_err(|_| "recovery_deck")?;
+        if deck.len() != 52 {
+            return Err("recovery_deck".into());
+        }
+        let n = keys.len();
+        let seat = keys
+            .iter()
+            .position(|k| k.party_id == self.inner.party_id)
+            .ok_or("recovery_party")?;
+        let mut bundles = Vec::new();
+        let mut masks = BTreeMap::new();
+        for index in [seat, seat + n].into_iter().chain(2 * n..2 * n + 5) {
+            let ct =
+                Ct::from_wire(deck.get(index).ok_or("recovery_index")?).ok_or("recovery_ct")?;
+            let (bundle, mask) = r::create(
+                &self.inner,
+                binding.clone(),
+                index as u32,
+                &ct,
+                keys.clone(),
+                index < 2 * n,
+                &mut OsRng,
+            )?;
+            if let Some(mask) = mask {
+                masks.insert(r::digest(&bundle)?, mask);
+            }
+            bundles.push(bundle);
+        }
+        let payload = serde_json::to_string(&bundles).map_err(|_| "recovery_encoding")?;
+        self.recovery_masks = masks;
+        self.recovery_prepared = Some((binding, payload.clone()));
+        Ok(payload)
+    }
+
+    /// Verify and retain ONLY this recipient's curve-point evaluation.
+    pub fn recovery_receive(&mut self, bundle_json: String) -> Result<String, String> {
+        use mental_poker::crypto_real::recovery as r;
+        let bundle: r::RecoveryBundle =
+            serde_json::from_str(&bundle_json).map_err(|_| "recovery_bundle")?;
+        let id = r::digest(&bundle)?;
+        if self.recovery_evaluations.contains_key(&id) {
+            return Ok(id);
+        }
+        if self.recovery_evaluations.len() >= 63 {
+            return Err("recovery_capacity".into());
+        }
+        let evaluation = r::receive(&self.inner, &bundle)?;
+        self.recovery_evaluations.insert(id.clone(), evaluation);
+        Ok(id)
+    }
+
+    /// The client must independently authorize the exact card before this call.
+    pub fn recovery_release(&self, id: String) -> Result<String, String> {
+        serde_json::to_string(
+            self.recovery_evaluations
+                .get(&id)
+                .ok_or("recovery_missing")?,
+        )
+        .map_err(|_| "recovery_encoding".into())
+    }
+
+    /// Called only when the owner signs an all-in intent (or forced-blind
+    /// admission). Publishing these masks irreversibly changes confidentiality.
+    pub fn recovery_masks(&self) -> Result<String, String> {
+        serde_json::to_string(&self.recovery_masks).map_err(|_| "recovery_encoding".into())
     }
 
     /// ADR-078 §5.1 — produce `vk_dlog_binding`: a message-binding Schnorr
@@ -595,5 +685,31 @@ pub fn cards_verify(bundle_json: String) -> String {
     match result {
         Ok(verified) => serde_json::json!({"ok": true, "verified": verified}).to_string(),
         Err(error) => serde_json::json!({"ok": false, "error": error}).to_string(),
+    }
+}
+
+/// Public recovery checks shared by the browser, worker and coordinator.
+#[wasm_bindgen]
+pub fn recovery_check(request: String) -> Result<String, String> {
+    use mental_poker::crypto_real::recovery as r;
+    let value: serde_json::Value =
+        serde_json::from_str(&request).map_err(|_| "recovery_request")?;
+    match value["op"].as_str() {
+        Some("digest") => r::digest(&value["value"]),
+        Some("bundle") => {
+            let bundle: r::RecoveryBundle =
+                serde_json::from_value(value["bundle"].clone()).map_err(|_| "recovery_bundle")?;
+            r::validate_bundle(&bundle)?;
+            r::digest(&bundle)
+        }
+        Some("mask") => {
+            let core: r::RecoveryCore =
+                serde_json::from_value(value["core"].clone()).map_err(|_| "recovery_core")?;
+            let mask: r::RecoveryMask =
+                serde_json::from_value(value["mask"].clone()).map_err(|_| "recovery_mask")?;
+            r::verify_mask(&core, &mask)?;
+            Ok("ok".into())
+        }
+        _ => Err("recovery_operation".into()),
     }
 }
