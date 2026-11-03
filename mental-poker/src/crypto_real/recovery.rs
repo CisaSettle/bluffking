@@ -78,7 +78,7 @@ pub struct RecoveryEvidence {
 }
 
 pub fn threshold(n: usize) -> Option<usize> {
-    (3..=9).contains(&n).then_some((2 * n + 2) / 3)
+    (3..=9).contains(&n).then(|| (2 * n).div_ceil(3))
 }
 
 pub fn digest<T: Serialize>(value: &T) -> Result<String, String> {
@@ -453,7 +453,7 @@ pub enum RecoveryServerMessage {
         binding: String,
     },
     Bundle {
-        bundle: RecoveryBundle,
+        bundle: Box<RecoveryBundle>,
         signature: String,
         initial_mask: Option<RecoveryMask>,
     },
