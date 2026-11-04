@@ -52,5 +52,9 @@ for f in mp_wasm.js mp_wasm.d.ts mp_wasm_bg.wasm.d.ts; do
   mv "$tmp" "$vendor/$f"
 done
 
+# Notices for the crates linked into the .wasm travel with the vendored binary;
+# client-game's build appends them to its third-party license file.
+node "$here/gen-licenses.mjs" "$vendor/THIRD-PARTY-LICENSES.md"
+
 echo "[build-web] vendored → $vendor"
 ls -la "$vendor"
