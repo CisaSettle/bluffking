@@ -680,6 +680,35 @@ pub async fn debit_refund_on(
     Ok(debit)
 }
 
+#[derive(Debug, Clone, Copy, Default, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeaderboardSort {
+    #[default]
+    Profit,
+    Balance,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LeaderboardRow {
+    pub balance: i64,
+    pub user_id: Uuid,
+    pub display_name: String,
+    pub net_won: i64,
+    pub hands_played: i32,
+}
+
+/// Fixed size of each lobby gold-bean ranking; there is no pagination.
+pub const LEADERBOARD_LIMIT: usize = 20;
+
+/// Top [`LEADERBOARD_LIMIT`] active players by lifetime profit or current
+/// total wallet balance, served from the in-memory wallet read model.
+pub async fn leaderboard(
+    pool: &PgPool,
+    sort: LeaderboardSort,
+) -> sqlx::Result<Vec<LeaderboardRow>> {
+    crate::beans_read_memory::leaderboard(pool, sort).await
+}
+
 /// Unsettled public-hand liabilities, held per process: the runtime owner
 /// runs every live table, and admission waits for ownership on handover.
 ///

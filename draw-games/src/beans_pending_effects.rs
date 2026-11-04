@@ -82,6 +82,9 @@ pub(crate) fn accept_effect(
         None
     };
     enqueue()?;
+    if let Some(key) = inner.users.get(&owner).and_then(|u| rank(owner, u)) {
+        inner.ranks.remove(&key);
+    }
     inner.epoch = inner.epoch.wrapping_add(1);
     let generation = inner.epoch;
     let balance = wallet.balance;
@@ -96,6 +99,9 @@ pub(crate) fn accept_effect(
     user.generation = generation;
     inner.count += 1 + usize::from(new_day);
     inner.bytes += 256;
+    if let Some(key) = inner.users.get(&owner).and_then(|u| rank(owner, u)) {
+        inner.ranks.insert(key);
+    }
     state.published.notify_waiters();
     Ok(balance)
 }

@@ -43,11 +43,37 @@ const RECENT_POKER_ACKS: usize = 4096;
 const DAILY: &str = "beans_daily_refill";
 const READ_PUBLICATION_WAIT: Duration = Duration::from_secs(2);
 static READ_WAITERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(256);
+/// Leaderboard reads wait on their own small pool so a burst of rankings
+/// can never take publication-wait slots from wallet and game reads.
+static LEADERBOARD_WAITERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(16);
+type RankKey = (std::cmp::Reverse<i64>, std::cmp::Reverse<i32>, Uuid);
+struct Rank {
+    profit: RankKey,
+    balance: RankKey,
+}
+
+/// Update both indexes through every existing wallet publication/invalidation path.
+/// Both rankings include only wallets with completed gold-bean games.
+#[derive(Default)]
+struct Rankings {
+    profit: BTreeSet<RankKey>,
+    balance: BTreeSet<RankKey>,
+}
+impl Rankings {
+    fn insert(&mut self, rank: Rank) {
+        if rank.profit.1 .0 > 0 {
+            self.profit.insert(rank.profit);
+            self.balance.insert(rank.balance);
+        }
+    }
+    fn remove(&mut self, rank: &Rank) {
+        self.profit.remove(&rank.profit);
+        self.balance.remove(&rank.balance);
+    }
+}
 #[derive(Default)]
 struct User {
     wallet: Option<Wallet>,
-    eligible: bool,
-    qa_dirty: bool,
     days: HashSet<NaiveDate>,
     receipts: HashMap<Uuid, Arc<Value>>,
     latest: HashMap<&'static str, Recent>,
@@ -86,6 +112,7 @@ struct Inner {
     active_writes: usize,
     active_users: HashMap<Uuid, usize>,
     users: HashMap<Uuid, User>,
+    ranks: Rankings,
     pending: BTreeSet<Uuid>,
     count: usize,
     bytes: usize,
@@ -222,8 +249,12 @@ impl Mutation {
         user.days.insert(day);
         user.bytes += added * 64;
         user.available = true;
+        let key = rank(id, user);
         inner.count += added;
         inner.bytes += added * 64;
+        if let Some(key) = key {
+            inner.ranks.insert(key);
+        }
         inner.pending.remove(&id);
         self.daily_published = true;
         state.published.notify_waiters();
@@ -324,6 +355,13 @@ impl Drop for ProfilePublicationObservation<'_> {
 /// overload, startup failure and a stalled publisher retain the usual 503.
 pub async fn read_after_publication<T>(
     pool: &PgPool,
+    read: impl FnMut() -> sqlx::Result<T>,
+) -> sqlx::Result<T> {
+    read_after_publication_in(pool, &READ_WAITERS, read).await
+}
+async fn read_after_publication_in<T>(
+    pool: &PgPool,
+    waiters: &'static tokio::sync::Semaphore,
     mut read: impl FnMut() -> sqlx::Result<T>,
 ) -> sqlx::Result<T> {
     match read() {
@@ -346,7 +384,7 @@ pub async fn read_after_publication<T>(
     if !ready {
         return Err(unavailable());
     }
-    let _slot = READ_WAITERS.try_acquire().map_err(|_| unavailable())?;
+    let _slot = waiters.try_acquire().map_err(|_| unavailable())?;
     let deadline = tokio::time::Instant::now() + READ_PUBLICATION_WAIT;
     loop {
         if tokio::time::Instant::now() >= deadline {
@@ -369,6 +407,23 @@ pub async fn read_after_publication<T>(
                 .map_err(|_| unavailable())?;
         }
     }
+}
+fn rank(id: Uuid, user: &User) -> Option<Rank> {
+    user.wallet
+        .as_ref()
+        .filter(|_| user.available)
+        .map(|w| Rank {
+            profit: (
+                std::cmp::Reverse(w.net_won),
+                std::cmp::Reverse(w.hands_played),
+                id,
+            ),
+            balance: (
+                std::cmp::Reverse(w.balance),
+                std::cmp::Reverse(w.hands_played),
+                id,
+            ),
+        })
 }
 fn wallet(row: &sqlx::postgres::PgRow) -> Wallet {
     Wallet {
@@ -473,10 +528,16 @@ pub(crate) fn accept_poker_effects_with<T>(
     inner.epoch = inner.epoch.wrapping_add(1);
     let generation = inner.epoch;
     for (id, delta, wallet) in updated {
+        if let Some(key) = inner.users.get(&id).and_then(|user| rank(id, user)) {
+            inner.ranks.remove(&key);
+        }
         let user = inner.users.get_mut(&id).expect("validated poker wallet");
         user.wallet = Some(wallet);
         user.poker.insert(record, delta);
         user.generation = generation;
+        if let Some(key) = rank(id, user) {
+            inner.ranks.insert(key);
+        }
     }
     inner.poker.insert(
         record,
@@ -607,6 +668,12 @@ fn replace(inner: &mut Inner, id: Uuid, user: User) -> sqlx::Result<()> {
     if rows > MAX_ROWS || bytes > MAX_BYTES || (old.is_none() && inner.users.len() >= MAX_USERS) {
         return Err(unavailable());
     }
+    if let Some(key) = old.and_then(|v| rank(id, v)) {
+        inner.ranks.remove(&key);
+    }
+    if let Some(key) = rank(id, &user) {
+        inner.ranks.insert(key);
+    }
     inner.users.insert(id, user);
     inner.count = rows;
     inner.bytes = bytes;
@@ -638,12 +705,12 @@ pub async fn hydrate(pool: &PgPool) -> sqlx::Result<()> {
         let mut tx = crate::live_directory::begin_read_snapshot(pool).await?;
         let mut loaded = Inner::default();
         // One streamed statement per source (one plan, one scan) in the snapshot.
-        let query = String::from("SELECT w.user_id,w.balance,w.net_won,w.hands_played,w.hands_won,w.refills,TRUE AS eligible FROM wallets w JOIN users u ON u.id=w.user_id WHERE w.game=$1 AND u.deleted_at IS DISTINCT FROM 'epoch'::timestamptz ORDER BY w.user_id");
+        let query = String::from("SELECT w.user_id,w.balance,w.net_won,w.hands_played,w.hands_won,w.refills FROM wallets w JOIN users u ON u.id=w.user_id WHERE w.game=$1 AND u.deleted_at IS DISTINCT FROM 'epoch'::timestamptz ORDER BY w.user_id");
         {
             let mut rows = sqlx::query(&query).bind(crate::game_catalog::BEANS).fetch(&mut *tx);
             while let Some(row) = rows.try_next().await? {
                 let id = row.get("user_id");
-                replace(&mut loaded, id, User { wallet: Some(wallet(&row)), eligible: row.get("eligible"), available: true, bytes: 512, ..User::default() })?;
+                replace(&mut loaded, id, User { wallet: Some(wallet(&row)), available: true, bytes: 512, ..User::default() })?;
             }
         }
         {
@@ -735,6 +802,9 @@ fn invalidate_locked(inner: &mut Inner, id: Uuid) {
     if !inner.ready {
         return;
     }
+    if let Some(key) = inner.users.get(&id).and_then(|user| rank(id, user)) {
+        inner.ranks.remove(&key);
+    }
     if !inner.users.contains_key(&id)
         && replace(
             inner,
@@ -772,43 +842,6 @@ pub fn invalidate_user(pool: &PgPool, id: Uuid) {
         Ok(Some(player)) if !player.active() => remove_user(pool, id),
         Ok(None) => remove_user(pool, id),
         _ => invalidate_state(&state(pool), id),
-    }
-}
-/// Telemetry producers call this only after committing a bkqa: marker.
-/// Repeated observations do not refresh an already excluded or fenced user.
-pub fn qa_marker_written(pool: &PgPool, id: Uuid) {
-    let player = match crate::player_directory::lookup(pool, id) {
-        Ok(Some(player)) => player,
-        Ok(None) => return,
-        Err(_) => {
-            invalidate_state(&state(pool), id);
-            return;
-        }
-    };
-    if !player.active()
-        || !(player.is_guest
-            || (player.email.starts_with("tg-") && player.email.ends_with("@telegram.invalid")))
-    {
-        return;
-    }
-    let state = state(pool);
-    let needed = {
-        let mut inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if !inner.ready {
-            inner.epoch = inner.epoch.wrapping_add(1);
-            return;
-        }
-        inner.users.get_mut(&id).is_some_and(|user| {
-            if user.eligible && !user.qa_dirty {
-                user.qa_dirty = true;
-                true
-            } else {
-                false
-            }
-        })
-    };
-    if needed {
-        invalidate_state(&state, id);
     }
 }
 /// A newly committed account has no bean wallet yet; its first GET can grant
@@ -854,10 +887,12 @@ pub fn remove_user(pool: &PgPool, id: Uuid) {
         .is_some_and(|user| !user.poker.is_empty() || !user.effects.is_empty())
         || crate::beans::holds::outstanding(id)
     {
+        if let Some(key) = inner.users.get(&id).and_then(|user| rank(id, user)) {
+            inner.ranks.remove(&key);
+        }
         let generation = inner.epoch;
         if let Some(user) = inner.users.get_mut(&id) {
             user.available = false;
-            user.eligible = false;
             user.retired = true;
             user.generation = generation;
         }
@@ -867,6 +902,9 @@ pub fn remove_user(pool: &PgPool, id: Uuid) {
     }
     inner.reservations.remove_user(id);
     if let Some(user) = inner.users.remove(&id) {
+        if let Some(key) = rank(id, &user) {
+            inner.ranks.remove(&key);
+        }
         inner.count -= count(&user);
         inner.bytes -= user.bytes;
     }
@@ -890,9 +928,9 @@ async fn read_user(
         evidence.stage("snapshot_begin");
         let mut tx = crate::live_directory::begin_read_snapshot(pool).await?;
         evidence.stage("wallet");
-        let query = String::from("SELECT w.balance,w.net_won,w.hands_played,w.hands_won,w.refills,TRUE AS eligible FROM wallets w JOIN users u ON u.id=w.user_id WHERE w.game=$1 AND w.user_id=$2 AND u.deleted_at IS DISTINCT FROM 'epoch'::timestamptz");
+        let query = String::from("SELECT w.balance,w.net_won,w.hands_played,w.hands_won,w.refills FROM wallets w JOIN users u ON u.id=w.user_id WHERE w.game=$1 AND w.user_id=$2 AND u.deleted_at IS DISTINCT FROM 'epoch'::timestamptz");
         let row = sqlx::query(&query).bind(crate::game_catalog::BEANS).bind(id).fetch_optional(&mut *tx).await?;
-        let mut user = User { wallet: row.as_ref().map(wallet), eligible: row.as_ref().is_some_and(|r| r.get("eligible")), available: true, bytes: 512, ..User::default() };
+        let mut user = User { wallet: row.as_ref().map(wallet), available: true, bytes: 512, ..User::default() };
         evidence.stage("daily_history");
         let mut after = None::<NaiveDate>;
         loop {
@@ -1243,6 +1281,73 @@ pub fn receipt(
             .filter(|value| value["game"] == game)
             .map(|details| (wallet.balance, details.clone()))
     }))
+}
+/// Top [`beans::LEADERBOARD_LIMIT`] from the rank index. A fenced wallet is
+/// out of the index until republished, so wait briefly for that publication
+/// instead of serving a ranking that silently skips it.
+pub async fn leaderboard(
+    pool: &PgPool,
+    sort: beans::LeaderboardSort,
+) -> sqlx::Result<Vec<beans::LeaderboardRow>> {
+    read_after_publication_in(pool, &LEADERBOARD_WAITERS, || {
+        leaderboard_snapshot(pool, sort)
+    })
+    .await
+}
+fn leaderboard_snapshot(
+    pool: &PgPool,
+    sort: beans::LeaderboardSort,
+) -> sqlx::Result<Vec<beans::LeaderboardRow>> {
+    let state = state(pool);
+    let inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
+    if !inner.ready
+        || inner
+            .pending
+            .iter()
+            .any(|id| inner.users.get(id).is_some_and(|user| !user.available))
+    {
+        return Err(unavailable());
+    }
+    let mut rows = Vec::with_capacity(beans::LEADERBOARD_LIMIT);
+    let ranks = match sort {
+        beans::LeaderboardSort::Profit => &inner.ranks.profit,
+        beans::LeaderboardSort::Balance => &inner.ranks.balance,
+    };
+    for (_, _, id) in ranks {
+        // An identity mid-mutation (rename, deletion) sits out this one read
+        // instead of failing the whole board; an unrecovered directory is a 503.
+        let player = match crate::player_directory::lookup_or_unresolved(pool, *id) {
+            Ok((Some(player), _)) => player,
+            Ok((None, _)) => continue,
+            Err(_) => return Err(unavailable()),
+        };
+        if !player.active() {
+            continue;
+        }
+        let wallet = inner
+            .users
+            .get(id)
+            .and_then(|user| user.wallet.as_ref())
+            .ok_or_else(unavailable)?;
+        rows.push(beans::LeaderboardRow {
+            user_id: *id,
+            display_name: crate::content_moderation::public_name_or_fallback(
+                player
+                    .display_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty()),
+                *id,
+            ),
+            balance: wallet.balance,
+            net_won: wallet.net_won,
+            hands_played: wallet.hands_played,
+        });
+        if rows.len() == beans::LEADERBOARD_LIMIT {
+            break;
+        }
+    }
+    Ok(rows)
 }
 
 /// Current wallet plus the newest committed cabinet result, scoped to its owner.

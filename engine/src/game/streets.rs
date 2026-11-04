@@ -231,6 +231,9 @@ impl GameHand {
         // Known set: every board card + every already-Revealed hole card.
         let mut known: std::collections::HashSet<crate::card::Card> =
             self.board.all_cards().into_iter().collect();
+        if let Some(second) = &self.second_board {
+            known.extend(second.all_cards());
+        }
         for seat in &self.seats {
             if let HoleSlot::Revealed(h) = seat.hole {
                 known.insert(h.card1);
@@ -253,6 +256,129 @@ impl GameHand {
     /// `None` in plaintext mode or when no board is pending.
     pub fn pending_board_street(&self) -> Option<Street> {
         self.pending_board_street
+    }
+
+    // ---------------------------------------------------------------------------
+    // All-in runout: run once / run twice
+    // ---------------------------------------------------------------------------
+
+    /// The street an all-in runout is about to deal while its run-once /
+    /// run-twice choice is still open.
+    ///
+    /// `Some` only in blind mode, when betting is closed for the rest of the
+    /// hand (every remaining contender but at most one is all-in), at least two
+    /// contenders remain, a board street is still pending, and no choice has
+    /// been recorded yet. The default — never calling [`Self::choose_runout`] —
+    /// is the ordinary single runout.
+    pub fn runout_choice_street(&self) -> Option<Street> {
+        if self.mode != HandMode::Blind || self.runout_choice.is_some() {
+            return None;
+        }
+        let street = self.pending_board_street?;
+        if street == Street::Preflop {
+            return None;
+        }
+        let betting_closed = self
+            .betting_round
+            .as_ref()
+            .map(|r| r.is_done())
+            .unwrap_or(false);
+        let contenders = self.seats.iter().filter(|s| !s.folded).count();
+        (betting_closed && contenders >= 2).then_some(street)
+    }
+
+    /// Record the all-in runout choice. `twice == true` makes the remaining
+    /// streets run twice: the first board continues through
+    /// [`Self::inject_board_for_street`] and the second run's own cards arrive
+    /// through [`Self::inject_second_run`] once the first board is complete.
+    pub fn choose_runout(&mut self, twice: bool) -> Result<(), BlindInjectError> {
+        let street = self
+            .runout_choice_street()
+            .ok_or(BlindInjectError::RunoutChoiceClosed)?;
+        self.runout_choice = Some(twice);
+        if twice {
+            self.run_twice_from = Some(street);
+        }
+        Ok(())
+    }
+
+    /// The first street dealt separately for each run, when running twice.
+    pub fn run_twice_from(&self) -> Option<Street> {
+        self.run_twice_from
+    }
+
+    /// Whether the second run still needs its cards.
+    pub fn second_run_pending(&self) -> bool {
+        self.run_twice_from.is_some() && self.second_board.is_none()
+    }
+
+    /// How many fresh cards the second run deals (5 from the flop, 2 from the
+    /// turn, 1 from the river; 0 when not running twice).
+    pub fn second_run_card_count(&self) -> usize {
+        self.run_twice_from.map_or(0, second_run_cards_from)
+    }
+
+    /// Feed the second run's own cards, in deal order, after the first board
+    /// is complete. Cards dealt before [`Self::run_twice_from`] are shared with
+    /// the first board.
+    pub fn inject_second_run(&mut self, cards: &[Card]) -> Result<(), BlindInjectError> {
+        let from = self
+            .run_twice_from
+            .ok_or(BlindInjectError::NoSecondRunPending)?;
+        if self.phase != Phase::Done || self.board.count() != 5 || self.second_board.is_some() {
+            return Err(BlindInjectError::NoSecondRunPending);
+        }
+        let expected = second_run_cards_from(from);
+        if cards.len() != expected {
+            return Err(BlindInjectError::WrongBoardCount {
+                street: from,
+                expected,
+                got: cards.len(),
+            });
+        }
+        self.check_injected_cards_unique(cards)?;
+        let mut second = self.board.clone();
+        match from {
+            Street::Flop => {
+                second.flop = Some([cards[0], cards[1], cards[2]]);
+                second.turn = Some(cards[3]);
+                second.river = Some(cards[4]);
+            }
+            Street::Turn => {
+                second.turn = Some(cards[0]);
+                second.river = Some(cards[1]);
+            }
+            Street::River => second.river = Some(cards[0]),
+            Street::Preflop => return Err(BlindInjectError::NoSecondRunPending),
+        }
+        self.second_board = Some(second);
+        Ok(())
+    }
+
+    /// Restore a recorded run-twice runout on a finished hand (review rebuild
+    /// of a settled hand, either mode). The caller supplies the street the runs
+    /// diverged at and the second run's own cards from the settled deck.
+    pub fn restore_run_twice(
+        &mut self,
+        from: Street,
+        cards: &[Card],
+    ) -> Result<(), BlindInjectError> {
+        if from == Street::Preflop
+            || self.phase != Phase::Done
+            || self.board.count() != 5
+            || self.run_twice_from.is_some()
+            || self.seats.iter().filter(|s| !s.folded).count() < 2
+        {
+            return Err(BlindInjectError::NoSecondRunPending);
+        }
+        self.runout_choice = Some(true);
+        self.run_twice_from = Some(from);
+        if let Err(error) = self.inject_second_run(cards) {
+            self.runout_choice = None;
+            self.run_twice_from = None;
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Compute the new-street betting-state triple
@@ -494,5 +620,15 @@ impl GameHand {
             }
         }
         start % n
+    }
+}
+
+/// Fresh cards a second run deals when the runs diverge at `from`.
+pub const fn second_run_cards_from(from: Street) -> usize {
+    match from {
+        Street::Preflop => 0,
+        Street::Flop => 5,
+        Street::Turn => 2,
+        Street::River => 1,
     }
 }
