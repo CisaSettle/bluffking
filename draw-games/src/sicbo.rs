@@ -97,14 +97,30 @@ impl IntoResponse for Error {
         error_code(status, code)
     }
 }
+/// The derived receipt, else a solo receipt written before derivation under
+/// the raw request id (a room round's receipt under that id is not this
+/// request's). Both are read in one statement, so a retry spanning the
+/// release replays instead of debiting again.
 async fn saved(
     conn: &mut crate::db_writer::PgConnection,
     user: Uuid,
     bet: &Bet,
     balance: i64,
 ) -> Result<Option<BetResult>, Error> {
-    let row = sqlx::query("SELECT details, balance_after, delta FROM wallet_ledger WHERE game=$1 AND user_id=$2 AND record_id=$3")
-        .bind(POLICY.game).bind(user).bind(bet.request_id).fetch_optional(conn).await?;
+    let derived = record_id(user, bet.request_id);
+    let rows = sqlx::query("SELECT record_id, details, balance_after, delta FROM wallet_ledger WHERE game=$1 AND user_id=$2 AND record_id=$3 \
+        UNION ALL SELECT record_id, details, balance_after, delta FROM wallet_ledger WHERE game=$1 AND user_id=$2 AND record_id=$4")
+        .bind(POLICY.game).bind(user).bind(derived).bind(bet.request_id).fetch_all(conn).await?;
+    let pick = |id: Uuid| {
+        rows.iter()
+            .find(|row| row.get::<Uuid, _>("record_id") == id)
+    };
+    let row = pick(derived).or_else(|| {
+        pick(bet.request_id).filter(|row| {
+            let details: serde_json::Value = row.get("details");
+            details["game"] == "sicbo" && details.get("room_code").is_none()
+        })
+    });
     let Some(row) = row else {
         return Ok(None);
     };
@@ -133,6 +149,11 @@ async fn saved(
         balance_after: row.get("balance_after"),
         delta: row.get("delta"),
     }))
+}
+/// The receipt (ledger and game record) id of a solo roll; see
+/// [`crate::beans::solo_record_id`].
+fn record_id(user: Uuid, request: Uuid) -> Uuid {
+    crate::beans::solo_record_id("sicbo", user, request)
 }
 pub async fn play(pool: &PgPool, user: Uuid, bet: &Bet) -> Result<BetResult, Error> {
     if Some(bet.stake) != crate::beans::solo_stake(MIN_STAKE, bet.expected_balance)
@@ -165,8 +186,9 @@ pub async fn play(pool: &PgPool, user: Uuid, bet: &Bet) -> Result<BetResult, Err
         }
         return Ok(result);
     }
-    // A room settlement uses its round id as the receipt key; a solo roll may
-    // not take the id of a round still open in any room (fails closed).
+    // A room settlement uses its round id as the receipt key. Solo receipts
+    // are derived ids, and a solo request may still not reuse the id of a
+    // round open in any room (fails closed).
     if round_in_play {
         return Err(Error::Conflict);
     }
@@ -209,8 +231,9 @@ pub async fn play(pool: &PgPool, user: Uuid, bet: &Bet) -> Result<BetResult, Err
         fairness: draw_games::sicbo::payout_proof(&reveal, dice, bet.side, bet.stake),
         max_reward,
     };
+    let record = record_id(user, bet.request_id);
     let play = wallet::Play {
-        record_id: bet.request_id,
+        record_id: record,
         delta,
         completes_hand: true,
         won,
@@ -255,7 +278,7 @@ pub async fn play(pool: &PgPool, user: Uuid, bet: &Bet) -> Result<BetResult, Err
     crate::game_records::record(
         &mut tx,
         crate::game_catalog::SICBO,
-        bet.request_id,
+        record,
         Some(bet.session_id),
         chrono::Utc::now(),
         &[(user, delta)],

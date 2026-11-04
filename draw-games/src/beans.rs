@@ -34,6 +34,19 @@ pub fn solo_stake(base: i64, expected: Option<i64>) -> Option<i64> {
         _ => None,
     }
 }
+/// Namespace of the server-derived receipt ids of client-requested solo plays.
+const SOLO_RECORD_NS: Uuid = Uuid::from_u128(0x8d2f_6c41_0b7e_4a93_9e15_c3a8_57d0_50e1);
+/// The shared wallet ledger keys play receipts by `(game, record_id, user)`
+/// only, and room/hand/lottery settlements use ids clients can see. A solo
+/// play's receipt id is therefore derived from its game, owner and request
+/// id and never equals a client-supplied id. Receipts written before this
+/// derivation kept the raw request id; each caller still looks that up second.
+pub fn solo_record_id(game: &str, user: Uuid, request: Uuid) -> Uuid {
+    Uuid::new_v5(
+        &SOLO_RECORD_NS,
+        format!("{game}:{user}:{request}").as_bytes(),
+    )
+}
 /// Extra beans ADDED by the once-per-Singapore-day claim (not a refill-to
 /// target). Reduced alongside the deterministic membership exchange.
 pub const DAILY_REFILL_TO: i64 = 200;
@@ -394,13 +407,17 @@ pub fn hand_effects(hand: &crate::persist::HandRecord) -> sqlx::Result<Vec<(Uuid
 /// wallet negative is clamped to the balance and logged; the invariant
 /// `balance >= stack` makes that unreachable in normal play, and clamping
 /// keeps the hand persist (and the table) alive instead of aborting it.
+/// Returns the players whose receipt was written under the hand's
+/// quarantine id (see [`wallet::quarantine_record_id`]).
 pub async fn settle_hand_on(
     conn: &mut PgConnection,
     hand_id: Uuid,
     players: &[(Uuid, PokerEffect)],
     has_bots: bool,
     memory_accepted: bool,
-) -> sqlx::Result<()> {
+) -> sqlx::Result<Vec<Uuid>> {
+    // Players whose receipt went to the hand's quarantine id.
+    let mut quarantined = Vec::new();
     // Lock wallets in user-id order, like every other multi-wallet settlement,
     // so overlapping settlements can never deadlock on lock order.
     let mut ordered: Vec<_> = players.iter().collect();
@@ -446,10 +463,76 @@ pub async fn settle_hand_on(
             hand_completed: Some(effect.played > 0),
             has_bots: Some(has_bots),
         };
-        let after = wallet::settle(conn, GAME, *user, &play).await?;
+        // Idempotency is the new hand row (caller), not this receipt key. A
+        // solo receipt written before solo ids were derived may hold the hand
+        // id: write this player's receipt under its quarantine id instead of
+        // failing the whole hand on every retry. The caller alerts operators
+        // once the hand's transaction outcome is known.
+        let (after, inserted) = wallet::settle_unless_taken(conn, GAME, *user, &play).await?;
+        if !inserted {
+            let taken: Option<Option<serde_json::Value>> = sqlx::query_scalar(
+                "SELECT details FROM wallet_ledger WHERE game=$1 AND record_id=$2 AND user_id=$3",
+            )
+            .bind(GAME)
+            .bind(hand_id)
+            .bind(*user)
+            .fetch_optional(&mut *conn)
+            .await?;
+            if !taken.is_some_and(|d| wallet::is_legacy_solo_receipt(d.as_ref())) {
+                return Err(sqlx::Error::Protocol(wallet::PLAY_RECEIPT_CONFLICT.into()));
+            }
+            let mut moved = play;
+            moved.record_id = wallet::quarantine_record_id(hand_id);
+            moved.details = Some(serde_json::json!({
+                "table": "public", "squid_delta": effect.squid_delta,
+                "quarantine": {"reason": "receipt_id_taken", "record_id": hand_id},
+            }));
+            wallet::receipt_on(conn, GAME, *user, &moved, after).await?;
+            quarantined.push(*user);
+        }
         wallet::project_session_balance(GAME, *user, after);
     }
-    Ok(())
+    Ok(quarantined)
+}
+
+/// Seated projections are published under the wallet row lock, inside the
+/// writing transaction, so they stay ordered with every later writer. When
+/// that transaction does not verifiably commit (an early error, a rollback
+/// or an unknown COMMIT outcome) the tentative value must not stay visible.
+/// Arm each user right after an in-transaction projection and call
+/// [`ProjectionFence::finish`] with the commit result. Dropped armed, it
+/// fences each still-seated projection ([`wallet::quarantine_user`]): no
+/// reload, because neither room-accepted effects nor post-commit delta
+/// publishers are ordered by the wallet row lock. Fenced readers use durable
+/// balances until the seat retires; money and the ledger are never touched.
+#[must_use]
+#[derive(Default)]
+pub struct ProjectionFence {
+    users: Vec<Uuid>,
+}
+
+impl ProjectionFence {
+    pub fn arm(&mut self, user: Uuid) {
+        self.users.push(user);
+    }
+
+    /// A verified commit made the in-transaction projections committed state.
+    pub fn finish(mut self, committed: bool) {
+        if committed {
+            self.users.clear();
+        }
+    }
+}
+
+impl Drop for ProjectionFence {
+    fn drop(&mut self) {
+        for user in self.users.drain(..) {
+            if wallet::held(GAME, user) {
+                wallet::quarantine_user(GAME, user);
+                tracing::error!(user = %user, "beans_projection_fenced_uncommitted");
+            }
+        }
+    }
 }
 
 /// [`ensure`] on a caller-owned connection: a missing wallet gets the
@@ -518,7 +601,7 @@ pub(crate) async fn credit_tournament_on(
 }
 
 /// Credits a paid pack. Caller holds the purchase row (status flip) in the
-/// same transaction.
+/// same transaction and arms a [`ProjectionFence`] for `user` on success.
 pub async fn credit_purchase_on(
     conn: &mut PgConnection,
     user: Uuid,
@@ -554,7 +637,9 @@ pub async fn credit_purchase_on(
 /// Debits refunded beans, never below zero (beans already lost at the table
 /// stay lost; the refund is the operator's decision, not a cash-out). The
 /// caller computes `beans` from the refunded amount (partial refunds debit
-/// in proportion) and records the provider refund id for idempotency.
+/// in proportion) and records the provider refund id for idempotency. The
+/// caller arms a [`ProjectionFence`] for `user` on success. Returns the
+/// beans actually debited, clamped to the balance.
 pub async fn debit_refund_on(
     pool: &PgPool,
     conn: &mut PgConnection,
@@ -592,34 +677,7 @@ pub async fn debit_refund_on(
     .execute(conn.writer())
     .await?;
     wallet::project_session_balance(GAME, user, after);
-    Ok(after)
-}
-
-#[derive(Debug, Clone, Copy, Default, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LeaderboardSort {
-    #[default]
-    Profit,
-    Balance,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct LeaderboardRow {
-    pub balance: i64,
-    pub user_id: Uuid,
-    pub display_name: String,
-    pub net_won: i64,
-    pub hands_played: i32,
-}
-
-/// Rank active players by lifetime profit or current total wallet balance.
-pub async fn leaderboard(
-    pool: &PgPool,
-    limit: i64,
-    offset: i64,
-    sort: LeaderboardSort,
-) -> sqlx::Result<Vec<LeaderboardRow>> {
-    crate::beans_read_memory::leaderboard(pool, limit, offset, sort)
+    Ok(debit)
 }
 
 /// Unsettled public-hand liabilities, held per process: the runtime owner

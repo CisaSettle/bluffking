@@ -835,6 +835,150 @@ impl<'a> Play<'a> {
     }
 }
 
+/// A settlement refused because one of its play receipt keys
+/// `(game, record_id, user)` was already taken: no retry can succeed.
+pub(crate) const PLAY_RECEIPT_CONFLICT: &str = "play_receipt_id_conflict";
+
+/// The unique play-receipt key (`wallet_ledger_play_uniq`) was violated.
+pub(crate) fn is_play_receipt_conflict(error: &sqlx::Error) -> bool {
+    error.as_database_error().is_some_and(|e| {
+        e.is_unique_violation() && e.constraint() == Some("wallet_ledger_play_uniq")
+    })
+}
+
+/// The ordered room writer's error for [`PLAY_RECEIPT_CONFLICT`]: fenced, so
+/// the writer stops instead of retrying the same refused settlement forever.
+pub(crate) fn fenced_play_receipt_conflict(error: &sqlx::Error) -> Option<String> {
+    matches!(error, sqlx::Error::Protocol(m) if m == PLAY_RECEIPT_CONFLICT)
+        .then(|| crate::write_behind::fenced(PLAY_RECEIPT_CONFLICT))
+}
+
+/// A receipt of the solo games whose record id was once the client's request
+/// id (roulette, slots, solo sicbo; see `beans::solo_record_id`). No room,
+/// hand or lottery receipt qualifies.
+pub(crate) fn is_legacy_solo_receipt(details: Option<&serde_json::Value>) -> bool {
+    details.is_some_and(|d| {
+        d.get("lottery_event").is_none()
+            && d.get("purpose").is_none()
+            && d.get("room_code").is_none()
+            && matches!(d["game"].as_str(), Some("roulette" | "slots" | "sicbo"))
+    })
+}
+
+const QUARANTINE_NS: Uuid = Uuid::from_u128(0x4e0a_93d1_7c2b_4f58_b6e3_1d9a_c05f_7a21);
+/// Where a settlement writes its receipt when a legacy solo receipt
+/// ([`is_legacy_solo_receipt`]) holds its own record id. Deterministic, so a
+/// retry and the balance reconciliation find the same row.
+pub(crate) fn quarantine_record_id(original: Uuid) -> Uuid {
+    Uuid::new_v5(&QUARANTINE_NS, original.as_bytes())
+}
+
+/// The ids under which the settlements `ids` may have committed: each id and
+/// its [`quarantine_record_id`].
+pub(crate) fn receipt_ids(ids: &[Uuid]) -> Vec<Uuid> {
+    ids.iter()
+        .copied()
+        .chain(ids.iter().copied().map(quarantine_record_id))
+        .collect()
+}
+
+/// Maps ledger rows read for [`receipt_ids`]`(ids)` to the settlement they
+/// prove committed, as `(settlement id, delta)`. A legacy solo receipt under
+/// a settlement's own id is not that settlement's evidence.
+pub(crate) fn committed_receipts(
+    ids: &[Uuid],
+    rows: Vec<(Uuid, i64, Option<serde_json::Value>)>,
+) -> Vec<(Uuid, i64)> {
+    let quarantined: HashMap<Uuid, Uuid> = ids
+        .iter()
+        .map(|id| (quarantine_record_id(*id), *id))
+        .collect();
+    rows.into_iter()
+        .filter_map(|(record, delta, details)| match quarantined.get(&record) {
+            // Only a quarantine receipt naming this settlement counts.
+            Some(original) => details
+                .as_ref()
+                .is_some_and(|d| d["quarantine"]["record_id"] == serde_json::json!(original))
+                .then_some((*original, delta)),
+            None if is_legacy_solo_receipt(details.as_ref()) => None,
+            None => Some((record, delta)),
+        })
+        .collect()
+}
+
+/// [`settle`] for a receipt key that a legacy solo receipt may hold. The
+/// wallet update and receipt stay one statement; a taken key inserts no
+/// receipt and returns `(balance, false)` with the wallet already updated
+/// and the transaction still usable, so the caller must write the receipt
+/// elsewhere ([`receipt_on`]) or fail the transaction.
+pub async fn settle_unless_taken(
+    conn: &mut PgConnection,
+    game: i16,
+    user_id: Uuid,
+    play: &Play<'_>,
+) -> sqlx::Result<(i64, bool)> {
+    sqlx::query_as(
+        "WITH updated AS (UPDATE wallets \
+            SET balance = balance + $3, \
+                net_won = net_won + $3, \
+                hands_played = hands_played + $4, \
+                hands_won = hands_won + $5, \
+                updated_at = now() \
+          WHERE user_id = $1 AND game = $2 \
+      RETURNING balance), \
+         inserted AS (INSERT INTO wallet_ledger \
+            (user_id, game, kind, record_id, room_code, revision, delta, balance_after, \
+             details, hand_completed, has_bots) \
+         SELECT $1, $2, 'play', $6, $7, $8, $3, balance, $9, $10, $11 FROM updated \
+         ON CONFLICT (game, record_id, user_id) WHERE record_id IS NOT NULL DO NOTHING \
+         RETURNING balance_after) \
+         SELECT balance, EXISTS(SELECT 1 FROM inserted) FROM updated",
+    )
+    .bind(user_id)
+    .bind(game)
+    .bind(play.delta)
+    .bind(i32::from(play.completes_hand))
+    .bind(i32::from(play.completes_hand && play.won))
+    .bind(play.record_id)
+    .bind(play.room_code)
+    .bind(play.revision)
+    .bind(&play.details)
+    .bind(play.hand_completed)
+    .bind(play.has_bots)
+    .fetch_one(conn.writer())
+    .await
+}
+
+/// The play receipt alone, for a wallet update [`settle_unless_taken`]
+/// already applied.
+pub async fn receipt_on(
+    conn: &mut PgConnection,
+    game: i16,
+    user_id: Uuid,
+    play: &Play<'_>,
+    balance_after: i64,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO wallet_ledger \
+            (user_id, game, kind, record_id, room_code, revision, delta, balance_after, \
+             details, hand_completed, has_bots) \
+         VALUES ($1, $2, 'play', $3, $4, $5, $6, $7, $8, $9, $10)",
+    )
+    .bind(user_id)
+    .bind(game)
+    .bind(play.record_id)
+    .bind(play.room_code)
+    .bind(play.revision)
+    .bind(play.delta)
+    .bind(balance_after)
+    .bind(&play.details)
+    .bind(play.hand_completed)
+    .bind(play.has_bots)
+    .execute(conn.writer())
+    .await
+    .map(|_| ())
+}
+
 /// Applies one play to the wallet and writes its ledger row. Returns the
 /// balance after. A delta that drives the balance negative fails the CHECK
 /// constraint, which rolls back the caller's transaction.

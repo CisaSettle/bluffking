@@ -533,20 +533,35 @@ impl DealerRoom for SicboRoom {
                 Err(sqlx::Error::RowNotFound) => continue,
                 Err(error) => return Err(error),
             }
-            // A room settlement reuses the round id as its receipt key. A solo
-            // roll submitted with that id (only a crafted client can) would
+            // A room settlement reuses the round id as its receipt key. This
+            // round's own receipt means a replay after a lost commit
+            // acknowledgement: already settled. Any other row under the id
+            // (only a solo receipt written before solo ids were derived) would
             // collide with the unique play receipt and wedge this room's
-            // writer, so that one wager is void instead.
-            let taken: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM wallet_ledger WHERE game=$2 AND record_id=$3 AND user_id=$1)",
+            // writer, so that one wager is void and operators are alerted.
+            let taken: Option<Option<Value>> = sqlx::query_scalar(
+                "SELECT details FROM wallet_ledger WHERE game=$2 AND record_id=$3 AND user_id=$1",
             )
             .bind(uid)
             .bind(wallet_game)
             .bind(round.round_id)
-            .fetch_one(&mut *conn)
+            .fetch_optional(&mut *conn)
             .await?;
-            if taken {
-                tracing::warn!(%uid, %code, "sicbo room wager reused a solo receipt id; voided");
+            if let Some(details) = taken {
+                let own = details.as_ref().is_some_and(|d| {
+                    d["game"] == "sicbo"
+                        && d["room_code"] == code
+                        && d["round_no"] == json!(round.round_no)
+                });
+                if !own {
+                    tracing::error!(
+                        alert_error = "Sicbo room wager voided: its receipt id was already used",
+                        alert_cause = "another receipt of this player already holds the room round id / 该玩家已有其他收据占用了本局 id",
+                        alert_action = "AI team reviews the player's conflicting ledger row and settles the voided wager by hand if owed; Loong action: none / AI 核查冲突流水并按需手工结算，Loong 无需操作",
+                        "[sicbo_room_receipt_id_conflict] user={uid} room={code} round={}",
+                        round.round_id
+                    );
+                }
                 continue;
             }
             if wallet::lock(&mut *conn, wallet_game, uid).await?.is_none() {

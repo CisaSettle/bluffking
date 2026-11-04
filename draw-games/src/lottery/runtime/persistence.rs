@@ -164,16 +164,28 @@ pub(super) async fn persist(
             .await?
             .ok_or_else(|| permanent("wallet row missing"))?;
     }
+    // This event's receipt id; a quarantined event writes under another.
+    let mut ledger_id = event.id;
     if let (Some(user), Some(effect)) = (event.owner, &event.effect) {
-        if let Some((delta, details)) = sqlx::query_as::<_, (i64, Option<Value>)>(
-            "SELECT delta,details FROM wallet_ledger WHERE user_id=$1 AND game=$2 AND record_id=$3",
-        )
-        .bind(user)
-        .bind(BEANS)
-        .bind(event.id)
-        .fetch_optional(&mut *tx)
-        .await?
+        let mut existing = ledger_row(&mut tx, user, event.id).await?;
+        if existing
+            .as_ref()
+            // Lottery receipts (fingerprinted, or legacy with a `purpose`)
+            // never qualify, so a genuine lottery mismatch stays permanent.
+            .is_some_and(|(_, details)| crate::wallet::is_legacy_solo_receipt(details.as_ref()))
         {
+            // Per-event quarantine: a solo-game receipt written before solo
+            // ids were derived holds this lottery id. It carries none of this
+            // event's money, so this event alone is written under its
+            // quarantine id (operators are alerted after commit) instead of
+            // fencing the writer and abandoning every user's work.
+            ledger_id = crate::wallet::quarantine_record_id(event.id);
+            existing = ledger_row(&mut tx, user, ledger_id).await?;
+        }
+        if let Some((delta, details)) = existing {
+            // Our own earlier commit (a lost acknowledgement) replays. Any
+            // other row stays a permanent mismatch, including another lottery
+            // receipt and a foreign row under the quarantine id.
             if delta != effect.ledger_delta
                 || details.as_ref().and_then(|d| d["lottery_event"].as_str())
                     != Some(fingerprint.as_str())
@@ -183,6 +195,11 @@ pub(super) async fn persist(
             let grants = read_grants(&mut tx, &event.max_cards).await?;
             tx.commit().await?;
             publish(pool, event);
+            // The first commit's acknowledgement may have been lost before
+            // its alert: a replayed quarantine alerts too.
+            if ledger_id != event.id {
+                quarantine_alert(event, ledger_id);
+            }
             return Ok(grants);
         }
     }
@@ -267,6 +284,9 @@ pub(super) async fn persist(
             sqlx::query("WITH updated AS (UPDATE wallets SET balance=balance+$3,updated_at=now() WHERE user_id=$1 AND game=$2 RETURNING balance) INSERT INTO wallet_ledger(user_id,game,kind,delta,balance_after,details) SELECT $1,$2,'bonus',$3,balance,$4 FROM updated").bind(user).bind(BEANS).bind(event.bonus).bind(reason).execute(&mut *tx).await?;
         }
         let mut details = json!({"purpose":event.kind,"game":event.game,"lottery_event":fingerprint,"ticket_ids":event.cards.iter().map(|t|t.card.id).collect::<Vec<_>>()});
+        if ledger_id != event.id {
+            details["quarantine"] = json!({"reason":"receipt_id_taken","record_id":event.id});
+        }
         if let Some(receipt) = &event.receipt {
             details["body_sha256"] = json!(receipt.hash);
             details["charged"] = json!(receipt.charged);
@@ -278,7 +298,7 @@ pub(super) async fn persist(
             BEANS,
             user,
             &crate::wallet::Play {
-                record_id: event.id,
+                record_id: ledger_id,
                 delta: effect.net,
                 completes_hand: effect.played != 0,
                 won: effect.won != 0,
@@ -331,6 +351,9 @@ pub(super) async fn persist(
     }
     tx.commit().await?;
     publish(pool, event);
+    if ledger_id != event.id {
+        quarantine_alert(event, ledger_id);
+    }
     if let Some(user) = event.owner {
         if !event.max_cards.is_empty() {
             crate::entitlement::invalidate_tier(pool, user)
@@ -352,6 +375,36 @@ pub(super) async fn persist(
     }
     Ok(grants)
 }
+/// After commit only: the event's receipt is durable under `ledger_id`.
+fn quarantine_alert(event: &Event, ledger_id: Uuid) {
+    tracing::error!(
+        alert_error = "Lottery receipt quarantined: its ledger id was already used",
+        alert_cause = "a solo-game receipt of this player holds the lottery receipt id; this event was written under its quarantine id instead / 该玩家的单机游戏收据占用了彩票收据 id，本事件改用隔离 id 写入",
+        alert_action = "AI team reviews the player's conflicting ledger row and the quarantined receipt; Loong action: none / AI 核查冲突流水与隔离收据，Loong 无需操作",
+        "[lottery_receipt_quarantined] user={} game={} kind={} event={} quarantine_id={ledger_id} tickets={}",
+        event.owner.unwrap_or_default(),
+        event.game,
+        event.kind,
+        event.id,
+        event.cards.len()
+    );
+}
+
+async fn ledger_row(
+    conn: &mut crate::db_writer::PgConnection,
+    user: Uuid,
+    record_id: Uuid,
+) -> sqlx::Result<Option<(i64, Option<Value>)>> {
+    sqlx::query_as(
+        "SELECT delta,details FROM wallet_ledger WHERE user_id=$1 AND game=$2 AND record_id=$3",
+    )
+    .bind(user)
+    .bind(BEANS)
+    .bind(record_id)
+    .fetch_optional(conn)
+    .await
+}
+
 async fn read_grants(
     conn: &mut crate::db_writer::PgConnection,
     ids: &[Uuid],

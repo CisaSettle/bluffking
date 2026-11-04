@@ -43,31 +43,6 @@ const RECENT_POKER_ACKS: usize = 4096;
 const DAILY: &str = "beans_daily_refill";
 const READ_PUBLICATION_WAIT: Duration = Duration::from_secs(2);
 static READ_WAITERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(256);
-type RankKey = (std::cmp::Reverse<i64>, std::cmp::Reverse<i32>, Uuid);
-struct Rank {
-    profit: RankKey,
-    balance: RankKey,
-}
-
-/// Update both indexes through every existing wallet publication/invalidation path.
-/// Both rankings include only wallets with completed gold-bean games.
-#[derive(Default)]
-struct Rankings {
-    profit: BTreeSet<RankKey>,
-    balance: BTreeSet<RankKey>,
-}
-impl Rankings {
-    fn insert(&mut self, rank: Rank) {
-        if rank.profit.1 .0 > 0 {
-            self.profit.insert(rank.profit);
-            self.balance.insert(rank.balance);
-        }
-    }
-    fn remove(&mut self, rank: &Rank) {
-        self.profit.remove(&rank.profit);
-        self.balance.remove(&rank.balance);
-    }
-}
 #[derive(Default)]
 struct User {
     wallet: Option<Wallet>,
@@ -111,7 +86,6 @@ struct Inner {
     active_writes: usize,
     active_users: HashMap<Uuid, usize>,
     users: HashMap<Uuid, User>,
-    ranks: Rankings,
     pending: BTreeSet<Uuid>,
     count: usize,
     bytes: usize,
@@ -248,12 +222,8 @@ impl Mutation {
         user.days.insert(day);
         user.bytes += added * 64;
         user.available = true;
-        let key = rank(id, user);
         inner.count += added;
         inner.bytes += added * 64;
-        if let Some(key) = key {
-            inner.ranks.insert(key);
-        }
         inner.pending.remove(&id);
         self.daily_published = true;
         state.published.notify_waiters();
@@ -400,23 +370,6 @@ pub async fn read_after_publication<T>(
         }
     }
 }
-fn rank(id: Uuid, user: &User) -> Option<Rank> {
-    user.wallet
-        .as_ref()
-        .filter(|_| user.available && user.eligible)
-        .map(|w| Rank {
-            profit: (
-                std::cmp::Reverse(w.net_won),
-                std::cmp::Reverse(w.hands_played),
-                id,
-            ),
-            balance: (
-                std::cmp::Reverse(w.balance),
-                std::cmp::Reverse(w.hands_played),
-                id,
-            ),
-        })
-}
 fn wallet(row: &sqlx::postgres::PgRow) -> Wallet {
     Wallet {
         balance: row.get("balance"),
@@ -520,16 +473,10 @@ pub(crate) fn accept_poker_effects_with<T>(
     inner.epoch = inner.epoch.wrapping_add(1);
     let generation = inner.epoch;
     for (id, delta, wallet) in updated {
-        if let Some(key) = inner.users.get(&id).and_then(|user| rank(id, user)) {
-            inner.ranks.remove(&key);
-        }
         let user = inner.users.get_mut(&id).expect("validated poker wallet");
         user.wallet = Some(wallet);
         user.poker.insert(record, delta);
         user.generation = generation;
-        if let Some(key) = rank(id, user) {
-            inner.ranks.insert(key);
-        }
     }
     inner.poker.insert(
         record,
@@ -660,12 +607,6 @@ fn replace(inner: &mut Inner, id: Uuid, user: User) -> sqlx::Result<()> {
     if rows > MAX_ROWS || bytes > MAX_BYTES || (old.is_none() && inner.users.len() >= MAX_USERS) {
         return Err(unavailable());
     }
-    if let Some(key) = old.and_then(|v| rank(id, v)) {
-        inner.ranks.remove(&key);
-    }
-    if let Some(key) = rank(id, &user) {
-        inner.ranks.insert(key);
-    }
     inner.users.insert(id, user);
     inner.count = rows;
     inner.bytes = bytes;
@@ -794,9 +735,6 @@ fn invalidate_locked(inner: &mut Inner, id: Uuid) {
     if !inner.ready {
         return;
     }
-    if let Some(key) = inner.users.get(&id).and_then(|user| rank(id, user)) {
-        inner.ranks.remove(&key);
-    }
     if !inner.users.contains_key(&id)
         && replace(
             inner,
@@ -916,9 +854,6 @@ pub fn remove_user(pool: &PgPool, id: Uuid) {
         .is_some_and(|user| !user.poker.is_empty() || !user.effects.is_empty())
         || crate::beans::holds::outstanding(id)
     {
-        if let Some(key) = inner.users.get(&id).and_then(|user| rank(id, user)) {
-            inner.ranks.remove(&key);
-        }
         let generation = inner.epoch;
         if let Some(user) = inner.users.get_mut(&id) {
             user.available = false;
@@ -932,9 +867,6 @@ pub fn remove_user(pool: &PgPool, id: Uuid) {
     }
     inner.reservations.remove_user(id);
     if let Some(user) = inner.users.remove(&id) {
-        if let Some(key) = rank(id, &user) {
-            inner.ranks.remove(&key);
-        }
         inner.count -= count(&user);
         inner.bytes -= user.bytes;
     }
@@ -986,8 +918,11 @@ async fn read_user(
         evidence.stage("poker_receipts");
         if !poker.is_empty() {
             let ids: Vec<_> = poker.keys().copied().collect();
-            let applied: Vec<(Uuid, i64)> = sqlx::query_as("SELECT record_id,delta FROM wallet_ledger WHERE game=$1 AND user_id=$2 AND kind='play' AND record_id=ANY($3)")
-                .bind(crate::game_catalog::BEANS).bind(id).bind(&ids).fetch_all(&mut *tx).await?;
+            // A hand may have committed under its quarantine id; a legacy
+            // solo receipt under the hand id proves nothing.
+            let rows: Vec<(Uuid, i64, Option<Value>)> = sqlx::query_as("SELECT record_id,delta,details FROM wallet_ledger WHERE game=$1 AND user_id=$2 AND kind='play' AND record_id=ANY($3)")
+                .bind(crate::game_catalog::BEANS).bind(id).bind(crate::wallet::receipt_ids(&ids)).fetch_all(&mut *tx).await?;
+            let applied = crate::wallet::committed_receipts(&ids, rows);
             let mut seen = HashSet::new();
             for (hand, delta) in applied {
                 if poker.get(&hand).map(|effect| effect.delta) != Some(delta) || !seen.insert(hand) {
@@ -1012,8 +947,11 @@ async fn read_user(
         evidence.stage("effect_receipts");
         if !effects.is_empty() {
             let ids: Vec<_> = effects.keys().copied().collect();
-            let applied: Vec<(Uuid,i64)> = sqlx::query_as("SELECT record_id,delta FROM wallet_ledger WHERE game=$1 AND user_id=$2 AND record_id=ANY($3)")
-                .bind(crate::game_catalog::BEANS).bind(id).bind(ids).fetch_all(&mut *tx).await?;
+            // As for hands: a lottery event may have committed under its
+            // quarantine id.
+            let rows: Vec<(Uuid,i64,Option<Value>)> = sqlx::query_as("SELECT record_id,delta,details FROM wallet_ledger WHERE game=$1 AND user_id=$2 AND record_id=ANY($3)")
+                .bind(crate::game_catalog::BEANS).bind(id).bind(crate::wallet::receipt_ids(&ids)).fetch_all(&mut *tx).await?;
+            let applied = crate::wallet::committed_receipts(&ids, rows);
             let mut seen = HashSet::new();
             for (record,delta) in applied {
                 if effects.get(&record).is_none_or(|e|e.ledger_delta!=delta) || !seen.insert(record) { return Err(unavailable()); }
@@ -1305,66 +1243,6 @@ pub fn receipt(
             .filter(|value| value["game"] == game)
             .map(|details| (wallet.balance, details.clone()))
     }))
-}
-pub fn leaderboard(
-    pool: &PgPool,
-    limit: i64,
-    offset: i64,
-    sort: beans::LeaderboardSort,
-) -> sqlx::Result<Vec<beans::LeaderboardRow>> {
-    let state = state(pool);
-    let inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
-    if !inner.ready
-        || inner
-            .pending
-            .iter()
-            .any(|id| inner.users.get(id).is_some_and(|user| !user.available))
-    {
-        return Err(unavailable());
-    }
-    let mut rows = Vec::new();
-    let mut skipped = 0usize;
-    let limit = crate::pagination::limit(Some(limit)) as usize;
-    let offset = crate::pagination::offset(Some(offset)) as usize;
-    let ranks = match sort {
-        beans::LeaderboardSort::Profit => &inner.ranks.profit,
-        beans::LeaderboardSort::Balance => &inner.ranks.balance,
-    };
-    for (_, _, id) in ranks {
-        let Some(player) = crate::player_directory::lookup(pool, *id)? else {
-            continue;
-        };
-        if !player.active() {
-            continue;
-        }
-        if skipped < offset {
-            skipped += 1;
-            continue;
-        }
-        let wallet = inner
-            .users
-            .get(id)
-            .and_then(|user| user.wallet.as_ref())
-            .ok_or_else(unavailable)?;
-        rows.push(beans::LeaderboardRow {
-            user_id: *id,
-            display_name: crate::content_moderation::public_name_or_fallback(
-                player
-                    .display_name
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty()),
-                *id,
-            ),
-            balance: wallet.balance,
-            net_won: wallet.net_won,
-            hands_played: wallet.hands_played,
-        });
-        if rows.len() == limit {
-            break;
-        }
-    }
-    Ok(rows)
 }
 
 /// Current wallet plus the newest committed cabinet result, scoped to its owner.
