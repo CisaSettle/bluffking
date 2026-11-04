@@ -67,6 +67,9 @@ impl GameHand {
             pending_board_street: self.pending_board_street,
             finished_street: self.finished_street,
             dead_small_blind: self.dead_small_blind,
+            runout_choice: self.runout_choice,
+            run_twice_from: self.run_twice_from,
+            second_board: self.second_board.clone(),
         }
     }
 

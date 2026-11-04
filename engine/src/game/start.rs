@@ -88,6 +88,9 @@ impl GameHand {
             pending_board_street: None,
             finished_street: None,
             dead_small_blind: false,
+            runout_choice: None,
+            run_twice_from: None,
+            second_board: None,
         }
     }
 
@@ -161,6 +164,9 @@ impl GameHand {
             pending_board_street: None,
             finished_street: None,
             dead_small_blind: false,
+            runout_choice: None,
+            run_twice_from: None,
+            second_board: None,
         }
     }
 

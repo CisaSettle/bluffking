@@ -120,6 +120,26 @@ pub struct RevealBoardRequest {
     pub street: engine::Street,
 }
 
+/// Second run of an all-in runout dealt twice: the street the runs diverge
+/// at. The worker returns that run's own cards from the deck positions right
+/// after the first board.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RevealSecondRunRequest {
+    pub from: engine::Street,
+}
+
+/// Deck positions of a second run that diverges at `from`, for a hand dealt
+/// to `n` seats: directly after the first board (`2n+5..`).
+pub fn second_run_positions(n: usize, from: engine::Street) -> std::ops::Range<usize> {
+    let count = match from {
+        engine::Street::Preflop => 0,
+        engine::Street::Flop => 5,
+        engine::Street::Turn => 2,
+        engine::Street::River => 1,
+    };
+    (2 * n + 5)..(2 * n + 5 + count)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RevealCardsResponse {
     pub cards: Vec<u8>,
@@ -180,6 +200,20 @@ pub fn check_settled_cards(
     for (i, card) in result.board.all_cards().into_iter().enumerate() {
         if deck.get(2 * n + i) != Some(&id(card)) {
             return Err("settled board does not match the sealed deck".into());
+        }
+    }
+    if let Some(run) = &result.run_twice {
+        let range = second_run_positions(n, run.from_street);
+        let shared = 5 - range.len();
+        let board = run.second_board.all_cards();
+        let first = result.board.all_cards();
+        if board.len() != 5 || first.len() != 5 || board[..shared] != first[..shared] {
+            return Err("settled second run does not share the first board".into());
+        }
+        for (offset, card) in board[shared..].iter().enumerate() {
+            if deck.get(range.start + offset) != Some(&id(*card)) {
+                return Err("settled second run does not match the sealed deck".into());
+            }
         }
     }
     for entry in &result.showdown {
@@ -299,6 +333,9 @@ struct SealedHand {
     delivered_seats: std::collections::HashSet<u8>,
     stage: DealerStage,
     showdown_seats: Option<Vec<u8>>,
+    /// The street a run-twice runout diverged at, once revealed. Fixed after
+    /// the first reveal so a retry returns the same cards.
+    second_run_from: Option<engine::Street>,
 }
 
 impl SealedHand {
@@ -398,6 +435,7 @@ impl SealedHand {
                 delivered_seats: Default::default(),
                 stage: DealerStage::Preflop,
                 showdown_seats: None,
+                second_run_from: None,
             },
             response_tickets,
         ))
@@ -425,6 +463,27 @@ impl SealedHand {
         // returns the same committed cards without regressing the stage.
         self.stage = self.stage.max(want);
         Ok(self.deck[range].to_vec())
+    }
+
+    fn reveal_second_run(&mut self, from: engine::Street) -> Result<Vec<u8>, &'static str> {
+        if self.stage < DealerStage::River || self.stage >= DealerStage::Settled {
+            return Err("second run is available only after the first river");
+        }
+        if from == engine::Street::Preflop {
+            return Err("second run must start at the flop, turn or river");
+        }
+        if self
+            .second_run_from
+            .is_some_and(|previous| previous != from)
+        {
+            return Err("second run cannot change after disclosure");
+        }
+        self.second_run_from = Some(from);
+        let range = second_run_positions(self.seats.len(), from);
+        self.deck
+            .get(range)
+            .map(<[u8]>::to_vec)
+            .ok_or("second run exceeds the deck")
     }
 
     fn reveal_showdown(&mut self, mut seats: Vec<u8>) -> Result<Vec<RevealedSeat>, &'static str> {
@@ -644,6 +703,29 @@ async fn reveal_board(
         return StatusCode::NOT_FOUND.into_response();
     };
     match hand.reveal_board(request.street) {
+        Ok(cards) => Json(RevealCardsResponse { cards }).into_response(),
+        Err(reason) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error":reason})),
+        )
+            .into_response(),
+    }
+}
+
+async fn reveal_second_run(
+    State(state): State<WorkerState>,
+    Path(hand_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(request): Json<RevealSecondRunRequest>,
+) -> impl IntoResponse {
+    if !internal_authorized(&headers, &state) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let mut hands = state.hands.write().await;
+    let Some(hand) = hands.get_mut(&hand_id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match hand.reveal_second_run(request.from) {
         Ok(cards) => Json(RevealCardsResponse { cards }).into_response(),
         Err(reason) => (
             StatusCode::CONFLICT,
@@ -1016,6 +1098,10 @@ fn worker_router(state: WorkerState) -> Router {
         )
         .route("/internal/hands/:hand_id/board", post(reveal_board))
         .route("/internal/hands/:hand_id/showdown", post(reveal_showdown))
+        .route(
+            "/internal/hands/:hand_id/second-run",
+            post(reveal_second_run),
+        )
         .route("/internal/hands/:hand_id/settle", post(settle_hand))
         .route("/internal/hands/:hand_id", delete(delete_hand))
         .route("/healthz", get(|| async { StatusCode::NO_CONTENT }))
@@ -1198,6 +1284,44 @@ impl SealedDealerClient {
             .await
             .map_err(|e| e.to_string())?;
         Ok(response.cards)
+    }
+
+    pub async fn reveal_second_run(
+        &self,
+        hand_id: Uuid,
+        from: engine::Street,
+    ) -> Result<Vec<u8>, String> {
+        let response: RevealCardsResponse = self
+            .send_with_retry(
+                self.request(self.http.post(format!(
+                    "{}/internal/hands/{hand_id}/second-run",
+                    self.base_url
+                )))
+                .json(&RevealSecondRunRequest { from }),
+            )
+            .await?
+            .json()
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(response.cards)
+    }
+
+    /// Deal the second run of a run-twice runout into `hand` once its first
+    /// board is complete. A no-op for an ordinary single runout.
+    pub async fn deal_second_run(
+        &self,
+        hand_id: Uuid,
+        hand: &mut engine::GameHand,
+    ) -> Result<(), String> {
+        if !hand.second_run_pending() || !hand.is_done() {
+            return Ok(());
+        }
+        let from = hand
+            .run_twice_from()
+            .ok_or("second run has no start street")?;
+        let ids = self.reveal_second_run(hand_id, from).await?;
+        let cards = deck_cards(&ids).ok_or("invalid sealed second-run card")?;
+        hand.inject_second_run(&cards).map_err(|e| format!("{e:?}"))
     }
 
     pub async fn reveal_showdown(
@@ -1559,6 +1683,7 @@ impl ActiveHand {
         ),
         String,
     > {
+        self.client.deal_second_run(self.hand_id, hand).await?;
         let contenders: Vec<_> = hand
             .seats()
             .iter()

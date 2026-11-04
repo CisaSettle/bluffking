@@ -241,6 +241,34 @@ pub struct HandResult {
     /// the same identity-checked, opt-in `CardsShown` path a loser's cards do.
     #[serde(default)]
     pub folded_hole_cards: HashMap<u64, HoleCards>,
+    /// Present only when the all-in contenders chose to run the remaining
+    /// board twice. `board`, `showdown` and `show_order` then describe the
+    /// first run; `pots` / `chips_awarded` / `final_stacks` are the merged
+    /// settlement of both runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_twice: Option<RunTwiceResult>,
+}
+
+/// Per-run detail of a hand whose all-in runout was dealt twice.
+///
+/// Every contested pot is split in two: the first run takes the larger half
+/// (an odd chip stays with the first run), the second run the rest. Each half
+/// is awarded on its own board and the halves are merged into
+/// [`HandResult::pots`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunTwiceResult {
+    /// The first street dealt separately for each run.
+    pub from_street: Street,
+    /// The complete second board. Cards dealt before `from_street` are shared
+    /// with [`HandResult::board`].
+    pub second_board: BoardCards,
+    /// Pot halves awarded on the first board.
+    pub first_pots: Vec<PotResult>,
+    /// Pot halves awarded on the second board.
+    pub second_pots: Vec<PotResult>,
+    /// Showdown ranking on the second board (same contenders as
+    /// [`HandResult::showdown`]).
+    pub second_showdown: Vec<ShowdownEntry>,
 }
 
 // ---------------------------------------------------------------------------
@@ -449,6 +477,13 @@ pub struct GameHand {
     /// seat that owed it is empty). Only honoured with three or more players;
     /// the big blind is then the seat left of `dealer_idx`. Default `false`.
     dead_small_blind: bool,
+    /// All-in runout choice: `None` until asked; `Some(false)` = run once,
+    /// `Some(true)` = run twice. Only an all-in runout can set it.
+    runout_choice: Option<bool>,
+    /// The first street dealt separately for each run, when running twice.
+    run_twice_from: Option<Street>,
+    /// The complete second board, once its own cards are known.
+    second_board: Option<BoardCards>,
 }
 
 /// Why a blind-mode `finish_blind` / `inject_*` call could not complete.
@@ -540,12 +575,22 @@ pub enum BlindInjectError {
     /// accepted (returns `Ok`).
     #[error("showdown reveal rejected: player {0:?} is already revealed with different cards")]
     AlreadyRevealed(PlayerId),
+    /// The second run cannot be dealt now: the hand did not choose to run
+    /// twice, has not finished its first board, or already has a second board.
+    #[error("second run rejected: no second run is pending")]
+    NoSecondRunPending,
+    /// The all-in runout choice is not open (betting not closed by an all-in,
+    /// no board pending, fewer than two contenders, or already chosen).
+    #[error("runout choice rejected: no all-in runout choice is open")]
+    RunoutChoiceClosed,
 }
 
 mod actions;
 mod pots;
 mod start;
 mod streets;
+
+pub use streets::second_run_cards_from as second_run_card_count_from;
 
 impl GameHand {
     /// Whether the hand is done.

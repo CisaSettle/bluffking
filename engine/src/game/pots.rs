@@ -315,8 +315,16 @@ impl GameHand {
         &self,
         eligible: &[(PlayerId, HoleCards)],
     ) -> Vec<ShowdownEntry> {
+        Self::showdown_on(eligible, &self.board)
+    }
+
+    /// Rank a non-empty eligible set on `board` (first or second run).
+    pub(super) fn showdown_on(
+        eligible: &[(PlayerId, HoleCards)],
+        board: &BoardCards,
+    ) -> Vec<ShowdownEntry> {
         if eligible.len() > 1 {
-            let ranked = rank_players(eligible, &self.board);
+            let ranked = rank_players(eligible, board);
             ranked
                 .into_iter()
                 .map(|(pid, rank)| {
@@ -341,7 +349,7 @@ impl GameHand {
             eligible
                 .iter()
                 .map(|(pid, hole)| {
-                    let rank = crate::eval::rank_hand(hole, &self.board);
+                    let rank = crate::eval::rank_hand(hole, board);
                     ShowdownEntry {
                         player_id: *pid,
                         hole_cards: *hole,
@@ -389,15 +397,57 @@ impl GameHand {
         let button_order = self.button_relative_order();
 
         let settlement_pots = self.settlement_side_pots();
-        let pot_results = distribute_pots(
-            &settlement_pots,
-            &eligible,
-            &self.board,
-            &button_order,
-            forfeiters,
-        );
+        let (pot_results, run_twice) = match (self.run_twice_from, self.second_board.as_ref()) {
+            // All-in runout dealt twice: each contested pot is halved (the odd
+            // chip stays with the first run) and each half is awarded on its
+            // own board. Uncalled-overage refunds stay whole in the first run.
+            (Some(from_street), Some(second_board)) => {
+                let (first_half, second_half) = split_pots_for_two_runs(&settlement_pots);
+                let first_pots = distribute_pots(
+                    &first_half,
+                    &eligible,
+                    &self.board,
+                    &button_order,
+                    forfeiters,
+                );
+                let second_pots = distribute_pots(
+                    &second_half,
+                    &eligible,
+                    second_board,
+                    &button_order,
+                    forfeiters,
+                );
+                let merged = merge_run_pots(&settlement_pots, &first_pots, &second_pots);
+                let second_showdown = if eligible.is_empty() {
+                    Vec::new()
+                } else {
+                    Self::showdown_on(&eligible, second_board)
+                };
+                (
+                    merged,
+                    Some(RunTwiceResult {
+                        from_street,
+                        second_board: second_board.clone(),
+                        first_pots,
+                        second_pots,
+                        second_showdown,
+                    }),
+                )
+            }
+            _ => (
+                distribute_pots(
+                    &settlement_pots,
+                    &eligible,
+                    &self.board,
+                    &button_order,
+                    forfeiters,
+                ),
+                None,
+            ),
+        };
 
-        let result = self.finalize_pots(pot_results, showdown);
+        let mut result = self.finalize_pots(pot_results, showdown);
+        result.run_twice = run_twice;
 
         // Emit HandFinished event.
         self.events.push(EngineEvent::HandFinished {
@@ -562,6 +612,7 @@ impl GameHand {
             showdown,
             show_order,
             folded_hole_cards,
+            run_twice: None,
         }
     }
 
@@ -767,6 +818,61 @@ impl GameHand {
         }
         self.cumulative_side_pots.extend(new_pots);
     }
+}
+
+/// Split settlement pots into the two halves of a run-twice runout. Both
+/// vectors keep the original order so `PotResult::index` lines up. A pot with
+/// an explicit uncalled-overage refund is never contested and stays whole in
+/// the first half (its second half is zero and is dropped by
+/// [`distribute_pots`]).
+pub(super) fn split_pots_for_two_runs(pots: &[SidePot]) -> (Vec<SidePot>, Vec<SidePot>) {
+    let mut first = Vec::with_capacity(pots.len());
+    let mut second = Vec::with_capacity(pots.len());
+    for pot in pots {
+        let second_amount = if pot.refund_to.is_empty() {
+            pot.amount.0 / 2
+        } else {
+            0
+        };
+        let mut a = pot.clone();
+        a.amount = Chips(pot.amount.0 - second_amount);
+        let mut b = pot.clone();
+        b.amount = Chips(second_amount);
+        first.push(a);
+        second.push(b);
+    }
+    (first, second)
+}
+
+/// Merge the two runs' awards back into one result per settlement pot.
+/// Winners keep first-run order; a player who won both halves is listed once
+/// with the sum.
+pub(super) fn merge_run_pots(
+    pots: &[SidePot],
+    first: &[PotResult],
+    second: &[PotResult],
+) -> Vec<PotResult> {
+    first
+        .iter()
+        .map(|run1| {
+            let mut winners = run1.winners.clone();
+            if let Some(run2) = second.iter().find(|r| r.index == run1.index) {
+                for w in &run2.winners {
+                    match winners.iter_mut().find(|x| x.player_id == w.player_id) {
+                        Some(existing) => existing.amount_won.0 += w.amount_won.0,
+                        None => winners.push(w.clone()),
+                    }
+                }
+            }
+            PotResult {
+                index: run1.index,
+                amount: pots.get(run1.index).map_or(run1.amount, |p| p.amount),
+                eligible_player_ids: run1.eligible_player_ids.clone(),
+                winners,
+                is_refund: run1.is_refund,
+            }
+        })
+        .collect()
 }
 
 /// Place odd chips in button-relative order, with player id breaking ties.
