@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 # Explicit metadata (U17/U53, dual-AI OSS review) — see engine/Cargo.toml.
 license = "AGPL-3.0-only"
-description = "Mental Poker card-dealing protocol: dealing abstraction, signed transcript, and offline verifier."
+description = "Verifiable card dealing: commit-reveal, verifiable-dealing bundles, server-blind crypto, and an offline verifier."
 repository = "https://github.com/CisaSettle/bluffking"
 # Never published to a registry — internal workspace crate (cargo-deny private).
 publish = false
@@ -12,15 +12,12 @@ publish = false
 [lints]
 workspace = true
 
-# Mental Poker card-dealing protocol: dealing abstraction, mock crypto,
-# signed hash-chain transcript, and an offline verifier.
+# Verifiable card dealing: ADR-064 commit-reveal, pf2 verifiable-dealing
+# bundles, the real server-blind crypto used by engine-blind dealing, and the
+# offline verifier.
 #
 # Pure crate — no async, no IO, no DB. Depends on `engine` only for the `Card`
 # type.
-
-[[bin]]
-name = "mp-verify"
-path = "src/bin/mp_verify.rs"
 
 # ADR-064 — offline commit-reveal verifier for existing_server hands.
 [[bin]]
@@ -38,18 +35,16 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 sha2 = "0.10"
-hmac = "0.12"
 hex = "0.4"
 # pf_verify (ADR-064) parses the per-hand UUID into its 16 raw bytes to bind the
 # deck seed; the workspace already enables v4+v7+serde.
 uuid = { workspace = true }
 ed25519-dalek = { version = "2.2.0", features = ["rand_core", "zeroize"] }
-# Server-blind crypto (ADR-063 primitives — GA'd for the engine-blind table class
-# by ADR-070, 2026-06-23; cross-vendor AI-audited, ADR-076/077/078; open-source
-# + independently verifiable).
+# Server-blind crypto (docs/architecture/mp-phase4-crypto-spec.md — GA'd for the
+# engine-blind table class by ADR-070, 2026-06-23; cross-vendor AI-audited,
+# ADR-076/077/078; open-source + independently verifiable).
 # In production these are selected ONLY for engine-blind sessions
-# (resolve_mp_crypto_mode); the generic mental_poker_production provider stays
-# rejected. Play-money only.
+# (resolve_mp_crypto_mode). Play-money only.
 curve25519-dalek = { version = "4.1.3", features = ["digest", "rand_core", "zeroize"] }
 merlin = "3"
 rand_core = "0.6"
@@ -60,7 +55,7 @@ rand_chacha = "0.3"
 chacha20poly1305 = "0.10"
 hkdf = "0.12"
 
-# WASM (Phase-4 web client, ADR-063): on wasm32-unknown-unknown the `rand 0.8 →
+# WASM (engine-blind web client, ADR-068): on wasm32-unknown-unknown the `rand 0.8 →
 # getrandom 0.2` chain needs the "js" backend (browser crypto.getRandomValues).
 # Target-gated — zero effect on the native server builds.
 [target.'cfg(target_arch = "wasm32")'.dependencies]

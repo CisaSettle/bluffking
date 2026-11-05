@@ -1,6 +1,6 @@
 # mp-wasm — browser crypto client for advanced encrypted dealing
 
-A thin `wasm-bindgen` wrapper over `mental_poker::crypto_real` (ADR-063), so a
+A thin `wasm-bindgen` wrapper over `mental_poker::crypto_real` (`docs/architecture/mp-phase4-crypto-spec.md`), so a
 browser can run DKG / verifiable shuffle / threshold decryption locally — the
 game server receives ciphertext for unshown hole cards. The browser client is
 integrated into the opt-in advanced encrypted-dealing path for all-human

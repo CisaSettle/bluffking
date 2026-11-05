@@ -3,8 +3,7 @@
 //! This module is the offline counterpart of the server's `pf_dealing.rs`. It
 //! reproduces — byte-for-byte, in the same `engine` crate the server uses — the
 //! deck of any `existing_server` hand from its revealed secrets and confirms it
-//! matches the persisted cards. It does NOT touch `verifier.rs` / `mp_verify`
-//! (the Mental Poker path).
+//! matches the persisted cards.
 //!
 //! Checks (must mirror the spec §3/§6 exactly):
 //!   1. `ds_hash("pf:seed-commit:v1",[server_seed]) == seed_commit`  (T2)
@@ -23,7 +22,7 @@
 //!   `(deck[p], deck[n+p])`); then board = `deck[2n], deck[2n+1], deck[2n+2]`
 //!   (flop), `deck[2n+3]` (turn), `deck[2n+4]` (river).
 //!
-//!   For solo/bots/MP-eligible tables the seats are contiguous from 0, so
+//!   For tables seated contiguously from 0,
 //!   `dealt_seats == [0, 1, .., n-1]` and deal_pos == seat. A PF multi-seat row
 //!   that omits `dealt_seats` is rejected FAIL-CLOSED (we never guess the
 //!   mapping — guessing would let a sparse honest hand silently pass with the

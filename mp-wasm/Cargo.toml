@@ -9,8 +9,8 @@ description = "PROTOTYPE wasm-bindgen wrapper over mental_poker::crypto_real for
 repository = "https://github.com/CisaSettle/bluffking"
 publish = false
 
-# Phase-4 server-blind WEB crypto client (ADR-063) — PROTOTYPE, pending external
-# audit. A thin wasm-bindgen wrapper over `mental_poker::crypto_real`, so the
+# Engine-blind server-blind WEB crypto client (ADR-068;
+# docs/architecture/mp-phase4-crypto-spec.md) — no external audit. A thin wasm-bindgen wrapper over `mental_poker::crypto_real`, so the
 # browser can run DKG / verifiable shuffle / threshold decryption locally (the
 # server only ever sees ciphertext). Detached from the parent workspace.
 [workspace]
