@@ -111,8 +111,10 @@ pub struct State {
     bet_revisions: BTreeMap<Uuid, u64>,
     result: Option<Roll>,
     deltas: BTreeMap<Uuid, i64>,
-    #[serde(default)]
-    max_rewards: BTreeSet<Uuid>,
+    /// Bean-round winners who drew the jackpot. The checkpoint key predates the
+    /// bean jackpot (it once meant a Max grant) and is kept for recovery.
+    #[serde(default, rename = "max_rewards")]
+    jackpots: BTreeSet<Uuid>,
     history: Vec<Value>,
     bots: Vec<Bot>,
     bot_bets: BTreeMap<Uuid, BotBet>,
@@ -141,7 +143,7 @@ impl State {
             bet_revisions: BTreeMap::new(),
             result: None,
             deltas: BTreeMap::new(),
-            max_rewards: BTreeSet::new(),
+            jackpots: BTreeSet::new(),
             history: Vec::new(),
             bots,
             bot_bets: BTreeMap::new(),
@@ -174,7 +176,7 @@ impl State {
         self.bet_revisions.clear();
         self.result = None;
         self.deltas.clear();
-        self.max_rewards.clear();
+        self.jackpots.clear();
         self.bot_deltas.clear();
         self.deal_bot_bets(now);
     }
@@ -211,7 +213,17 @@ pub struct Round {
     fairness: Reveal,
     has_bots: bool,
     bettors: Vec<(Uuid, Wager, i64)>,
-    max_rewards: BTreeSet<Uuid>,
+    jackpots: BTreeSet<Uuid>,
+}
+
+impl Round {
+    /// The bean jackpot owed to `uid` in this round, if any (see
+    /// [`crate::sicbo::jackpot_bonus`]). Practice rounds never pay one.
+    fn jackpot(&self, uid: Uuid, wager: Wager) -> Option<i64> {
+        (self.wallet_unit == WalletUnit::Beans && self.jackpots.contains(&uid))
+            .then(|| crate::sicbo::jackpot_bonus(wager.stake))
+            .flatten()
+    }
 }
 
 /// The room the player is seated in, from memory.
@@ -272,9 +284,9 @@ fn settle_round(state: &mut State, now: i64) -> Option<Round> {
         state.deltas.insert(uid, delta);
         if state.wallet_unit == WalletUnit::Beans
             && delta > 0
-            && crate::sicbo::wins_max(reveal, uid)
+            && crate::sicbo::wins_jackpot(reveal, uid)
         {
-            state.max_rewards.insert(uid);
+            state.jackpots.insert(uid);
         }
         bettors.push((uid, wager, delta));
     }
@@ -319,7 +331,7 @@ fn settle_round(state: &mut State, now: i64) -> Option<Round> {
         fairness: state.fairness.clone(),
         has_bots: !state.bots.is_empty(),
         bettors,
-        max_rewards: state.max_rewards.clone(),
+        jackpots: state.jackpots.clone(),
     })
 }
 
@@ -336,6 +348,7 @@ impl DealerRoom for SicboRoom {
         "bet_revision",
         "delta",
         "max_reward",
+        "jackpot_bonus",
     ];
     type Bet = BetRequest;
     type State = State;
@@ -402,8 +415,12 @@ impl DealerRoom for SicboRoom {
     fn uses_current_wallet(state: &State) -> bool {
         state.wallet_unit == WalletUnit::Beans
     }
-    fn reward_users(round: &Round) -> Vec<Uuid> {
-        round.max_rewards.iter().copied().collect()
+    fn bonus_credits(round: &Round) -> Vec<(Uuid, i64)> {
+        round
+            .bettors
+            .iter()
+            .filter_map(|&(uid, wager, _)| Some((uid, round.jackpot(uid, wager)?)))
+            .collect()
     }
     fn advance(state: &mut State, now: i64) -> bool {
         if state.result.is_some() && now >= state.deadline_ms {
@@ -517,7 +534,8 @@ impl DealerRoom for SicboRoom {
         "bet_close_ms":if state.result.is_none(){Some(state.deadline_ms-BET_LOCK_MS)}else{None},
         "bet_revision":state.bet_revisions.get(&uid).copied().unwrap_or(0),
         "balance":balance,"available":balance-reserved,"bet":bet,"result":result,"delta":state.deltas.get(&uid),
-        "max_reward":state.max_rewards.contains(&uid),
+        "jackpot_bonus":state.bets.get(&uid).filter(|_| state.wallet_unit == WalletUnit::Beans && state.jackpots.contains(&uid))
+            .and_then(|wager| crate::sicbo::jackpot_bonus(wager.stake)),
         "fairness_commitment":&state.fairness.commitment,
         "fairness_status":fairness_status,
         "min_stake":MIN_STAKE,"max_stake":MAX_STAKE,"ai":!state.bots.is_empty(),
@@ -567,21 +585,24 @@ impl DealerRoom for SicboRoom {
             if wallet::lock(&mut *conn, wallet_game, uid).await?.is_none() {
                 continue;
             }
-            // Keep the membership grant in the same transaction as the original bean payout.
-            let max_reward =
-                if round.wallet_unit == WalletUnit::Beans && round.max_rewards.contains(&uid) {
-                    Some(
-                        crate::game_rewards::grant_max_on(&mut *conn, uid, "sicbo", round.round_id)
-                            .await?,
-                    )
-                } else {
-                    None
-                };
+            // The jackpot commits with the round's bean payout, before its
+            // receipt so that receipt's balance includes it.
+            let jackpot_bonus = round.jackpot(uid, wager).unwrap_or(0);
+            if jackpot_bonus > 0 {
+                crate::sicbo::credit_jackpot(
+                    &mut *conn,
+                    uid,
+                    jackpot_bonus,
+                    json!({"game":"sicbo","purpose":"sicbo_jackpot","request_id":round.round_id,
+                        "room_code":code,"round_no":round.round_no,"stake":wager.stake}),
+                )
+                .await?;
+            }
             // Same receipt shape as a solo roll, so history renders both alike.
             let details = json!({"game":"sicbo","unit":round.wallet_unit,
                 "request_id":round.round_id,"side":wager.side,"stake":wager.stake,
                 "dice":round.result.dice,"total":round.result.total,"triple":round.result.triple,"won":delta>0,
-                "room_code":code,"round_no":round.round_no,"max_reward":max_reward,
+                "room_code":code,"round_no":round.round_no,"jackpot_bonus":jackpot_bonus,
                 "fairness":draw_games::sicbo::payout_proof(&round.fairness, round.result.dice, wager.side, wager.stake)});
             let play = wallet::Play {
                 record_id: round.round_id,

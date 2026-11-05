@@ -113,8 +113,9 @@ pub trait DealerRoom: Send + Sync + Sized + 'static {
     fn uses_current_wallet(_state: &Self::State) -> bool {
         true
     }
-    /// Membership recipients whose tier cache must be refreshed after commit/replay.
-    fn reward_users(_round: &Self::Round) -> Vec<Uuid> {
+    /// Bean bonuses `persist_round` credits beside the round's deltas
+    /// (current-wallet rounds only), for the accepted-balance projection.
+    fn bonus_credits(_round: &Self::Round) -> Vec<(Uuid, i64)> {
         Vec::new()
     }
     /// Opens the next round once the result has been shown; true if it did.
@@ -509,11 +510,6 @@ async fn persist<R: DealerRoom>(pool: &PgPool, code: &str, snap: &Snapshot<R>) -
                 crate::beans_read_memory::invalidate_user(pool, *user);
             }
         }
-        if let Some(round) = &snap.round {
-            for user in R::reward_users(round) {
-                crate::entitlement::invalidate_tier(pool, user);
-            }
-        }
         publish_ledger::<R>(pool, snap).await;
         return Ok(());
     }
@@ -551,11 +547,6 @@ async fn persist<R: DealerRoom>(pool: &PgPool, code: &str, snap: &Snapshot<R>) -
     }
     committed?;
     publish_ledger::<R>(pool, snap).await;
-    if let Some(round) = &snap.round {
-        for user in R::reward_users(round) {
-            crate::entitlement::invalidate_tier(pool, user);
-        }
-    }
     Ok(())
 }
 
@@ -653,6 +644,11 @@ fn accept_change<R: DealerRoom>(
                     true,
                     delta > 0,
                 );
+            }
+        }
+        if R::POLICY.game == crate::game_catalog::BEANS {
+            for (uid, bonus) in R::bonus_credits(&round) {
+                wallet::project_external_credit(R::POLICY.game, uid, bonus);
             }
         }
     }

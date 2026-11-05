@@ -4,8 +4,9 @@
 //! friend rooms and solo practice keep their own chip models. Every user
 //! starts with [`GRANT`] beans, may claim an extra [`DAILY_REFILL_TO`] per day
 //! and, only while [`pack_enabled`] is on, may buy a [`PACK_BEANS`] pack.
-//! Beans have no monetary value, cannot be
-//! cashed out, transferred or gifted.
+//! Beans have no monetary value and cannot be
+//! cashed out; the only transfer is a seated player's fee-bearing gift to
+//! another human at the same public table ([`crate::bean_gift`]).
 //!
 //! Accounting model: the wallet balance always INCLUDES the stack a player has
 //! on a public table. Each completed public-table hand settles its per-player
@@ -54,6 +55,12 @@ pub const DAILY_REFILL_TO: i64 = 200;
 pub const STAKE_KEY: &str = "10/20";
 pub const SB: u32 = 10;
 pub const BB: u32 = 20;
+/// Owner 2026-11-05: public tables play 10/20/40 — a forced straddle of
+/// 2 × BB on every hand with three or more dealt seats — plus a 10-bean ante
+/// per dealt seat. Applies to public sessions created from now on; a session
+/// already running keeps the rules it was created with.
+pub const STRADDLE_BB: u8 = 2;
+pub const ANTE: u32 = 10;
 pub const BUY_IN: u32 = 2_000;
 
 /// A departed member must bring back the same stack in this room generation.
@@ -214,6 +221,10 @@ pub struct Profile {
     pub hands_won: i32,
     pub buy_in: u32,
     pub stake: &'static str,
+    /// Forced straddle amount in beans (0 = none).
+    pub straddle: u32,
+    /// Per-seat ante in beans (0 = none).
+    pub ante: u32,
     pub daily_refill_to: i64,
     pub initial_grant: i64,
     /// True when today's free refill has not been claimed yet regardless of the current balance.
@@ -244,6 +255,8 @@ pub async fn profile(pool: &PgPool, user: Uuid) -> sqlx::Result<Profile> {
         hands_won: w.hands_won,
         buy_in: BUY_IN,
         stake: STAKE_KEY,
+        straddle: BB * u32::from(STRADDLE_BB),
+        ante: ANTE,
         daily_refill_to: DAILY_REFILL_TO,
         initial_grant: crate::auth::registration_reward::BEANS,
         daily_available,

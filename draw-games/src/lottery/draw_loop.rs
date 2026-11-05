@@ -169,7 +169,7 @@ async fn settle_one(pool: &PgPool) -> Result<bool, Error> {
     let mut tickets: Vec<TicketRow> = rows.iter().map(TicketRow::from_row).collect();
     let mut paid = 0i64;
     let mut best = 0i16;
-    let mut membership_granted = false;
+    let mut jackpot_bonus = 0i64;
     let now = Utc::now();
     for ticket in &mut tickets {
         let (prize, tier) = if balance.is_some() {
@@ -183,12 +183,14 @@ async fn settle_one(pool: &PgPool) -> Result<bool, Error> {
                     &bonus_numbers,
                 )
                 .ok_or(Error::InvalidEntry)?;
-            if entry.awards_max(prize, tier) {
-                let grant =
-                    crate::game_rewards::grant_max_on(&mut tx, user, game.as_str(), ticket.id)
-                        .await?;
-                ticket.entry["reward_grant"] = json!(grant);
-                membership_granted = true;
+            let bonus = entry
+                .jackpot_bonus(&protocol, i64::from(ticket.multiplier), prize, tier)
+                .ok_or(Error::InvalidEntry)?;
+            if bonus > 0 {
+                ticket.entry["jackpot_bonus"] = json!(bonus);
+                jackpot_bonus = jackpot_bonus
+                    .checked_add(bonus)
+                    .ok_or(Error::InvalidEntry)?;
             }
             (prize, tier)
         } else {
@@ -214,6 +216,9 @@ async fn settle_one(pool: &PgPool) -> Result<bool, Error> {
             record_id,delta:paid,completes_hand:true,won:paid>0,room_code:None,revision:None,hand_completed:None,has_bots:None,
             details:Some(json!({"purpose":"draw","game":game.as_str(),"period":period,"tickets":tickets.iter().map(|t|json!({"id":t.id,"prize":t.prize,"tier":t.tier})).collect::<Vec<_>>()})),
         }).await?;
+        if jackpot_bonus > 0 {
+            jackpot_ledger(&mut tx, user, game, period, record_id, jackpot_bonus).await?;
+        }
     }
     let ids: Vec<Uuid> = tickets.iter().map(|t| t.id).collect();
     let prizes: Vec<i64> = tickets.iter().map(|t| t.prize.unwrap_or(0)).collect();
@@ -246,9 +251,6 @@ async fn settle_one(pool: &PgPool) -> Result<bool, Error> {
     if paid > 0 {
         crate::read_cache::invalidate_unread_count(pool, user);
     }
-    if membership_granted {
-        crate::entitlement::invalidate_tier(pool, user);
-    }
     if balance.is_some() {
         crate::stats_writer::send(crate::stats_writer::StatsEvent::LotteryPaid {
             day: super::sgt_day(now),
@@ -258,6 +260,30 @@ async fn settle_one(pool: &PgPool) -> Result<bool, Error> {
         });
     }
     Ok(true)
+}
+
+/// Credits a settlement's jackpot bonus beans next to (never inside) its draw
+/// payout, so ticket prizes stay exactly what the published proof recomputes.
+pub(super) async fn jackpot_ledger(
+    conn: &mut crate::db_writer::PgConnection,
+    user: Uuid,
+    game: Game,
+    period: i64,
+    settlement: Uuid,
+    bonus: i64,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "WITH updated AS (UPDATE wallets SET balance=balance+$3,updated_at=now() WHERE user_id=$1 AND game=$2 RETURNING balance) \
+         INSERT INTO wallet_ledger(user_id,game,kind,delta,balance_after,details) \
+         SELECT $1,$2,'bonus',$3,balance,$4 FROM updated",
+    )
+    .bind(user)
+    .bind(POLICY.game)
+    .bind(bonus)
+    .bind(json!({"purpose":"lottery_jackpot","game":game.as_str(),"period":period,"settlement_id":settlement}))
+    .execute(conn.writer())
+    .await?;
+    Ok(())
 }
 
 /// A winner's inbox receipt commits atomically with the credited prizes. The
@@ -278,40 +304,32 @@ pub(super) async fn notify_winner(
         Game::Fucai3d => ("福彩3D", "Welfare 3D"),
         Game::Scratch => return Ok(()),
     };
-    let mut grant_count = 0i64;
-    let mut starts_at: Option<i64> = None;
-    let mut ends_at: Option<i64> = None;
+    let mut bonus = 0i64;
+    let mut jackpots = 0usize;
     for ticket in tickets {
-        let grant = &ticket.entry["reward_grant"];
-        if let (Some(start), Some(end)) =
-            (grant["starts_at_ms"].as_i64(), grant["ends_at_ms"].as_i64())
-        {
-            grant_count += 1;
-            starts_at = Some(starts_at.map_or(start, |previous| previous.min(start)));
-            ends_at = Some(ends_at.map_or(end, |previous| previous.max(end)));
+        if let Some(amount) = ticket.entry["jackpot_bonus"].as_i64() {
+            bonus = bonus
+                .checked_add(amount)
+                .ok_or_else(|| sqlx::Error::Protocol("lottery jackpot bonus overflow".into()))?;
+            jackpots += 1;
         }
     }
-    let days = grant_count * 30;
-    let membership = if grant_count == 0 {
-        serde_json::Value::Null
-    } else {
-        json!({
-            "tier": "max", "days": days, "grants": grant_count,
-            "starts_at_ms": starts_at, "ends_at_ms": ends_at,
-        })
-    };
+    let credited = paid
+        .checked_add(bonus)
+        .ok_or_else(|| sqlx::Error::Protocol("lottery credit overflow".into()))?;
     let zh_title = format!("{zh_game}中奖奖励已到账");
     let en_title = format!("{en_game} winnings credited");
-    let mut zh_body = format!("本期中奖 {paid} 金豆已自动到账，无需领取。");
-    let mut en_body = format!(
-        "Your {paid} gold beans from this draw were credited automatically. No claim needed."
-    );
-    if days > 0 {
-        zh_body.push_str(&format!("另获 Max 会员 {days} 天，已自动增加到会员期限。"));
-        en_body.push_str(&format!(
-            " An additional {days} days of Max membership were added to your membership term."
-        ));
-    }
+    let (zh_body, en_body) = if bonus > 0 {
+        (
+            format!("本期中奖 {paid} 金豆，另有 {jackpots} 张票据中头奖获额外奖励 {bonus} 金豆，共 {credited} 金豆已自动到账，无需领取。"),
+            format!("Your {paid} gold beans from this draw plus a {bonus}-bean jackpot bonus on {jackpots} ticket(s) ({credited} total) were credited automatically. No claim needed."),
+        )
+    } else {
+        (
+            format!("本期中奖 {paid} 金豆已自动到账，无需领取。"),
+            format!("Your {paid} gold beans from this draw were credited automatically. No claim needed."),
+        )
+    };
     let key = format!("lottery-win:{}", super::draw_credit_id(game, period, user));
     sqlx::query(
         "INSERT INTO notifications (id,user_id,type,title,body,payload,dedupe_key) \
@@ -324,11 +342,11 @@ pub(super) async fn notify_winner(
     .bind(&zh_body)
     .bind(json!({
         "lottery": {
-            "game": game.as_str(), "period": period, "prize": paid, "bonus_beans": 0,
-            "credited_beans": paid,
+            "game": game.as_str(), "period": period, "prize": paid, "bonus_beans": bonus,
+            "credited_beans": credited,
             "ticket_count": tickets.len(),
             "winning_tickets": tickets.iter().filter(|t| t.prize.unwrap_or(0) > 0).count(),
-            "membership": membership,
+            "membership": serde_json::Value::Null,
         },
         "i18n": {"zh": {"title": zh_title, "body": zh_body}, "en": {"title": en_title, "body": en_body}},
     }))

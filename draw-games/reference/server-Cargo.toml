@@ -152,6 +152,10 @@ tikv-jemallocator = "0.6"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
 async-stream = "0.3.6"
 
+[build-dependencies]
+# build.rs turns client-game/src/lib/gameRegistry.json into game_registry.rs.
+serde_json = { workspace = true }
+
 [dev-dependencies]
 # ONLY for the offline ops example `examples/generate_bnb_hd_xpub.rs` (ADR-086
 # Option B). The live server binary must never be able to construct a BIP-39

@@ -19,7 +19,9 @@ pub const POLICY: wallet::Policy = crate::beans::POLICY;
 
 /// A separate purpose-bound stream preserves a room prize across checkpoint recovery.
 /// The draw proof and the base bean payout use their original entropy stream.
-pub(crate) fn wins_max(reveal: &draw_games::proof::Reveal, user: Uuid) -> bool {
+/// The stream label predates the bean jackpot (it once chose a Max membership
+/// prize); it stays unchanged so a recovered round keeps its original decision.
+pub(crate) fn wins_jackpot(reveal: &draw_games::proof::Reveal, user: Uuid) -> bool {
     let seed = draw_games::proof::sha256_fields(&[
         b"bluffking-sicbo-max-prize-v1",
         reveal.commitment.game.as_bytes(),
@@ -29,6 +31,40 @@ pub(crate) fn wins_max(reveal: &draw_games::proof::Reveal, user: Uuid) -> bool {
         user.as_bytes(),
     ]);
     draw_games::proof::Entropy::new(seed).below(10_000) == 0
+}
+
+/// A jackpot pays 5 × the highest bean payout this stake can win: a winning
+/// small/big returns the stake plus an equal win (2 × stake), so the bonus is
+/// 10 × stake (1,000 beans on a 100-bean wager). `None` only on overflow.
+pub(crate) fn jackpot_bonus(stake: i64) -> Option<i64> {
+    stake
+        .checked_mul(2)?
+        .checked_mul(5)
+        .filter(|bonus| *bonus > 0)
+}
+
+/// Credits a jackpot as a separate bean `bonus` row in the caller's settlement
+/// transaction, before the play receipt, so that receipt's `balance_after`
+/// includes it while its `delta` stays the verifiable rules payout. The caller
+/// holds the account and wallet locks; a missing wallet credits nothing.
+pub(crate) async fn credit_jackpot(
+    conn: &mut crate::db_writer::PgConnection,
+    user: Uuid,
+    bonus: i64,
+    details: serde_json::Value,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "WITH updated AS (UPDATE wallets SET balance=balance+$3,updated_at=now() WHERE user_id=$1 AND game=$2 RETURNING balance) \
+         INSERT INTO wallet_ledger(user_id,game,kind,delta,balance_after,details) \
+         SELECT $1,$2,'bonus',$3,balance,$4 FROM updated",
+    )
+    .bind(user)
+    .bind(POLICY.game)
+    .bind(bonus)
+    .bind(details)
+    .execute(conn.writer())
+    .await?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -52,8 +88,12 @@ pub struct Receipt {
     pub triple: bool,
     pub won: bool,
     pub fairness: serde_json::Value,
-    #[serde(default)]
+    /// Legacy: the Max membership grant of a jackpot settled before the bean jackpot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_reward: Option<serde_json::Value>,
+    /// Bean jackpot credited with this roll (a separate `bonus` ledger row).
+    #[serde(default)]
+    pub jackpot_bonus: i64,
 }
 #[derive(Debug, Serialize)]
 pub struct BetResult {
@@ -181,9 +221,6 @@ pub async fn play(pool: &PgPool, user: Uuid, bet: &Bet) -> Result<BetResult, Err
         let committed = tx.commit().await;
         crate::beans_read_memory::invalidate_user(pool, user);
         committed?;
-        if result.receipt.max_reward.is_some() {
-            crate::entitlement::invalidate_tier(pool, user);
-        }
         return Ok(result);
     }
     // A room settlement uses its round id as the receipt key. Solo receipts
@@ -213,12 +250,19 @@ pub async fn play(pool: &PgPool, user: Uuid, bet: &Bet) -> Result<BetResult, Err
     let dice = draw_games::sicbo::draw(&reveal).map_err(|_| Error::Invalid)?;
     let won = wins(dice, bet.side);
     let delta = draw_games::sicbo::delta(dice, bet.side, bet.stake);
-    let max_reward = if won && wins_max(&reveal, user) {
-        Some(json!(
-            crate::game_rewards::grant_max_on(&mut tx, user, "sicbo", bet.request_id).await?
-        ))
+    let jackpot_bonus = if won && wins_jackpot(&reveal, user) {
+        let bonus = jackpot_bonus(bet.stake).ok_or(Error::Invalid)?;
+        credit_jackpot(
+            &mut tx,
+            user,
+            bonus,
+            json!({"game":"sicbo","purpose":"sicbo_jackpot","request_id":bet.request_id,
+                "record_id":record_id(user, bet.request_id),"stake":bet.stake}),
+        )
+        .await?;
+        bonus
     } else {
-        None
+        0
     };
     let receipt = Receipt {
         request_id: bet.request_id,
@@ -229,7 +273,8 @@ pub async fn play(pool: &PgPool, user: Uuid, bet: &Bet) -> Result<BetResult, Err
         triple: dice[0] == dice[1] && dice[1] == dice[2],
         won,
         fairness: draw_games::sicbo::payout_proof(&reveal, dice, bet.side, bet.stake),
-        max_reward,
+        max_reward: None,
+        jackpot_bonus,
     };
     let record = record_id(user, bet.request_id);
     let play = wallet::Play {
@@ -268,9 +313,6 @@ pub async fn play(pool: &PgPool, user: Uuid, bet: &Bet) -> Result<BetResult, Err
             let committed = tx.commit().await;
             crate::beans_read_memory::invalidate_user(pool, user);
             committed?;
-            if result.receipt.max_reward.is_some() {
-                crate::entitlement::invalidate_tier(pool, user);
-            }
             return Ok(result);
         }
         Err(e) => return Err(e.into()),
@@ -288,9 +330,6 @@ pub async fn play(pool: &PgPool, user: Uuid, bet: &Bet) -> Result<BetResult, Err
     crate::beans_read_memory::invalidate_user(pool, user);
     committed?;
     wallet::project_session_balance(POLICY.game, user, balance_after);
-    if receipt.max_reward.is_some() {
-        crate::entitlement::invalidate_tier(pool, user);
-    }
     Ok(BetResult {
         receipt,
         balance_after,

@@ -97,10 +97,13 @@ pub fn ticket_json(game: Game, t: &TicketRow) -> Value {
     if game == Game::Scratch {
         super::scratch::project(&mut out, t);
     } else {
+        // Max grants are legacy (pre-bonus) jackpot rewards; new ones are beans.
         out["reward_grant"] = t.entry["reward_grant"].clone();
+        out["jackpot_bonus"] = t.entry["jackpot_bonus"].clone();
         // Public entries remain the normalized selected numbers used by proofs.
         if let Some(entry) = out["entry"].as_object_mut() {
             entry.remove("reward_grant");
+            entry.remove("jackpot_bonus");
         }
         out["proof_plan"] = json!(t.proof_plan);
         out["proof_status"] = json!(if t.proof_plan.is_some() {
@@ -276,7 +279,7 @@ async fn replay_stored(
     }
     let ids: Vec<Uuid> = serde_json::from_value(details["ticket_ids"].clone()).unwrap_or_default();
     let rows = sqlx::query(&format!(
-        "SELECT {TICKET_COLUMNS} FROM lottery_tickets WHERE purchase_id=$1 AND (game<>'scratch' OR (cost=100 AND entry->'reward_version'='1'::jsonb))"
+        "SELECT {TICKET_COLUMNS} FROM lottery_tickets WHERE purchase_id=$1 AND (game<>'scratch' OR (cost=100 AND entry->'reward_version' IN ('1'::jsonb,'2'::jsonb)))"
     ))
     .bind(record_id)
     .fetch_all(conn)
@@ -778,7 +781,7 @@ struct FeedScan {
 const FEED_SQL: &str = "SELECT t.purchase_id, t.user_id, t.bought_at, t.stakes, t.multiplier, t.prize, t.tier, t.settled_at, \
         u.id IS NOT NULL AS user_found, u.display_name \
    FROM (SELECT purchase_id, user_id, bought_at, stakes, multiplier, prize, tier, settled_at FROM lottery_tickets \
-          WHERE game=$1 AND (game<>'scratch' OR (cost=100 AND entry->'reward_version'='1'::jsonb)) \
+          WHERE game=$1 AND (game<>'scratch' OR (cost=100 AND entry->'reward_version' IN ('1'::jsonb,'2'::jsonb))) \
           ORDER BY bought_at DESC LIMIT $2) t \
    LEFT JOIN users u ON u.id = t.user_id \
   ORDER BY t.bought_at DESC";
@@ -1138,7 +1141,7 @@ pub async fn tickets(
         "SELECT t.{} , p.numbers AS result_numbers, p.bonus AS result_bonus, p.bonus_numbers AS result_bonus_numbers, p.draw_proof AS result_proof \
          FROM lottery_tickets t LEFT JOIN lottery_periods p \
            ON p.game = t.game AND p.period = t.period AND p.status <> 'open' \
-         WHERE t.user_id=$1 AND t.game=$2 AND (t.game<>'scratch' OR (t.cost=100 AND t.entry->'reward_version'='1'::jsonb)) AND ({}) ORDER BY t.bought_at DESC, t.id LIMIT $3 OFFSET $4",
+         WHERE t.user_id=$1 AND t.game=$2 AND (t.game<>'scratch' OR (t.cost=100 AND t.entry->'reward_version' IN ('1'::jsonb,'2'::jsonb))) AND ({}) ORDER BY t.bought_at DESC, t.id LIMIT $3 OFFSET $4",
         TICKET_COLUMNS.replace(", ", ", t."),
         filter.predicate()
     ))

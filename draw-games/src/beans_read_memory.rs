@@ -641,6 +641,9 @@ fn add_ledger(
         } else if details["game"] == "roulette" {
             "roulette"
         } else if details["game"] == "foodshake" {
+            // 吃喝摇摇乐 was retired on 2026-11-05; its settled rows still
+            // classify here so they never surface as a slots receipt, and the
+            // hydration query keeps matching the 0111 partial index.
             "foodshake"
         } else {
             "slots"
@@ -727,8 +730,12 @@ pub async fn hydrate(pool: &PgPool) -> sqlx::Result<()> {
             }
         }
         {
-            let mut rows = sqlx::query_as::<_, (i64, Uuid, Option<Uuid>, i64, Value)>("SELECT id,user_id,record_id,balance_after,details FROM wallet_ledger WHERE game=$1 AND (details->>'purpose'='casual_entry' OR (kind='play' AND (details->>'purpose'='claw_grab' OR details->>'game' IN ('slots','roulette','foodshake')))) AND id>0 ORDER BY id")
-                .bind(crate::game_catalog::BEANS).fetch(&mut *tx);
+            // Literal game and predicate: they match the partial index
+            // wallet_ledger_beans_read_hydration (schema 0111) exactly, so even
+            // a generic plan reads only these rows (prod 11-05: 2.7k of 20.7k).
+            const _: () = assert!(crate::game_catalog::BEANS == 10);
+            let mut rows = sqlx::query_as::<_, (i64, Uuid, Option<Uuid>, i64, Value)>("SELECT id,user_id,record_id,balance_after,details FROM wallet_ledger WHERE game=10 AND (details->>'purpose'='casual_entry' OR (kind='play' AND (details->>'purpose'='claw_grab' OR details->>'game' IN ('slots','roulette','foodshake')))) AND id>0 ORDER BY id")
+                .fetch(&mut *tx);
             while let Some((_, owner, record, balance, details)) = rows.try_next().await? {
                 if let Some(user) = loaded.users.get_mut(&owner) {
                     let before = user.bytes;

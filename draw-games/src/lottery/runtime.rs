@@ -958,7 +958,7 @@ async fn prepare_scratch(pool: &PgPool, user: Uuid, ticket: Option<Uuid>) -> Res
     let mut cards = super::scratch::my_cards(&mut conn, user).await?;
     if let Some(id) = ticket {
         if !cards.iter().any(|c| c.id == id) {
-            if let Some(row) = sqlx::query(&format!("SELECT {} FROM lottery_tickets WHERE id=$1 AND user_id=$2 AND game='scratch' AND cost=100 AND entry->'reward_version'='1'::jsonb", store::TICKET_COLUMNS))
+            if let Some(row) = sqlx::query(&format!("SELECT {} FROM lottery_tickets WHERE id=$1 AND user_id=$2 AND game='scratch' AND cost=100 AND {}", store::TICKET_COLUMNS, super::scratch::REWARD_VERSION_SQL))
                 .bind(id).bind(user).fetch_optional(&mut *conn).await? {
                 cards.push(TicketRow::from_row(&row));
             }
@@ -1421,19 +1421,14 @@ fn accept_numbers(
     ))
 }
 
-fn scratch_reward(card: &TicketRow) -> Result<(i64, bool), Error> {
-    let reward: Option<draw_games::scratch::Reward> =
-        serde_json::from_value(card.entry["reward"].clone()).map_err(|_| Error::InvalidEntry)?;
-    Ok(match reward {
-        Some(draw_games::scratch::Reward::Beans { amount }) => (amount, false),
-        Some(draw_games::scratch::Reward::Membership { tier, days })
-            if tier == "max" && days == 30 =>
-        {
-            (0, true)
-        }
-        Some(_) => return Err(Error::InvalidEntry),
-        None => (0, false),
-    })
+/// Beans for a settling card's service reward, recorded on the card so a
+/// converted version-1 Max reward stays auditable. No membership is granted.
+fn scratch_reward(card: &mut TicketRow) -> Result<i64, Error> {
+    let amount = super::scratch::reward_beans(card)?;
+    if amount > 0 {
+        card.entry["reward_beans"] = json!(amount);
+    }
+    Ok(amount)
 }
 fn accept_scratch(
     pool: &PgPool,
@@ -1449,16 +1444,12 @@ fn accept_scratch(
     {
         return Err(Error::InvalidEntry);
     }
+    let reward_version = body.reward_version()?;
     if body.count > draw_games::scratch::MAX_BATCH_CARDS {
         return Err(Error::TooManyTickets);
     }
     let batch = body.count > 1 || body.all_in;
-    let mut identity = json!({"game":"scratch","cost":body.cost,"count":body.count,"fairness":{"offer_id":body.fairness.offer_id,"commitment":body.fairness.commitment,"client_seed":body.fairness.client_seed}});
-    if body.all_in {
-        identity["all_in"] = json!(true);
-        identity["expected_balance"] = json!(body.expected_balance)
-    }
-    let hash = store::body_sha256(&identity);
+    let hash = store::body_sha256(&body.identity());
     let state = state(pool);
     let mut lock = state.data.lock().unwrap_or_else(|e| e.into_inner());
     let data = lock.as_mut().ok_or_else(unavailable)?;
@@ -1518,7 +1509,7 @@ fn accept_scratch(
     };
     let generated = draw_games::scratch::generate(&reveal, body.cost, body.count)
         .map_err(|_| Error::InvalidEntry)?;
-    let rewards = draw_games::scratch::rewards(&reveal, body.cost, body.count)
+    let rewards = draw_games::scratch::rewards(&reveal, body.cost, body.count, reward_version)
         .map_err(|_| Error::InvalidEntry)?;
     let id = if batch {
         super::scratch_batch_id(user, body.request_id)
@@ -1545,8 +1536,8 @@ fn accept_scratch(
     });
     let mut paid = 0i64;
     for (i, card) in generated.into_iter().enumerate() {
-        let entry = json!({"cost":body.cost,"lucky":card.lucky,"numbers":card.numbers,"fairness":{"kind":"scratch","reveal":reveal,"cost":body.cost,"count":body.count,"index":i,"numbers":card.numbers,"lucky":card.lucky,"prize":card.prize,"hits":card.hits},"reward_version":1,"reward":rewards[i]});
-        let ticket = TicketRow {
+        let entry = json!({"cost":body.cost,"lucky":card.lucky,"numbers":card.numbers,"fairness":{"kind":"scratch","reveal":reveal,"cost":body.cost,"count":body.count,"index":i,"numbers":card.numbers,"lucky":card.lucky,"prize":card.prize,"hits":card.hits},"reward_version":reward_version,"reward":rewards[i]});
+        let mut ticket = TicketRow {
             id: Uuid::new_v4(),
             purchase_id: id,
             period: 0,
@@ -1563,11 +1554,8 @@ fn accept_scratch(
         };
         if batch {
             paid = paid.checked_add(card.prize).ok_or(Error::InvalidEntry)?;
-            let (bonus, max) = scratch_reward(&ticket)?;
+            let bonus = scratch_reward(&mut ticket)?;
             event.bonus = event.bonus.checked_add(bonus).ok_or(Error::InvalidEntry)?;
-            if max {
-                event.max_cards.push(ticket.id)
-            }
         }
         event.cards.push(OwnedTicket {
             user,
@@ -1643,7 +1631,7 @@ fn reveal_card(
             t.user == user
                 && t.game == "scratch"
                 && t.card.cost == 100
-                && t.card.entry["reward_version"] == 1
+                && matches!(t.card.entry["reward_version"].as_u64(), Some(1 | 2))
         })
         .cloned()
         .ok_or(Error::TicketNotFound)?;
@@ -1728,11 +1716,8 @@ fn reveal_card(
         owned.card.prize = Some(paid);
         owned.card.tier = Some(tier);
         owned.card.settled_at = Some(event.at);
-        let (bonus, max) = scratch_reward(&owned.card)?;
+        let bonus = scratch_reward(&mut owned.card)?;
         event.bonus = bonus;
-        if max {
-            event.max_cards.push(ticket)
-        }
         event.effect = Some(PendingEffect {
             balance: paid + bonus,
             net: paid,
@@ -1840,7 +1825,7 @@ pub async fn run(pool: PgPool) {
         }
         if std::time::Instant::now() >= scratch_expiry_due {
             scratch_expiry_due = std::time::Instant::now() + Duration::from_secs(60);
-            let expired = sqlx::query("SELECT id,user_id FROM lottery_tickets WHERE game='scratch' AND cost=100 AND entry->'reward_version'='1'::jsonb AND settled_at IS NULL AND bought_at < now()-interval '30 days' ORDER BY bought_at,id LIMIT 20").fetch_all(&pool).await;
+            let expired = sqlx::query(&format!("SELECT id,user_id FROM lottery_tickets WHERE game='scratch' AND cost=100 AND {} AND settled_at IS NULL AND bought_at < now()-interval '30 days' ORDER BY bought_at,id LIMIT 20", super::scratch::REWARD_VERSION_SQL)).fetch_all(&pool).await;
             if let Ok(rows) = expired {
                 for row in rows {
                     let (user, id) = (row.get("user_id"), row.get("id"));
@@ -2036,8 +2021,13 @@ fn settle(pool: &PgPool) -> Result<bool, Error> {
                     )
                     .ok_or(Error::InvalidEntry)?;
                 paid = paid.checked_add(prize).ok_or(Error::InvalidEntry)?;
-                if entry.awards_max(prize, tier) {
-                    event.max_cards.push(t.card.id)
+                let bonus = entry
+                    .jackpot_bonus(&protocol, i64::from(t.card.multiplier), prize, tier)
+                    .ok_or(Error::InvalidEntry)?;
+                if bonus > 0 {
+                    // Credited by the writer as a separate bonus ledger row.
+                    t.card.entry["jackpot_bonus"] = json!(bonus);
+                    event.bonus = event.bonus.checked_add(bonus).ok_or(Error::InvalidEntry)?;
                 }
                 t.card.prize = Some(prize);
                 t.card.tier = Some(tier);
@@ -2051,7 +2041,7 @@ fn settle(pool: &PgPool) -> Result<bool, Error> {
                 .ok_or(Error::InvalidEntry)?;
             event.period = Some(row);
             event.effect = Some(PendingEffect {
-                balance: paid,
+                balance: paid.checked_add(event.bonus).ok_or(Error::InvalidEntry)?,
                 net: paid,
                 played: 1,
                 won: i32::from(paid > 0),

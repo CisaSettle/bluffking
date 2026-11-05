@@ -13,7 +13,10 @@ pub const MAX_BATCH_CARDS: usize = 1_000;
 
 pub const PRIZES: [i64; 6] = [1, 1, 2, 2, 5, 10];
 
-/// Version-one service prizes are additive to the unchanged number-match payout.
+/// Service prizes are additive to the unchanged number-match payout.
+/// Version 1 drew 30 days of Max in bucket 31; version 2 (current) draws
+/// [`TOP_REWARD_BEANS`] there instead. `Membership` only appears in stored
+/// version-1 cards; it is no longer granted and settles as beans.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Reward {
@@ -21,9 +24,37 @@ pub enum Reward {
     Membership { tier: String, days: i64 },
 }
 
+/// Reward table used for new purchases.
+pub const REWARD_VERSION: u8 = 2;
+/// Five times the highest ordinary service prize (100,000 beans).
+pub const TOP_REWARD_BEANS: i64 = 500_000;
+
+impl Reward {
+    /// Beans credited when a card holding this stored reward settles. A
+    /// version-1 Max reward no longer grants membership: it pays the top
+    /// bean prize that replaced it.
+    pub fn settled_beans(&self) -> Result<i64, String> {
+        match self {
+            Reward::Beans { amount } if *amount > 0 => Ok(*amount),
+            Reward::Membership { tier, days } if tier == "max" && *days == 30 => {
+                Ok(TOP_REWARD_BEANS)
+            }
+            _ => Err("invalid scratch service reward".into()),
+        }
+    }
+}
+
 /// Reproducible reward suffix after the current purchase's number draws.
-pub fn rewards(reveal: &Reveal, cost: i64, count: usize) -> Result<Vec<Option<Reward>>, String> {
-    if reveal.commitment.game != "scratch" || cost != 100 || !(1..=MAX_BATCH_CARDS).contains(&count)
+pub fn rewards(
+    reveal: &Reveal,
+    cost: i64,
+    count: usize,
+    version: u8,
+) -> Result<Vec<Option<Reward>>, String> {
+    if reveal.commitment.game != "scratch"
+        || cost != 100
+        || !(1..=MAX_BATCH_CARDS).contains(&count)
+        || !(1..=REWARD_VERSION).contains(&version)
     {
         return Err("invalid service reward purchase".into());
     }
@@ -36,9 +67,12 @@ pub fn rewards(reveal: &Reveal, cost: i64, count: usize) -> Result<Vec<Option<Re
             0..=19 => Some(Reward::Beans { amount: 10_000 }),
             20 => Some(Reward::Beans { amount: 100_000 }),
             21..=30 => Some(Reward::Beans { amount: 1_000 }),
-            31 => Some(Reward::Membership {
+            31 if version == 1 => Some(Reward::Membership {
                 tier: "max".into(),
                 days: 30,
+            }),
+            31 => Some(Reward::Beans {
+                amount: TOP_REWARD_BEANS,
             }),
             _ => None,
         })
@@ -140,16 +174,22 @@ pub fn verify(value: &Value) -> Result<Value, String> {
     {
         return Err("scratch card or prize differs from the committed draw".into());
     }
-    if receipt.reward_version != 1 {
+    if !(1..=REWARD_VERSION).contains(&receipt.reward_version) {
         return Err("unsupported scratch reward version".into());
     }
-    let expected = rewards(&receipt.reveal, receipt.cost, receipt.count)?;
+    let expected = rewards(
+        &receipt.reveal,
+        receipt.cost,
+        receipt.count,
+        receipt.reward_version,
+    )?;
     if expected[receipt.index] != receipt.reward {
         return Err("service reward differs from the committed draw".into());
     }
     Ok(json!({
         "reward_version": receipt.reward_version,
         "reward": receipt.reward,
+        "reward_beans": receipt.reward.as_ref().map(Reward::settled_beans).transpose()?,
         "verified": true,
         "kind": "scratch",
         "draw_id": receipt.reveal.commitment.draw_id,

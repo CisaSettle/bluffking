@@ -278,8 +278,10 @@ pub(super) async fn persist(
         if event.bonus > 0 {
             let reason = if event.kind == "daily" {
                 json!({"reason":"daily_refill"})
+            } else if event.kind == "settle" {
+                json!({"purpose":"lottery_jackpot","game":event.game,"lottery_event_id":event.id})
             } else {
-                json!({"purpose":"scratch_reward","reward_version":1,"lottery_event_id":event.id})
+                json!({"purpose":"scratch_reward","reward_version":event.cards.first().map(|t| t.card.entry["reward_version"].clone()),"lottery_event_id":event.id})
             };
             sqlx::query("WITH updated AS (UPDATE wallets SET balance=balance+$3,updated_at=now() WHERE user_id=$1 AND game=$2 RETURNING balance) INSERT INTO wallet_ledger(user_id,game,kind,delta,balance_after,details) SELECT $1,$2,'bonus',$3,balance,$4 FROM updated").bind(user).bind(BEANS).bind(event.bonus).bind(reason).execute(&mut *tx).await?;
         }
