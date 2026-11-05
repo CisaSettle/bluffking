@@ -131,7 +131,7 @@ async fn settle_one(pool: &PgPool) -> Result<bool, Error> {
     )
     .execute(&mut *tx)
     .await?;
-    let row = sqlx::query("SELECT numbers,bonus,bonus_numbers FROM lottery_periods WHERE game=$1 AND period=$2 AND status='drawn' FOR UPDATE SKIP LOCKED")
+    let row = sqlx::query("SELECT numbers,bonus,bonus_numbers,proof_plan FROM lottery_periods WHERE game=$1 AND period=$2 AND status='drawn' FOR UPDATE SKIP LOCKED")
         .bind(game.as_str()).bind(period).fetch_optional(&mut *tx).await?;
     let Some(row) = row else {
         return Ok(false);
@@ -139,6 +139,11 @@ async fn settle_one(pool: &PgPool) -> Result<bool, Error> {
     let numbers: Vec<i16> = row.get("numbers");
     let bonus: Option<i16> = row.get("bonus");
     let bonus_numbers: Vec<i16> = row.get("bonus_numbers");
+    // The period's plan fixes which prize table applies (see `prize_scale`).
+    let protocol = super::prize_protocol(
+        row.get::<Option<serde_json::Value>, _>("proof_plan")
+            .as_ref(),
+    );
     let user:Option<Uuid> = sqlx::query_scalar("SELECT user_id FROM lottery_tickets WHERE game=$1 AND period=$2 AND settled_at IS NULL ORDER BY user_id,id LIMIT 1")
         .bind(game.as_str()).bind(period).fetch_optional(&mut *tx).await?;
     let Some(user) = user else {
@@ -171,6 +176,7 @@ async fn settle_one(pool: &PgPool) -> Result<bool, Error> {
             let entry = Entry::from_stored(game, &ticket.entry).ok_or(Error::InvalidEntry)?;
             let (prize, tier) = entry
                 .prize(
+                    &protocol,
                     i64::from(ticket.multiplier),
                     &numbers,
                     bonus,

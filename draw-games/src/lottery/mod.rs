@@ -37,6 +37,14 @@ pub fn sgt_day(at: DateTime<Utc>) -> chrono::NaiveDate {
     at.with_timezone(&sgt()).date_naive()
 }
 
+/// Protocol whose prize table settles a period. Periods drawn before plans
+/// existed keep the unscaled base table, as when they were sold.
+pub fn prize_protocol(plan: Option<&serde_json::Value>) -> String {
+    plan.and_then(|plan| plan["protocol"].as_str())
+        .unwrap_or(draw_games::lottery::LEGACY_PROTOCOL)
+        .to_owned()
+}
+
 pub fn now_ms() -> i64 {
     Utc::now().timestamp_millis()
 }

@@ -505,7 +505,10 @@ pub async fn buy_numbers(
         .map_err(|_| Error::InvalidEntry)?;
     plan.validate().map_err(|_| Error::InvalidEntry)?;
     let expected = &body.proof_commitment;
-    if plan.protocol != draw_games::lottery::PROTOCOL
+    // v2 plans (unscaled prizes) remain purchasable while their period sells;
+    // the stored plan must still match the submitted commitment exactly.
+    if (plan.protocol != draw_games::lottery::PROTOCOL
+        && plan.protocol != draw_games::lottery::V2_PROTOCOL)
         || plan.game != game.as_str()
         || plan.period != selling.id
         || &plan.commitment != expected

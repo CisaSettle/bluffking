@@ -1283,7 +1283,10 @@ fn accept_numbers(
         serde_json::from_value(row.proof_plan.clone().ok_or(Error::FairnessRequired)?)
             .map_err(|_| Error::InvalidEntry)?;
     plan.validate().map_err(|_| Error::InvalidEntry)?;
-    if plan.commitment != body.proof_commitment {
+    if (plan.protocol != draw_games::lottery::PROTOCOL
+        && plan.protocol != draw_games::lottery::V2_PROTOCOL)
+        || plan.commitment != body.proof_commitment
+    {
         return Err(Error::RequestConflict);
     }
     let before = beans_read_memory::ensure(pool, user)?.balance;
@@ -1976,6 +1979,8 @@ fn settle(pool: &PgPool) -> Result<bool, Error> {
         .collect::<Vec<_>>();
     for ((g, period), mut row) in periods {
         let game = Game::parse(&g).ok_or(Error::InvalidEntry)?;
+        // The period's plan fixes which prize table applies (see `prize_scale`).
+        let protocol = super::prize_protocol(row.proof_plan.as_ref());
         let pending = data
             .by_period
             .get(&(g.clone(), period))
@@ -2023,6 +2028,7 @@ fn settle(pool: &PgPool) -> Result<bool, Error> {
                 let entry = Entry::from_stored(game, &t.card.entry).ok_or(Error::InvalidEntry)?;
                 let (prize, tier) = entry
                     .prize(
+                        &protocol,
                         i64::from(t.card.multiplier),
                         row.numbers.as_deref().ok_or(Error::InvalidEntry)?,
                         row.bonus,
