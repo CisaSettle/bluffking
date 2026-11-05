@@ -35,6 +35,8 @@ pub const TOTO_PRIZE: [i64; 8] = [0, 10_000_000, 1_000_000, 10_000, 3_000, 500, 
 pub const FC3D_STRAIGHT: i64 = 1_040;
 pub const FC3D_GROUP3: i64 = 346;
 pub const FC3D_GROUP6: i64 = 173;
+/// A jackpot ticket also earns this many times one top-tier stake prize.
+pub const JACKPOT_BONUS_FACTOR: i64 = 5;
 
 /// Happy8 base beans per 注 (stake included) by picks × hits; see [`prize_scale`].
 pub fn happy8_prize(picks: usize, hits: usize) -> i64 {
@@ -243,8 +245,10 @@ impl Entry {
         }
     }
 
-    /// One Max 30-day award per winning ticket, regardless of its stake count.
-    pub fn awards_max(&self, prize: i64, tier: i16) -> bool {
+    /// Whether a settled result hit this game's jackpot: one award per
+    /// winning ticket, regardless of its stake count. Tickets settled before
+    /// the jackpot bonus carried a Max 30-day membership grant instead.
+    pub fn awards_jackpot(&self, prize: i64, tier: i16) -> bool {
         prize > 0
             && match self {
                 Entry::Ssq { .. } | Entry::Dlt { .. } | Entry::Toto { .. } => tier == 1,
@@ -252,6 +256,33 @@ impl Entry {
                 Entry::Straight(_) => tier == 1,
                 Entry::Group3(_) | Entry::Group6(_) => false,
             }
+    }
+
+    /// Extra beans for a jackpot ticket: [`JACKPOT_BONUS_FACTOR`] × ONE
+    /// top-tier stake prize at this ticket's multiplier under `protocol`
+    /// (never a multiple of a compound ticket's whole payout). `Some(0)` when
+    /// the result is not a jackpot; `None` on overflow or an unknown protocol.
+    pub fn jackpot_bonus(
+        &self,
+        protocol: &str,
+        multiplier: i64,
+        prize: i64,
+        tier: i16,
+    ) -> Option<i64> {
+        if !self.awards_jackpot(prize, tier) {
+            return Some(0);
+        }
+        let top = match self {
+            Entry::Ssq { .. } => SSQ_PRIZE[1],
+            Entry::Dlt { .. } => DLT_PRIZE[1],
+            Entry::Toto { .. } => TOTO_PRIZE[1],
+            Entry::Happy8 { .. } => happy8_prize(10, 10),
+            Entry::Straight(_) => FC3D_STRAIGHT,
+            Entry::Group3(_) | Entry::Group6(_) => return Some(0),
+        };
+        top.checked_mul(prize_scale(self.game(), protocol)?)?
+            .checked_mul(multiplier)?
+            .checked_mul(JACKPOT_BONUS_FACTOR)
     }
 
     /// Prize in beans and tier for `multiplier` × this ticket against a draw
@@ -938,9 +969,16 @@ pub fn verify(value: &Value) -> Result<Value, String> {
         if !settled && (!ticket["prize"].is_null() || !ticket["tier"].is_null()) {
             return Err("unsettled ticket claims a credited prize".into());
         }
-        let max_award = entry.awards_max(prize, tier);
+        let jackpot = entry.awards_jackpot(prize, tier);
+        let expected_bonus = entry
+            .jackpot_bonus(&plan.protocol, multiplier, prize, tier)
+            .ok_or("jackpot bonus overflow")?;
         let grant = &ticket["reward_grant"];
-        if settled && max_award {
+        let bonus = &ticket["jackpot_bonus"];
+        // A settled jackpot carries exactly one award: the bean bonus, or the
+        // Max 30-day grant that tickets settled before the bonus received.
+        let legacy_max = settled && jackpot && !grant.is_null() && bonus.is_null();
+        if legacy_max {
             let start = grant["starts_at_ms"]
                 .as_i64()
                 .ok_or("missing Max reward start")?;
@@ -955,9 +993,21 @@ pub fn verify(value: &Value) -> Result<Value, String> {
             }
         } else if !grant.is_null() {
             return Err("ticket claims an unearned membership reward".into());
+        } else if settled && jackpot {
+            if bonus.as_i64() != Some(expected_bonus) {
+                return Err("jackpot bonus mismatch".into());
+            }
+        } else if !bonus.is_null() {
+            return Err("ticket claims an unearned jackpot bonus".into());
         }
+        let credited_bonus = if settled && jackpot && !legacy_max {
+            expected_bonus
+        } else {
+            0
+        };
         receipt_result = json!({ "stakes": entry.stakes(), "cost": cost, "prize": prize, "tier": tier,
-            "max_membership_days": if max_award { 30 } else { 0 },
+            "jackpot_bonus": credited_bonus,
+            "max_membership_days": if legacy_max { 30 } else { 0 },
             "reward_grant": grant, "settled": settled, "credited_prize_checked": settled });
     }
     Ok(
