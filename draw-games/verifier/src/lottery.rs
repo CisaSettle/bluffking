@@ -25,7 +25,9 @@ pub const TOTO_MAX: u8 = 49;
 pub const HAPPY8_MAX: u8 = 80;
 pub const HAPPY8_DRAW: usize = 20;
 
-/// Chips per winning 注 by prize group (`PAYOUTS × BET 10`).
+/// Base beans per winning 注 by prize group. These are the v1/v2 tables, which
+/// were sized for the old 10-bean 注; v3 plans multiply every base prize by
+/// [`prize_scale`] so that the 100-bean 注 keeps the original return rate.
 pub const SSQ_PRIZE: [i64; 7] = [0, 10_000_000, 1_000_000, 15_000, 1_000, 50, 25];
 /// Seven prize tiers under the 2026 DLT matching rules, in practice beans.
 pub const DLT_PRIZE: [i64; 8] = [0, 10_000_000, 1_000_000, 25_000, 1_500, 750, 75, 25];
@@ -34,7 +36,7 @@ pub const FC3D_STRAIGHT: i64 = 1_040;
 pub const FC3D_GROUP3: i64 = 346;
 pub const FC3D_GROUP6: i64 = 173;
 
-/// Happy8 chips per 注 (stake included) by picks × hits.
+/// Happy8 base beans per 注 (stake included) by picks × hits; see [`prize_scale`].
 pub fn happy8_prize(picks: usize, hits: usize) -> i64 {
     match (picks, hits) {
         (1, 1) => 9,
@@ -252,11 +254,13 @@ impl Entry {
             }
     }
 
-    /// Prize in chips and tier for `multiplier` × this ticket against a draw.
-    /// `None` when the stored draw does not fit the game (never for rows the
-    /// draw loop wrote).
+    /// Prize in beans and tier for `multiplier` × this ticket against a draw
+    /// planned under `protocol` (see [`prize_scale`]). `None` when the stored
+    /// draw does not fit the game (never for rows the draw loop wrote) or the
+    /// protocol is unknown.
     pub fn prize(
         &self,
+        protocol: &str,
         multiplier: i64,
         numbers: &[i16],
         bonus: Option<i16>,
@@ -423,7 +427,21 @@ impl Entry {
                 (prize, i16::from(won))
             }
         };
-        Some((per_multiplier.checked_mul(multiplier)?, tier))
+        let scale = prize_scale(self.game(), protocol)?;
+        Some((
+            per_multiplier.checked_mul(scale)?.checked_mul(multiplier)?,
+            tier,
+        ))
+    }
+
+    fn game(&self) -> Game {
+        match self {
+            Entry::Ssq { .. } => Game::Ssq,
+            Entry::Dlt { .. } => Game::Dlt,
+            Entry::Toto { .. } => Game::Toto,
+            Entry::Happy8 { .. } => Game::Happy8,
+            Entry::Straight(_) | Entry::Group3(_) | Entry::Group6(_) => Game::Fucai3d,
+        }
     }
 }
 
@@ -654,8 +672,28 @@ pub fn sgt() -> FixedOffset {
     FixedOffset::east_opt(SGT_OFFSET_SECS).expect("Singapore UTC offset is valid")
 }
 
-pub const PROTOCOL: &str = "bluffking-lottery-drand-v2-minute";
+/// v3 = the v2 minute schedule with prize tables scaled to the 100-bean 注.
+pub const PROTOCOL: &str = "bluffking-lottery-drand-v3-minute";
+/// Minute draws with the unscaled base tables (2026-10-25 until v3).
+pub const V2_PROTOCOL: &str = "bluffking-lottery-drand-v2-minute";
 pub const LEGACY_PROTOCOL: &str = "bluffking-lottery-drand-v1";
+
+/// Multiplier applied to every base prize table entry under `protocol`.
+/// v1/v2 plans keep their original tables so saved receipts still verify.
+/// v3 restores the return rate the base tables had at the old 注 price:
+/// SSQ/DLT/TOTO 10 → 100 beans (×10), Happy8 4 → 100 (×25), Fucai3D 2 → 100 (×50).
+pub fn prize_scale(game: Game, protocol: &str) -> Option<i64> {
+    match protocol {
+        PROTOCOL => Some(match game {
+            Game::Ssq | Game::Dlt | Game::Toto => 10,
+            Game::Happy8 => 25,
+            Game::Fucai3d => 50,
+            Game::Scratch => 1,
+        }),
+        V2_PROTOCOL | LEGACY_PROTOCOL => Some(1),
+        _ => None,
+    }
+}
 
 /// All choice points are derived from the game and wall-clock period. The
 /// commitment binds the protocol version, sales deadline and exact future pulse.
@@ -679,14 +717,14 @@ impl Plan {
 
     fn schedule_for(game: Game, protocol: &str) -> Result<Schedule, String> {
         match protocol {
-            PROTOCOL => game.schedule(),
+            PROTOCOL | V2_PROTOCOL => game.schedule(),
             LEGACY_PROTOCOL => game.legacy_schedule(),
             _ => return Err("unsupported lottery protocol".into()),
         }
         .ok_or_else(|| "not a scheduled lottery".into())
     }
 
-    fn with_protocol(game: Game, period: i64, protocol: &str) -> Result<Self, String> {
+    pub fn with_protocol(game: Game, period: i64, protocol: &str) -> Result<Self, String> {
         let schedule = Self::schedule_for(game, protocol)?;
         let draw_at_ms = period
             .checked_add(1)
@@ -881,6 +919,7 @@ pub fn verify(value: &Value) -> Result<Value, String> {
         }
         let (prize, tier) = entry
             .prize(
+                &plan.protocol,
                 multiplier,
                 &proof.numbers,
                 proof.bonus,

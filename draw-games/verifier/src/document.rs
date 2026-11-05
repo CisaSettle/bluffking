@@ -42,8 +42,12 @@ fn match_receipt(proof: &Value, receipt: &Value) -> Result<(), String> {
                 .as_array()
                 .ok_or("Missing saved selections")?;
             if terms["all_in"].as_bool() == Some(true) {
-                if proof["plan"]["protocol"] != crate::lottery::PROTOCOL
-                    || terms["multiplier"].as_i64() != Some(1)
+                // ALL-IN exists since the v2 minute protocol; v3 only rescales prizes.
+                let protocol = proof["plan"]["protocol"].as_str();
+                if !matches!(
+                    protocol,
+                    Some(crate::lottery::PROTOCOL | crate::lottery::V2_PROTOCOL)
+                ) || terms["multiplier"].as_i64() != Some(1)
                 {
                     return Err("Invalid ALL-IN receipt mode or protocol".into());
                 }
