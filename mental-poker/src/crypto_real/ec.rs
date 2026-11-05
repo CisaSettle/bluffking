@@ -1,5 +1,5 @@
 //! Elliptic-curve primitives over **ristretto255** — **cross-vendor AI-audited
-//! (ADR-076/077/078); open-source + verifiable (ADR-063 §1, spec §1)**.
+//! (ADR-076/077/078); open-source + verifiable (spec §1)**.
 //!
 //! This is the shared arithmetic substrate for the server-blind dealing
 //! increment: ElGamal ciphertexts, the card-id ↔ message-point encoding + 52-
@@ -21,7 +21,7 @@
 //! ## Status
 //!
 //! Cross-vendor AI-audited (ADR-076/077/078); open-source + verifiable. GA'd for
-//! the engine-blind table class by ADR-070 (which lifted the ADR-063 cage); in
+//! the engine-blind table class by ADR-070; in
 //! production these run ONLY for engine-blind sessions (`resolve_mp_crypto_mode`).
 
 use crate::hash::ds_hash;
@@ -75,7 +75,7 @@ pub fn point_from_bytes(b: &[u8]) -> Option<RistrettoPoint> {
 /// identity with a trivially-valid DLEQ. Any one of these silently degrades
 /// n-of-n confidentiality to (n-1)-of-(n-1). Each call site still keeps its own
 /// reject (defense-in-depth across independent trust boundaries — DKG, shuffle,
-/// threshold-decrypt, transcript verifier); this only dedupes the predicate.
+/// threshold-decrypt); this only dedupes the predicate.
 pub fn is_identity_pubkey(q: &RistrettoPoint) -> bool {
     use curve25519_dalek::traits::IsIdentity;
     q.is_identity()

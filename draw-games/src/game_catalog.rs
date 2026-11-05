@@ -62,7 +62,7 @@ pub fn from_name(name: &str) -> Option<i16> {
 }
 
 /// Discovery order, including games with no account record rows.
-pub const HUB_GAMES: [&str; 27] = [
+pub const HUB_GAMES: [&str; 28] = [
     "poker",
     "shortdeck",
     "baccarat",
@@ -84,6 +84,7 @@ pub const HUB_GAMES: [&str; 27] = [
     "claw",
     "slots",
     "roulette",
+    "foodshake",
     "toto",
     "ssq",
     "dlt",
@@ -95,7 +96,7 @@ pub const HUB_GAMES: [&str; 27] = [
 /// Hub games in the 金豆专区 tab, in hub order: the client's `BEAN_GAME_IDS`
 /// (client-game/src/lib/gameCatalog.ts) minus its two tools, which have no
 /// game route. Keep the two lists in step.
-pub const BEAN_HUB_GAMES: [&str; 27] = [
+pub const BEAN_HUB_GAMES: [&str; 28] = [
     "sangong",
     "ddz",
     "guandan",
@@ -117,6 +118,7 @@ pub const BEAN_HUB_GAMES: [&str; 27] = [
     "claw",
     "slots",
     "roulette",
+    "foodshake",
     "toto",
     "ssq",
     "dlt",
@@ -128,7 +130,8 @@ pub const BEAN_HUB_GAMES: [&str; 27] = [
 /// Singapore release day of recently shipped hub games, mirroring the client's
 /// `GAME_LAUNCH_DATES`; the hub lists a game under 新游戏 for
 /// `NEW_GAME_WINDOW_DAYS` days. Add each new game in both places.
-pub const GAME_LAUNCH_DATES: [(&str, &str); 6] = [
+pub const GAME_LAUNCH_DATES: [(&str, &str); 7] = [
+    ("foodshake", "2026-11-05"),
     ("roulette", "2026-11-02"),
     ("ssq", "2026-10-16"),
     ("dlt", "2026-10-23"),

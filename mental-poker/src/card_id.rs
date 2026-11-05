@@ -1,7 +1,7 @@
-//! Canonical card identity for the Mental Poker protocol.
+//! Canonical card identity for verifiable dealing.
 //!
 //! A [`CardId`] is an integer `0..=51`. The mapping is stable and
-//! domain-independent so it can appear in commitments and the transcript:
+//! domain-independent so it can appear in commitments and proofs:
 //!
 //! ```text
 //! card_id = rank_index * 4 + suit_index
@@ -34,9 +34,4 @@ pub fn id_to_card(id: CardId) -> Option<Card> {
     let rank = Rank::ALL[(id / 4) as usize];
     let suit = Suit::ALL[(id % 4) as usize];
     Some(Card::new(rank, suit))
-}
-
-/// `true` if `id` is a valid card identifier (`0..=51`).
-pub fn is_valid_card_id(id: u32) -> bool {
-    id < DECK_SIZE as u32
 }

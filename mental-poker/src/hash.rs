@@ -12,9 +12,6 @@ use sha2::{Digest, Sha256};
 /// A 32-byte SHA-256 digest.
 pub type Hash = [u8; 32];
 
-/// The all-zero hash — used as the `previous_event_hash` of the first event.
-pub const ZERO_HASH: Hash = [0u8; 32];
-
 /// Domain-separated SHA-256 over a list of byte slices.
 ///
 /// Layout: `len(domain) ‖ domain ‖ count ‖ (len(part) ‖ part)*`.
@@ -30,16 +27,9 @@ pub fn ds_hash(domain: &str, parts: &[&[u8]]) -> Hash {
     h.finalize().into()
 }
 
-/// Hex-encode a hash for transcript fields.
+/// Hex-encode a hash.
 pub fn hex_hash(h: &Hash) -> String {
     hex::encode(h)
-}
-
-/// Decode a hex string back into a [`Hash`]. Returns `None` on malformed input.
-pub fn parse_hash(s: &str) -> Option<Hash> {
-    let mut out = [0u8; 32];
-    hex::decode_to_slice(s, &mut out).ok()?;
-    Some(out)
 }
 
 /// Canonical JSON serialization: object keys sorted recursively, no insignificant

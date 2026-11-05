@@ -1,4 +1,4 @@
-//! mp-wasm — browser crypto core for engine-blind dealing (ADR-063). Live under
+//! mp-wasm — browser crypto core for engine-blind dealing (ADR-068). Live under
 //! ADR-101's trusted-single-operator scope; no external audit has been done and
 //! no trustless claim is made. A thin wasm-bindgen surface over `mental_poker::crypto_real`
 //! so the browser runs the real threshold-ElGamal / DKG / Chaum–Pedersen path
@@ -122,7 +122,7 @@ impl WasmParty {
         let mut rng = OsRng;
         let q = point_from_hex(&q_hex).ok_or("bad q_hex")?;
         let wires: Vec<CtWire> = serde_json::from_str(&deck_json).map_err(|e| e.to_string())?;
-        // The deck comes from the untrusted coordinator (ADR-063/068
+        // The deck comes from the untrusted coordinator (ADR-068
         // T-ACTIVE-COORDINATOR). Validate its length BEFORE proving: an empty deck
         // would underflow `prod_blind[n - 1]` in the permutation prover and TRAP
         // the whole wasm instance instead of returning `Err`, and an over-large
@@ -327,7 +327,6 @@ pub fn ed25519_verify(vk_hex: String, message: String, signature_hex: String) ->
     // rejects a malformed/wrong signature.
     let dir = KeyDirectory {
         keys: BTreeMap::from([(SIGNER_ID.to_string(), vk_hex)]),
-        is_mock: false,
     };
     match Ed25519SignatureProvider::verifier_from_directory(&dir) {
         Some(v) => v.verify(SIGNER_ID, message.as_bytes(), &signature_hex),

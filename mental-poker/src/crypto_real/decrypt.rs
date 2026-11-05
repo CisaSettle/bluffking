@@ -1,5 +1,5 @@
 //! Threshold ElGamal decryption + Chaum–Pedersen (DLEQ) proofs — **cross-vendor
-//! AI-audited (ADR-076/077/078); open-source + verifiable (ADR-063 §4, spec §4)**.
+//! AI-audited (ADR-076/077/078); open-source + verifiable (spec §4)**.
 //!
 //! This is the **server-blind core**: the deck is ElGamal ciphertext under the
 //! joint key `Q = Σ x_i·G` from the DKG (crypto_real::dkg). To recover a card's
@@ -32,7 +32,7 @@
 //! ## Status
 //!
 //! Cross-vendor AI-audited (ADR-076/077/078); open-source + verifiable. GA'd for
-//! the engine-blind table class by ADR-070 (which lifted the ADR-063 cage); in
+//! the engine-blind table class by ADR-070; in
 //! production these run ONLY for engine-blind sessions (`resolve_mp_crypto_mode`).
 
 use crate::crypto_real::dkg::challenge_scalar;
@@ -417,151 +417,4 @@ pub fn verify_and_open_point(
 pub fn combine(ct: &Ct, shares: &[RistrettoPoint]) -> Option<u8> {
     let sum_d: RistrettoPoint = shares.iter().sum();
     card_id_from_point(&(ct.c2 - sum_d))
-}
-
-// ---------------------------------------------------------------------------
-// F3 — the offline-verifier seam: a real DecryptionProvider for the
-// cp-threshold-ristretto scheme.
-// ---------------------------------------------------------------------------
-
-/// Wire form carried in [`DecryptionProof::attestation`] for the real
-/// threshold-decryption scheme (canonical-JSON-then-hex). It bundles the card's
-/// ElGamal ciphertext with the n-of-n threshold opening so the offline verifier
-/// is fully self-contained (the trait only passes `(party, deck_index, card_id,
-/// salt)`, not the ciphertext).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ThresholdOpenWire {
-    /// The card's ElGamal ciphertext `(C1, C2)`.
-    pub ct: crate::crypto_real::ec::CtWire,
-    /// The n-of-n threshold opening (one DLEQ-proved share per DKG party).
-    pub threshold: ThresholdDecryptionProof,
-}
-
-/// Serialize a [`ThresholdOpenWire`] into the `attestation` hex string.
-pub fn encode_threshold_attestation(open: &ThresholdOpenWire) -> String {
-    let bytes =
-        crate::hash::canonical_json(&serde_json::to_value(open).expect("serialize threshold open"));
-    hex::encode(bytes)
-}
-
-fn decode_threshold_attestation(att: &str) -> Option<ThresholdOpenWire> {
-    let bytes = hex::decode(att).ok()?;
-    serde_json::from_slice(&bytes).ok()
-}
-
-/// A real [`DecryptionProvider`](crate::crypto::DecryptionProvider) for the
-/// `cp-threshold-ristretto-v1` scheme — **cross-vendor AI-audited
-/// (ADR-076/077/078); open-source + verifiable (ADR-063, audit F3)**.
-///
-/// `verify_decryption` decodes the ciphertext + n-of-n threshold opening from the
-/// attestation, verifies **every** share's Chaum–Pedersen DLEQ against the
-/// DKG-published party public keys (held by the provider), enforces the n-of-n
-/// quorum (exactly one share per party, no dup/missing), combines `M = C2 − Σ D_i`,
-/// and checks the recovered card id equals the claimed `card_id`. A forged or
-/// sub-quorum opening is rejected — so an exported real-crypto transcript is
-/// end-to-end checkable offline (F3).
-///
-/// The provider holds the party public keys `Q_i` (the DKG public shares); the
-/// offline verifier reconstructs them from the transcript's `key_registered`
-/// events (`Σ` of which is the joint key the shuffle is bound to — F2).
-///
-/// F3 (round-1 re-audit residual): the provider can ALSO hold the verified final
-/// ciphertext deck (`expected_deck`). When present, `verify_decryption` anchors
-/// the attestation's self-supplied `open.ct` to `expected_deck[deck_index]` and
-/// rejects any mismatch — so the threshold open is checked against the EXACT
-/// ciphertext the committed final deck froze, not a ciphertext the prover chose.
-/// Without the anchor (`None`), the open's ciphertext is unconstrained and card
-/// integrity rests solely on the card-commit layer; the anchor closes that gap
-/// whenever the final ciphertext deck is available to the verifier (the
-/// real-shuffle path, where the deck travels in the shuffle attestation).
-pub struct RealThresholdDecryptionProvider {
-    party_pubkeys: Vec<(String, RistrettoPoint)>,
-    expected_deck: Option<Vec<Ct>>,
-}
-
-impl RealThresholdDecryptionProvider {
-    /// Build the verifier-side provider from the DKG party public keys (no
-    /// ciphertext anchor — card integrity then rests on the card-commit layer).
-    pub fn new(party_pubkeys: Vec<(String, RistrettoPoint)>) -> Self {
-        RealThresholdDecryptionProvider {
-            party_pubkeys,
-            expected_deck: None,
-        }
-    }
-
-    /// Build the verifier-side provider WITH the verified final ciphertext deck
-    /// (F3 anchor). Every opened card's attestation ciphertext must equal
-    /// `expected_deck[deck_index]` — a prover cannot open a ciphertext other than
-    /// the one the committed final deck froze.
-    pub fn with_expected_deck(
-        party_pubkeys: Vec<(String, RistrettoPoint)>,
-        expected_deck: Vec<Ct>,
-    ) -> Self {
-        RealThresholdDecryptionProvider {
-            party_pubkeys,
-            expected_deck: Some(expected_deck),
-        }
-    }
-}
-
-impl crate::crypto::DecryptionProvider for RealThresholdDecryptionProvider {
-    fn scheme(&self) -> &'static str {
-        SCHEME
-    }
-
-    fn prove_decryption(
-        &self,
-        _party: &str,
-        _deck_index: u32,
-        _card_id: u8,
-        _salt: &crate::crypto::Salt,
-    ) -> crate::crypto::DecryptionProof {
-        // The real opening is produced by the parties (each contributes a DLEQ
-        // share); this verifier-side provider does not synthesize proofs.
-        // Transcript builders call `encode_threshold_attestation` directly.
-        unimplemented!(
-            "RealThresholdDecryptionProvider is verify-only; build the attestation \
-             with encode_threshold_attestation from the parties' shares"
-        )
-    }
-
-    fn verify_decryption(
-        &self,
-        _party: &str,
-        deck_index: u32,
-        card_id: u8,
-        _salt: &crate::crypto::Salt,
-        proof: &crate::crypto::DecryptionProof,
-    ) -> bool {
-        if proof.scheme != SCHEME {
-            return false;
-        }
-        let open = match decode_threshold_attestation(&proof.attestation) {
-            Some(o) => o,
-            None => return false,
-        };
-        let ct = match Ct::from_wire(&open.ct) {
-            Some(c) => c,
-            None => return false,
-        };
-        // F3 anchor: when the verifier knows the committed final ciphertext deck,
-        // the attestation's self-supplied ciphertext MUST equal the deck entry at
-        // this index. A prover cannot substitute a ciphertext it can open more
-        // conveniently — the open is checked against the EXACT frozen ciphertext.
-        if let Some(deck) = &self.expected_deck {
-            match deck.get(deck_index as usize) {
-                Some(expected) if expected.c1 == ct.c1 && expected.c2 == ct.c2 => {}
-                _ => return false,
-            }
-        }
-        // Verify every DLEQ + n-of-n quorum and recover the card id.
-        match verify_and_open(deck_index, &ct, &self.party_pubkeys, &open.threshold) {
-            // The recovered card must equal the claimed card_id (which the state
-            // machine has independently pinned to the committed deck via
-            // card_commit(card_id, salt)). A mismatch means the threshold open
-            // does not actually decrypt to the card the transcript claims.
-            Ok(recovered) => recovered == card_id,
-            Err(_) => false,
-        }
-    }
 }

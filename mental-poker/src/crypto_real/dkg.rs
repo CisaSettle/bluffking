@@ -1,9 +1,9 @@
 //! Distributed Key Generation (n-of-n) — **cross-vendor AI-audited
-//! (ADR-076/077/078); open-source + verifiable (ADR-063 §2, spec §2)**.
+//! (ADR-076/077/078); open-source + verifiable (spec §2)**.
 //!
 //! Produces a joint ElGamal public key `Q = Σ Q_i` over `n` parties such that
 //! decryption requires **all n** secret shares `x_i` (n-of-n; no relaxed
-//! quorum, per ADR-041 R2 / threat T4). The coordinator holds **no** share, so
+//! quorum, threat T4). The coordinator holds **no** share, so
 //! it can decrypt nothing (threat T1).
 //!
 //! ## Mechanism (hand-rolled Feldman/Pedersen-committed DKG)
@@ -29,7 +29,7 @@
 //! ## Status
 //!
 //! Cross-vendor AI-audited (ADR-076/077/078); open-source + verifiable. GA'd for
-//! the engine-blind table class by ADR-070 (which lifted the ADR-063 cage); in
+//! the engine-blind table class by ADR-070; in
 //! production these run ONLY for engine-blind sessions (`resolve_mp_crypto_mode`). The
 //! increment-1 harness simulates all `n` parties locally with real `OsRng`; the
 //! interactive WS choreography is out of scope.

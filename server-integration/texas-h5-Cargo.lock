@@ -1811,7 +1811,6 @@ dependencies = [
  "getrandom 0.2.17",
  "hex",
  "hkdf",
- "hmac",
  "merlin",
  "rand 0.8.6",
  "rand_chacha 0.3.1",

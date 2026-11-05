@@ -1,23 +1,21 @@
-//! Real **asymmetric** Ed25519 transcript signing — **cross-vendor AI-audited
-//! (ADR-076/077/078); open-source + verifiable (ADR-063 §5, spec §5)**.
+//! Real **asymmetric** Ed25519 signing — **cross-vendor AI-audited
+//! (ADR-076/077/078); open-source + verifiable
+//! (`docs/architecture/mp-phase4-crypto-spec.md` §5)**.
 //!
-//! [`Ed25519SignatureProvider`] implements the existing
+//! [`Ed25519SignatureProvider`] implements the
 //! [`SignatureProvider`](crate::signing::SignatureProvider) trait with
-//! `ed25519-dalek` 2.2.0, replacing the forgeable symmetric-HMAC
-//! [`MockSignatureProvider`](crate::signing::MockSignatureProvider).
+//! `ed25519-dalek` 2.2.0.
 //!
-//! ## Why this is sound where the mock is not
+//! ## Why this is sound
 //!
-//! The mock is *symmetric*: its "verification key" **is** the HMAC secret, so
-//! anyone who can verify can also forge. Ed25519 is *asymmetric*:
+//! Ed25519 is *asymmetric*:
 //!
 //! - **Signing** needs the 32-byte `SigningKey` (a secret seed). Only the
-//!   owning party holds it; it is NEVER placed in the transcript nor sent to
-//!   the coordinator.
+//!   owning party holds it; it is NEVER sent to the coordinator.
 //! - **Verifying** needs only the 32-byte `VerifyingKey` (a public point). The
-//!   exported [`KeyDirectory`](crate::signing::KeyDirectory) carries these with
-//!   `is_mock = false` — they are safe to publish. A holder of public keys
-//!   alone **cannot** forge a signature (threat T8).
+//!   exported [`KeyDirectory`](crate::signing::KeyDirectory) carries only these
+//!   — they are safe to publish. A holder of public keys alone **cannot**
+//!   forge a signature (threat T8).
 //! - **Determinism:** Ed25519 (RFC 8032) is deterministic — the same key over
 //!   the same message always yields the same 64-byte signature. This satisfies
 //!   the [`SignatureProvider`](crate::signing::SignatureProvider) replay
@@ -29,15 +27,14 @@
 //! - `VerifyingKey`: 32-byte compressed Edwards point (`to_bytes`), lower-case
 //!   hex in [`KeyDirectory`](crate::signing::KeyDirectory).
 //! - `Signature`: 64 bytes (`R ‖ s`, `to_bytes`), lower-case hex (128 chars),
-//!   carried in the transcript `signature` / `contributor_signature` fields.
-//!   The existing `Signature = String` (hex) type is unchanged.
+//!   carried in the `mp_*` signature fields. The `Signature = String` (hex)
+//!   type is unchanged.
 //!
 //! ## Status
 //!
 //! Cross-vendor AI-audited (ADR-076/077/078); open-source + verifiable. GA'd for
 //! the engine-blind table class by ADR-070; in production selected ONLY for
-//! engine-blind sessions (`resolve_mp_crypto_mode`) — the generic
-//! `mental_poker_production` provider stays rejected. `ed25519-dalek` itself is
+//! engine-blind sessions (`resolve_mp_crypto_mode`). `ed25519-dalek` itself is
 //! an audited lineage (Quarkslab 2019 scope, fiat-crypto formally-verified field
 //! backend); the *Phase-4 integration* as a whole is cross-vendor AI-audited and
 //! independently verifiable.
@@ -136,10 +133,8 @@ impl Ed25519SignatureProvider {
             .map(|vk| hex::encode(vk.to_bytes()))
     }
 
-    /// Export the **public** verifying keys for the transcript. `is_mock` is
-    /// `false`: unlike [`MockSignatureProvider`](crate::signing::MockSignatureProvider)'s
-    /// directory (which leaks the symmetric secret), this directory carries only
-    /// public keys and is safe to publish to every verifier / auditor.
+    /// Export the **public** verifying keys. The directory carries only public
+    /// keys and is safe to publish to every verifier / auditor.
     pub fn directory(&self) -> KeyDirectory {
         KeyDirectory {
             keys: self
@@ -147,7 +142,6 @@ impl Ed25519SignatureProvider {
                 .iter()
                 .map(|(signer, vk)| (signer.clone(), hex::encode(vk.to_bytes())))
                 .collect(),
-            is_mock: false,
         }
     }
 
@@ -155,14 +149,10 @@ impl Ed25519SignatureProvider {
     /// [`KeyDirectory`] (public keys only — no secret seed is present, so the
     /// result can verify but not sign).
     ///
-    /// Returns `None` if `dir.is_mock` is `true` (a mock/symmetric directory is
-    /// not an Ed25519 public-key set) or if any key is not a canonical
+    /// Returns `None` if any key is not a canonical
     /// 32-byte Ed25519 verifying key — including small-order (weak) points and
     /// non-canonical encodings (threat T8/T9 decode reject — no panic; U30).
     pub fn verifier_from_directory(dir: &KeyDirectory) -> Option<Self> {
-        if dir.is_mock {
-            return None;
-        }
         let mut verifying = BTreeMap::new();
         for (signer, hex_key) in &dir.keys {
             let bytes = hex::decode(hex_key).ok()?;
@@ -186,7 +176,7 @@ impl SignatureProvider for Ed25519SignatureProvider {
             Some(sk) => hex::encode(sk.sign(message).to_bytes()),
             // An unknown signer (or a verifier-only instance with no secret for
             // `signer`) produces an obviously-invalid signature rather than
-            // panicking — the verifier will reject it. Mirrors the mock's "00".
+            // panicking — the verifier will reject it.
             None => "00".to_string(),
         }
     }

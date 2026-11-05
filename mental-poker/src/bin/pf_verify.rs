@@ -189,7 +189,7 @@ fn verify_v1(value: serde_json::Value) -> i32 {
         }
     };
     if rec.server_seed.is_empty() {
-        // Legacy / MP-dealt hand: no commit-reveal secrets to verify.
+        // Legacy / engine-blind hand: no commit-reveal secrets to verify.
         println!(
             "SKIPPED: hand {} has no server_seed (not a commit-reveal hand)",
             rec.hand_id

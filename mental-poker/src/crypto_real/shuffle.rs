@@ -1,8 +1,8 @@
 //! Verifiable re-encryption shuffle — **cross-vendor AI-audited (ADR-076/077/078);
-//! open-source + verifiable (ADR-063 §3, spec §3 / §3.6)**.
+//! open-source + verifiable (spec §3 / §3.6)**.
 //!
 //! This is the single highest-risk primitive of the server-blind increment and
-//! the one with **no audited off-the-shelf ristretto crate** (ADR-063 §2). It
+//! the one with **no audited off-the-shelf ristretto crate** (spec §3). It
 //! implements [`ShuffleProofProvider`](crate::crypto::ShuffleProofProvider) with
 //! a **sound** sigma-based re-encryption-shuffle argument over ristretto255,
 //! made non-interactive with a `merlin` Fiat–Shamir transcript. It ships behind
@@ -30,8 +30,8 @@
 //! card-integrity term is `N!/ℓ^CHAL_REPS` ≈ 2⁻²⁷⁸ at N=52, `CHAL_REPS = 2`
 //! (BUG-125); the OVERALL proof soundness error is dominated by the Part-B
 //! permutation / β-compression Schwartz–Zippel term `O(N·CHAL_REPS/ℓ)` ≈ 2⁻²⁴⁵ —
-//! both terms far below 2⁻¹²⁸. It catches the exact attack the
-//! `MockShuffleProofProvider` cannot.
+//! both terms far below 2⁻¹²⁸. It catches a card swap or replacement, which a
+//! proof that only binds deck hashes cannot.
 //!
 //! ## Soundness mechanism (why a card swap is caught)
 //!
@@ -100,7 +100,7 @@
 //!   claims. The *soundness* property (a swap is rejected) is what the TR-1/2/3
 //!   tests gate, at the ~2⁻²⁴⁵ overall soundness bound noted above (BUG-125).
 //! - **Cross-vendor AI-audited (ADR-076/077/078); open-source + verifiable.** GA'd
-//!   for the engine-blind table class by ADR-070 (which lifted the ADR-063 cage); in
+//!   for the engine-blind table class by ADR-070; in
 //!   production reachable ONLY for engine-blind sessions via
 //!   `resolve_mp_crypto_mode` and the engine-blind coordinator.
 
@@ -1259,10 +1259,10 @@ fn deserialize_argument(att: &str) -> Option<ShuffleArgument> {
 }
 
 /// F3 (verifier anchor): decode the **output ciphertext deck** carried in a real
-/// shuffle proof's attestation. The offline verifier uses this on the last
-/// shuffle round to recover the committed final ciphertext deck, then anchors
-/// every threshold-decryption open to `deck[deck_index]` (so a prover cannot open
-/// a ciphertext it never committed to). Returns `None` for a non-real / malformed
+/// shuffle proof's attestation. The `pf2` / card-proof verifiers use this to
+/// recover the committed ciphertext deck, then anchor every threshold-decryption
+/// open to `deck[deck_index]` (so a prover cannot open a ciphertext it never
+/// committed to). Returns `None` for a non-real / malformed
 /// attestation.
 pub fn output_deck_from_proof(proof: &ShuffleProof) -> Option<Vec<Ct>> {
     if proof.scheme != SCHEME && proof.scheme != CARD_SCHEME {
@@ -1297,7 +1297,7 @@ fn uniform_below<R: RngCore + CryptoRng>(rng: &mut R, bound: usize) -> usize {
 // ===========================================================================
 
 /// Real verifiable re-encryption shuffle provider — **cross-vendor AI-audited
-/// (ADR-076/077/078); open-source + verifiable (ADR-063)**.
+/// (ADR-076/077/078); open-source + verifiable**.
 ///
 /// Implements [`ShuffleProofProvider`] with the sound sigma-based interim
 /// argument (scheme [`SCHEME`]). The prover holds the input/output decks + the
