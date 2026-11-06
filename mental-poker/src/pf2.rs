@@ -46,8 +46,7 @@ use crate::crypto_real::decrypt::{
 };
 use crate::crypto_real::dkg::DkgParty;
 use crate::crypto_real::ec::{
-    canonical_starting_deck, deck_hash, point_from_hex, point_to_bytes, point_to_hex, Ct,
-    DECK_SIZE,
+    canonical_starting_deck, deck_hash, point_from_hex, point_to_bytes, point_to_hex, Ct, DECK_SIZE,
 };
 use crate::crypto_real::shuffle::{output_deck_from_proof, RealShuffleProofProvider, Shuffle};
 use crate::hash::ds_hash;
@@ -345,8 +344,7 @@ pub(crate) fn verify_deck(bundle: &Bundle, max_seats: usize) -> Result<Verified,
         return Err(Pf2Error::Malformed("hand_id"));
     }
     let commit = hex32(&bundle.commit, "commit")?;
-    let public_key =
-        point_from_hex(&bundle.public_key).ok_or(Pf2Error::Malformed("public_key"))?;
+    let public_key = point_from_hex(&bundle.public_key).ok_or(Pf2Error::Malformed("public_key"))?;
     if point_to_hex(&public_key) != bundle.public_key {
         return Err(Pf2Error::Malformed("public_key"));
     }
@@ -356,11 +354,16 @@ pub(crate) fn verify_deck(bundle: &Bundle, max_seats: usize) -> Result<Verified,
     }
     let mut client_seeds = BTreeMap::new();
     for (seat, seed) in &bundle.client_seeds {
-        let seat: u8 = seat.parse().map_err(|_| Pf2Error::Malformed("client_seeds"))?;
+        let seat: u8 = seat
+            .parse()
+            .map_err(|_| Pf2Error::Malformed("client_seeds"))?;
         if !seats.contains(&seat) || bundle.withheld_seats.contains(&seat) {
             return Err(Pf2Error::SeedSeat);
         }
-        if client_seeds.insert(seat, hex32(seed, "client_seeds")?).is_some() {
+        if client_seeds
+            .insert(seat, hex32(seed, "client_seeds")?)
+            .is_some()
+        {
             return Err(Pf2Error::Malformed("client_seeds"));
         }
     }
@@ -389,8 +392,13 @@ pub(crate) fn verify_deck(bundle: &Bundle, max_seats: usize) -> Result<Verified,
     let mut cards = BTreeMap::new();
     for opening in &bundle.openings {
         let index = *order.get(opening.position).ok_or(Pf2Error::Position)?;
-        let card = verify_and_open(opening.position as u32, &deck[index], &dealer, &opening.proof)
-            .map_err(|_| Pf2Error::Opening(opening.position))?;
+        let card = verify_and_open(
+            opening.position as u32,
+            &deck[index],
+            &dealer,
+            &opening.proof,
+        )
+        .map_err(|_| Pf2Error::Opening(opening.position))?;
         if card != opening.card {
             return Err(Pf2Error::Opening(opening.position));
         }
