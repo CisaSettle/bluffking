@@ -750,7 +750,7 @@ pub async fn hydrate(pool: &PgPool) -> sqlx::Result<()> {
         let rooms: Vec<(String, Value)> = sqlx::query_as("SELECT code,state FROM game_room_checkpoints WHERE game='sicbo'")
             .fetch_all(&mut *tx).await?;
         for (code, snapshot) in rooms { loaded.reservations.sicbo_commit(&code, &snapshot); }
-        let cards: Vec<(String, String, i64, Value)> = sqlx::query_as("SELECT game,code,revision,state FROM game_room_checkpoints WHERE game IN ('zjh','niuniu','shortdeck','sangong','ddz','blackjack','gomoku','checkers','colorcards','zhuoji','chengdu','guandan','xiangqi','kwx') AND (state->'opts'->>'beans'='true' OR state->'bean_match'->>'enabled'='true')").fetch_all(&mut *tx).await?;
+        let cards: Vec<(String, String, i64, Value)> = sqlx::query_as("SELECT game,code,revision,state FROM game_room_checkpoints WHERE game IN ('zjh','niuniu','shortdeck','sangong','ddz','blackjack','tenhalf','gomoku','checkers','colorcards','zhuoji','chengdu','guandan','xiangqi','kwx') AND (state->'opts'->>'beans'='true' OR state->'bean_match'->>'enabled'='true')").fetch_all(&mut *tx).await?;
         for (game, code, revision, snapshot) in cards { loaded.cards.hydrate(&game, &code, revision as u64, &snapshot)?; }
         tx.commit().await?;
         Ok::<_, sqlx::Error>(loaded)

@@ -43,6 +43,7 @@ pub enum Game {
     Ddz,
     Guandan,
     Blackjack,
+    Tenhalf,
     Baccarat,
     Colorcards,
 }
@@ -65,6 +66,7 @@ impl Game {
             Self::Ddz => "ddz",
             Self::Guandan => "guandan",
             Self::Blackjack => "blackjack",
+            Self::Tenhalf => "tenhalf",
             Self::Baccarat => "baccarat",
             Self::Colorcards => "colorcards",
         }
@@ -78,6 +80,7 @@ impl Game {
             Self::Ddz,
             Self::Guandan,
             Self::Blackjack,
+            Self::Tenhalf,
             Self::Baccarat,
             Self::Colorcards,
         ]
@@ -110,7 +113,7 @@ impl Context {
             Game::Zjh | Game::Colorcards => 10,
             Game::Ddz => 3,
             Game::Guandan => 4,
-            Game::Baccarat => 1,
+            Game::Baccarat | Game::Tenhalf => 1,
             _ => 6,
         };
         if self.seats.is_empty()
