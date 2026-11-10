@@ -590,6 +590,9 @@ mod pots;
 mod start;
 mod streets;
 
+/// Canonical pot awarding for validated replay/solver inputs. Callers must
+/// provide legal, distinct cards and contribution-derived pots.
+pub use pots::distribute_pots as settle_pots;
 pub use streets::second_run_cards_from as second_run_card_count_from;
 
 impl GameHand {

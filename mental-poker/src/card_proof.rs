@@ -113,7 +113,8 @@ impl Context {
             Game::Zjh | Game::Colorcards => 10,
             Game::Ddz => 3,
             Game::Guandan => 4,
-            Game::Baccarat | Game::Tenhalf => 1,
+            Game::Baccarat => 1,
+            Game::Tenhalf => 12,
             _ => 6,
         };
         if self.seats.is_empty()

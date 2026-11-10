@@ -33,6 +33,7 @@ publish = false
 [dependencies]
 engine = { path = "../engine" }
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 # Open-source postflop CFR solver (b-inary/postflop-solver), AGPL-3.0-or-later.

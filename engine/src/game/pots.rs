@@ -915,7 +915,7 @@ pub(super) fn odd_chip_recipients(
 /// - at least one eligible contributor is a **forfeiter**: a forfeiter must
 ///   never get its stake back, so the layer is awarded to the honest revealers
 ///   (`eligible_with_cards`), ranked among themselves — forfeit-not-refund.
-pub(super) fn distribute_pots(
+pub fn distribute_pots(
     pots: &[SidePot],
     eligible_with_cards: &[(PlayerId, HoleCards)],
     board: &BoardCards,

@@ -56,6 +56,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+pub mod policy;
+pub mod river;
+
 use engine::card::Card;
 use engine::hand::HoleCards;
 use serde::Serialize;
@@ -586,6 +589,16 @@ pub fn solve_spot(req: &SolveRequest) -> Result<SolveOutput, SolveError> {
 /// measured exploitability and real iteration count), or abandons the solve with
 /// [`SolveError::Cancelled`] once the cancel flag is set.
 pub fn solve_spot_with(req: &SolveRequest, ctl: &SolveControl) -> Result<SolveOutput, SolveError> {
+    let (game, run) = solve_game(req, ctl)?;
+    project_output(&game, req, run)
+}
+
+/// Retain the solved tree for callers that follow its continuation policy.
+fn solve_game(
+    req: &SolveRequest,
+    ctl: &SolveControl,
+) -> Result<(PostFlopGame, CfrRun), SolveError> {
+    ctl.check_cancel()?;
     // --- Cheap, solve-free validation (single source of truth) --------------
     // N2 (codex MED): run the FULL `validate_request` first so EVERY input is
     // validated before a game is constructed — honoring this crate's documented
@@ -676,7 +689,7 @@ pub fn solve_spot_with(req: &SolveRequest, ctl: &SolveControl) -> Result<SolveOu
     // Required before reading equity/EV/strategy at the (root) node.
     game.cache_normalized_weights();
 
-    project_output(&game, req, run)
+    Ok((game, run))
 }
 
 /// Outcome of [`run_cfr`].

@@ -277,7 +277,7 @@ pub async fn load_history_page_filtered(
         // A baccarat session is all practice-chip room rounds or all solo
         // gold-bean hands; its first record tells which.
         query.push("jsonb_build_object('hands', CASE WHEN page.game=5 THEN COALESCE((SELECT jsonb_array_length(r.detail->'results') FROM filtered_records r WHERE r.game=5 AND r.user_id=$1 AND r.record_id=page.record_id),page.hands) ELSE page.hands END, 'started_at', page.started_at, \
-             'unit', CASE WHEN page.game IN (1,2,3,5,6,7,8,9,12,13,14,15,20,21,22,24) THEN (SELECT CASE WHEN EXISTS (SELECT 1 FROM wallet_ledger l WHERE l.game=10 AND l.record_id=f.record_id AND l.user_id=$1 \
+             'unit', CASE WHEN page.game IN (1,2,3,5,6,7,8,9,12,13,14,15,20,21,22,24,25) THEN (SELECT CASE WHEN EXISTS (SELECT 1 FROM wallet_ledger l WHERE l.game=10 AND l.record_id=f.record_id AND l.user_id=$1 \
              AND l.kind='play' AND (l.details->>'unit'='beans' OR l.details->>'game'='baccarat')) \
              THEN 'beans' ELSE 'practice' END FROM (SELECT r.record_id FROM game_records r WHERE r.user_id=$1 AND r.game=page.game \
              AND COALESCE(r.session_id,r.record_id)=page.session_id LIMIT 1) f) END)");
@@ -427,6 +427,10 @@ const DETAIL_ARMS: &[(&[i16], &str)] = &[
     (
         &[20],
         r#"(SELECT r.detail FROM game_records r WHERE r.game=20 AND r.user_id=$1 AND r.record_id=page.record_id)"#,
+    ),
+    (
+        &[25],
+        r#"(SELECT r.detail FROM game_records r WHERE r.game=25 AND r.user_id=$1 AND r.record_id=page.record_id)"#,
     ),
     (
         &[15],
