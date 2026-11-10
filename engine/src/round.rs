@@ -693,6 +693,36 @@ impl BettingRound {
 
     // ---- Public accessors ----
 
+    /// Build pots using each player's prior-street contributions as well as
+    /// this round. Pure solver/replay entrypoint; never mutates the round.
+    /// Requires exactly one prior amount per seated player and rejects overflow.
+    pub fn side_pots_with_prior(
+        &self,
+        prior: &[(PlayerId, Chips)],
+    ) -> Result<Vec<SidePot>, ActionError> {
+        if prior.len() != self.players.len() {
+            return Err(ActionError::InvalidAction);
+        }
+        let mut combined = self.clone();
+        let mut total = 0u32;
+        for player in &mut combined.players {
+            let mut matches = prior.iter().filter(|(id, _)| *id == player.player_id);
+            let amount = matches.next().ok_or(ActionError::InvalidAction)?.1;
+            if matches.next().is_some() {
+                return Err(ActionError::InvalidAction);
+            }
+            player.contributed.0 = player
+                .contributed
+                .0
+                .checked_add(amount.0)
+                .ok_or(ActionError::InvalidAction)?;
+            total = total
+                .checked_add(player.contributed.0)
+                .ok_or(ActionError::InvalidAction)?;
+        }
+        Ok(combined.side_pots())
+    }
+
     /// Contribution of a player this round.
     pub fn player_contributed(&self, player_id: PlayerId) -> Chips {
         self.players
