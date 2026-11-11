@@ -177,6 +177,16 @@ struct State {
     /// Revision a rehydrated ring starts from, so clients on the same
     /// runtime_epoch never discard its views as older than what they hold.
     floor: AtomicU64,
+    /// The writer's terminal error for the event it stopped at.
+    refused: Mutex<Option<String>>,
+    /// Accepted jobs that do not depend on a refused event, waiting to be
+    /// handed to the next writer by [`hydrate`].
+    resume: Mutex<Vec<Arc<Job>>>,
+    /// Wakes [`run`]: a write committed (purchase, period, draw or settlement,
+    /// so a slot may be free or settlement may continue) or was refused.
+    wake: tokio::sync::Notify,
+    /// The last retention pass deleted a full batch: run the next one soon.
+    retention_more: std::sync::atomic::AtomicBool,
 }
 fn state(pool: &PgPool) -> Arc<State> {
     type Pools = HashMap<usize, (Weak<sqlx::postgres::PgConnectOptions>, Arc<State>)>;
@@ -201,6 +211,10 @@ fn state(pool: &PgPool) -> Arc<State> {
                     queued: AtomicUsize::new(0),
                     accepted: Mutex::new(VecDeque::new()),
                     floor: AtomicU64::new(0),
+                    refused: Mutex::new(None),
+                    resume: Mutex::new(Vec::new()),
+                    wake: tokio::sync::Notify::new(),
+                    retention_more: std::sync::atomic::AtomicBool::new(false),
                 }),
             )
         })
@@ -220,10 +234,10 @@ pub fn ready(pool: &PgPool) -> bool {
         .unwrap_or_else(|e| e.into_inner())
         .is_some()
 }
+/// The lottery exists only on the single realtime owner: a process that is
+/// not (or not yet) that owner accepts nothing and serves no view.
 fn check_owner() -> Result<(), Error> {
-    if !crate::write_behind::accepting()
-        || (crate::runtime_owner::configured() && !crate::runtime_owner::active())
-    {
+    if !crate::write_behind::accepting() || !crate::realtime_mode::enabled() {
         return Err(unavailable());
     }
     Ok(())
@@ -279,7 +293,7 @@ impl Data {
         // Scratch replay windows are retired only by serialized cold preparation.
         self.receipts.retain(|_, receipt| receipt.game == "scratch");
         // Compaction re-serializes the whole working set under the data lock;
-        // the idle tick calls this every second, so only pay when a row left.
+        // the runtime loop calls this on every commit, so only pay when a row left.
         if before != (self.periods.len(), self.tickets.len(), self.receipts.len()) {
             self.compact();
         }
@@ -423,6 +437,21 @@ fn admit(
     spend: i64,
 ) -> Result<CommitReceipt, Error> {
     check_owner()?;
+    if event.kind != "settle" {
+        let mut parked = parked();
+        let now = std::time::Instant::now();
+        parked.players.retain(|_, until| *until > now);
+        if event
+            .owner
+            .is_some_and(|owner| parked.players.contains_key(&owner))
+            || event
+                .cards
+                .iter()
+                .any(|t| parked.cards.contains(&t.card.id))
+        {
+            return Err(unavailable());
+        }
+    }
     let bytes = serde_json::to_vec(&event)
         .map_err(|_| Error::InvalidEntry)?
         .len()
@@ -568,6 +597,9 @@ pub async fn hydrate(pool: &PgPool) -> sqlx::Result<()> {
                             job.event.id, job.event.game, job.event.kind
                         );
                         if persistence::is_permanent(&e) {
+                            *state.refused.lock().unwrap_or_else(|e| e.into_inner()) =
+                                Some(error.clone());
+                            state.wake.notify_one();
                             crate::write_behind::fenced(&error)
                         } else {
                             error
@@ -612,14 +644,40 @@ pub async fn hydrate(pool: &PgPool) -> sqlx::Result<()> {
                     work.complete()
                 }
                 state.queued.fetch_sub(job.bytes, Ordering::AcqRel);
+                state.wake.notify_one();
             }
             Ok(next)
         }
     });
-    *state.writer.lock().unwrap_or_else(|e| e.into_inner()) = Some(writer);
+    // Installed and resumed while holding the data lock, which every command
+    // and every commit needs first, so none can see the ring between the two.
+    let mut installed = state.data.lock().unwrap_or_else(|e| e.into_inner());
     *state.published.lock().unwrap_or_else(|e| e.into_inner()) =
         Some(published::Published::new(data.clone()));
-    *state.data.lock().unwrap_or_else(|e| e.into_inner()) = Some(data);
+    let data = installed.insert(data);
+    let mut writer = writer;
+    // Accepted events the refused one did not touch continue on this writer,
+    // in their accepted order, on top of the committed state just loaded.
+    let resumed: Vec<_> =
+        std::mem::take(&mut *state.resume.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut lost = 0usize;
+    for job in resumed {
+        // Not gated on the writer's health: a transient error of an earlier
+        // resumed write must not cost the ones queued behind it.
+        if writer.enqueue(Some(job.clone())).is_ok() {
+            data.apply(&job.event);
+            accepted(&state).push_back(job);
+        } else {
+            abandon(pool, &state, &job);
+            lost += 1;
+        }
+    }
+    if lost > 0 {
+        // The fresh queue holds more than a writer can ever have had accepted.
+        tracing::error!(lost, "lottery_resume_queue_full");
+    }
+    *state.writer.lock().unwrap_or_else(|e| e.into_inner()) = Some(writer);
+    drop(installed);
     if floor > 0 {
         for game in Game::ALL {
             let _ = state.changed.send(Notice {
@@ -641,9 +699,7 @@ pub async fn hydrate(pool: &PgPool) -> sqlx::Result<()> {
 /// one job at a time, every few minutes at least (period rows), so one held
 /// connection stays warm. Any failed write drops it (a retry starts on a
 /// fresh one), and it is closed one pool connection lifetime after it was
-/// taken, or at its next write after a schema upgrade by another process is
-/// observed (`db::predates_schema_change`), so a schema change cannot pin a
-/// stale statement cache.
+/// taken.
 struct WriterConnection {
     conn: crate::db_writer::PoolConnection<sqlx::Postgres>,
     since: std::time::Instant,
@@ -662,14 +718,16 @@ async fn persist_on_held(
     if event.kind == "retention" {
         // Runs on its own pool transactions; taking the writer connection too
         // would only cost the pool a second one meanwhile.
-        persistence::retention(pool).await?;
+        if persistence::retention(pool).await? {
+            state(pool).retention_more.store(true, Ordering::Release);
+        }
         return Ok(vec![]);
     }
     let hold = pool.options().get_max_connections() >= HOLD_MIN_POOL_CONNECTIONS;
-    if held.as_ref().is_some_and(|held| {
-        let age = held.since.elapsed();
-        age >= crate::db::CONNECTION_MAX_LIFETIME || crate::db::predates_schema_change(age)
-    }) {
+    if held
+        .as_ref()
+        .is_some_and(|held| held.since.elapsed() >= crate::db::CONNECTION_MAX_LIFETIME)
+    {
         *held = None;
     }
     // Taken out for the write: only a successful write puts it back, so an
@@ -681,8 +739,6 @@ async fn persist_on_held(
     let mut writer = match held.take() {
         Some(writer) => writer,
         None => {
-            // Taken before checkout: a schema upgrade observed while the
-            // checkout was in progress must still retire this connection.
             let since = std::time::Instant::now();
             let mut conn = pool.acquire().await?;
             conn.close_on_drop();
@@ -700,11 +756,78 @@ fn accepted(state: &State) -> std::sync::MutexGuard<'_, VecDeque<Arc<Job>>> {
     state.accepted.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// A permanent persist error fences the writer: nothing queued can commit, so
-/// memory no longer matches SQL. Drop the ring and every accepted-but-unwritten
-/// job (their bean effects reload from SQL, their purge holds release) and let
-/// the run loop hydrate again. Accepted purchases that never committed vanish;
-/// none is charged twice.
+/// Ends an accepted job that will never be written: its bean effect leaves
+/// memory (the wallet reloads from SQL), its purge hold releases, and whoever
+/// waits for its commit gets "unavailable".
+fn abandon(pool: &PgPool, state: &State, job: &Job) {
+    if let (Some(owner), Some(_)) = (job.event.owner, &job.event.effect) {
+        beans_read_memory::effect_abandoned(pool, owner, job.event.id);
+    }
+    if let Some(work) = &job.work {
+        work.complete()
+    }
+    state.queued.fetch_sub(job.bytes, Ordering::AcqRel);
+}
+
+/// What an event touches: its owner and the periods whose row or tickets it
+/// carries. Two events sharing neither are independent of each other.
+fn touches(event: &Event) -> (Option<Uuid>, Vec<(String, i64)>) {
+    let mut periods: Vec<(String, i64)> = event
+        .period
+        .iter()
+        .map(|row| (event.game.clone(), row.period))
+        .collect();
+    for ticket in event.cards.iter().filter(|t| t.card.period != 0) {
+        let key = (ticket.game.clone(), ticket.card.period);
+        if !periods.contains(&key) {
+            periods.push(key);
+        }
+    }
+    (event.owner, periods)
+}
+
+/// Periods and settlements whose own event the database refused in this
+/// process. The runtime does not produce their events again (they would be
+/// refused again); the next start retries them once.
+#[derive(Default)]
+struct Parked {
+    /// A period whose creation, draw or closing was refused: nothing more is
+    /// sold, drawn or settled in it.
+    periods: std::collections::HashSet<(String, i64)>,
+    /// A user's settlement of a period that was refused or cannot be priced:
+    /// those tickets stay unsettled and unpaid.
+    settlements: std::collections::HashSet<(String, i64, Uuid)>,
+    /// A scratch card whose reveal was refused: it keeps its saved state and
+    /// neither the player nor the expiry sweep reveals it again.
+    cards: std::collections::HashSet<Uuid>,
+    /// A player whose own request was refused, and until when further
+    /// requests of that player are declined: a refusal that repeats must not
+    /// stop the writer for everyone again and again.
+    players: HashMap<Uuid, std::time::Instant>,
+}
+/// How long a player's requests are declined after one of them was refused.
+const REFUSED_PLAYER_HOLD: Duration = Duration::from_secs(300);
+fn parked() -> std::sync::MutexGuard<'static, Parked> {
+    static PARKED: OnceLock<Mutex<Parked>> = OnceLock::new();
+    PARKED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// The database refused ONE accepted event for a reason retrying cannot change
+/// (`persistence::is_permanent`), which stops the ordered writer at it. That
+/// event is dropped and reported, and with it only the accepted events that
+/// were built on it: later events of the same player and of the same period,
+/// transitively. Every other accepted event is kept and resumes, in order, on
+/// a fresh writer ([`hydrate`]) over memory reloaded from SQL, so memory and
+/// durable state agree again without anyone else losing accepted work.
+///
+/// A dropped event was never written: nothing is charged or paid twice. The
+/// player of a dropped purchase or reveal gets "unavailable" for that request
+/// and sees the balance and tickets from before it, and further lottery
+/// requests of that player are declined for five minutes; a dropped
+/// settlement leaves its tickets unsettled (see [`Parked`]).
 async fn discard_fenced(pool: &PgPool) -> bool {
     let state = state(pool);
     let fenced = || {
@@ -733,21 +856,91 @@ async fn discard_fenced(pool: &PgPool) -> bool {
         .map_or(0, |data| data.revision);
     *state.published.lock().unwrap_or_else(|e| e.into_inner()) = None;
     state.floor.store(revision + 1, Ordering::Release);
-    let abandoned: Vec<_> = accepted(&state).drain(..).collect();
-    for job in &abandoned {
-        if let (Some(owner), Some(_)) = (job.event.owner, &job.event.effect) {
-            beans_read_memory::effect_abandoned(pool, owner, job.event.id);
+    let mut queue: VecDeque<_> = accepted(&state).drain(..).collect();
+    let reason = state
+        .refused
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .unwrap_or_default();
+    // The writer commits in FIFO order: the head is the refused event.
+    let refused = queue.pop_front();
+    let (mut owners, mut periods) = (Vec::new(), Vec::new());
+    let mut dropped = 0usize;
+    if let Some(job) = &refused {
+        let (owner, touched) = touches(&job.event);
+        owners.extend(owner);
+        periods.extend(touched);
+        let period = job
+            .event
+            .period
+            .as_ref()
+            .map(|row| row.period)
+            .or_else(|| job.event.cards.first().map(|t| t.card.period));
+        if let Some(period) = period.filter(|period| *period != 0) {
+            match (job.event.kind.as_str(), job.event.owner) {
+                ("settle", Some(owner)) => {
+                    parked()
+                        .settlements
+                        .insert((job.event.game.clone(), period, owner));
+                }
+                ("draw" | "period", _) => {
+                    parked().periods.insert((job.event.game.clone(), period));
+                }
+                _ => {}
+            }
         }
-        if let Some(work) = &job.work {
-            work.complete()
+        if job.event.kind != "settle" {
+            let mut parked = parked();
+            if job.event.kind == "reveal" {
+                parked
+                    .cards
+                    .extend(job.event.cards.iter().map(|t| t.card.id));
+            }
+            if let Some(owner) = job.event.owner {
+                parked
+                    .players
+                    .insert(owner, std::time::Instant::now() + REFUSED_PLAYER_HOLD);
+            }
         }
-        state.queued.fetch_sub(job.bytes, Ordering::AcqRel);
+        tracing::error!(
+            alert_error = "Lottery event refused by the database and dropped",
+            alert_cause = "one accepted lottery event can never be written (constraint, receipt or plan mismatch); it was dropped before anything of it was saved, its player's balance and tickets are back to the saved state, and all other lottery work continues / 一条已受理的彩票事件无法落库（约束、收据或开奖计划不一致），已在写入前丢弃，该玩家的余额与彩票恢复为已保存状态，其余彩票业务照常进行",
+            alert_action = "AI team reads the refusal reason, checks that player's wallet, tickets and the period row, and settles a parked settlement or period by hand; Loong action: none / AI 根据拒绝原因核查该玩家钱包、彩票与期次，必要时手工结算被搁置的结算或期次，Loong 无需操作",
+            "[lottery_event_refused] event={} kind={} game={} user={} period={} reason={reason}",
+            job.event.id,
+            job.event.kind,
+            job.event.game,
+            job.event.owner.map(|u| u.to_string()).unwrap_or_else(|| "-".into()),
+            period.unwrap_or(0),
+        );
+        abandon(pool, &state, job);
+    }
+    let mut kept = Vec::new();
+    for job in queue {
+        let (owner, touched) = touches(&job.event);
+        if owner.is_some_and(|owner| owners.contains(&owner))
+            || touched.iter().any(|key| periods.contains(key))
+        {
+            owners.extend(owner);
+            periods.extend(touched);
+            abandon(pool, &state, &job);
+            dropped += 1;
+        } else {
+            kept.push(job);
+        }
     }
     tracing::error!(
-        abandoned = abandoned.len(),
+        dropped_dependents = dropped,
+        resumed = kept.len(),
         revision,
         "lottery_writer_fenced_rehydrating"
     );
+    state
+        .resume
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .extend(kept);
     true
 }
 
@@ -768,6 +961,13 @@ fn ensure_period(
         return Ok(());
     }
     if super::now_ms() >= selling.closes_ms {
+        return Err(Error::SalesClosed);
+    }
+    // Its creation was refused: nothing can be sold in it.
+    if parked()
+        .periods
+        .contains(&(game.as_str().into(), selling.id))
+    {
         return Err(Error::SalesClosed);
     }
     if data
@@ -1151,12 +1351,9 @@ pub async fn buy_scratch(
 ) -> Result<Purchase, Error> {
     let validation = lottery_span(LotteryStage::Validate);
     player(pool, user)?;
-    let mut identity = json!({"game":"scratch","cost":body.cost,"count":body.count,"fairness":{"offer_id":body.fairness.offer_id,"commitment":body.fairness.commitment,"client_seed":body.fairness.client_seed}});
-    if body.all_in {
-        identity["all_in"] = json!(true);
-        identity["expected_balance"] = json!(body.expected_balance);
-    }
-    let hash = store::body_sha256(&identity);
+    // The same normalised identity the purchase stored (reward_version
+    // included), so a retried request replays instead of conflicting.
+    let hash = store::body_sha256(&body.identity());
     let state = state(pool);
     drop(validation);
     let command = {
@@ -1397,12 +1594,10 @@ fn accept_numbers(
     event.period = Some(row);
     event.receipt = Some(receipt.clone());
     event.effect = Some(PendingEffect {
-        balance: -charged,
-        net: -charged,
+        delta: -charged,
+        bonus: 0,
         played: 0,
         won: 0,
-        ledger_delta: -charged,
-        day: None,
     });
     let purchased = event
         .cards
@@ -1578,12 +1773,10 @@ fn accept_scratch(
         after,
     });
     event.effect = Some(PendingEffect {
-        balance: delta + event.bonus,
-        net: delta,
+        delta,
+        bonus: event.bonus,
         played: i32::from(batch),
         won: i32::from(batch && paid > 0),
-        ledger_delta: delta,
-        day: None,
     });
     let purchased = event
         .cards
@@ -1645,7 +1838,7 @@ fn reveal_card(
             let balance = job
                 .event
                 .before
-                .checked_add(job.event.effect.as_ref().map_or(0, |e| e.balance))
+                .checked_add(job.event.effect.as_ref().map_or(0, |e| e.delta + e.bonus))
                 .ok_or(Error::InvalidEntry)?;
             return Ok((
                 store::ticket_json(Game::Scratch, &owned.card),
@@ -1719,12 +1912,10 @@ fn reveal_card(
         let bonus = scratch_reward(&mut owned.card)?;
         event.bonus = bonus;
         event.effect = Some(PendingEffect {
-            balance: paid + bonus,
-            net: paid,
+            delta: paid,
+            bonus,
             played: 1,
             won: i32::from(paid > 0),
-            ledger_delta: paid,
-            day: None,
         });
         after = before
             .checked_add(paid)
@@ -1737,111 +1928,462 @@ fn reveal_card(
     Ok((wire, after, receipt))
 }
 
+/// Settlement events kept in the writer queue at once (it holds 64), so a
+/// large draw pays out continuously without taking purchases' room.
+const SETTLE_IN_FLIGHT: usize = 16;
+/// Settlement events decided between two yields to other tasks.
+const SETTLE_BATCH: usize = 20;
+/// Expired scratch cards revealed per sweep query.
+const SCRATCH_BATCH: usize = 20;
+/// Least wait before an expiry sweep repeats while cards it found remain
+/// unsettled in SQL (a failed reveal, or one whose write is still queued).
+const SCRATCH_RETRY: Duration = Duration::from_secs(60);
+const DAY: Duration = Duration::from_secs(24 * 3600);
+
+/// Retry delay after `failures` consecutive passes left due work unfinished:
+/// 0.5 s doubling to 5 s (a pending beacon is fetched at most every 5 s anyway).
+fn backoff(failures: u32) -> Duration {
+    Duration::from_millis(500u64 << failures.saturating_sub(1).min(4)).min(Duration::from_secs(5))
+}
+
+/// What the loop keeps between passes.
+struct Schedule {
+    /// The first fence rehydrates at once. One that recurs within five
+    /// minutes backs off 1s..16s instead of reloading the ring again and again.
+    fences: u32,
+    last_fence: std::time::Instant,
+    hydrate_after: std::time::Instant,
+    /// A failed slot recovery holds back draws and settlement until it is retried.
+    recover_after: Option<std::time::Instant>,
+    /// Games whose unsettled periods in SQL may not all fit their memory
+    /// slots. Set by every hydration; a game leaves once a recovery query
+    /// returns fewer periods than it had free slots.
+    backlog: Vec<Game>,
+    /// Stranded periods found at this start, reopened one at a time.
+    stranded: Option<VecDeque<(String, i64)>>,
+    stranded_after: std::time::Instant,
+    retention_due: std::time::Instant,
+    scratch_due: std::time::Instant,
+    failures: u32,
+}
+
+/// Event driven: each pass does the work that is due, then the loop sleeps
+/// until the next known deadline (next period opening or draw, next scratch
+/// expiry, next retention, a retry) or until a write commits or is refused
+/// (purchase, period change, draw, settlement: a slot may be free, settlement
+/// may continue). Nothing is polled while idle; readiness gates are awaited.
 pub async fn run(pool: PgPool) {
-    let mut scratch_expiry_due = std::time::Instant::now();
-    let mut retention_due = std::time::Instant::now() + Duration::from_secs(3600);
-    // A fence that recurs soon after rehydrating backs off 2s..64s instead of
-    // reloading the ring and abandoning other users' work every second.
-    let (mut fences, mut last_fence) = (0u32, std::time::Instant::now());
-    let mut hydrate_after = std::time::Instant::now();
-    let mut tick = tokio::time::interval(Duration::from_secs(1));
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let state = state(&pool);
+    let now = std::time::Instant::now();
+    let mut schedule = Schedule {
+        fences: 0,
+        last_fence: now,
+        hydrate_after: now,
+        recover_after: None,
+        backlog: Game::DRAWN.to_vec(),
+        stranded: None,
+        stranded_after: now,
+        retention_due: now + Duration::from_secs(3600),
+        scratch_due: now,
+        failures: 0,
+    };
     loop {
-        tick.tick().await;
+        if !gates_ready(&pool).await {
+            break;
+        }
+        let next = pass(&pool, &mut schedule).await;
         if !crate::write_behind::accepting() {
             break;
         }
-        if crate::runtime_owner::configured()
-            && (!crate::runtime_owner::active() || !crate::runtime_owner::recovery_ready(&pool))
+        // `notify_one` keeps a permit, so a commit during the pass is not lost.
+        tokio::select! {
+            _ = state.wake.notified() => {}
+            _ = tokio::time::sleep_until(next.into()) => {}
+            _ = crate::write_behind::shutdown_started() => {}
+        }
+    }
+}
+
+/// Waits until the lottery may run here: this process is the realtime owner,
+/// startup recovery finished, and the wallet and player directory are loaded.
+/// False once the process stops accepting (release handoff draining).
+async fn gates_ready(pool: &PgPool) -> bool {
+    let mut wait = Duration::from_millis(20);
+    loop {
+        if !crate::write_behind::accepting() {
+            return false;
+        }
+        let configured = crate::runtime_owner::configured();
+        if crate::realtime_mode::enabled()
+            && (!configured || crate::runtime_owner::recovery_ready(pool))
+            && beans_read_memory::ready(pool)
+            && crate::player_directory::ready(pool)
         {
-            continue;
+            return true;
         }
-        if !beans_read_memory::ready(&pool) || !crate::player_directory::ready(&pool) {
-            continue;
+        if configured && !crate::runtime_owner::active() {
+            // Standby: woken when this process takes ownership.
+            tokio::select! {
+                _ = crate::runtime_owner::wait_active() => {}
+                _ = crate::write_behind::shutdown_started() => {}
+            }
+        } else if !configured && !crate::realtime_mode::enabled() {
+            // No single owner configured: the lottery never runs here.
+            crate::write_behind::shutdown_started().await;
+        } else if configured && !crate::runtime_owner::recovery_ready(pool) {
+            tokio::select! {
+                _ = crate::runtime_owner::wait_recovery_ready(pool) => {}
+                _ = crate::write_behind::shutdown_started() => {}
+            }
+        } else {
+            // Wallet or directory still loading (development mode without a
+            // host owner, or lagging the recovery barrier).
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                _ = crate::write_behind::shutdown_started() => {}
+            }
+            wait = (wait * 2).min(Duration::from_secs(1));
         }
-        if discard_fenced(&pool).await {
-            let now = std::time::Instant::now();
-            fences = if now.duration_since(last_fence) < Duration::from_secs(300) {
-                fences.saturating_add(1)
-            } else {
-                1
+    }
+}
+
+/// One pass over everything due; returns when the loop needs to look again.
+async fn pass(pool: &PgPool, s: &mut Schedule) -> std::time::Instant {
+    let state = state(pool);
+    let now = std::time::Instant::now();
+    if discard_fenced(pool).await {
+        s.fences = if now.duration_since(s.last_fence) < Duration::from_secs(300) {
+            s.fences.saturating_add(1)
+        } else {
+            1
+        };
+        s.last_fence = now;
+        s.hydrate_after = now
+            + match s.fences {
+                0 | 1 => Duration::ZERO,
+                n => Duration::from_secs(1 << (n - 2).min(4)),
             };
-            last_fence = now;
-            hydrate_after = now + Duration::from_secs(1 << fences.min(6));
+    } else if state
+        .refused
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some()
+    {
+        // The writer refused an event and is about to stop; discard it then.
+        return now + Duration::from_millis(20);
+    }
+    if !ready(pool) {
+        if now < s.hydrate_after {
+            return s.hydrate_after;
         }
-        if !ready(&pool) {
-            if std::time::Instant::now() < hydrate_after {
-                continue;
+        let started = std::time::Instant::now();
+        let result = hydrate(pool).await;
+        tracing::info!(
+            stage = "lottery::runtime",
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            success = result.is_ok(),
+            "runtime_memory_hydration_finished"
+        );
+        if let Err(error) = result {
+            tracing::warn!(%error, "lottery_hydration_retry");
+            s.failures = s.failures.saturating_add(1);
+            s.hydrate_after = std::time::Instant::now() + backoff(s.failures);
+            return s.hydrate_after;
+        }
+        s.backlog = Game::DRAWN.to_vec();
+        s.recover_after = None;
+    }
+    if s.recover_after.is_some_and(|after| now < after) {
+        return s.recover_after.unwrap_or(now);
+    }
+    {
+        let _command = state.commands.lock().await;
+        if let Err(error) = recover_slots(pool, &mut s.backlog).await {
+            tracing::warn!(?error, "lottery_ring_recovery_waiting");
+            s.failures = s.failures.saturating_add(1);
+            let after = std::time::Instant::now() + backoff(s.failures);
+            s.recover_after = Some(after);
+            return after;
+        }
+        s.recover_after = None;
+    }
+    let mut retry = false;
+    let mut again = false;
+    if s.stranded.is_none() && now >= s.stranded_after {
+        match persistence::stranded(pool).await {
+            Ok((periods, unusable)) => {
+                if !periods.is_empty() || unusable > 0 {
+                    tracing::error!(
+                        alert_error = "Lottery tickets were left unsettled in periods already marked settled",
+                        alert_cause = "a period was marked settled without these tickets (a second backend wrote the same database); the runtime now settles them from the stored draw, once / 有期次在这些彩票未结算时被标记为已结算（另一个后端写了同一数据库），运行时将按已存开奖结果补结算一次",
+                        alert_action = "AI team checks the later lottery_stranded_period_reopened lines and anything counted as unusable (a period without stored plan or draw, a ticket whose period row is gone) and settles those by hand; Loong action: none / AI 核对后续 lottery_stranded_period_reopened 日志，并手工处理无法自动结算的期次或彩票，Loong 无需操作",
+                        "[lottery_stranded_tickets] periods={} unusable={unusable}",
+                        periods.len()
+                    );
+                }
+                s.stranded = Some(periods.into());
             }
-            let started = std::time::Instant::now();
-            let result = hydrate(&pool).await;
-            tracing::info!(
-                stage = "lottery::runtime",
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                success = result.is_ok(),
-                "runtime_memory_hydration_finished"
+            Err(error) => {
+                tracing::warn!(%error, "lottery_stranded_scan_retry");
+                s.stranded_after = std::time::Instant::now() + Duration::from_secs(60);
+            }
+        }
+    }
+    if let Some(queue) = s.stranded.as_mut().filter(|queue| !queue.is_empty()) {
+        // One per pass; with none fitting, a freed slot (a commit) wakes the loop.
+        match reopen_stranded(pool, queue).await {
+            Ok(reopened) => again |= reopened,
+            Err(error) => {
+                tracing::warn!(?error, "lottery_stranded_reopen_waiting");
+                retry = true;
+            }
+        }
+    }
+    if state.retention_more.swap(false, Ordering::AcqRel) {
+        s.retention_due = s.retention_due.min(now + Duration::from_secs(60));
+    }
+    if now >= s.retention_due {
+        let mut lock = state.data.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(data) = lock.as_mut() {
+            let event = Event::new(Game::Ssq, None, "retention", Uuid::new_v4());
+            s.retention_due = std::time::Instant::now()
+                + if admit(pool, &state, data, event, 0).is_ok() {
+                    DAY
+                } else {
+                    // The writer is busy or failing: never a past-due deadline.
+                    backoff(s.failures.saturating_add(1))
+                };
+        }
+    }
+    for game in Game::DRAWN {
+        if let Err(error) = advance(pool, game).await {
+            tracing::warn!(
+                ?error,
+                game = game.as_str(),
+                "lottery_memory_advance_waiting"
             );
-            if let Err(error) = result {
-                tracing::warn!(%error, "lottery_hydration_retry");
-                continue;
-            }
+            retry = true;
         }
-        {
-            let state = state(&pool);
-            let _command = state.commands.lock().await;
-            if let Err(error) = recover_slots(&pool).await {
-                tracing::warn!(?error, "lottery_ring_recovery_waiting");
-                continue;
-            }
+    }
+    retry |= settle_all(pool).await;
+    if std::time::Instant::now() >= s.scratch_due {
+        s.scratch_due = std::time::Instant::now() + expire_scratch(pool).await;
+    }
+    // Draw work from memory: the next period boundary, the next draw, and a
+    // draw that is due but still waits (its beacon is not out yet).
+    let (next_ms, due) = drawn_deadline(pool);
+    retry |= due;
+    let now = std::time::Instant::now();
+    let mut next = (now
+        + Duration::from_millis(next_ms.saturating_sub(super::now_ms()).max(0) as u64 + 1))
+    .min(s.retention_due)
+    .min(s.scratch_due);
+    if s.stranded.is_none() {
+        next = next.min(s.stranded_after);
+    }
+    if retry {
+        s.failures = s.failures.saturating_add(1);
+        next = next.min(now + backoff(s.failures));
+    } else {
+        s.failures = 0;
+    }
+    if again {
+        next = now;
+    }
+    next
+}
+
+/// Settles drawn periods until none is left, `SETTLE_BATCH` events between
+/// yields. Pauses while `SETTLE_IN_FLIGHT` writes are queued: each commit
+/// wakes the loop to continue. True when work is left that only a retry can
+/// finish (an error, or an owner whose wallet or directory row was unreadable).
+async fn settle_all(pool: &PgPool) -> bool {
+    let state = state(pool);
+    let mut settled = 0usize;
+    loop {
+        if accepted(&state).len() >= SETTLE_IN_FLIGHT {
+            return false;
         }
-        if std::time::Instant::now() >= retention_due {
-            let state = state(&pool);
-            let mut lock = state.data.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(data) = lock.as_mut() {
-                let event = Event::new(Game::Ssq, None, "retention", Uuid::new_v4());
-                if admit(&pool, &state, data, event, 0).is_ok() {
-                    retention_due = std::time::Instant::now() + Duration::from_secs(3600);
+        match settle(pool) {
+            Ok(true) => {
+                settled += 1;
+                if settled % SETTLE_BATCH == 0 {
+                    tokio::task::yield_now().await;
                 }
             }
-        }
-        for game in Game::DRAWN {
-            if let Err(error) = advance(&pool, game).await {
-                tracing::warn!(
-                    ?error,
-                    game = game.as_str(),
-                    "lottery_memory_advance_waiting"
-                );
+            Ok(false) => {
+                let lock = state.data.lock().unwrap_or_else(|e| e.into_inner());
+                return lock.as_ref().is_some_and(|data| {
+                    data.periods
+                        .iter()
+                        .any(|(key, r)| r.status == "drawn" && !parked().periods.contains(key))
+                });
             }
-        }
-        for _ in 0..20 {
-            match settle(&pool) {
-                Ok(true) => {}
-                Ok(false) => break,
-                Err(error) => {
-                    tracing::warn!(?error, "lottery_memory_settlement_waiting");
-                    break;
-                }
-            }
-        }
-        if std::time::Instant::now() >= scratch_expiry_due {
-            scratch_expiry_due = std::time::Instant::now() + Duration::from_secs(60);
-            let expired = sqlx::query(&format!("SELECT id,user_id FROM lottery_tickets WHERE game='scratch' AND cost=100 AND {} AND settled_at IS NULL AND bought_at < now()-interval '30 days' ORDER BY bought_at,id LIMIT 20", super::scratch::REWARD_VERSION_SQL)).fetch_all(&pool).await;
-            if let Ok(rows) = expired {
-                for row in rows {
-                    let (user, id) = (row.get("user_id"), row.get("id"));
-                    let state = state(&pool);
-                    let _command = state.commands.lock().await;
-                    if prepare_scratch(&pool, user, Some(id)).await.is_ok() {
-                        let _ = reveal_card(&pool, user, id, None, true);
-                    }
-                }
+            Err(error) => {
+                tracing::warn!(?error, "lottery_memory_settlement_waiting");
+                return true;
             }
         }
     }
 }
-async fn recover_slots(pool: &PgPool) -> Result<(), Error> {
+
+/// The next draw-game deadline (wall-clock ms: the next period boundary or
+/// an earlier open period's draw) and whether a draw is already due.
+fn drawn_deadline(pool: &PgPool) -> (i64, bool) {
+    let now = super::now_ms();
+    let mut next = Game::DRAWN
+        .iter()
+        .filter_map(|game| game.schedule())
+        .map(|schedule| schedule.period_at(now).draw_ms)
+        .min()
+        .unwrap_or(now + 60_000);
+    let mut due = false;
     let state = state(pool);
-    let keys = {
+    let lock = state.data.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(data) = lock.as_ref() {
+        for (key, row) in data.periods.iter().filter(|(_, r)| r.status == "open") {
+            let Some(plan) = row
+                .proof_plan
+                .clone()
+                .and_then(|p| serde_json::from_value::<draw_games::lottery::Plan>(p).ok())
+            else {
+                continue;
+            };
+            if plan.draw_at_ms > now {
+                next = next.min(plan.draw_at_ms);
+            } else if !parked().periods.contains(key) {
+                due = true;
+            }
+        }
+    }
+    (next, due)
+}
+
+/// Reveals scratch cards 30 days after purchase; returns the wait until the
+/// next sweep: none while full batches keep coming, else until the oldest
+/// unsettled card expires (at most a day, at least `SCRATCH_RETRY`).
+async fn expire_scratch(pool: &PgPool) -> Duration {
+    let skip: Vec<Uuid> = parked().cards.iter().copied().collect();
+    let rows = match sqlx::query(&format!("SELECT id,user_id FROM lottery_tickets WHERE game='scratch' AND cost=100 AND {} AND settled_at IS NULL AND bought_at < now()-interval '30 days' AND NOT (id=ANY($1)) ORDER BY bought_at,id LIMIT {SCRATCH_BATCH}", super::scratch::REWARD_VERSION_SQL)).bind(&skip).fetch_all(pool).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(%error, "lottery_scratch_expiry_retry");
+            return SCRATCH_RETRY;
+        }
+    };
+    let mut revealed = 0usize;
+    let mut last = None;
+    for row in &rows {
+        let (user, id): (Uuid, Uuid) = (row.get("user_id"), row.get("id"));
+        if parked().cards.contains(&id) {
+            continue;
+        }
+        let state = state(pool);
+        let _command = state.commands.lock().await;
+        if prepare_scratch(pool, user, Some(id)).await.is_ok() {
+            if let Ok((_, _, receipt)) = reveal_card(pool, user, id, None, true) {
+                revealed += 1;
+                last = Some(receipt);
+            }
+        }
+    }
+    if rows.len() == SCRATCH_BATCH && revealed == SCRATCH_BATCH {
+        // Re-sweep once the batch is durable, so SQL no longer returns it.
+        if let Some(receipt) = last {
+            if receipt.wait().await.is_ok() {
+                return Duration::ZERO;
+            }
+        }
+        return SCRATCH_RETRY;
+    }
+    let skip: Vec<Uuid> = parked().cards.iter().copied().collect();
+    match sqlx::query_scalar::<_, Option<DateTime<Utc>>>(&format!("SELECT min(bought_at) FROM lottery_tickets WHERE game='scratch' AND cost=100 AND {} AND settled_at IS NULL AND NOT (id=ANY($1))", super::scratch::REWARD_VERSION_SQL)).bind(&skip).fetch_one(pool).await {
+        // A card bought from now on expires after a full 30 days.
+        Ok(oldest) => (oldest.unwrap_or_else(Utc::now) + chrono::Duration::days(30) - Utc::now())
+            .to_std()
+            .unwrap_or_default()
+            .clamp(SCRATCH_RETRY, DAY),
+        Err(error) => {
+            tracing::warn!(%error, "lottery_scratch_expiry_retry");
+            SCRATCH_RETRY
+        }
+    }
+}
+/// Reopens the next stranded period for settlement when its game has a slot
+/// to spare beside the period on sale; the ordinary settlement loop then pays
+/// its unsettled tickets and marks it settled again. Exactly once: a ticket
+/// is settled in the same transaction as its credit, and only unsettled
+/// tickets are ever paid. True when a period left the queue.
+async fn reopen_stranded(
+    pool: &PgPool,
+    queue: &mut VecDeque<(String, i64)>,
+) -> Result<bool, Error> {
+    let state = state(pool);
+    let _command = state.commands.lock().await;
+    // The first queued period whose game has room; one game's full slots
+    // never hold back another game's recovery.
+    let next = {
+        let lock = state.data.lock().unwrap_or_else(|e| e.into_inner());
+        let data = lock.as_ref().ok_or_else(unavailable)?;
+        queue.retain(|key| !data.periods.contains_key(key));
+        queue
+            .iter()
+            .position(|(game, _)| {
+                data.periods
+                    .range((game.clone(), i64::MIN)..=(game.clone(), i64::MAX))
+                    .count()
+                    + 2
+                    <= PERIOD_SLOTS
+            })
+            .and_then(|index| queue.remove(index))
+    };
+    let Some((game, period)) = next else {
+        return Ok(false);
+    };
+    // Taken off the queue for good: a period that cannot be loaded or does
+    // not fit is reported once, not reloaded under the command lock forever.
+    let reopened = match persistence::load_stranded(pool, &game, period).await {
+        Ok(Some(reopened)) => reopened,
+        Ok(None) => return Ok(true),
+        Err(error) => {
+            tracing::error!(%error, game, period, "lottery_stranded_period_unusable");
+            return Ok(true);
+        }
+    };
+    let mut lock = state.data.lock().unwrap_or_else(|e| e.into_inner());
+    let data = lock.as_mut().ok_or_else(unavailable)?;
+    let mut public = state.published.lock().unwrap_or_else(|e| e.into_inner());
+    let public = public.as_mut().ok_or_else(unavailable)?;
+    if data.bytes.saturating_add(reopened.bytes) > MAX_BYTES
+        || public.data.bytes.saturating_add(reopened.bytes) > MAX_BYTES
+    {
+        tracing::error!(game, period, "lottery_stranded_period_unusable");
+        return Ok(true);
+    }
+    let unsettled = reopened
+        .tickets
+        .values()
+        .filter(|t| t.card.settled_at.is_none())
+        .count();
+    public.data.periods.extend(reopened.periods.clone());
+    for ticket in reopened.tickets.values() {
+        public.data.insert(ticket.clone());
+    }
+    public.data.compact();
+    data.periods.extend(reopened.periods);
+    for ticket in reopened.tickets.into_values() {
+        data.insert(ticket);
+    }
+    data.compact();
+    tracing::info!(game, period, unsettled, "lottery_stranded_period_reopened");
+    Ok(true)
+}
+
+/// Retires durable settled periods, then refills free slots from SQL, but
+/// only for `backlog` games: elsewhere every unsettled period is in memory.
+async fn recover_slots(pool: &PgPool, backlog: &mut Vec<Game>) -> Result<(), Error> {
+    let state = state(pool);
+    let (keys, wanted) = {
         let mut lock = state.data.lock().unwrap_or_else(|e| e.into_inner());
         let data = lock.as_mut().ok_or_else(unavailable)?;
         if data.revision != data.durable {
@@ -1856,9 +2398,38 @@ async fn recover_slots(pool: &PgPool) -> Result<(), Error> {
         {
             public.data.retire_durable_periods();
         }
-        data.periods.keys().cloned().collect::<Vec<_>>()
+        let wanted = backlog
+            .iter()
+            .map(|game| {
+                let held = data
+                    .periods
+                    .range((game.as_str().into(), i64::MIN)..=(game.as_str().into(), i64::MAX))
+                    .count();
+                (*game, PERIOD_SLOTS.saturating_sub(held))
+            })
+            .filter(|(_, free)| *free > 0)
+            .collect::<Vec<_>>();
+        if wanted.is_empty() {
+            return Ok(());
+        }
+        (data.periods.keys().cloned().collect::<Vec<_>>(), wanted)
     };
-    let recovered = persistence::hydrate_missing(pool, &keys).await?;
+    let games = wanted.iter().map(|(game, _)| *game).collect::<Vec<_>>();
+    let recovered = persistence::hydrate_missing(pool, &keys, &games).await?;
+    // A game given fewer periods than it had free slots has none left in SQL
+    // outside memory: new periods are only ever created by this runtime.
+    let drained = wanted
+        .iter()
+        .filter(|(game, free)| {
+            recovered
+                .periods
+                .keys()
+                .filter(|(g, _)| g == game.as_str())
+                .count()
+                < *free
+        })
+        .map(|(game, _)| *game)
+        .collect::<Vec<_>>();
     let mut lock = state.data.lock().unwrap_or_else(|e| e.into_inner());
     let data = lock.as_mut().ok_or_else(unavailable)?;
     if data.bytes.saturating_add(recovered.bytes) > MAX_BYTES {
@@ -1882,10 +2453,12 @@ async fn recover_slots(pool: &PgPool) -> Result<(), Error> {
         }
         data.compact();
     }
+    backlog.retain(|game| !drained.contains(game));
     tracing::debug!(
         periods = data.periods.len(),
         tickets = data.tickets.len(),
         bytes = data.bytes,
+        backlog = backlog.len(),
         "lottery_ring_size"
     );
     Ok(())
@@ -1916,7 +2489,10 @@ async fn advance(pool: &PgPool, game: Game) -> Result<(), Error> {
                     .clone()
                     .and_then(|p| serde_json::from_value::<draw_games::lottery::Plan>(p).ok())
             })
-            .find(|p| p.draw_at_ms <= super::now_ms())
+            .find(|p| {
+                p.draw_at_ms <= super::now_ms()
+                    && !parked().periods.contains(&(game.as_str().into(), p.period))
+            })
     };
     let Some(plan) = plan else { return Ok(()) };
     let Some(beacon) = super::beacon::fetch(plan.beacon_round)
@@ -1959,7 +2535,7 @@ fn settle(pool: &PgPool) -> Result<bool, Error> {
     let periods = data
         .periods
         .iter()
-        .filter(|(_, r)| r.status == "drawn")
+        .filter(|(key, r)| r.status == "drawn" && !parked().periods.contains(*key))
         .map(|(k, r)| (k.clone(), r.clone()))
         .collect::<Vec<_>>();
     for ((g, period), mut row) in periods {
@@ -1973,6 +2549,7 @@ fn settle(pool: &PgPool) -> Result<bool, Error> {
             .flatten()
             .filter_map(|id| data.tickets.get(id))
             .filter(|t| t.card.settled_at.is_none())
+            .filter(|t| !parked().settlements.contains(&(g.clone(), period, t.user)))
             .cloned()
             .collect::<Vec<_>>();
         if pending.is_empty() {
@@ -2001,53 +2578,90 @@ fn settle(pool: &PgPool) -> Result<bool, Error> {
             let Ok(before) = beans_read_memory::settlement_balance(pool, owner) else {
                 continue;
             };
-            let mut event = Event::new(
-                game,
-                Some(owner),
-                "settle",
-                super::draw_credit_id(game, period, owner),
-            );
-            event.before = before;
-            let mut paid = 0i64;
-            for mut t in pending.iter().filter(|t| t.user == owner).cloned() {
-                let entry = Entry::from_stored(game, &t.card.entry).ok_or(Error::InvalidEntry)?;
-                let (prize, tier) = entry
-                    .prize(
-                        &protocol,
-                        i64::from(t.card.multiplier),
-                        row.numbers.as_deref().ok_or(Error::InvalidEntry)?,
-                        row.bonus,
-                        &row.bonus_numbers,
-                    )
+            // One credit per (game, period, user). A user who already has
+            // settled tickets in this period (only in a reopened stranded
+            // period, see `persistence::stranded`) gets a receipt of its own
+            // for the remaining ones, derived from the first of them.
+            let mine = || {
+                data.by_period
+                    .get(&(g.clone(), period))
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|id| data.tickets.get(id))
+                    .filter(move |t| t.user == owner)
+            };
+            let id = if mine().any(|t| t.card.settled_at.is_some()) {
+                let first = mine()
+                    .filter(|t| t.card.settled_at.is_none())
+                    .map(|t| t.card.id)
+                    .min()
                     .ok_or(Error::InvalidEntry)?;
-                paid = paid.checked_add(prize).ok_or(Error::InvalidEntry)?;
-                let bonus = entry
-                    .jackpot_bonus(&protocol, i64::from(t.card.multiplier), prize, tier)
-                    .ok_or(Error::InvalidEntry)?;
-                if bonus > 0 {
-                    // Credited by the writer as a separate bonus ledger row.
-                    t.card.entry["jackpot_bonus"] = json!(bonus);
-                    event.bonus = event.bonus.checked_add(bonus).ok_or(Error::InvalidEntry)?;
+                super::record_id(&format!("draw:{g}:{period}:{owner}:{first}"))
+            } else {
+                super::draw_credit_id(game, period, owner)
+            };
+            // A ticket that cannot be priced must not stop every other
+            // settlement: this user's credit is skipped and reported.
+            let priced = (|| -> Result<Event, Error> {
+                let mut row = row.clone();
+                let mut event = Event::new(game, Some(owner), "settle", id);
+                event.before = before;
+                let mut paid = 0i64;
+                for mut t in pending.iter().filter(|t| t.user == owner).cloned() {
+                    let entry =
+                        Entry::from_stored(game, &t.card.entry).ok_or(Error::InvalidEntry)?;
+                    let (prize, tier) = entry
+                        .prize(
+                            &protocol,
+                            i64::from(t.card.multiplier),
+                            row.numbers.as_deref().ok_or(Error::InvalidEntry)?,
+                            row.bonus,
+                            &row.bonus_numbers,
+                        )
+                        .ok_or(Error::InvalidEntry)?;
+                    paid = paid.checked_add(prize).ok_or(Error::InvalidEntry)?;
+                    let bonus = entry
+                        .jackpot_bonus(&protocol, i64::from(t.card.multiplier), prize, tier)
+                        .ok_or(Error::InvalidEntry)?;
+                    if bonus > 0 {
+                        // Credited by the writer as its own non-play ledger row,
+                        // next to (never inside) the prize the proof recomputes.
+                        t.card.entry["jackpot_bonus"] = json!(bonus);
+                        event.bonus = event.bonus.checked_add(bonus).ok_or(Error::InvalidEntry)?;
+                    }
+                    t.card.prize = Some(prize);
+                    t.card.tier = Some(tier);
+                    t.card.settled_at = Some(event.at);
+                    event.cards.push(t)
                 }
-                t.card.prize = Some(prize);
-                t.card.tier = Some(tier);
-                t.card.settled_at = Some(event.at);
-                event.cards.push(t)
-            }
-            row.paid = row.paid.checked_add(paid).ok_or(Error::InvalidEntry)?;
-            row.winners = row
-                .winners
-                .checked_add(i32::from(paid > 0))
-                .ok_or(Error::InvalidEntry)?;
-            event.period = Some(row);
-            event.effect = Some(PendingEffect {
-                balance: paid.checked_add(event.bonus).ok_or(Error::InvalidEntry)?,
-                net: paid,
-                played: 1,
-                won: i32::from(paid > 0),
-                ledger_delta: paid,
-                day: None,
-            });
+                row.paid = row.paid.checked_add(paid).ok_or(Error::InvalidEntry)?;
+                row.winners = row
+                    .winners
+                    .checked_add(i32::from(paid > 0))
+                    .ok_or(Error::InvalidEntry)?;
+                event.period = Some(row);
+                paid.checked_add(event.bonus).ok_or(Error::InvalidEntry)?;
+                event.effect = Some(PendingEffect {
+                    delta: paid,
+                    bonus: event.bonus,
+                    played: 1,
+                    won: i32::from(paid > 0),
+                });
+                Ok(event)
+            })();
+            let event = match priced {
+                Ok(event) => event,
+                Err(error) => {
+                    parked().settlements.insert((g.clone(), period, owner));
+                    tracing::error!(
+                        alert_error = "Lottery tickets could not be settled: their stored entry cannot be priced",
+                        alert_cause = "a stored ticket entry or its period's draw does not parse for the prize table; these tickets stay unsettled and unpaid while every other settlement continues / 已存彩票内容或该期开奖无法按奖表计算，这些彩票保持未结算，其他结算照常进行",
+                        alert_action = "AI team inspects the user's unsettled tickets of that period and settles them by hand; Loong action: none / AI 核查该用户该期未结算彩票并手工结算，Loong 无需操作",
+                        "[lottery_settlement_unpriceable] game={g} period={period} user={owner} error={error:?}"
+                    );
+                    return Ok(true);
+                }
+            };
             admit(pool, &state, data, event, 0)?;
             return Ok(true);
         }

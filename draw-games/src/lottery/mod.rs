@@ -2,17 +2,18 @@
 //!
 //! Everybody buys from the same house; there are no rooms, roles or bots.
 //! The number games (双色球 `ssq`, 大乐透 `dlt`, TOTO `toto`, 快乐8 `happy8`,
-//! 福彩3D `fucai3d`) sell tickets for wall-clock periods and a draw loop in every
-//! backend draws each due period exactly once (database-arbitrated) and
-//! settles it one user per transaction. 刮刮乐 `scratch` cards are generated
-//! at purchase and revealed spot by spot. One shared practice wallet
-//! (`game_catalog::BEANS`, first-use grant 10,000, daily claim +2,000) backs all
-//! six games; every ledger record id is derived here, so retries never debit
-//! or credit twice.
+//! 福彩3D `fucai3d`) sell tickets for wall-clock periods; the single realtime
+//! owner draws each due period and settles it one user per event. 刮刮乐
+//! `scratch` cards are generated at purchase and revealed spot by spot. All six
+//! games spend and pay gold beans through [`crate::bean_ledger`]: one posting
+//! per purchase, per user and drawn period, and per settled card or batch.
+//! Every ledger record id is derived here, so a retry or a re-settlement after
+//! a crash never debits or credits twice.
 //!
-//! Module map: [`rules`] entry validation, stakes and prizes; [`store`]
-//! purchases, views, refills; [`scratch`] cards; [`draw_loop`] draws,
-//! settlement and retention; [`handlers`] HTTP.
+//! Module map: [`rules`] entry validation, stakes and prizes; [`runtime`] the
+//! memory authority (purchases, draws, settlement, reveals) and its ordered
+//! writer; [`store`] replay and history reads; [`scratch`] card projection;
+//! [`draw_loop`] winner notices and retention; [`handlers`] HTTP.
 
 pub mod beacon;
 pub mod draw_loop;

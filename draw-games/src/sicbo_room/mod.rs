@@ -5,4 +5,4 @@
 //! AI co-bettors (`crate::casino_bots`) never touch wallets.
 mod store;
 
-pub use store::{current_room, seated, SicboRoom};
+pub use store::{seated, SicboRoom};

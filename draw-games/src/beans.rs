@@ -16,11 +16,16 @@
 //! same (the bust stack is 0). Mid-hand top-ups reserve only wallet headroom
 //! above the durable hand-start stack and earlier pending top-ups; they apply
 //! at the next hand boundary without changing the current pot or wallet.
+//!
+//! Reserving, releasing and settling beans for a game goes through
+//! [`crate::bean_ledger`], which also documents the ledger row format and
+//! the restart argument.
 
 use crate::db_writer::{PgConnection, PgPool};
 use serde::Serialize;
 use uuid::Uuid;
 
+use crate::bean_ledger::{self, Amount, Leg, Reason, Transfer};
 use crate::game_catalog::BEANS as GAME;
 use crate::wallet::{self, Policy, Wallet};
 
@@ -40,8 +45,7 @@ const SOLO_RECORD_NS: Uuid = Uuid::from_u128(0x8d2f_6c41_0b7e_4a93_9e15_c3a8_57d
 /// The shared wallet ledger keys play receipts by `(game, record_id, user)`
 /// only, and room/hand/lottery settlements use ids clients can see. A solo
 /// play's receipt id is therefore derived from its game, owner and request
-/// id and never equals a client-supplied id. Receipts written before this
-/// derivation kept the raw request id; each caller still looks that up second.
+/// id and never equals a client-supplied id.
 pub fn solo_record_id(game: &str, user: Uuid, request: Uuid) -> Uuid {
     Uuid::new_v5(
         &SOLO_RECORD_NS,
@@ -61,6 +65,32 @@ pub const BB: u32 = 20;
 /// already running keeps the rules it was created with.
 pub const STRADDLE_BB: u8 = 2;
 pub const ANTE: u32 = 10;
+/// Owner 2026-11-11: new public tables also run 血战鱿鱼 (full squid,
+/// penalty in BB, default extra tokens) and a timed Bomb Pot (each dealt seat
+/// posts this many BB every 5-8 minutes). Same defaults as the friend-room
+/// setup form. Running sessions keep the rules they were created with.
+pub const SQUID_PENALTY_BB: u8 = 5;
+pub const SQUID_EXTRA_TOKENS: u8 = 3;
+pub const BOMB_POT_BB: u64 = 5;
+pub const BOMB_POT_INTERVAL_MINUTES: [u16; 2] = [5, 8];
+
+/// Rule keys every new public beans session adds to its `session_config`.
+/// Bomb Pot needs durable runtime checkpoints (as friend-room create does).
+pub fn public_rule_config() -> serde_json::Map<String, serde_json::Value> {
+    let mut rules = serde_json::Map::new();
+    rules.insert("squid_penalty_bb".into(), SQUID_PENALTY_BB.into());
+    rules.insert("squid_mode".into(), "full".into());
+    rules.insert("squid_extra_tokens".into(), SQUID_EXTRA_TOKENS.into());
+    rules.insert("squid_funding".into(), "stack".into());
+    if crate::runtime_checkpoint::enabled() {
+        rules.insert("bomb_pot_bb".into(), BOMB_POT_BB.into());
+        rules.insert(
+            "bomb_pot_interval_minutes".into(),
+            serde_json::json!(BOMB_POT_INTERVAL_MINUTES),
+        );
+    }
+    rules
+}
 pub const BUY_IN: u32 = 2_000;
 
 /// A departed member must bring back the same stack in this room generation.
@@ -225,6 +255,10 @@ pub struct Profile {
     pub straddle: u32,
     /// Per-seat ante in beans (0 = none).
     pub ante: u32,
+    /// 血战鱿鱼 penalty per share in beans (0 = no squid).
+    pub squid_penalty: u32,
+    /// Per-seat Bomb Pot contribution in beans (0 = no Bomb Pot).
+    pub bomb_pot: u32,
     pub daily_refill_to: i64,
     pub initial_grant: i64,
     /// True when today's free refill has not been claimed yet regardless of the current balance.
@@ -249,7 +283,8 @@ pub async fn profile(pool: &PgPool, user: Uuid) -> sqlx::Result<Profile> {
     Ok(Profile {
         balance: w.balance,
         available_balance,
-        reserved_balance: w.balance - available_balance,
+        // A balance a settlement left negative reserves nothing.
+        reserved_balance: (w.balance - available_balance).max(0),
         net_won: w.net_won,
         hands_played: w.hands_played,
         hands_won: w.hands_won,
@@ -257,6 +292,12 @@ pub async fn profile(pool: &PgPool, user: Uuid) -> sqlx::Result<Profile> {
         stake: STAKE_KEY,
         straddle: BB * u32::from(STRADDLE_BB),
         ante: ANTE,
+        squid_penalty: BB * u32::from(SQUID_PENALTY_BB),
+        bomb_pot: if crate::runtime_checkpoint::enabled() {
+            BB * BOMB_POT_BB as u32
+        } else {
+            0
+        },
         daily_refill_to: DAILY_REFILL_TO,
         initial_grant: crate::auth::registration_reward::BEANS,
         daily_available,
@@ -318,29 +359,25 @@ pub async fn claim_daily(pool: &PgPool, user: Uuid) -> sqlx::Result<DailyOutcome
         return Ok(DailyOutcome::AlreadyClaimed { balance: before });
     }
     let granted = DAILY_REFILL_TO;
-    let after = before
-        .checked_add(granted)
-        .ok_or_else(|| sqlx::Error::Protocol("beans balance overflow".into()))?;
-    sqlx::query(
-        "UPDATE wallets SET balance = $3, updated_at = now() WHERE user_id = $1 AND game = $2",
+    // Keyed by the Singapore day the database just claimed.
+    let posted = bean_ledger::credit(
+        &mut tx,
+        &Transfer::one(Leg::new(
+            user,
+            Reason::DailyRefill,
+            day,
+            Amount::Credit(granted),
+            serde_json::json!({ "day": day }),
+        )),
     )
-    .bind(user)
-    .bind(GAME)
-    .bind(after)
-    .execute(&mut *tx)
     .await?;
-    sqlx::query(
-        "INSERT INTO wallet_ledger (user_id, game, kind, delta, balance_after, details) \
-         VALUES ($1, $2, 'bonus', $3, $4, $5)",
-    )
-    .bind(user)
-    .bind(GAME)
-    .bind(granted)
-    .bind(after)
-    .bind(serde_json::json!({ "reason": "daily_refill" }))
-    .execute(&mut *tx)
-    .await?;
+    let after = posted.of(user)?.balance_after;
     tx.commit().await?;
+    if !posted.applied() {
+        // The ledger already holds today's claim; only the day counter was missing.
+        beans_mutation.publish_daily(day, before);
+        return Ok(DailyOutcome::AlreadyClaimed { balance: before });
+    }
     wallet::project_session_balance(GAME, user, after);
     beans_mutation.publish_daily(day, after);
     Ok(DailyOutcome::Granted {
@@ -413,99 +450,65 @@ pub fn hand_effects(hand: &crate::persist::HandRecord) -> sqlx::Result<Vec<(Uuid
     Ok(effects.into_iter().collect())
 }
 
+/// Owner 2026-11-11: a game settlement whose loss exceeds the wallet is posted
+/// in full, the balance goes negative, play continues and operators are told.
+/// Every bean settlement writer reports a negative result here. `wallets` is
+/// how many wallets the record left below zero.
+pub(crate) fn alert_negative_settlement(record: Uuid, user: Option<Uuid>, wallets: i64) {
+    let user = user.map(|u| u.to_string()).unwrap_or_else(|| "-".into());
+    tracing::error!(
+        alert_error = "Gold-bean settlement left a wallet negative: the loss exceeds the wallet",
+        alert_cause = "the stake was not fully backed by the wallet; the result was settled in full and the balance is now below zero / 下注或桌上筹码没有被钱包余额完全覆盖；本局已按全额结算，余额现为负数",
+        alert_action = "AI team finds what spent this wallet below its stake; Loong decides whether to correct the negative balance / AI 排查该钱包为何低于下注额，是否修正负余额由 Loong 决定",
+        "[bean_settlement_negative_balance] record={record} user={user} wallets={wallets}"
+    );
+}
+
 /// Settles one completed public-table hand into every human's beans wallet
-/// on the caller's transaction (the hand write). Idempotency comes from the
-/// `(game, record_id, user_id)` unique ledger index: the caller only invokes
-/// this when the hand row was newly inserted. A delta that would drive a
-/// wallet negative is clamped to the balance and logged; the invariant
-/// `balance >= stack` makes that unreachable in normal play, and clamping
-/// keeps the hand persist (and the table) alive instead of aborting it.
-/// Returns the players whose receipt was written under the hand's
-/// quarantine id (see [`wallet::quarantine_record_id`]).
+/// on the caller's transaction (the hand write), as one
+/// [`crate::bean_ledger`] posting: every participant or nobody, never
+/// clamped. The caller only invokes this when the hand row was newly
+/// inserted, so receipts already present under the hand id are a conflict.
 pub async fn settle_hand_on(
     conn: &mut PgConnection,
     hand_id: Uuid,
+    session: Option<Uuid>,
     players: &[(Uuid, PokerEffect)],
     has_bots: bool,
-    memory_accepted: bool,
-) -> sqlx::Result<Vec<Uuid>> {
-    // Players whose receipt went to the hand's quarantine id.
-    let mut quarantined = Vec::new();
-    // Lock wallets in user-id order, like every other multi-wallet settlement,
-    // so overlapping settlements can never deadlock on lock order.
-    let mut ordered: Vec<_> = players.iter().collect();
-    ordered.sort_unstable_by_key(|(user, _)| *user);
-    for (user, effect) in ordered {
-        let delta = &effect.delta;
-        if memory_accepted || effect.squid_delta != 0 {
-            // The startup-ready authority can grant a first wallet before its
-            // separate grant writer commits. This idempotent operation keeps
-            // that grant and this hand's receipt ordered under the wallet lock.
-            ensure_on(conn, *user).await?;
-        }
-        let Some(balance) = wallet::lock(conn, GAME, *user).await? else {
-            tracing::warn!(hand_id = %hand_id, user = %user, "beans_settle_no_wallet");
-            continue;
-        };
-        if (memory_accepted || effect.squid_delta != 0)
-            && balance.checked_add(*delta).is_none_or(|after| after < 0)
-        {
-            return Err(sqlx::Error::Protocol(
-                "accepted poker settlement conflicts with durable wallet".into(),
-            ));
-        }
-        let applied = if balance + *delta < 0 {
-            tracing::error!(
-                hand_id = %hand_id, user = %user, balance, delta,
-                "beans_settle_clamped_negative"
-            );
-            -balance
-        } else {
-            *delta
-        };
-        let play = wallet::Play {
-            record_id: hand_id,
-            delta: applied,
-            completes_hand: effect.played > 0,
-            won: effect.won > 0,
-            room_code: None,
-            revision: None,
-            details: Some(
-                serde_json::json!({ "table": "public", "squid_delta": effect.squid_delta }),
-            ),
-            hand_completed: Some(effect.played > 0),
-            has_bots: Some(has_bots),
-        };
-        // Idempotency is the new hand row (caller), not this receipt key. A
-        // solo receipt written before solo ids were derived may hold the hand
-        // id: write this player's receipt under its quarantine id instead of
-        // failing the whole hand on every retry. The caller alerts operators
-        // once the hand's transaction outcome is known.
-        let (after, inserted) = wallet::settle_unless_taken(conn, GAME, *user, &play).await?;
-        if !inserted {
-            let taken: Option<Option<serde_json::Value>> = sqlx::query_scalar(
-                "SELECT details FROM wallet_ledger WHERE game=$1 AND record_id=$2 AND user_id=$3",
-            )
-            .bind(GAME)
-            .bind(hand_id)
-            .bind(*user)
-            .fetch_optional(&mut *conn)
-            .await?;
-            if !taken.is_some_and(|d| wallet::is_legacy_solo_receipt(d.as_ref())) {
-                return Err(sqlx::Error::Protocol(wallet::PLAY_RECEIPT_CONFLICT.into()));
+) -> sqlx::Result<()> {
+    use crate::bean_ledger::{Entry, Kind, Posted, Posting};
+    let posting = Posting {
+        game: "poker",
+        kind: Kind::Hand,
+        record_id: hand_id,
+        room_code: None,
+        session,
+        has_bots,
+        meta: serde_json::json!({ "table": "public" }),
+        entries: players
+            .iter()
+            .map(|(user, effect)| Entry {
+                user: *user,
+                delta: effect.delta,
+                completes_hand: effect.played > 0,
+                won: effect.won > 0,
+                meta: Some(serde_json::json!({ "squid_delta": effect.squid_delta })),
+            })
+            .collect(),
+    };
+    match bean_ledger::settle(conn, &posting).await? {
+        Posted::Applied(receipts) => {
+            for receipt in receipts {
+                wallet::project_session_balance(GAME, receipt.user, receipt.balance_after);
             }
-            let mut moved = play;
-            moved.record_id = wallet::quarantine_record_id(hand_id);
-            moved.details = Some(serde_json::json!({
-                "table": "public", "squid_delta": effect.squid_delta,
-                "quarantine": {"reason": "receipt_id_taken", "record_id": hand_id},
-            }));
-            wallet::receipt_on(conn, GAME, *user, &moved, after).await?;
-            quarantined.push(*user);
+            Ok(())
         }
-        wallet::project_session_balance(GAME, *user, after);
+        Posted::Replayed => Err(bean_ledger::refuse(
+            &posting,
+            bean_ledger::RECEIPT_CONFLICT,
+            "receipts exist for a newly written hand",
+        )),
     }
-    Ok(quarantined)
 }
 
 /// Seated projections are published under the wallet row lock, inside the
@@ -549,27 +552,10 @@ impl Drop for ProjectionFence {
 }
 
 /// [`ensure`] on a caller-owned connection: a missing wallet gets the
-/// first-use grant and its ledger row, so a purchase that arrives before the
-/// first profile read never swallows the grant.
+/// first-use grant and its ledger row ([`bean_ledger::grant_on`]), so a
+/// purchase that arrives before the first profile read never swallows it.
 pub async fn ensure_on(conn: &mut PgConnection, user: Uuid) -> sqlx::Result<()> {
-    let inserted = sqlx::query(
-        "INSERT INTO wallets (user_id, game, balance) VALUES ($1, $2, $3) ON CONFLICT (user_id, game) DO NOTHING",
-    )
-    .bind(user)
-    .bind(GAME)
-    .bind(GRANT)
-    .execute(conn.writer())
-    .await?
-    .rows_affected();
-    if inserted == 1 {
-        sqlx::query("INSERT INTO wallet_ledger (user_id, game, kind, delta, balance_after) VALUES ($1, $2, 'grant', $3, $3)")
-            .bind(user)
-            .bind(GAME)
-            .bind(GRANT)
-            .execute(conn.writer())
-            .await?;
-    }
-    Ok(())
+    bean_ledger::grant_on(conn, user).await.map(|_| ())
 }
 
 /// Credits a tournament reward on its outbox transaction. The caller holds the
@@ -583,34 +569,35 @@ pub(crate) async fn credit_tournament_on(
     reward_kind: &str,
     amount: i64,
 ) -> sqlx::Result<i64> {
-    if !(1..=1_000_000).contains(&amount)
-        || !matches!(
-            reward_kind,
-            "champion" | "runner_up" | "third" | "participation" | "final_table"
-        )
-    {
+    let reason = match reward_kind {
+        "champion" => Reason::TournamentChampion,
+        "runner_up" => Reason::TournamentRunnerUp,
+        "third" => Reason::TournamentThird,
+        "participation" => Reason::TournamentParticipation,
+        "final_table" => Reason::TournamentFinalTable,
+        _ => {
+            return Err(sqlx::Error::Protocol(
+                "invalid tournament bean award".into(),
+            ))
+        }
+    };
+    if !(1..=1_000_000).contains(&amount) {
         return Err(sqlx::Error::Protocol(
             "invalid tournament bean award".into(),
         ));
     }
-    ensure_on(conn, user).await?;
-    let before = wallet::lock(conn, GAME, user)
-        .await?
-        .ok_or(sqlx::Error::RowNotFound)?;
-    let after = before
-        .checked_add(amount)
-        .ok_or_else(|| sqlx::Error::Protocol("beans balance overflow".into()))?;
-    sqlx::query("UPDATE wallets SET balance=$3,updated_at=now() WHERE user_id=$1 AND game=$2")
-        .bind(user)
-        .bind(GAME)
-        .bind(after)
-        .execute(conn.writer())
-        .await?;
-    sqlx::query("INSERT INTO wallet_ledger(user_id,game,kind,delta,balance_after,details) VALUES($1,$2,'bonus',$3,$4,$5)")
-        .bind(user).bind(GAME).bind(amount).bind(after)
-        .bind(serde_json::json!({"reason":format!("tournament_{reward_kind}"),"reward_kind":reward_kind,"edition_id":edition,"tournament_reward_id":reward}))
-        .execute(conn.writer()).await?;
-    Ok(after)
+    let posted = bean_ledger::credit(
+        conn,
+        &Transfer::one(Leg::new(
+            user,
+            reason,
+            reward,
+            Amount::Credit(amount),
+            serde_json::json!({"reward_kind":reward_kind,"edition_id":edition,"tournament_reward_id":reward}),
+        )),
+    )
+    .await?;
+    Ok(posted.of(user)?.balance_after)
 }
 
 /// Credits a paid pack. Caller holds the purchase row (status flip) in the
@@ -621,28 +608,18 @@ pub async fn credit_purchase_on(
     purchase_id: Uuid,
     beans: i64,
 ) -> sqlx::Result<i64> {
-    ensure_on(&mut *conn, user).await?;
-    let before = wallet::lock(conn, GAME, user)
-        .await?
-        .ok_or(sqlx::Error::RowNotFound)?;
-    let after = before + beans;
-    sqlx::query("UPDATE wallets SET balance = $3, refills = refills + 1, updated_at = now() WHERE user_id = $1 AND game = $2")
-        .bind(user)
-        .bind(GAME)
-        .bind(after)
-        .execute(conn.writer())
-        .await?;
-    sqlx::query(
-        "INSERT INTO wallet_ledger (user_id, game, kind, delta, balance_after, details) \
-         VALUES ($1, $2, 'purchase', $3, $4, $5)",
+    let posted = bean_ledger::credit(
+        conn,
+        &Transfer::one(Leg::new(
+            user,
+            Reason::Purchase,
+            purchase_id,
+            Amount::Credit(beans),
+            serde_json::json!({ "purchase_id": purchase_id }),
+        )),
     )
-    .bind(user)
-    .bind(GAME)
-    .bind(beans)
-    .bind(after)
-    .bind(serde_json::json!({ "purchase_id": purchase_id }))
-    .execute(conn.writer())
     .await?;
+    let after = posted.of(user)?.balance_after;
     wallet::project_session_balance(GAME, user, after);
     Ok(after)
 }
@@ -650,17 +627,19 @@ pub async fn credit_purchase_on(
 /// Debits refunded beans, never below zero (beans already lost at the table
 /// stay lost; the refund is the operator's decision, not a cash-out). The
 /// caller computes `beans` from the refunded amount (partial refunds debit
-/// in proportion) and records the provider refund id for idempotency. The
-/// caller arms a [`ProjectionFence`] for `user` on success. Returns the
-/// beans actually debited, clamped to the balance.
+/// in proportion); `refund_id` is the provider's refund id and the ledger
+/// idempotency key. The caller arms a [`ProjectionFence`] for `user` on
+/// success. Returns the beans actually debited, clamped to the balance; the
+/// ledger row records both the requested and the applied amount.
 pub async fn debit_refund_on(
     pool: &PgPool,
     conn: &mut PgConnection,
     user: Uuid,
     purchase_id: Uuid,
+    refund_id: &str,
     beans: i64,
 ) -> sqlx::Result<i64> {
-    let before = wallet::lock(conn, GAME, user)
+    wallet::lock(conn, GAME, user)
         .await?
         .ok_or(sqlx::Error::RowNotFound)?;
     if !spendable(pool, conn, user).await? {
@@ -668,29 +647,20 @@ pub async fn debit_refund_on(
             "beans_in_use: retry refund after settlement".into(),
         ));
     }
-    let debit = beans.min(before).max(0);
-    let after = before - debit;
-    sqlx::query(
-        "UPDATE wallets SET balance = $3, updated_at = now() WHERE user_id = $1 AND game = $2",
+    let posted = bean_ledger::credit(
+        conn,
+        &Transfer::one(Leg::new(
+            user,
+            Reason::Refund,
+            refund_id,
+            Amount::Reclaim(beans),
+            serde_json::json!({ "purchase_id": purchase_id, "refund_id": refund_id }),
+        )),
     )
-    .bind(user)
-    .bind(GAME)
-    .bind(after)
-    .execute(conn.writer())
     .await?;
-    sqlx::query(
-        "INSERT INTO wallet_ledger (user_id, game, kind, delta, balance_after, details) \
-         VALUES ($1, $2, 'refund', $3, $4, $5)",
-    )
-    .bind(user)
-    .bind(GAME)
-    .bind(-debit)
-    .bind(after)
-    .bind(serde_json::json!({ "purchase_id": purchase_id, "requested": beans }))
-    .execute(conn.writer())
-    .await?;
-    wallet::project_session_balance(GAME, user, after);
-    Ok(debit)
+    let receipt = posted.of(user)?;
+    wallet::project_session_balance(GAME, user, receipt.balance_after);
+    Ok(-receipt.delta)
 }
 
 #[derive(Debug, Clone, Copy, Default, serde::Deserialize)]

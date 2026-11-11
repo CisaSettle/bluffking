@@ -94,11 +94,12 @@ struct PokerReceipt {
     players: Vec<(Uuid, beans::PokerEffect)>,
     committed: bool,
     session: Option<Uuid>,
+    /// The hold'em table whose stacks carry this result until it commits.
+    room: Option<Uuid>,
     departures: Vec<(Uuid, chrono::DateTime<chrono::Utc>, u64)>,
 }
 #[derive(Clone)]
 pub struct Recent {
-    pub record: Uuid,
     pub balance: i64,
     pub details: Arc<Value>,
     bytes: usize,
@@ -443,13 +444,13 @@ fn apply_poker(wallet: &mut Wallet, effect: beans::PokerEffect) -> sqlx::Result<
 }
 
 fn apply_poker_totals(wallet: &mut Wallet, delta: i64, played: i32, won: i32) -> sqlx::Result<()> {
+    // A settlement posts its full delta even when the wallet cannot cover
+    // it (owner 2026-11-11): the balance then goes negative and counts as
+    // zero spendable everywhere until it recovers.
     let balance = wallet
         .balance
         .checked_add(delta)
-        .filter(|balance| *balance >= 0)
-        .ok_or_else(|| {
-            sqlx::Error::Protocol("accepted poker balance overflow or overdraft".into())
-        })?;
+        .ok_or_else(|| sqlx::Error::Protocol("accepted poker balance overflow".into()))?;
     let net_won = wallet.net_won.checked_add(delta).ok_or_else(unavailable)?;
     let hands_played = wallet
         .hands_played
@@ -545,6 +546,9 @@ pub(crate) fn accept_poker_effects_with<T>(
             players,
             committed: false,
             session: departed_hand.and_then(|hand| hand.session_id),
+            room: checkpoint
+                .map(|(session, _)| session)
+                .or_else(|| departed_hand.and_then(|hand| hand.session_id)),
             departures,
         },
     );
@@ -612,12 +616,90 @@ pub fn poker_released(pool: &PgPool, hand: Uuid) {
         remove_user(pool, id);
     }
 }
+/// The hand's settlement was refused for good ([`crate::bean_ledger::terminal_reason`]):
+/// its table is fenced and nothing of it will become durable. Drop its
+/// accepted overlay and every later accepted result of the same table, and
+/// reload the affected wallets from SQL; they stay unavailable meanwhile.
+pub(crate) fn poker_abandoned(pool: &PgPool, hand: Uuid) {
+    let state = state(pool);
+    let mut inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(room) = inner.poker.get(&hand).map(|receipt| receipt.room) else {
+        return;
+    };
+    let abandoned: Vec<Uuid> = inner
+        .poker
+        .iter()
+        .filter(|(id, receipt)| {
+            !receipt.committed && (**id == hand || (room.is_some() && receipt.room == room))
+        })
+        .map(|(id, _)| *id)
+        .collect();
+    let mut affected = HashSet::new();
+    for id in abandoned {
+        if let Some(receipt) = inner.poker.remove(&id) {
+            for (user, _) in receipt.players {
+                if let Some(entry) = inner.users.get_mut(&user) {
+                    entry.poker.remove(&id);
+                }
+                affected.insert(user);
+            }
+        }
+    }
+    for user in affected {
+        invalidate_locked(&mut inner, user);
+    }
+    drop(inner);
+    state.wake.notify_one();
+    state.published.notify_waiters();
+}
+
+/// Wallets whose live reservations exceed their accepted balance. Only the
+/// few accounts that hold a reservation are examined; bounded and memory-only.
+pub(crate) fn over_reserved(pool: &PgPool) -> Vec<Uuid> {
+    const MAX_CHECKED: usize = 5_000;
+    let state = state(pool);
+    let inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
+    if !inner.ready {
+        return Vec::new();
+    }
+    let mut candidates: BTreeSet<Uuid> = inner.reservations.holders().collect();
+    candidates.extend(inner.cards.holders());
+    candidates
+        .into_iter()
+        .take(MAX_CHECKED)
+        .filter(|user| {
+            let Some(balance) = inner
+                .users
+                .get(user)
+                .and_then(|entry| entry.wallet.as_ref())
+                .map(|wallet| wallet.balance)
+            else {
+                return false;
+            };
+            crate::live_directory::memory_snapshot_for_user(pool, *user)
+                .and_then(|directory| {
+                    reservations::reserved(&inner, &directory, *user, false, None, None)
+                })
+                // A wallet a settlement left negative is reported as such; it
+                // is over-reserved only by what its seats still hold.
+                .is_ok_and(|reserved| reserved > 0 && reserved > balance.max(0))
+        })
+        .collect()
+}
 fn add_ledger(
     user: &mut User,
     record: Option<Uuid>,
     balance: i64,
     details: Value,
 ) -> sqlx::Result<()> {
+    // A 2048 reward (a bonus row without a record id) is kept beside its
+    // entry, under the id derived from that entry's record.
+    let record = record.or_else(|| {
+        (details["reason"] == "casual_reward")
+            .then(|| details["meta"]["entry_record"].as_str()?.parse().ok())
+            .flatten()
+            .map(crate::handlers::casual_beans::reward_id)
+    });
     let Some(record) = record else {
         return Ok(());
     };
@@ -626,28 +708,16 @@ fn add_ledger(
         .len()
         .saturating_mul(2)
         .saturating_add(256);
-    if details["purpose"] == "casual_entry" {
-        if user.receipts.contains_key(&record) {
-            return Err(unavailable());
-        }
-        if user.bytes.saturating_add(bytes) > MAX_BYTES || count(user) >= MAX_ROWS {
-            return Err(unavailable());
-        }
-        user.bytes += bytes;
-        user.receipts.insert(record, Arc::new(details));
-    } else {
-        let game = if details["purpose"] == "claw_grab" {
-            "claw"
-        } else if details["game"] == "roulette" {
-            "roulette"
-        } else if details["game"] == "foodshake" {
-            // 吃喝摇摇乐 was retired on 2026-11-05; its settled rows still
-            // classify here so they never surface as a slots receipt, and the
-            // hydration query keeps matching the 0111 partial index.
-            "foodshake"
-        } else {
-            "slots"
-        };
+    // v2 rows only (`crate::bean_ledger`): casual receipts are kept by
+    // record id, the cabinets keep their newest result.
+    let game = match details["game"].as_str() {
+        Some("2048" | "call-fold" | "lucky-draw") => None,
+        Some("claw") => Some("claw"),
+        Some("roulette") => Some("roulette"),
+        Some("slots") => Some("slots"),
+        _ => return Ok(()),
+    };
+    if let Some(game) = game {
         let previous = user.latest.get(game).map_or(0, |row| row.bytes);
         let next = user.bytes.saturating_sub(previous).saturating_add(bytes);
         if next > MAX_BYTES {
@@ -657,12 +727,20 @@ fn add_ledger(
         user.latest.insert(
             game,
             Recent {
-                record,
                 balance,
                 details: Arc::new(details),
                 bytes,
             },
         );
+    } else {
+        if user.receipts.contains_key(&record) {
+            return Err(unavailable());
+        }
+        if user.bytes.saturating_add(bytes) > MAX_BYTES || count(user) >= MAX_ROWS {
+            return Err(unavailable());
+        }
+        user.bytes += bytes;
+        user.receipts.insert(record, Arc::new(details));
     }
     Ok(())
 }
@@ -731,10 +809,10 @@ pub async fn hydrate(pool: &PgPool) -> sqlx::Result<()> {
         }
         {
             // Literal game and predicate: they match the partial index
-            // wallet_ledger_beans_read_hydration (schema 0111) exactly, so even
-            // a generic plan reads only these rows (prod 11-05: 2.7k of 20.7k).
+            // wallet_ledger_beans_read_hydration (schema 0129) exactly, so even
+            // a generic plan reads only these rows.
             const _: () = assert!(crate::game_catalog::BEANS == 10);
-            let mut rows = sqlx::query_as::<_, (i64, Uuid, Option<Uuid>, i64, Value)>("SELECT id,user_id,record_id,balance_after,details FROM wallet_ledger WHERE game=10 AND (details->>'purpose'='casual_entry' OR (kind='play' AND (details->>'purpose'='claw_grab' OR details->>'game' IN ('slots','roulette','foodshake')))) AND id>0 ORDER BY id")
+            let mut rows = sqlx::query_as::<_, (i64, Uuid, Option<Uuid>, i64, Value)>("SELECT id,user_id,record_id,balance_after,details FROM wallet_ledger WHERE game=10 AND details->>'v'='2' AND details->>'game' IN ('slots','roulette','claw','2048','call-fold','lucky-draw') AND (kind='play' OR details->>'reason'='casual_reward') AND id>0 ORDER BY id")
                 .fetch(&mut *tx);
             while let Some((_, owner, record, balance, details)) = rows.try_next().await? {
                 if let Some(user) = loaded.users.get_mut(&owner) {
@@ -750,7 +828,7 @@ pub async fn hydrate(pool: &PgPool) -> sqlx::Result<()> {
         let rooms: Vec<(String, Value)> = sqlx::query_as("SELECT code,state FROM game_room_checkpoints WHERE game='sicbo'")
             .fetch_all(&mut *tx).await?;
         for (code, snapshot) in rooms { loaded.reservations.sicbo_commit(&code, &snapshot); }
-        let cards: Vec<(String, String, i64, Value)> = sqlx::query_as("SELECT game,code,revision,state FROM game_room_checkpoints WHERE game IN ('zjh','niuniu','shortdeck','sangong','ddz','blackjack','tenhalf','gomoku','checkers','colorcards','zhuoji','chengdu','shanghai','guandan','xiangqi','kwx') AND (state->'opts'->>'beans'='true' OR state->'bean_match'->>'enabled'='true')").fetch_all(&mut *tx).await?;
+        let cards: Vec<(String, String, i64, Value)> = sqlx::query_as("SELECT game,code,revision,state FROM game_room_checkpoints WHERE game=ANY($1) AND (state->'opts'->>'beans'='true' OR state->'bean_match'->>'enabled'='true')").bind(crate::games::table_ids()).fetch_all(&mut *tx).await?;
         for (game, code, revision, snapshot) in cards { loaded.cards.hydrate(&game, &code, revision as u64, &snapshot)?; }
         tx.commit().await?;
         Ok::<_, sqlx::Error>(loaded)
@@ -953,8 +1031,12 @@ async fn read_user(
         evidence.stage("ledger_history");
         let mut after = 0i64;
         loop {
-            let rows: Vec<(i64, Option<Uuid>, i64, Value)> = sqlx::query_as("SELECT id,record_id,balance_after,details FROM wallet_ledger WHERE user_id=$1 AND game=$2 AND (details->>'purpose'='casual_entry' OR (kind='play' AND (details->>'purpose'='claw_grab' OR details->>'game' IN ('slots','roulette','foodshake')))) AND id>$3 ORDER BY id LIMIT $4")
-                .bind(id).bind(crate::game_catalog::BEANS).bind(after).bind(PAGE).fetch_all(&mut *tx).await?;
+            // Literal game and predicate: they match the partial index
+            // wallet_ledger_beans_read_user (schema 0135) exactly, so even a
+            // generic plan reads only this account's casual rows.
+            const _: () = assert!(crate::game_catalog::BEANS == 10);
+            let rows: Vec<(i64, Option<Uuid>, i64, Value)> = sqlx::query_as("SELECT id,record_id,balance_after,details FROM wallet_ledger WHERE user_id=$1 AND game=10 AND details->>'v'='2' AND details->>'game' IN ('slots','roulette','claw','2048','call-fold','lucky-draw') AND (kind='play' OR details->>'reason'='casual_reward') AND id>$2 ORDER BY id LIMIT $3")
+                .bind(id).bind(after).bind(PAGE).fetch_all(&mut *tx).await?;
             if rows.is_empty() { break; }
             for (cursor, record, balance, details) in rows { after = cursor; add_ledger(&mut user, record, balance, details)?; }
             if count(&user) > MAX_ROWS || user.bytes > MAX_BYTES { return Err(unavailable()); }
@@ -965,11 +1047,8 @@ async fn read_user(
         evidence.stage("poker_receipts");
         if !poker.is_empty() {
             let ids: Vec<_> = poker.keys().copied().collect();
-            // A hand may have committed under its quarantine id; a legacy
-            // solo receipt under the hand id proves nothing.
-            let rows: Vec<(Uuid, i64, Option<Value>)> = sqlx::query_as("SELECT record_id,delta,details FROM wallet_ledger WHERE game=$1 AND user_id=$2 AND kind='play' AND record_id=ANY($3)")
-                .bind(crate::game_catalog::BEANS).bind(id).bind(crate::wallet::receipt_ids(&ids)).fetch_all(&mut *tx).await?;
-            let applied = crate::wallet::committed_receipts(&ids, rows);
+            let applied: Vec<(Uuid, i64)> = sqlx::query_as("SELECT record_id,delta FROM wallet_ledger WHERE game=$1 AND user_id=$2 AND kind='play' AND record_id=ANY($3)")
+                .bind(crate::game_catalog::BEANS).bind(id).bind(&ids).fetch_all(&mut *tx).await?;
             let mut seen = HashSet::new();
             for (hand, delta) in applied {
                 if poker.get(&hand).map(|effect| effect.delta) != Some(delta) || !seen.insert(hand) {
@@ -994,21 +1073,17 @@ async fn read_user(
         evidence.stage("effect_receipts");
         if !effects.is_empty() {
             let ids: Vec<_> = effects.keys().copied().collect();
-            // As for hands: a lottery event may have committed under its
-            // quarantine id.
-            let rows: Vec<(Uuid,i64,Option<Value>)> = sqlx::query_as("SELECT record_id,delta,details FROM wallet_ledger WHERE game=$1 AND user_id=$2 AND record_id=ANY($3)")
-                .bind(crate::game_catalog::BEANS).bind(id).bind(crate::wallet::receipt_ids(&ids)).fetch_all(&mut *tx).await?;
-            let applied = crate::wallet::committed_receipts(&ids, rows);
+            let applied: Vec<(Uuid,i64)> = sqlx::query_as("SELECT record_id,delta FROM wallet_ledger WHERE game=$1 AND user_id=$2 AND record_id=ANY($3)")
+                .bind(crate::game_catalog::BEANS).bind(id).bind(&ids).fetch_all(&mut *tx).await?;
             let mut seen = HashSet::new();
             for (record,delta) in applied {
-                if effects.get(&record).is_none_or(|e|e.ledger_delta!=delta) || !seen.insert(record) { return Err(unavailable()); }
+                if effects.get(&record).is_none_or(|e|e.delta!=delta) || !seen.insert(record) { return Err(unavailable()); }
             }
-            let mut total = PendingEffect {balance:0,net:0,played:0,won:0,ledger_delta:0,day:None};
+            let mut total = PendingEffect {delta:0,bonus:0,played:0,won:0};
             for (record,effect) in &effects {
-                if let Some(day)=effect.day {user.days.insert(day);}
                 if !seen.contains(record) {
-                    total.balance=total.balance.checked_add(effect.balance).ok_or_else(unavailable)?;
-                    total.net=total.net.checked_add(effect.net).ok_or_else(unavailable)?;
+                    total.delta=total.delta.checked_add(effect.delta).ok_or_else(unavailable)?;
+                    total.bonus=total.bonus.checked_add(effect.bonus).ok_or_else(unavailable)?;
                     total.played=total.played.checked_add(effect.played).ok_or_else(unavailable)?;
                     total.won=total.won.checked_add(effect.won).ok_or_else(unavailable)?;
                 }

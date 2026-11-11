@@ -2,9 +2,7 @@ use crate::casino_bots::{self, Bot};
 use crate::casino_room::{DealerRoom, Registry};
 use crate::db_writer::PgConnection;
 use crate::room_clock::RoomClock;
-use crate::sicbo::{Side, MAX_STAKE, MIN_STAKE, POLICY};
-use crate::wallet;
-use chrono::Utc;
+use crate::sicbo::{Side, MAX_STAKE, MIN_STAKE};
 use draw_games::proof::{commit, Reveal};
 use rand::{rngs::OsRng, Rng, RngCore};
 use serde::{Deserialize, Serialize};
@@ -24,22 +22,13 @@ const HISTORY: usize = 60;
 
 pub use crate::casino_room::{Error, Result};
 
-/// Missing checkpoint metadata means a wager accepted before the bean upgrade.
-/// Keep the denomination on the round, including after repeated crash recovery.
+/// The room's denomination as its checkpoint names it (`"wallet_unit":"beans"`):
+/// `beans_reservations` and `room_limits` read that key from the snapshot.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum WalletUnit {
     #[default]
-    Practice,
     Beans,
-}
-impl WalletUnit {
-    fn game(self) -> i16 {
-        match self {
-            Self::Practice => crate::game_catalog::SICBO,
-            Self::Beans => crate::game_catalog::BEANS,
-        }
-    }
 }
 
 /// One player's whole wager for a round: the solo game's sides and limits.
@@ -111,9 +100,8 @@ pub struct State {
     bet_revisions: BTreeMap<Uuid, u64>,
     result: Option<Roll>,
     deltas: BTreeMap<Uuid, i64>,
-    /// Bean-round winners who drew the jackpot. The checkpoint key predates the
-    /// bean jackpot (it once meant a Max grant) and is kept for recovery.
-    #[serde(default, rename = "max_rewards")]
+    /// Winners of this round who drew the jackpot.
+    #[serde(default)]
     jackpots: BTreeSet<Uuid>,
     history: Vec<Value>,
     bots: Vec<Bot>,
@@ -161,13 +149,6 @@ impl State {
         self.result.is_none() && now < self.deadline_ms - BET_LOCK_MS
     }
     fn next(&mut self, now: i64) {
-        if self.wallet_unit == WalletUnit::Practice {
-            // The old session remains in durable records; don't sum its chips
-            // into the new bean session or its room leaderboard.
-            self.history_session_id = Uuid::now_v7();
-            self.standings = Default::default();
-        }
-        self.wallet_unit = WalletUnit::Beans;
         self.round_id = Uuid::now_v7();
         self.fairness = new_fairness(self.round_id);
         self.round_no += 1;
@@ -205,7 +186,6 @@ impl State {
 /// One settled round, as the writer makes it durable.
 #[derive(Clone)]
 pub struct Round {
-    wallet_unit: WalletUnit,
     session_id: Uuid,
     round_id: Uuid,
     round_no: i64,
@@ -218,18 +198,15 @@ pub struct Round {
 
 impl Round {
     /// The bean jackpot owed to `uid` in this round, if any (see
-    /// [`crate::sicbo::jackpot_bonus`]). Practice rounds never pay one.
+    /// [`crate::sicbo::jackpot_bonus`]).
     fn jackpot(&self, uid: Uuid, wager: Wager) -> Option<i64> {
-        (self.wallet_unit == WalletUnit::Beans && self.jackpots.contains(&uid))
+        self.jackpots
+            .contains(&uid)
             .then(|| crate::sicbo::jackpot_bonus(wager.stake))
             .flatten()
     }
 }
 
-/// The room the player is seated in, from memory.
-pub fn current_room(uid: Uuid) -> Option<String> {
-    SicboRoom::registry().seat(uid)
-}
 /// Whether the player holds a seat in any sicbo room. Solo rolls and refills
 /// are refused while seated so a pending room wager can always be covered.
 /// The membership row is written before a seat is usable and removed only
@@ -282,10 +259,7 @@ fn settle_round(state: &mut State, now: i64) -> Option<Round> {
     for (&uid, &wager) in &state.bets {
         let delta = wager.delta(dice);
         state.deltas.insert(uid, delta);
-        if state.wallet_unit == WalletUnit::Beans
-            && delta > 0
-            && crate::sicbo::wins_jackpot(reveal, uid)
-        {
+        if delta > 0 && crate::sicbo::wins_jackpot(reveal, uid) {
             state.jackpots.insert(uid);
         }
         bettors.push((uid, wager, delta));
@@ -323,7 +297,6 @@ fn settle_round(state: &mut State, now: i64) -> Option<Round> {
     state.deadline_ms =
         now + REVEAL_MS + if collect { COLLECT_MS } else { 0 } + if payout { PAYOUT_MS } else { 0 };
     Some(Round {
-        wallet_unit: state.wallet_unit,
         session_id: state.history_session_id,
         round_id: state.round_id,
         round_no: state.round_no,
@@ -339,7 +312,6 @@ impl DealerRoom for SicboRoom {
     const LABEL: &'static str = "sicbo room";
     const DEALER: &'static str = "sicbo";
     const MAX_MEMBERS: usize = MAX_MEMBERS;
-    const POLICY: wallet::Policy = POLICY;
     const REQUIRE_DURABLE_BETS: bool = true;
     const PRIVATE_FIELDS: &'static [&'static str] = &[
         "balance",
@@ -347,7 +319,6 @@ impl DealerRoom for SicboRoom {
         "bet",
         "bet_revision",
         "delta",
-        "max_reward",
         "jackpot_bonus",
     ];
     type Bet = BetRequest;
@@ -363,6 +334,16 @@ impl DealerRoom for SicboRoom {
     fn bots(state: &State) -> usize {
         state.bots.len()
     }
+    fn remove_bot(state: &mut State, bot: Uuid) -> bool {
+        let before = state.bots.len();
+        state.bots.retain(|b| b.id != bot);
+        state.bot_bets.remove(&bot);
+        state.bot_deltas.remove(&bot);
+        state.bots.len() != before
+    }
+    fn bot_roster(state: &State) -> Vec<(Uuid, String)> {
+        state.bots.iter().map(|b| (b.id, b.name.clone())).collect()
+    }
     fn shift_release_clocks(state: &mut State, elapsed_ms: i64) {
         state.deadline_ms = state.deadline_ms.saturating_add(elapsed_ms);
         state.clock.expires_at_ms = state
@@ -375,6 +356,17 @@ impl DealerRoom for SicboRoom {
     }
     fn deadline_ms(state: &State) -> i64 {
         state.deadline_ms
+    }
+    fn next_reveal_ms(state: &State, after: i64) -> Option<i64> {
+        if state.result.is_some() {
+            return None;
+        }
+        state
+            .bot_bets
+            .values()
+            .map(|bet| bet.at_ms)
+            .filter(|at| *at > after)
+            .min()
     }
     fn settled(state: &State) -> bool {
         state.result.is_some()
@@ -402,18 +394,6 @@ impl DealerRoom for SicboRoom {
     }
     fn deltas(round: &Round) -> Vec<(Uuid, i64)> {
         round.bettors.iter().map(|(u, _, d)| (*u, *d)).collect()
-    }
-    fn projection_deltas(round: &Round) -> Vec<(Uuid, i64)> {
-        // Recovery activates the current bean wallet. A legacy practice result
-        // remains durable in its original wallet and cannot change that display.
-        if round.wallet_unit == WalletUnit::Beans {
-            Self::deltas(round)
-        } else {
-            Vec::new()
-        }
-    }
-    fn uses_current_wallet(state: &State) -> bool {
-        state.wallet_unit == WalletUnit::Beans
     }
     fn bonus_credits(round: &Round) -> Vec<(Uuid, i64)> {
         round
@@ -463,9 +443,7 @@ impl DealerRoom for SicboRoom {
         if state.bets.get(&uid).copied() == wager {
             return Ok(false);
         }
-        // Old accepted wagers retain their exact receipt/retry semantics, but
-        // no new wager may join a legacy round under the new bean UI.
-        if state.wallet_unit != WalletUnit::Beans || !state.betting_open(now) {
+        if !state.betting_open(now) {
             return Err(Error::Code("bet_closed"));
         }
         if wager.is_some_and(|w| !w.valid()) {
@@ -500,7 +478,7 @@ impl DealerRoom for SicboRoom {
         now: i64,
     ) -> Value {
         let bet = state.bets.get(&uid);
-        let reserved = if state.wallet_unit == WalletUnit::Beans && state.result.is_none() {
+        let reserved = if state.result.is_none() {
             bet.map(|w| w.stake).unwrap_or(0)
         } else {
             0
@@ -534,104 +512,79 @@ impl DealerRoom for SicboRoom {
         "bet_close_ms":if state.result.is_none(){Some(state.deadline_ms-BET_LOCK_MS)}else{None},
         "bet_revision":state.bet_revisions.get(&uid).copied().unwrap_or(0),
         "balance":balance,"available":balance-reserved,"bet":bet,"result":result,"delta":state.deltas.get(&uid),
-        "jackpot_bonus":state.bets.get(&uid).filter(|_| state.wallet_unit == WalletUnit::Beans && state.jackpots.contains(&uid))
+        "jackpot_bonus":state.bets.get(&uid).filter(|_| state.jackpots.contains(&uid))
             .and_then(|wager| crate::sicbo::jackpot_bonus(wager.stake)),
         "fairness_commitment":&state.fairness.commitment,
         "fairness_status":fairness_status,
         "min_stake":MIN_STAKE,"max_stake":MAX_STAKE,"ai":!state.bots.is_empty(),
         "members":members_view(state,members,uid,now),"history":state.history})
     }
+    /// One [`crate::bean_ledger`] posting for the round's bettors, then its
+    /// jackpot credits, in the checkpoint's transaction.
     async fn persist_round(conn: &mut PgConnection, code: &str, round: &Round) -> sqlx::Result<()> {
-        let mut records = Vec::new();
-        let wallet_game = round.wallet_unit.game();
-        // Deterministic UUID order also defines wallet-lock order.
-        for &(uid, wager, delta) in &round.bettors {
-            match crate::db::lock_game_participants(&mut *conn, &[uid]).await {
-                Ok(()) => {}
-                Err(sqlx::Error::RowNotFound) => continue,
-                Err(error) => return Err(error),
-            }
-            // A room settlement reuses the round id as its receipt key. This
-            // round's own receipt means a replay after a lost commit
-            // acknowledgement: already settled. Any other row under the id
-            // (only a solo receipt written before solo ids were derived) would
-            // collide with the unique play receipt and wedge this room's
-            // writer, so that one wager is void and operators are alerted.
-            let taken: Option<Option<Value>> = sqlx::query_scalar(
-                "SELECT details FROM wallet_ledger WHERE game=$2 AND record_id=$3 AND user_id=$1",
-            )
-            .bind(uid)
-            .bind(wallet_game)
-            .bind(round.round_id)
-            .fetch_optional(&mut *conn)
-            .await?;
-            if let Some(details) = taken {
-                let own = details.as_ref().is_some_and(|d| {
-                    d["game"] == "sicbo"
-                        && d["room_code"] == code
-                        && d["round_no"] == json!(round.round_no)
-                });
-                if !own {
-                    tracing::error!(
-                        alert_error = "Sicbo room wager voided: its receipt id was already used",
-                        alert_cause = "another receipt of this player already holds the room round id / 该玩家已有其他收据占用了本局 id",
-                        alert_action = "AI team reviews the player's conflicting ledger row and settles the voided wager by hand if owed; Loong action: none / AI 核查冲突流水并按需手工结算，Loong 无需操作",
-                        "[sicbo_room_receipt_id_conflict] user={uid} room={code} round={}",
-                        round.round_id
-                    );
-                }
-                continue;
-            }
-            if wallet::lock(&mut *conn, wallet_game, uid).await?.is_none() {
-                continue;
-            }
-            // The jackpot commits with the round's bean payout, before its
-            // receipt so that receipt's balance includes it.
-            let jackpot_bonus = round.jackpot(uid, wager).unwrap_or(0);
-            if jackpot_bonus > 0 {
+        use crate::bean_ledger::{self, Entry, Kind, Posted, Posting};
+        let shared = json!({"request_id":round.round_id,"dice":round.result.dice,
+            "total":round.result.total,"triple":round.result.triple,
+            "room_code":code,"round_no":round.round_no});
+        // Same receipt as a solo roll, so history renders both alike.
+        let plays = Posting {
+            game: "sicbo",
+            kind: Kind::Round,
+            record_id: round.round_id,
+            room_code: Some(code),
+            session: Some(round.session_id),
+            has_bots: round.has_bots,
+            meta: shared,
+            entries: round
+                .bettors
+                .iter()
+                .map(|&(uid, wager, delta)| Entry {
+                    user: uid,
+                    delta,
+                    completes_hand: true,
+                    won: delta > 0,
+                    meta: Some(json!({"side":wager.side,"stake":wager.stake,"won":delta>0,
+                        "jackpot_bonus":round.jackpot(uid, wager).unwrap_or(0),
+                        "fairness":draw_games::sicbo::payout_proof(&round.fairness, round.result.dice, wager.side, wager.stake)})),
+                })
+                .collect(),
+        };
+        let records: Vec<(Uuid, i64, Value)> = match bean_ledger::settle(&mut *conn, &plays).await?
+        {
+            // Posted entries only: an erased bettor has no record either.
+            Posted::Applied(receipts) => plays
+                .entries
+                .iter()
+                .filter(|entry| receipts.iter().any(|r| r.user == entry.user))
+                .map(|entry| {
+                    let receipt = bean_ledger::receipt(&bean_ledger::details(&plays, entry));
+                    (entry.user, entry.delta, receipt)
+                })
+                .collect(),
+            // Replay after a lost commit acknowledgement: already settled.
+            Posted::Replayed => return Ok(()),
+        };
+        // Jackpots commit with the round. The play receipts above carry the
+        // rules payout only; each bonus is its own idempotent credit.
+        for &(uid, wager, _) in &round.bettors {
+            if let Some(bonus) = round.jackpot(uid, wager) {
                 crate::sicbo::credit_jackpot(
                     &mut *conn,
                     uid,
-                    jackpot_bonus,
-                    json!({"game":"sicbo","purpose":"sicbo_jackpot","request_id":round.round_id,
+                    round.round_id,
+                    bonus,
+                    json!({"request_id":round.round_id,"record_id":round.round_id,
                         "room_code":code,"round_no":round.round_no,"stake":wager.stake}),
                 )
                 .await?;
             }
-            // Same receipt shape as a solo roll, so history renders both alike.
-            let details = json!({"game":"sicbo","unit":round.wallet_unit,
-                "request_id":round.round_id,"side":wager.side,"stake":wager.stake,
-                "dice":round.result.dice,"total":round.result.total,"triple":round.result.triple,"won":delta>0,
-                "room_code":code,"round_no":round.round_no,"jackpot_bonus":jackpot_bonus,
-                "fairness":draw_games::sicbo::payout_proof(&round.fairness, round.result.dice, wager.side, wager.stake)});
-            let play = wallet::Play {
-                record_id: round.round_id,
-                delta,
-                completes_hand: true,
-                won: delta > 0,
-                room_code: Some(code),
-                revision: None,
-                details: Some(details),
-                hand_completed: Some(true),
-                has_bots: Some(round.has_bots),
-            };
-            match wallet::settle(&mut *conn, wallet_game, uid, &play).await {
-                Ok(_) => {}
-                // Account deletion removes the wallet; its hold vanishes with it.
-                Err(sqlx::Error::RowNotFound) => {
-                    tracing::warn!(%uid, %code, "sicbo bettor has no wallet at settlement; skipped");
-                    continue;
-                }
-                Err(e) => return Err(e),
-            }
-            records.push((uid, delta));
         }
-        crate::game_records::record(
+        crate::game_records::record_beans(
             &mut *conn,
             crate::game_catalog::SICBO,
             round.round_id,
             Some(round.session_id),
-            Utc::now(),
+            round.has_bots,
             &records,
         )
         .await?;
@@ -671,7 +624,7 @@ fn members_view(state: &State, members: &[(Uuid, String)], uid: Uuid, now: i64) 
             .get(&bot.id)
             .filter(|b| settled || b.at_ms <= now)
             .map(|b| b.wager);
-        json!({"name":bot.name,"user_id":null,"me":false,"ai":true,"bet":bet,"chips":bot.chips,
+        json!({"name":bot.name,"user_id":null,"bot_id":bot.id,"me":false,"ai":true,"bet":bet,"chips":bot.chips,
             "delta":if settled {state.bot_deltas.get(&bot.id).copied()} else {None}})
     }));
     out

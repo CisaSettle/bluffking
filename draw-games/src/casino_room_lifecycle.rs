@@ -1,6 +1,6 @@
 use super::*;
 
-/// Loads every open room, its members and their wallets once per process,
+/// Loads every open room and its members (a bean room's wallets too) once per process,
 /// before the first room request or dealer tick.
 pub async fn recover<R: DealerRoom>(pool: &PgPool) -> sqlx::Result<()> {
     let registry = R::registry();
@@ -45,7 +45,7 @@ pub async fn recover<R: DealerRoom>(pool: &PgPool) -> sqlx::Result<()> {
                             .entry(row.get("code"))
                             .or_default()
                             .insert(uid, Member::new(row.get("name"), false));
-                        users.push(uid);
+                        users.push((uid, row.get::<String, _>("code")));
                         after_user = Some(uid);
                     }
                     if members.len() < crate::pagination::DEFAULT_LIMIT as usize {
@@ -55,12 +55,16 @@ pub async fn recover<R: DealerRoom>(pool: &PgPool) -> sqlx::Result<()> {
                 let room_count = rooms.len();
                 install::<R>(pool, rooms, by_room)?;
                 // At most 100 rooms (eight members each) are retained outside
-                // the registry. Activate owned rooms' wallets before admitting
-                // any request through the shared recovery guard.
-                for uid in users {
-                    if let Some(code) = registry.seat(uid) {
-                        let w = wallet::ensure(pool, R::POLICY, uid).await?;
-                        wallet::activate(R::POLICY.game, uid, &code, w);
+                // the registry. Activate owned bean rooms' wallets before
+                // admitting any request through the shared recovery guard; a
+                // points room's stacks came back with its snapshot.
+                if beans::<R>() {
+                    for (uid, code) in users {
+                        // Only seats of rooms this process installed.
+                        if registry.room(&code).is_some() && super::holds::<R>(uid, &code) {
+                            let w = wallet::ensure(pool, crate::beans::POLICY, uid).await?;
+                            wallet::activate(crate::game_catalog::BEANS, uid, &code, w);
+                        }
                     }
                 }
                 if room_count < crate::pagination::DEFAULT_LIMIT as usize {
@@ -82,7 +86,6 @@ pub(super) fn install<R: DealerRoom>(
 ) -> sqlx::Result<()> {
     let registry = R::registry();
     let mut map = registry.rooms.lock().unwrap();
-    let mut seats = registry.seats.lock().unwrap();
     for row in rooms {
         let code: String = row.get("code");
         // A later page or wallet load may have failed after earlier rooms
@@ -122,8 +125,19 @@ pub(super) fn install<R: DealerRoom>(
             if memory_lifecycle::<R>() {
                 let owner = memory_membership::current(R::DEALER, &code, *uid)
                     .map(Ok)
-                    .unwrap_or_else(|| memory_membership::claim(R::DEALER, &code, *uid))
-                    .map_err(sqlx::Error::Protocol)?;
+                    .unwrap_or_else(|| {
+                        // Recovery restores what was admitted before.
+                        memory_membership::claim(
+                            R::DEALER,
+                            &code,
+                            *uid,
+                            super::bean_room::<R>(),
+                            false,
+                        )
+                    })
+                    .map_err(|_| {
+                        sqlx::Error::Protocol("conflicting recovered room membership".into())
+                    })?;
                 owner.accepted();
                 owner.admitted();
                 memberships.push(owner);
@@ -133,7 +147,14 @@ pub(super) fn install<R: DealerRoom>(
                         .unwrap_or_else(|| crate::display_name::fallback_display_name(*uid));
                 }
             }
-            seats.insert(*uid, code.clone());
+        }
+        if !memory_lifecycle::<R>() {
+            // Recovery restores what was admitted before.
+            let users: Vec<Uuid> = members.keys().copied().collect();
+            memory_membership::hold(R::DEALER, &code, super::bean_room::<R>(), &users, None)
+                .map_err(|_| {
+                    sqlx::Error::Protocol("conflicting recovered room membership".into())
+                })?;
         }
         let state = Arc::new(state);
         let initial = memory_lifecycle::<R>().then(|| Snapshot {
@@ -145,7 +166,6 @@ pub(super) fn install<R: DealerRoom>(
             revision: R::revision(&state),
             state: state.clone(),
             round: None,
-            buy_in: None,
             memberships,
         });
         let room = Room {
@@ -165,6 +185,8 @@ pub(super) fn install<R: DealerRoom>(
             spectators: Spectators::default(),
             handoff_guard: Some(handoff_guard),
             release_paused: false,
+            pushed_at_ms: 0,
+            push_retry: false,
         };
         map.insert(code.clone(), handoff_room::<R>(pool, &code, room)?);
     }
@@ -403,8 +425,10 @@ pub(super) async fn sweep<R: DealerRoom>(pool: &PgPool) -> Result<()> {
             }
         }
         for uid in finish_join {
-            let w = committed_admission_wallet::<R>(pool, uid, &code).await?;
-            wallet::activate(R::POLICY.game, uid, &code, w);
+            if beans::<R>() {
+                let w = wallet::ensure(pool, crate::beans::POLICY, uid).await?;
+                wallet::activate(crate::game_catalog::BEANS, uid, &code, w);
+            }
             if let Some(m) = room.members.get_mut(&uid) {
                 m.joining = false;
             }
@@ -412,11 +436,13 @@ pub(super) async fn sweep<R: DealerRoom>(pool: &PgPool) -> Result<()> {
         }
         for uid in &gone {
             room.members.remove(uid);
-            wallet::retire(R::POLICY.game, *uid, &code);
-            registry.release_seat(*uid, &code);
+            if beans::<R>() {
+                wallet::retire(crate::game_catalog::BEANS, *uid, &code);
+            }
+            super::release_seat::<R>(*uid, &code);
         }
         // A previously unknown create becomes authoritative only once its
-        // durable membership and wallet have both been reconciled.
+        // durable membership (and a bean room's wallet) has been reconciled.
         if room.registry_generation.is_none()
             && !room.members.is_empty()
             && room
@@ -443,23 +469,57 @@ pub(super) async fn sweep<R: DealerRoom>(pool: &PgPool) -> Result<()> {
 /// Closes rooms on the rules every other game room follows
 /// (`crate::room_clock::IdleWatch`): once the session clock has run out and
 /// the last result has shown, and — only on the shared cleanup tick
-/// (`reclaim`) — once no member has joined or wagered for ten minutes. A round holding human wagers always settles first.
+/// (`reclaim`) — once no member has joined or wagered for the reclaim window
+/// (five minutes by default). A round holding human wagers always settles first.
 /// Every seat is released, so the room code frees with the row.
-pub(super) async fn close_idle<R: DealerRoom>(pool: &PgPool, now: i64, reclaim: bool) {
+///
+/// `deferred` carries the rooms a reclaim pass found due but could not close
+/// yet (a member's join or leave in flight — such as the close of the same
+/// player's other room): they are retried on the next pass instead of
+/// waiting for the next cleanup tick. Returns whether any due room was busy,
+/// so the dealer passes again shortly.
+pub(super) async fn close_idle<R: DealerRoom>(
+    pool: &PgPool,
+    now: i64,
+    tick: bool,
+    deferred: &mut std::collections::BTreeSet<String>,
+) -> bool {
+    let mut still_deferred = std::collections::BTreeSet::new();
+    let mut busy = false;
     for (code, shared) in R::registry().all() {
-        if let Some(closing) = begin_close::<R>(pool, &code, &shared, now, reclaim).await {
-            // Off the dealer loop: a stalled writer must not stop other rooms.
-            let Some(request) = crate::release_handoff::admit_request(true) else {
-                crate::release_handoff::fail("room close raced frozen barrier");
+        let reclaim = tick || deferred.contains(&code);
+        let closing = match begin_close::<R>(pool, &code, &shared, now, reclaim).await {
+            Close::Due(closing) => closing,
+            Close::Busy => {
+                busy = true;
+                if reclaim {
+                    still_deferred.insert(code);
+                }
                 continue;
-            };
-            let pool = pool.clone();
-            tokio::spawn(async move {
-                let _request = request;
-                finish_close::<R>(pool, code, shared, closing).await;
-            });
-        }
+            }
+            Close::NotDue => continue,
+        };
+        // Off the dealer loop: a stalled writer must not stop other rooms.
+        let Some(request) = crate::release_handoff::admit_request(true) else {
+            crate::release_handoff::fail("room close raced frozen barrier");
+            continue;
+        };
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            let _request = request;
+            finish_close::<R>(pool, code, shared, closing).await;
+        });
     }
+    *deferred = still_deferred;
+    busy
+}
+
+/// What [`begin_close`] decided for one room.
+pub(super) enum Close {
+    NotDue,
+    /// Due, but a member's join or leave is in flight; the next pass retries.
+    Busy,
+    Due(Closing),
 }
 
 /// Decides under the room lock and fences the room (`closed`) when it is due.
@@ -469,24 +529,30 @@ pub(super) async fn begin_close<R: DealerRoom>(
     shared: &Shared<R>,
     now: i64,
     reclaim: bool,
-) -> Option<Closing> {
+) -> Close {
     let registry = R::registry();
     let mut room = shared.lock().await;
     if room.closed || room.release_paused || crate::release_handoff::draining() {
-        return None;
+        return Close::NotDue;
     }
     let expired = R::clock(&room.state).expired(now);
     let in_play = R::open_bets(&room.state);
     room.idle.observe(in_play);
-    if !room.idle.expiry_due(in_play, expired) && !(reclaim && room.idle.reclaim_due(in_play)) {
-        return None;
+    // A points room whose writer is fenced can never save again: it closes
+    // now instead of holding its players until the reclaim tick.
+    let dead = memory_lifecycle::<R>() && room.writer.is_closed();
+    if !dead
+        && !room.idle.expiry_due(in_play, expired)
+        && !(reclaim && room.idle.reclaim_due(in_play))
+    {
+        return Close::NotDue;
     }
     // A join or leave in flight finishes first; the next pass retries.
     let mut held = Vec::new();
     for (uid, m) in &room.members {
         match registry.user_lock(*uid).try_lock_owned() {
             Ok(guard) if !m.joining && !m.leaving => held.push(guard),
-            _ => return None,
+            _ => return Close::Busy,
         }
     }
     room.closed = true;
@@ -497,8 +563,8 @@ pub(super) async fn begin_close<R: DealerRoom>(
     // `room_not_found` and return to the lobby.
     room.subscribers.clear();
     room.spectators.close();
-    tracing::info!(%code, "{} room closing after inactivity or expiry", R::DEALER);
-    Some(Closing {
+    tracing::info!(%code, fenced_writer = dead, "{} room closing after inactivity or expiry", R::DEALER);
+    Close::Due(Closing {
         registry_generation: room.registry_generation,
         require_empty: false,
         members: room.members.keys().copied().collect(),
@@ -519,10 +585,20 @@ pub(super) async fn finish_close<R: DealerRoom>(
 ) {
     let mut registration = crate::room_registry::mutation(&pool, Some(&code));
     let mut wait = Duration::from_millis(200);
-    loop {
+    let mut fenced_logged = false;
+    // `true` once the rows are gone; `false` when a fenced room had to leave
+    // a row it cannot prove is its own.
+    let released = loop {
         let deleted = async {
-            // Every settlement the wallets saw is durable before the seats go.
-            flushed(&shared).await?;
+            // Every settlement the room accepted is durable before the seats go.
+            // `flushed` fails only once the writer is fenced: it stopped for
+            // good and nothing it still held can land, so waiting again would
+            // never end. The close goes on from what is durable.
+            let fenced = flushed(&shared).await.is_err();
+            if fenced && !fenced_logged {
+                fenced_logged = true;
+                tracing::warn!(%code, "{} room closing past its fenced writer", R::DEALER);
+            }
             let mut tx = pool.begin().await?;
             let current_round: Option<String> = sqlx::query_scalar(&format!(
                 "SELECT state->>'round_id' FROM game_room_checkpoints WHERE code=$1 AND game='{}' FOR UPDATE",
@@ -534,12 +610,21 @@ pub(super) async fn finish_close<R: DealerRoom>(
             // Gone already: an earlier attempt committed. A different room
             // generation must never be deleted or have its code released.
             let Some(current_round) = current_round else {
-                return Ok(());
+                return Ok(true);
             };
             if current_round != closing.round.to_string() {
+                // A fenced writer can never bring the row to this round
+                // (memory ran ahead of what it saved), so no retry can match:
+                // leave the row and keep the code fenced rather than loop.
+                if fenced {
+                    tracing::warn!(%code, %current_round, "{} fenced room left its stored row", R::DEALER);
+                    return Ok(false);
+                }
                 return Err(Error::Unavailable);
             }
-            if closing.require_empty {
+            // A fenced writer never saved the last leave, so its stale member
+            // rows belong to this room and go with it.
+            if closing.require_empty && !fenced {
                 let occupied: bool = sqlx::query_scalar(
                     "SELECT EXISTS(SELECT 1 FROM game_room_checkpoint_members WHERE code=$1 AND game=$2)",
                 )
@@ -559,18 +644,23 @@ pub(super) async fn finish_close<R: DealerRoom>(
                     .await?;
             }
             registration.commit(tx.commit()).await?;
-            Ok::<(), Error>(())
+            Ok::<bool, Error>(true)
         }
         .await;
         match deleted {
-            Ok(()) => break,
+            Ok(released) => break released,
             Err(error) => {
                 tracing::warn!(?error, %code, "{} room close retrying", R::DEALER);
                 tokio::time::sleep(wait).await;
                 wait = (wait * 2).min(Duration::from_secs(10));
             }
         }
-    }
+    };
+    // Ends the registry fence either way; the code itself stays retired
+    // below unless the rows are gone (a left row keeps its code out of the
+    // pool until restart). A bean room fenced on an unposted hand closes with
+    // that hand void: its bettors were quarantined when the writer fenced.
+    drop(registration);
     let registry = R::registry();
     {
         let mut rooms = registry.rooms.lock().unwrap();
@@ -579,16 +669,17 @@ pub(super) async fn finish_close<R: DealerRoom>(
         }
     }
     for uid in &closing.members {
-        if memory_lifecycle::<R>() {
-            if let Some(owner) = memory_membership::current(R::DEALER, &code, *uid) {
-                owner.depart();
-                owner.complete(Ok(()));
-            }
+        if beans::<R>() {
+            wallet::retire(crate::game_catalog::BEANS, *uid, &code);
         }
-        wallet::retire(R::POLICY.game, *uid, &code);
-        registry.release_seat(*uid, &code);
+        super::release_seat::<R>(*uid, &code);
     }
-    if let Some(generation) = closing.registry_generation {
+    // The room is over and its writer settled or fenced: a departure the
+    // fenced writer refused (or one still pending) must not block its
+    // player's next room. A row a fenced room had to leave is a points room's
+    // and goes with the idle sweep once nothing here runs it.
+    crate::game_hub::membership::forget_room(R::DEALER, &code);
+    if let Some(generation) = closing.registry_generation.filter(|_| released) {
         crate::room_registry::confirm_retired_pending(&pool, R::DEALER, &code, generation).await;
     }
 }

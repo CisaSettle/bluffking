@@ -12,6 +12,14 @@ pub(super) struct Reservations {
 }
 
 impl Reservations {
+    /// Accounts holding a hold'em or 押大小 reservation.
+    pub(super) fn holders(&self) -> impl Iterator<Item = Uuid> + '_ {
+        self.poker.keys().map(|(_, user, _)| *user).chain(
+            self.sicbo
+                .values()
+                .flat_map(|(_, bets)| bets.keys().copied()),
+        )
+    }
     pub(super) fn remove_user(&mut self, user: Uuid) {
         self.poker.retain(|(_, owner, _), _| *owner != user);
     }
@@ -246,6 +254,47 @@ pub(super) fn reserved(
                 .ok_or_else(unavailable)?;
         }
     }
+    // The memory balance already includes accepted winnings whose settlement
+    // has not committed. A crash would void them, so they may only back the
+    // stack of the table that produced them: a card room keeps them in its own
+    // reservation until its checkpoint commits (`accept_card_snapshot`), and a
+    // hold'em table while the winner still holds the seat its accepted
+    // checkpoint reserved. Otherwise (the winner left) they stay reserved here.
+    if !sql_balance {
+        if let Some(owner) = inner.users.get(&user) {
+            for (hand, effect) in &owner.poker {
+                if effect.delta <= 0 || inner.cards.carries(*hand) {
+                    continue;
+                }
+                let seated = inner
+                    .poker
+                    .get(hand)
+                    .and_then(|receipt| receipt.room)
+                    .is_some_and(|session| {
+                        directory.memberships_for(user).any(|(room, member)| {
+                            room.id == session
+                                && room.ended_at.is_none()
+                                && member.left_at.is_none()
+                                && inner.reservations.poker.contains_key(&(
+                                    session,
+                                    user,
+                                    member.joined_at,
+                                ))
+                        })
+                    });
+                if !seated {
+                    total = total.checked_add(effect.delta).ok_or_else(unavailable)?;
+                }
+            }
+            // A lottery prize has no table: until its ledger row commits it
+            // backs nothing (no purchase, seat, stake, gift or fee).
+            for effect in owner.effects.values() {
+                total = total
+                    .checked_add(effect.balance()?.max(0))
+                    .ok_or_else(unavailable)?;
+            }
+        }
+    }
     // Accepted losses are already in the memory wallet, but a SQL debit may
     // lock the older durable balance. Keep these losses covered until COMMIT.
     if sql_balance {
@@ -256,7 +305,7 @@ pub(super) fn reserved(
             .flat_map(|u| u.effects.values())
         {
             total = total
-                .checked_add(effect.balance.saturating_neg().max(0))
+                .checked_add(effect.balance()?.saturating_neg().max(0))
                 .ok_or_else(unavailable)?;
         }
         for delta in inner

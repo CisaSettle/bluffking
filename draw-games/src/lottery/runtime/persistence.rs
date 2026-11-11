@@ -47,28 +47,47 @@ const PERMANENT: &str = "lottery_permanent: ";
 fn permanent(what: &str) -> sqlx::Error {
     sqlx::Error::Protocol(format!("{PERMANENT}{what}"))
 }
-/// Permanent: our own mismatch markers, unique (23505) and foreign-key (23503)
-/// violations. A CHECK violation (23514) stays retryable: bean memory admits a
-/// spend against poker credit whose own writer has not committed yet, and the
-/// retry succeeds once it lands. Timeouts, lock waits, serialization failures
-/// and connection loss stay retryable too.
+/// Permanent = decided by the event itself, so retrying it cannot succeed:
+/// our own mismatch markers, a bean posting or bonus credit the ledger
+/// refuses, every integrity violation (SQLSTATE class 23: unique, foreign
+/// key, CHECK, which includes the ledger balance and immutability guards),
+/// every data exception (class 22) and a trigger's plain refusal (P0001: the
+/// published-plan and completed-draw guards). The writer stops at such an
+/// event and `discard_fenced` drops it alone and resumes the rest. Timeouts,
+/// lock waits, serialization failures and connection loss stay retryable.
+///
+/// None of these is reachable through a player's request today: the bean
+/// wallet may go negative (no balance CHECK), a pending credit is never
+/// spendable, record ids and transfer keys are derived and checked before
+/// admission, tickets carry the plan of their period, and an account cannot
+/// be erased while it has accepted work.
 pub(super) fn is_permanent(error: &sqlx::Error) -> bool {
+    if crate::bean_ledger::terminal_reason(error).is_some() {
+        return true;
+    }
     match error {
-        sqlx::Error::Protocol(message) => message.starts_with(PERMANENT),
-        sqlx::Error::Database(e) => e
-            .code()
-            .is_some_and(|code| code == "23505" || code == "23503"),
+        sqlx::Error::Protocol(message) => {
+            message.starts_with(PERMANENT)
+                || message == crate::bean_ledger::TRANSFER_KEY_CONFLICT
+                || message == crate::bean_ledger::TRANSFER_INVALID
+        }
+        sqlx::Error::Database(e) => e.code().is_some_and(|code| {
+            code.starts_with("23") || code.starts_with("22") || code == "P0001"
+        }),
         _ => false,
     }
 }
 
 pub(super) async fn hydrate(pool: &PgPool) -> sqlx::Result<Data> {
-    hydrate_missing(pool, &[]).await
+    hydrate_missing(pool, &[], &Game::DRAWN).await
 }
 
+/// Fills the free slots of `games` with their oldest unsettled periods that
+/// are not already in memory (`existing`).
 pub(super) async fn hydrate_missing(
     pool: &PgPool,
     existing: &[(String, i64)],
+    games: &[Game],
 ) -> sqlx::Result<Data> {
     let mut tx = pool.begin_read().await?;
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ,READ ONLY")
@@ -81,7 +100,7 @@ pub(super) async fn hydrate_missing(
     .await?;
     let mut data = Data::default();
     // Three slots per game, oldest outstanding work first. Never hydrate history.
-    for game in Game::DRAWN {
+    for &game in games {
         let loaded: Vec<i64> = existing
             .iter()
             .filter(|(g, _)| g == game.as_str())
@@ -102,37 +121,130 @@ pub(super) async fn hydrate_missing(
     }
     let keys: Vec<_> = data.periods.keys().cloned().collect();
     for (game, period) in keys {
-        let mut after = None::<Uuid>;
-        loop {
-            let rows = sqlx::query(&format!("SELECT user_id,game,{} FROM lottery_tickets WHERE game=$1 AND period=$2 AND id>COALESCE($3,'00000000-0000-0000-0000-000000000000'::uuid) ORDER BY id LIMIT $4", store::TICKET_COLUMNS))
-                .bind(&game).bind(period).bind(after).bind(PAGE).fetch_all(&mut *tx).await?;
-            if rows.is_empty() {
-                break;
-            }
-            for row in rows {
-                let card = TicketRow::from_row(&row);
-                after = Some(card.id);
-                data.insert(OwnedTicket {
-                    user: row.get("user_id"),
-                    game: game.clone(),
-                    card,
-                });
-            }
-            bounded(&data)?;
-        }
+        load_tickets(&mut tx, &mut data, &game, period).await?;
     }
     tx.commit().await?;
+    sort_recent(&mut data);
+    Ok(data)
+}
+
+/// Every ticket of one period, settled or not, in id pages.
+async fn load_tickets(
+    conn: &mut crate::db_writer::PgConnection,
+    data: &mut Data,
+    game: &str,
+    period: i64,
+) -> sqlx::Result<()> {
+    let mut after = None::<Uuid>;
+    loop {
+        let rows = sqlx::query(&format!("SELECT user_id,game,{} FROM lottery_tickets WHERE game=$1 AND period=$2 AND id>COALESCE($3,'00000000-0000-0000-0000-000000000000'::uuid) ORDER BY id LIMIT $4", store::TICKET_COLUMNS))
+            .bind(game).bind(period).bind(after).bind(PAGE).fetch_all(&mut *conn).await?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        for row in rows {
+            let card = TicketRow::from_row(&row);
+            after = Some(card.id);
+            data.insert(OwnedTicket {
+                user: row.get("user_id"),
+                game: game.to_owned(),
+                card,
+            });
+        }
+        bounded(data)?;
+    }
+}
+
+fn sort_recent(data: &mut Data) {
     for ids in data.recent.values_mut() {
         let mut sorted: Vec<_> = ids.drain(..).collect();
         sorted.sort_by_key(|id| std::cmp::Reverse((data.tickets[id].card.bought_at, *id)));
         sorted.truncate(100);
         *ids = sorted.into();
     }
-    Ok(data)
 }
 
-/// The periodic retention job: its own pool transactions, no writer connection.
-pub(super) async fn retention(pool: &PgPool) -> sqlx::Result<()> {
+/// Periods already marked settled that still hold unsettled number tickets,
+/// oldest first. A single owner never produces one (a period is marked
+/// settled only after every ticket of it settled, and nothing is sold after
+/// the draw); they come from a second backend on the same database marking a
+/// period settled without having seen another backend's tickets. Read once
+/// per start through the unsettled-ticket index. A period without a stored
+/// plan or draw cannot be settled by the runtime and is only counted, like
+/// the unsettled tickets whose period row no longer exists (retention removed
+/// it): the second number returned is periods plus such tickets.
+pub(super) async fn stranded(pool: &PgPool) -> sqlx::Result<(Vec<(String, i64)>, i64)> {
+    let mut tx = pool.begin_read().await?;
+    sqlx::query(
+        "SELECT set_config('lock_timeout','500ms',true),set_config('statement_timeout','2s',true)",
+    )
+    .execute(&mut *tx)
+    .await?;
+    let rows: Vec<(String, i64, bool)> = sqlx::query_as(
+        "SELECT p.game,p.period,(p.numbers IS NOT NULL AND p.proof_plan IS NOT NULL AND p.draw_proof IS NOT NULL) \
+           FROM lottery_periods p \
+          WHERE p.status='settled' AND (p.game,p.period) IN \
+                (SELECT t.game,t.period FROM lottery_tickets t WHERE t.settled_at IS NULL AND t.game<>'scratch') \
+          ORDER BY p.game,p.period LIMIT 1000",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    let orphaned: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM lottery_tickets t WHERE t.settled_at IS NULL AND t.game<>'scratch' \
+            AND NOT EXISTS(SELECT 1 FROM lottery_periods p WHERE p.game=t.game AND p.period=t.period)",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    let unusable = rows.iter().filter(|row| !row.2).count() as i64 + orphaned;
+    Ok((
+        rows.into_iter()
+            .filter(|row| row.2)
+            .map(|(game, period, _)| (game, period))
+            .collect(),
+        unusable,
+    ))
+}
+
+/// One [`stranded`] period with all of its tickets, reopened for settlement:
+/// in memory it is `drawn` again, with the draw it already has. `None` when
+/// it is no longer stranded.
+pub(super) async fn load_stranded(
+    pool: &PgPool,
+    game: &str,
+    period: i64,
+) -> sqlx::Result<Option<Data>> {
+    let mut tx = pool.begin_read().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ,READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "SELECT set_config('lock_timeout','500ms',true),set_config('statement_timeout','2s',true)",
+    )
+    .execute(&mut *tx)
+    .await?;
+    let row = sqlx::query("SELECT game,period,status,numbers,bonus,bonus_numbers,drawn_at,settled_at,tickets,stakes,players,sales,paid,winners,proof_plan,draw_proof FROM lottery_periods p WHERE game=$1 AND period=$2 AND status='settled' AND numbers IS NOT NULL AND proof_plan IS NOT NULL AND draw_proof IS NOT NULL AND EXISTS(SELECT 1 FROM lottery_tickets t WHERE t.game=p.game AND t.period=p.period AND t.settled_at IS NULL)")
+        .bind(game).bind(period).fetch_optional(&mut *tx).await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let mut reopened = PeriodRow::from_row(&row);
+    reopened.status = "drawn".into();
+    reopened.settled_at = None;
+    let mut data = Data {
+        bytes: resident(&reopened),
+        ..Data::default()
+    };
+    data.periods.insert((game.to_owned(), period), reopened);
+    load_tickets(&mut tx, &mut data, game, period).await?;
+    tx.commit().await?;
+    sort_recent(&mut data);
+    Ok(Some(data))
+}
+
+/// The daily retention job: its own pool transactions, no writer connection.
+/// True when a statement deleted a full batch, so more rows are due.
+pub(super) async fn retention(pool: &PgPool) -> sqlx::Result<bool> {
     super::super::draw_loop::retention(pool)
         .await
         .map_err(|e| match e {
@@ -164,43 +276,57 @@ pub(super) async fn persist(
             .await?
             .ok_or_else(|| permanent("wallet row missing"))?;
     }
-    // This event's receipt id; a quarantined event writes under another.
-    let mut ledger_id = event.id;
+    // The event's wallet effect is one bean-ledger play posting under the
+    // event id, plus one bonus credit keyed by the same id when the event
+    // pays a jackpot or card bonus; both are written before anything else of
+    // the event. The posting is idempotent on (event id, user): a replay
+    // means our own earlier commit (a lost acknowledgement), whose bonus,
+    // tickets and period committed with it.
     if let (Some(user), Some(effect)) = (event.owner, &event.effect) {
-        let mut existing = ledger_row(&mut tx, user, event.id).await?;
-        if existing
-            .as_ref()
-            // Lottery receipts (fingerprinted, or legacy with a `purpose`)
-            // never qualify, so a genuine lottery mismatch stays permanent.
-            .is_some_and(|(_, details)| crate::wallet::is_legacy_solo_receipt(details.as_ref()))
-        {
-            // Per-event quarantine: a solo-game receipt written before solo
-            // ids were derived holds this lottery id. It carries none of this
-            // event's money, so this event alone is written under its
-            // quarantine id (operators are alerted after commit) instead of
-            // fencing the writer and abandoning every user's work.
-            ledger_id = crate::wallet::quarantine_record_id(event.id);
-            existing = ledger_row(&mut tx, user, ledger_id).await?;
-        }
-        if let Some((delta, details)) = existing {
-            // Our own earlier commit (a lost acknowledgement) replays. Any
-            // other row stays a permanent mismatch, including another lottery
-            // receipt and a foreign row under the quarantine id.
-            if delta != effect.ledger_delta
-                || details.as_ref().and_then(|d| d["lottery_event"].as_str())
-                    != Some(fingerprint.as_str())
+        let posted =
+            crate::bean_ledger::settle(&mut tx, &posting(event, user, effect, &fingerprint))
+                .await?;
+        if posted == crate::bean_ledger::Posted::Replayed {
+            // Same id and delta but another accepted event is not ours.
+            if stored_fingerprint(&mut tx, user, event.id)
+                .await?
+                .as_deref()
+                != Some(fingerprint.as_str())
             {
                 return Err(permanent("ledger fingerprint mismatch"));
             }
             let grants = read_grants(&mut tx, &event.max_cards).await?;
             tx.commit().await?;
             publish(pool, event);
-            // The first commit's acknowledgement may have been lost before
-            // its alert: a replayed quarantine alerts too.
-            if ledger_id != event.id {
-                quarantine_alert(event, ledger_id);
-            }
+            // The attempt that committed never reached its statistics.
+            statistics(event, game);
             return Ok(grants);
+        }
+        if effect.bonus > 0 {
+            let reason = if game == Game::Scratch {
+                crate::bean_ledger::Reason::ScratchReward
+            } else {
+                crate::bean_ledger::Reason::LotteryJackpot
+            };
+            let credited = crate::bean_ledger::credit(
+                &mut tx,
+                &crate::bean_ledger::Transfer::one(crate::bean_ledger::Leg {
+                    game: Some(&event.game),
+                    ..crate::bean_ledger::Leg::new(
+                        user,
+                        reason,
+                        event.id,
+                        crate::bean_ledger::Amount::Credit(effect.bonus),
+                        json!({"lottery_event_id": event.id}),
+                    )
+                }),
+            )
+            .await
+            .map_err(sqlx::Error::from)?;
+            // The play row was new, so its bonus cannot exist yet.
+            if !credited.applied() {
+                return Err(permanent("bonus credit already posted"));
+            }
         }
     }
     if let (Some(user), Some(id)) = (event.owner, event.claim) {
@@ -268,51 +394,6 @@ pub(super) async fn persist(
             return Err(permanent("ticket owner mismatch"));
         }
     }
-    if let (Some(user), Some(effect)) = (event.owner, &event.effect) {
-        if let Some(day) = effect.day {
-            let n=sqlx::query("INSERT INTO daily_usage(scope,subject_key,feature,usage_date,count) VALUES('feature_user',$1,'beans_daily_refill',$2,1) ON CONFLICT DO NOTHING").bind(user.to_string()).bind(day).execute(&mut *tx).await?.rows_affected();
-            if n != 1 {
-                return Err(permanent("daily refill already used"));
-            }
-        }
-        if event.bonus > 0 {
-            let reason = if event.kind == "daily" {
-                json!({"reason":"daily_refill"})
-            } else if event.kind == "settle" {
-                json!({"purpose":"lottery_jackpot","game":event.game,"lottery_event_id":event.id})
-            } else {
-                json!({"purpose":"scratch_reward","reward_version":event.cards.first().map(|t| t.card.entry["reward_version"].clone()),"lottery_event_id":event.id})
-            };
-            sqlx::query("WITH updated AS (UPDATE wallets SET balance=balance+$3,updated_at=now() WHERE user_id=$1 AND game=$2 RETURNING balance) INSERT INTO wallet_ledger(user_id,game,kind,delta,balance_after,details) SELECT $1,$2,'bonus',$3,balance,$4 FROM updated").bind(user).bind(BEANS).bind(event.bonus).bind(reason).execute(&mut *tx).await?;
-        }
-        let mut details = json!({"purpose":event.kind,"game":event.game,"lottery_event":fingerprint,"ticket_ids":event.cards.iter().map(|t|t.card.id).collect::<Vec<_>>()});
-        if ledger_id != event.id {
-            details["quarantine"] = json!({"reason":"receipt_id_taken","record_id":event.id});
-        }
-        if let Some(receipt) = &event.receipt {
-            details["body_sha256"] = json!(receipt.hash);
-            details["charged"] = json!(receipt.charged);
-            details["balance_before"] = json!(receipt.before);
-            details["accepted_balance_after"] = json!(receipt.after)
-        }
-        crate::wallet::settle(
-            &mut tx,
-            BEANS,
-            user,
-            &crate::wallet::Play {
-                record_id: ledger_id,
-                delta: effect.net,
-                completes_hand: effect.played != 0,
-                won: effect.won != 0,
-                room_code: None,
-                revision: None,
-                details: Some(details),
-                hand_completed: None,
-                has_bots: None,
-            },
-        )
-        .await?;
-    }
     if let Some(user) = event.owner {
         let settled: Vec<_> = cards
             .iter()
@@ -325,7 +406,8 @@ pub(super) async fn persist(
                     .await
                     .map_err(|error| match error {
                         Error::Db(e) => e,
-                        _ => db_unavailable(),
+                        // Decided by the stored card: no retry can change it.
+                        _ => permanent("scratch winner notice"),
                     })?;
             } else {
                 let paid = settled.iter().map(|t| t.prize.unwrap_or(0)).sum::<i64>();
@@ -353,56 +435,103 @@ pub(super) async fn persist(
     }
     tx.commit().await?;
     publish(pool, event);
-    if ledger_id != event.id {
-        quarantine_alert(event, ledger_id);
-    }
-    if let Some(user) = event.owner {
-        if !event.max_cards.is_empty() {
-            crate::entitlement::invalidate_tier(pool, user)
-        }
-        crate::read_cache::invalidate_unread_count(pool, user);
-        if let Some(receipt) = &event.receipt {
-            crate::stats_writer::send(crate::stats_writer::StatsEvent::LotteryPurchase {
-                day: super::super::sgt_day(event.at),
-                game: game.as_str(),
-                user,
-                tickets: cards.len() as i64,
-                stakes: cards
-                    .iter()
-                    .map(|t| i64::from(t.card.stakes) * i64::from(t.card.multiplier))
-                    .sum(),
-                sales: receipt.charged,
-            });
-        }
-    }
+    statistics(event, game);
     Ok(grants)
 }
-/// After commit only: the event's receipt is durable under `ledger_id`.
-fn quarantine_alert(event: &Event, ledger_id: Uuid) {
-    tracing::error!(
-        alert_error = "Lottery receipt quarantined: its ledger id was already used",
-        alert_cause = "a solo-game receipt of this player holds the lottery receipt id; this event was written under its quarantine id instead / 该玩家的单机游戏收据占用了彩票收据 id，本事件改用隔离 id 写入",
-        alert_action = "AI team reviews the player's conflicting ledger row and the quarantined receipt; Loong action: none / AI 核查冲突流水与隔离收据，Loong 无需操作",
-        "[lottery_receipt_quarantined] user={} game={} kind={} event={} quarantine_id={ledger_id} tickets={}",
-        event.owner.unwrap_or_default(),
-        event.game,
-        event.kind,
-        event.id,
-        event.cards.len()
-    );
+/// Day statistics of a committed event, sent once: by the attempt that saw
+/// the commit succeed, or by the replay of one whose acknowledgement was lost.
+/// Fire-and-forget; never part of the write.
+fn statistics(event: &Event, game: Game) {
+    let Some(user) = event.owner else { return };
+    if let Some(receipt) = &event.receipt {
+        crate::stats_writer::send(crate::stats_writer::StatsEvent::LotteryPurchase {
+            day: super::super::sgt_day(event.at),
+            game: game.as_str(),
+            user,
+            tickets: event.cards.len() as i64,
+            stakes: event
+                .cards
+                .iter()
+                .map(|t| i64::from(t.card.stakes) * i64::from(t.card.multiplier))
+                .sum(),
+            sales: receipt.charged,
+        });
+    }
+    // Prizes of the cards this event settled (a settlement that paid nothing
+    // still counts, like a played round).
+    let settled = || event.cards.iter().filter(|t| t.card.settled_at.is_some());
+    if settled().next().is_some() {
+        crate::stats_writer::send(crate::stats_writer::StatsEvent::LotteryPaid {
+            day: super::super::sgt_day(event.at),
+            game: game.as_str(),
+            user,
+            paid: settled().map(|t| t.card.prize.unwrap_or(0)).sum(),
+        });
+    }
 }
 
-async fn ledger_row(
+/// The play posting of an event (`details.v = 2`, kind `draw`). `meta.op` is
+/// the event kind (`purchase`, `scratch_batch`, `reveal`, `settle`); `prize`
+/// is what its settled tickets paid; a purchase carries its replay facts.
+fn posting<'a>(
+    event: &'a Event,
+    user: Uuid,
+    effect: &PendingEffect,
+    fingerprint: &str,
+) -> crate::bean_ledger::Posting<'a> {
+    let settled = event.cards.iter().filter(|t| t.card.settled_at.is_some());
+    let mut meta = json!({
+        "op": event.kind,
+        "lottery_event": fingerprint,
+        "ticket_ids": event.cards.iter().map(|t| t.card.id).collect::<Vec<_>>(),
+        "prize": settled.map(|t| t.card.prize.unwrap_or(0)).sum::<i64>(),
+    });
+    if let Some(period) = event
+        .cards
+        .first()
+        .map(|t| t.card.period)
+        .filter(|p| *p != 0)
+    {
+        meta["period"] = json!(period);
+    }
+    if let Some(receipt) = &event.receipt {
+        meta["body_sha256"] = json!(receipt.hash);
+        meta["charged"] = json!(receipt.charged);
+        meta["balance_before"] = json!(receipt.before);
+        meta["accepted_balance_after"] = json!(receipt.after);
+    }
+    crate::bean_ledger::Posting {
+        game: &event.game,
+        kind: crate::bean_ledger::Kind::Draw,
+        record_id: event.id,
+        room_code: None,
+        session: None,
+        has_bots: false,
+        meta,
+        entries: vec![crate::bean_ledger::Entry {
+            user,
+            delta: effect.delta,
+            completes_hand: effect.played != 0,
+            won: effect.won != 0,
+            meta: None,
+        }],
+    }
+}
+
+/// The accepted-event fingerprint of the receipt posted for `record`.
+async fn stored_fingerprint(
     conn: &mut crate::db_writer::PgConnection,
     user: Uuid,
-    record_id: Uuid,
-) -> sqlx::Result<Option<(i64, Option<Value>)>> {
-    sqlx::query_as(
-        "SELECT delta,details FROM wallet_ledger WHERE user_id=$1 AND game=$2 AND record_id=$3",
+    record: Uuid,
+) -> sqlx::Result<Option<String>> {
+    sqlx::query_scalar(
+        "SELECT details->'meta'->>'lottery_event' FROM wallet_ledger \
+          WHERE user_id=$1 AND game=$2 AND kind='play' AND record_id=$3 \
+            AND details->'meta'->>'lottery_event' IS NOT NULL LIMIT 1",
     )
     .bind(user)
     .bind(BEANS)
-    .bind(record_id)
+    .bind(record)
     .fetch_optional(conn)
     .await
 }
@@ -425,7 +554,7 @@ async fn read_grants(
             result.push((
                 row.get("id"),
                 serde_json::from_value(entry["reward_grant"].clone())
-                    .map_err(|_| db_unavailable())?,
+                    .map_err(|_| permanent("stored reward grant"))?,
             ))
         }
     }

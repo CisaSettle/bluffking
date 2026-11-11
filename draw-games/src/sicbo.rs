@@ -1,5 +1,5 @@
 //! Solo three-dice game. The shared gold-bean wallet row serializes wagers;
-//! the ledger receipt is committed together with the balance and record.
+//! the [`crate::bean_ledger`] posting commits together with the game record.
 use crate::db_writer::PgPool;
 use crate::handlers::respond::error_code;
 use crate::{app_state::AppState, auth::middleware::AuthUser, wallet};
@@ -43,28 +43,34 @@ pub(crate) fn jackpot_bonus(stake: i64) -> Option<i64> {
         .filter(|bonus| *bonus > 0)
 }
 
-/// Credits a jackpot as a separate bean `bonus` row in the caller's settlement
-/// transaction, before the play receipt, so that receipt's `balance_after`
-/// includes it while its `delta` stays the verifiable rules payout. The caller
-/// holds the account and wallet locks; a missing wallet credits nothing.
+/// Credits a jackpot as its own bonus row ([`crate::bean_ledger::credit`],
+/// idempotent on the play's record id) in the settlement transaction, before
+/// the play receipt: that receipt's `balance_after` includes it while its
+/// `delta` stays the verifiable rules payout. `false` when the account is
+/// erased (nothing to credit).
 pub(crate) async fn credit_jackpot(
     conn: &mut crate::db_writer::PgConnection,
     user: Uuid,
+    play_record: Uuid,
     bonus: i64,
-    details: serde_json::Value,
-) -> sqlx::Result<()> {
-    sqlx::query(
-        "WITH updated AS (UPDATE wallets SET balance=balance+$3,updated_at=now() WHERE user_id=$1 AND game=$2 RETURNING balance) \
-         INSERT INTO wallet_ledger(user_id,game,kind,delta,balance_after,details) \
-         SELECT $1,$2,'bonus',$3,balance,$4 FROM updated",
-    )
-    .bind(user)
-    .bind(POLICY.game)
-    .bind(bonus)
-    .bind(details)
-    .execute(conn.writer())
-    .await?;
-    Ok(())
+    meta: serde_json::Value,
+) -> sqlx::Result<bool> {
+    use crate::bean_ledger::{credit, Amount, Leg, Reason, Transfer, TransferError};
+    let leg = Leg {
+        game: Some("sicbo"),
+        ..Leg::new(
+            user,
+            Reason::SicboJackpot,
+            play_record,
+            Amount::Credit(bonus),
+            meta,
+        )
+    };
+    match credit(conn, &Transfer::one(leg)).await {
+        Ok(_) => Ok(true),
+        Err(TransferError::Db(sqlx::Error::RowNotFound)) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -88,9 +94,6 @@ pub struct Receipt {
     pub triple: bool,
     pub won: bool,
     pub fairness: serde_json::Value,
-    /// Legacy: the Max membership grant of a jackpot settled before the bean jackpot.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_reward: Option<serde_json::Value>,
     /// Bean jackpot credited with this roll (a separate `bonus` ledger row).
     #[serde(default)]
     pub jackpot_bonus: i64,
@@ -137,34 +140,25 @@ impl IntoResponse for Error {
         error_code(status, code)
     }
 }
-/// The derived receipt, else a solo receipt written before derivation under
-/// the raw request id (a room round's receipt under that id is not this
-/// request's). Both are read in one statement, so a retry spanning the
-/// release replays instead of debiting again.
+/// This request's committed roll, read under the wallet lock.
 async fn saved(
     conn: &mut crate::db_writer::PgConnection,
     user: Uuid,
     bet: &Bet,
     balance: i64,
 ) -> Result<Option<BetResult>, Error> {
-    let derived = record_id(user, bet.request_id);
-    let rows = sqlx::query("SELECT record_id, details, balance_after, delta FROM wallet_ledger WHERE game=$1 AND user_id=$2 AND record_id=$3 \
-        UNION ALL SELECT record_id, details, balance_after, delta FROM wallet_ledger WHERE game=$1 AND user_id=$2 AND record_id=$4")
-        .bind(POLICY.game).bind(user).bind(derived).bind(bet.request_id).fetch_all(conn).await?;
-    let pick = |id: Uuid| {
-        rows.iter()
-            .find(|row| row.get::<Uuid, _>("record_id") == id)
-    };
-    let row = pick(derived).or_else(|| {
-        pick(bet.request_id).filter(|row| {
-            let details: serde_json::Value = row.get("details");
-            details["game"] == "sicbo" && details.get("room_code").is_none()
-        })
-    });
+    let row = sqlx::query(
+        "SELECT details, balance_after, delta FROM wallet_ledger WHERE game=$1 AND user_id=$2 AND record_id=$3",
+    )
+    .bind(POLICY.game)
+    .bind(user)
+    .bind(record_id(user, bet.request_id))
+    .fetch_optional(conn)
+    .await?;
     let Some(row) = row else {
         return Ok(None);
     };
-    let details: serde_json::Value = row.get("details");
+    let details = crate::bean_ledger::receipt(&row.get::<serde_json::Value, _>("details"));
     if details["game"] != "sicbo" || details["session_id"] != json!(bet.session_id) {
         return Err(Error::Conflict);
     }
@@ -196,19 +190,13 @@ fn record_id(user: Uuid, request: Uuid) -> Uuid {
     crate::beans::solo_record_id("sicbo", user, request)
 }
 pub async fn play(pool: &PgPool, user: Uuid, bet: &Bet) -> Result<BetResult, Error> {
+    use crate::bean_ledger::{self, Entry, Kind, Posting};
     if Some(bet.stake) != crate::beans::solo_stake(MIN_STAKE, bet.expected_balance)
         || bet.request_id.is_nil()
         || bet.session_id.is_nil()
     {
         return Err(Error::Invalid);
     }
-    // Recovery and room inspection may need pool connections or room locks.
-    // Finish them before holding the wallet transaction so concurrent retries
-    // cannot exhaust the pool while waiting for recovery or the room sweep.
-    let round_in_play =
-        crate::casino_room::round_in_play::<crate::sicbo_room::SicboRoom>(pool, bet.request_id)
-            .await
-            .unwrap_or(true);
     let _beans_mutation = crate::beans_read_memory::mutation(pool, [user]);
     wallet::ensure(pool, POLICY, user).await?;
     let mut tx = pool.begin().await?;
@@ -222,12 +210,6 @@ pub async fn play(pool: &PgPool, user: Uuid, bet: &Bet) -> Result<BetResult, Err
         crate::beans_read_memory::invalidate_user(pool, user);
         committed?;
         return Ok(result);
-    }
-    // A room settlement uses its round id as the receipt key. Solo receipts
-    // are derived ids, and a solo request may still not reuse the id of a
-    // round open in any room (fails closed).
-    if round_in_play {
-        return Err(Error::Conflict);
     }
     let available = crate::beans::available_on(pool, &mut tx, user, balance, None).await?;
     if bet
@@ -250,14 +232,15 @@ pub async fn play(pool: &PgPool, user: Uuid, bet: &Bet) -> Result<BetResult, Err
     let dice = draw_games::sicbo::draw(&reveal).map_err(|_| Error::Invalid)?;
     let won = wins(dice, bet.side);
     let delta = draw_games::sicbo::delta(dice, bet.side, bet.stake);
+    let record = record_id(user, bet.request_id);
     let jackpot_bonus = if won && wins_jackpot(&reveal, user) {
         let bonus = jackpot_bonus(bet.stake).ok_or(Error::Invalid)?;
         credit_jackpot(
             &mut tx,
             user,
+            record,
             bonus,
-            json!({"game":"sicbo","purpose":"sicbo_jackpot","request_id":bet.request_id,
-                "record_id":record_id(user, bet.request_id),"stake":bet.stake}),
+            json!({"request_id":bet.request_id,"record_id":record,"stake":bet.stake}),
         )
         .await?;
         bonus
@@ -273,57 +256,38 @@ pub async fn play(pool: &PgPool, user: Uuid, bet: &Bet) -> Result<BetResult, Err
         triple: dice[0] == dice[1] && dice[1] == dice[2],
         won,
         fairness: draw_games::sicbo::payout_proof(&reveal, dice, bet.side, bet.stake),
-        max_reward: None,
         jackpot_bonus,
     };
-    let record = record_id(user, bet.request_id);
-    let play = wallet::Play {
+    let mut meta = json!(receipt);
+    meta["session_id"] = json!(bet.session_id);
+    let posting = Posting {
+        game: "sicbo",
+        kind: Kind::Solo,
         record_id: record,
-        delta,
-        completes_hand: true,
-        won,
         room_code: None,
-        revision: None,
-        details: Some({
-            let mut details = json!(receipt);
-            details["session_id"] = json!(bet.session_id);
-            details["game"] = json!("sicbo");
-            details["unit"] = json!("beans");
-            details
-        }),
-        hand_completed: Some(true),
-        has_bots: Some(false),
+        session: Some(bet.session_id),
+        has_bots: false,
+        meta,
+        entries: vec![Entry {
+            user,
+            delta,
+            completes_hand: true,
+            won,
+            meta: None,
+        }],
     };
-    let settled = wallet::settle(&mut tx, POLICY.game, user, &play).await;
-    let balance_after = match settled {
-        Ok(balance) => balance,
-        Err(e)
-            if e.as_database_error()
-                .is_some_and(|e| e.is_unique_violation()) =>
-        {
-            tx.rollback().await?;
-            let mut tx = pool.begin().await?;
-            crate::db::lock_active_users(&mut tx, &[user]).await?;
-            let balance = wallet::lock(&mut tx, POLICY.game, user)
-                .await?
-                .ok_or(sqlx::Error::RowNotFound)?;
-            let result = saved(&mut tx, user, bet, balance)
-                .await?
-                .ok_or(sqlx::Error::RowNotFound)?;
-            let committed = tx.commit().await;
-            crate::beans_read_memory::invalidate_user(pool, user);
-            committed?;
-            return Ok(result);
-        }
-        Err(e) => return Err(e.into()),
-    };
-    crate::game_records::record(
+    let balance_after = bean_ledger::settle_one(&mut tx, &posting).await?;
+    crate::game_records::record_beans(
         &mut tx,
         crate::game_catalog::SICBO,
         record,
         Some(bet.session_id),
-        chrono::Utc::now(),
-        &[(user, delta)],
+        false,
+        &[(
+            user,
+            delta,
+            bean_ledger::receipt(&bean_ledger::details(&posting, &posting.entries[0])),
+        )],
     )
     .await?;
     let committed = tx.commit().await;
@@ -343,12 +307,11 @@ pub async fn profile(
 ) -> Result<Json<serde_json::Value>, Error> {
     let wallet = wallet::ensure(&state.pool, POLICY, auth.user_id).await?;
     crate::casino_room::recover::<crate::sicbo_room::SicboRoom>(&state.pool).await?;
-    let room = crate::sicbo_room::current_room(auth.user_id);
     let fairness_offer = crate::draw_fairness::offer(&state.pool, auth.user_id, "sicbo").await?;
-    Ok(Json(
-        json!({ "wallet":wallet, "room":room, "min_stake":MIN_STAKE, "max_stake":MAX_STAKE,
-            "fairness_offer":fairness_offer }),
-    ))
+    let mut body = json!({ "wallet":wallet, "min_stake":MIN_STAKE, "max_stake":MAX_STAKE,
+        "fairness_offer":fairness_offer });
+    crate::casino_room::rooms_fields::<crate::sicbo_room::SicboRoom>(auth.user_id, &mut body);
+    Ok(Json(body))
 }
 pub async fn bet(
     State(state): State<AppState>,
@@ -365,17 +328,16 @@ pub async fn ledger(
     auth: AuthUser,
     Query(query): Query<LedgerQuery>,
 ) -> Result<Json<serde_json::Value>, Error> {
-    // Preserve old independent-chip receipts alongside this game's new bean
-    // receipts, without leaking unrelated shared-wallet games into dice history.
-    let entries: Vec<serde_json::Value> = sqlx::query_scalar(
+    // This game's own plays (solo rolls and room rounds).
+    let entries: Vec<serde_json::Value> = sqlx::query_scalar(&format!(
         "SELECT to_jsonb(l) FROM (SELECT id,kind,record_id,room_code,revision,delta,
-         balance_after,COALESCE(details,'{}'::jsonb) || jsonb_build_object('unit', CASE WHEN game=$2 THEN 'practice' ELSE 'beans' END) AS details,
+         balance_after,{} AS details,
          hand_completed,has_bots,created_at FROM wallet_ledger
-         WHERE user_id=$1 AND kind='play' AND (game=$2 OR (game=$3 AND details->>'game'='sicbo'))
-         ORDER BY id DESC LIMIT $4 OFFSET $5) l",
-    )
+         WHERE user_id=$1 AND kind='play' AND game=$2 AND details->>'game'='sicbo'
+         ORDER BY id DESC LIMIT $3 OFFSET $4) l",
+        crate::bean_ledger::RECEIPT_SQL
+    ))
     .bind(auth.user_id)
-    .bind(crate::game_catalog::SICBO)
     .bind(POLICY.game)
     .bind(query.limit())
     .bind(query.offset())

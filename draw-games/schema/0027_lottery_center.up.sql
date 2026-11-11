@@ -119,6 +119,8 @@ DO $$
 DECLARE
  def text;
 BEGIN
+ -- 0132 replaced the per-game whitelists by public.games; a re-run has nothing to widen.
+ IF to_regclass('public.games') IS NOT NULL THEN RETURN; END IF;
  SELECT pg_get_constraintdef(c.oid) INTO def FROM pg_constraint c
   WHERE c.conrelid = 'public.wallets'::regclass AND c.conname = 'wallets_game_check';
  IF def IS NULL THEN

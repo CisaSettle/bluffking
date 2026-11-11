@@ -33,57 +33,6 @@ pub(crate) fn accepting() -> bool {
     !QUIESCING.load(Ordering::Acquire)
 }
 
-// Retain membership until its leave snapshot commits. This prevents another
-// room from overtaking a pending leave while the database still owns the seat.
-fn memberships() -> &'static Mutex<std::collections::HashMap<(&'static str, uuid::Uuid), String>> {
-    static MEMBERS: OnceLock<Mutex<std::collections::HashMap<(&'static str, uuid::Uuid), String>>> =
-        OnceLock::new();
-    MEMBERS.get_or_init(Default::default)
-}
-pub(crate) fn reserved_room(game: &'static str, user: uuid::Uuid) -> Option<String> {
-    memberships().lock().unwrap().get(&(game, user)).cloned()
-}
-/// Everyone a room of `game` holds a reservation for.
-pub(crate) fn reserved_members(game: &'static str, code: &str) -> Vec<uuid::Uuid> {
-    memberships()
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|((g, _), c)| *g == game && c.as_str() == code)
-        .map(|((_, user), _)| *user)
-        .collect()
-}
-pub(crate) fn reserve_members(
-    game: &'static str,
-    code: &str,
-    users: &[uuid::Uuid],
-) -> Result<Vec<uuid::Uuid>, String> {
-    let mut members = memberships().lock().unwrap();
-    if users
-        .iter()
-        .any(|u| members.get(&(game, *u)).is_some_and(|c| c != code))
-    {
-        return Err("in_other_room".into());
-    }
-    let added = users
-        .iter()
-        .copied()
-        .filter(|u| !members.contains_key(&(game, *u)))
-        .collect::<Vec<_>>();
-    for user in &added {
-        members.insert((game, *user), code.to_owned());
-    }
-    Ok(added)
-}
-pub(crate) fn release_members(game: &'static str, code: &str, users: &[uuid::Uuid]) {
-    let mut members = memberships().lock().unwrap();
-    for user in users {
-        if members.get(&(game, *user)).is_some_and(|c| c == code) {
-            members.remove(&(game, *user));
-        }
-    }
-}
-
 #[derive(Default)]
 struct DrainState {
     queued: AtomicU64,
@@ -278,6 +227,21 @@ impl<T: Clone + Send + Sync + 'static> Ordered<T> {
             progress,
             drain_state,
             sequence: 0,
+        }
+    }
+    /// Resolves once the worker has stopped (fenced, or every handle
+    /// dropped) and [`Self::is_closed`] holds for any handle still alive.
+    pub fn stopped(&self) -> impl Future<Output = ()> + Send + 'static {
+        let mut progress = self.progress.clone();
+        // Weak: waiting here must not keep a dropped writer's worker alive.
+        let pending = self.pending.downgrade();
+        async move {
+            while progress.changed().await.is_ok() {}
+            // The worker drops its progress sender and receiver on the same
+            // return; wait for the receiver too.
+            if let Some(pending) = pending.upgrade() {
+                pending.closed().await;
+            }
         }
     }
     /// The worker stopped for good (fenced); nothing enqueued will be written.

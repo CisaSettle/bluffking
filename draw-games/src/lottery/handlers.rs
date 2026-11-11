@@ -1,5 +1,5 @@
 //! Authenticated lottery HTTP endpoints; rule failures have stable wire codes.
-use super::{scratch, store, Game};
+use super::{runtime, store, Game};
 use crate::api_resources::OperationPath as Path;
 use crate::request_timing::{lottery_span, mark_lottery, LotteryStage};
 use crate::{app_state::AppState, auth::middleware::AuthUser, handlers::respond::error_code};
@@ -67,7 +67,7 @@ pub async fn view(
     Path(name): Path<String>,
 ) -> Result<Json<Value>, Error> {
     Ok(Json(
-        store::view(&state.pool, auth.user_id, game(&name)?).await?,
+        runtime::view(&state.pool, auth.user_id, game(&name)?).await?,
     ))
 }
 /// Cold scratch hydration and creation of a durable fairness commitment are
@@ -77,14 +77,9 @@ pub async fn prepare(
     auth: AuthUser,
     Path(name): Path<String>,
 ) -> Result<Json<Value>, Error> {
-    let game = game(&name)?;
-    if crate::realtime_mode::enabled() {
-        Ok(Json(
-            super::runtime::prepare(&state.pool, auth.user_id, game).await?,
-        ))
-    } else {
-        Ok(Json(store::view(&state.pool, auth.user_id, game).await?))
-    }
+    Ok(Json(
+        runtime::prepare(&state.pool, auth.user_id, game(&name)?).await?,
+    ))
 }
 
 /// Ancillary SQL history is fetched independently of the current memory view.
@@ -111,38 +106,24 @@ pub async fn buy(
     body: Result<Json<Value>, JsonRejection>,
 ) -> Result<Response, Error> {
     let game = game(&name)?;
-    mark_lottery(game.as_str(), crate::realtime_mode::enabled());
+    mark_lottery(game.as_str());
     let decoding = lottery_span(LotteryStage::Decode);
     let Json(body) = body.map_err(|_| Error::InvalidEntry)?;
     let purchase = if game == Game::Scratch {
         let body = serde_json::from_value(body).map_err(|_| Error::InvalidEntry)?;
         drop(decoding);
-        scratch::buy(&state.pool, auth.user_id, &body).await?
+        runtime::buy_scratch(&state.pool, auth.user_id, &body).await?
     } else {
         let body = serde_json::from_value(body).map_err(|_| Error::InvalidEntry)?;
         drop(decoding);
-        store::buy_numbers(&state.pool, auth.user_id, game, &body).await?
+        runtime::buy_numbers(&state.pool, auth.user_id, game, &body).await?
     };
     let _reply = lottery_span(LotteryStage::Reply);
     if query.receipt_only && game != Game::Scratch {
         // The transaction has committed. Hall crowd/feed/history reads must not
         // delay its receipt or turn their failure into a failed purchase.
         // A replay's balance_after is historical; read the current wallet once.
-        let (balance, available_balance) = if crate::realtime_mode::enabled() {
-            super::runtime::balance(&state.pool, auth.user_id)?
-        } else {
-            let balance = store::ensure_wallet(&state.pool, auth.user_id).await?;
-            (
-                balance,
-                crate::beans_read_memory::available(
-                    &state.pool,
-                    auth.user_id,
-                    balance,
-                    false,
-                    None,
-                )?,
-            )
-        };
+        let (balance, available_balance) = runtime::balance(&state.pool, auth.user_id)?;
         return Ok(Json(json!({
             "purchased": purchase.purchased, "charged": purchase.charged,
             "balance_before": purchase.balance_before, "balance_after": purchase.balance_after,
@@ -150,7 +131,7 @@ pub async fn buy(
         }))
         .into_response());
     }
-    let view = store::view(&state.pool, auth.user_id, game).await?;
+    let view = runtime::view(&state.pool, auth.user_id, game).await?;
     Ok(Json(
         json!({"view":view,"purchased":purchase.purchased,"charged":purchase.charged,"balance_before":purchase.balance_before,"balance_after":purchase.balance_after}),
     ).into_response())
@@ -168,12 +149,14 @@ pub async fn reveal(
 ) -> Result<Json<Value>, Error> {
     let Json(body) = body.map_err(|_| Error::InvalidEntry)?;
     let (ticket, balance) =
-        scratch::reveal(&state.pool, auth.user_id, body.ticket_id, body.index).await?;
+        runtime::reveal(&state.pool, auth.user_id, body.ticket_id, body.index).await?;
     Ok(Json(json!({"ticket":ticket,"balance":balance})))
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Refill {
+    /// Part of the wire contract; the daily claim is idempotent per day.
+    #[allow(dead_code)]
     request_id: Uuid,
 }
 pub async fn refill(
@@ -181,9 +164,9 @@ pub async fn refill(
     auth: AuthUser,
     body: Result<Json<Refill>, JsonRejection>,
 ) -> Result<Json<Value>, Error> {
-    let Json(body) = body.map_err(|_| Error::InvalidEntry)?;
+    let _request: Json<Refill> = body.map_err(|_| Error::InvalidEntry)?;
     Ok(Json(
-        json!({"granted": super::REFILL, "balance":store::refill(&state.pool, auth.user_id, body.request_id).await?}),
+        json!({"granted": super::REFILL, "balance": runtime::refill(&state.pool, auth.user_id).await?}),
     ))
 }
 #[derive(Deserialize)]

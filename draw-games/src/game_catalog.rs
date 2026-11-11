@@ -19,10 +19,14 @@ pub struct Game {
     pub beans: bool,
     /// Settles through the lottery center.
     pub lottery: bool,
+    /// Its rooms can be published to a club's room list.
+    pub club_rooms: bool,
+    /// A room game that also has a no-table route reporting `solo_game_play`.
+    pub solo_play: bool,
     /// Singapore release day of a recently shipped game.
     pub launched: Option<&'static str>,
     pub record_code: Option<i16>,
-    /// `/api/games/{id}/…` resources, named after `handlers::game_api` routes.
+    /// `/api/games/{id}/…` resources, named after the `crate::games::Api` fields.
     pub api: &'static [&'static str],
 }
 
@@ -33,15 +37,56 @@ pub const SQUID: i16 = 4;
 /// Platform-wide 金豆 wallet shared by public tables and lottery games. Not a
 /// game: never listed in `ALL`, never produces game records.
 pub const BEANS: i16 = 10;
-/// Retired lottery wallet identity, retained for historical receipts.
-pub const LOTTERY: i16 = 23;
 
 /// Identities outside the registry, kept with their wire names.
-const EXTRA_NAMES: [(i16, &str); 3] = [(SQUID, "squid"), (BEANS, "beans"), (LOTTERY, "lottery")];
+const EXTRA_NAMES: [(i16, &str); 2] = [(SQUID, "squid"), (BEANS, "beans")];
+
+/// One row of the database's `public.games` (schema 0132).
+pub struct CatalogRow {
+    pub slug: &'static str,
+    pub code: Option<i16>,
+    pub kind: &'static str,
+    pub lottery: bool,
+    pub solo_play: bool,
+}
+
+/// Identities SQL knows beside the hub registry: the poker side game with its
+/// own records, tournaments (rated as their own game) and the two bean tools.
+const OFF_HUB: [(&str, Option<i16>, &str); 4] = [
+    ("squid", Some(SQUID), "side"),
+    ("tournament", None, "event"),
+    ("call-fold", None, "tool"),
+    ("lucky-draw", None, "tool"),
+];
+
+/// What `db::initialize` writes to `public.games` on every start: adding a
+/// game to the registry is all its SQL lookups need.
+pub fn catalog_rows() -> Vec<CatalogRow> {
+    GAMES
+        .iter()
+        .map(|game| CatalogRow {
+            slug: game.id,
+            code: game.record_code,
+            kind: game.kind,
+            lottery: game.lottery,
+            solo_play: crate::handlers::telemetry::SOLO_GAMES.contains(&game.id),
+        })
+        .chain(OFF_HUB.iter().map(|&(slug, code, kind)| CatalogRow {
+            slug,
+            code,
+            kind,
+            lottery: false,
+            solo_play: false,
+        }))
+        .collect()
+}
 
 /// Games that write account record rows: every registry `recordCode` plus squid.
 pub fn all() -> impl Iterator<Item = i16> {
-    GAMES.iter().filter_map(|game| game.record_code).chain([SQUID])
+    GAMES
+        .iter()
+        .filter_map(|game| game.record_code)
+        .chain([SQUID])
 }
 
 /// Wire name used by `/api/records` and the client game catalog.
@@ -50,7 +95,12 @@ pub fn name(code: i16) -> &'static str {
         .iter()
         .find(|game| game.record_code == Some(code))
         .map(|game| game.id)
-        .or_else(|| EXTRA_NAMES.iter().find(|(c, _)| *c == code).map(|(_, n)| *n))
+        .or_else(|| {
+            EXTRA_NAMES
+                .iter()
+                .find(|(c, _)| *c == code)
+                .map(|(_, n)| *n)
+        })
         .unwrap_or("unknown")
 }
 
@@ -66,76 +116,6 @@ pub fn game(id: &str) -> Option<&'static Game> {
 /// The hub lists a game under 新游戏 for this many days after `launched`.
 pub const NEW_GAME_WINDOW_DAYS: i64 = 30;
 
-const fn str_eq(a: &str, b: &str) -> bool {
-    let (a, b) = (a.as_bytes(), b.as_bytes());
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut i = 0;
-    while i < a.len() {
-        if a[i] != b[i] {
-            return false;
-        }
-        i += 1;
-    }
-    true
-}
-
-const fn contains(list: &[&str], item: &str) -> bool {
-    let mut i = 0;
-    while i < list.len() {
-        if str_eq(list[i], item) {
-            return true;
-        }
-        i += 1;
-    }
-    false
-}
-
-/// Compile-time check used by `handlers::game_api`: the games a resource
-/// dispatches are exactly the registry games that list it in `api`.
-pub const fn api_matches(resource: &str, dispatched: &[&str]) -> bool {
-    let mut i = 0;
-    while i < dispatched.len() {
-        let mut known = false;
-        let mut g = 0;
-        while g < GAMES.len() {
-            if str_eq(GAMES[g].id, dispatched[i]) {
-                known = true;
-            }
-            g += 1;
-        }
-        if !known {
-            return false;
-        }
-        i += 1;
-    }
-    let mut g = 0;
-    while g < GAMES.len() {
-        if contains(GAMES[g].api, resource) != contains(dispatched, GAMES[g].id) {
-            return false;
-        }
-        g += 1;
-    }
-    true
-}
-
-/// Every resource named in a registry `api` list has a `game_api` route.
-pub const fn api_resources_known(routes: &[&str]) -> bool {
-    let mut g = 0;
-    while g < GAMES.len() {
-        let mut r = 0;
-        while r < GAMES[g].api.len() {
-            if !contains(routes, GAMES[g].api[r]) {
-                return false;
-            }
-            r += 1;
-        }
-        g += 1;
-    }
-    true
-}
-
 /// `/ws/<id>` for a room game other than poker (poker's table socket is
 /// `/ws`). Those games serve their socket and `/api/games/<id>/rooms…` from
 /// the runtime owner. `None` for every other id.
@@ -147,5 +127,78 @@ pub fn room_socket(id: &str) -> Option<&'static str> {
             .map(|game| format!("/ws/{}", game.id))
             .collect()
     });
-    PATHS.iter().map(String::as_str).find(|path| path.strip_prefix("/ws/") == Some(id))
+    PATHS
+        .iter()
+        .map(String::as_str)
+        .find(|path| path.strip_prefix("/ws/") == Some(id))
+}
+
+/// The client latency catalog: every endpoint whose client latency is
+/// recorded, and the endpoint (or endpoint prefix) -> game ownership.
+pub struct LatencyCatalog {
+    pub endpoints: Vec<String>,
+    pub attribution: std::collections::BTreeMap<String, String>,
+}
+
+/// `client-game/src/data/latency*.json` (endpoints that are not one game's
+/// standard resources) plus the per-game entries the registry implies, exactly
+/// as the client derives them (`gameLatencyCatalog` in `gameRegistry.ts`):
+/// `/api/games/<id>/<latencyPaths[resource]>` for each `api` resource (or the
+/// row's `latency.api`), owned by the game unless `latency.attributed` is
+/// false, and `<lotteryLatencyPaths>?game=<id>` for each lottery game.
+pub fn latency_catalog() -> &'static LatencyCatalog {
+    static CATALOG: std::sync::LazyLock<LatencyCatalog> = std::sync::LazyLock::new(|| {
+        let mut endpoints: Vec<String> = serde_json::from_str(include_str!(
+            "../../client-game/src/data/latencyEndpoints.json"
+        ))
+        .expect("static latency endpoints");
+        let mut attribution: std::collections::BTreeMap<String, String> = serde_json::from_str(
+            include_str!("../../client-game/src/data/latencyGameAttribution.json"),
+        )
+        .expect("static latency game attribution");
+        let registry: serde_json::Value =
+            serde_json::from_str(include_str!("../../client-game/src/lib/gameRegistry.json"))
+                .expect("static game registry");
+        let strings = |value: &serde_json::Value| -> Vec<String> {
+            value
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let lottery_paths = strings(&registry["lotteryLatencyPaths"]);
+        for game in registry["games"].as_array().into_iter().flatten() {
+            let Some(id) = game["id"].as_str() else {
+                continue;
+            };
+            let resources = match &game["latency"]["api"] {
+                serde_json::Value::Null => strings(&game["api"]),
+                listed => strings(listed),
+            };
+            let mine: Vec<String> = resources
+                .iter()
+                .filter_map(|resource| registry["latencyPaths"][resource.as_str()].as_str())
+                .map(|path| format!("/api/games/{id}/{path}"))
+                .collect();
+            if !mine.is_empty() && game["latency"]["attributed"] != false {
+                attribution.insert(format!("/api/games/{id}"), id.to_owned());
+            }
+            endpoints.extend(mine);
+            if game["lottery"] == true {
+                for path in &lottery_paths {
+                    endpoints.push(format!("{path}?game={id}"));
+                    attribution.insert(format!("{path}?game={id}"), id.to_owned());
+                }
+            }
+        }
+        LatencyCatalog {
+            endpoints,
+            attribution,
+        }
+    });
+    &CATALOG
 }
