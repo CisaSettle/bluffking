@@ -6,7 +6,7 @@
 //! implements [`ShuffleProofProvider`](crate::crypto::ShuffleProofProvider) with
 //! a **sound** sigma-based re-encryption-shuffle argument over ristretto255,
 //! made non-interactive with a `merlin` Fiat–Shamir transcript. It ships behind
-//! the spec §3.6 interim discriminator [`SCHEME`] = `"reenc-shuffle-ristretto-v1"`
+//! the spec §3.6 interim discriminator [`SCHEME`] = `"reenc-shuffle-ristretto-v2"`
 //! (NOT the full Bayer–Groth `"bg-shuffle-ristretto-v1"` — see "What this proves"
 //! and "Honest caveats").
 //!
@@ -117,7 +117,7 @@ use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT as G;
 // safe on the prover's secret-dependent paths as well as the verifier's.
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_TABLE as GT;
 use curve25519_dalek::ristretto::CompressedRistretto;
-use curve25519_dalek::ristretto::RistrettoPoint;
+use curve25519_dalek::ristretto::{RistrettoBasepointTable, RistrettoPoint};
 use curve25519_dalek::scalar::Scalar;
 use curve25519_dalek::traits::{Identity, VartimeMultiscalarMul};
 use merlin::Transcript;
@@ -477,7 +477,16 @@ impl Shuffle {
             pi.swap(i, j);
         }
         let rho: Vec<Scalar> = (0..n).map(|_| Scalar::random(rng)).collect();
-        let output: Vec<Ct> = (0..n).map(|k| input[pi[k]].reencrypt(q, &rho[k])).collect();
+        // A table for Q costs a few variable-base mults and makes each of the
+        // n re-encryptions fixed-base; the resulting points are identical.
+        let output: Vec<Ct> = if n >= 16 {
+            let q_table = RistrettoBasepointTable::create(q);
+            (0..n)
+                .map(|k| input[pi[k]].reencrypt_with_table(&q_table, &rho[k]))
+                .collect()
+        } else {
+            (0..n).map(|k| input[pi[k]].reencrypt(q, &rho[k])).collect()
+        };
         Shuffle {
             input,
             output,

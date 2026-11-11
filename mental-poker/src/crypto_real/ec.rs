@@ -29,7 +29,7 @@ use crate::hash::ds_hash;
 // constant-time fixed-base ladder (~4x a variable-base mult), so it is safe on
 // prover/secret-dependent paths too.
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_TABLE as GT;
-use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
+use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoBasepointTable, RistrettoPoint};
 use curve25519_dalek::scalar::Scalar;
 use rand_core::RngCore;
 use serde::{Deserialize, Serialize};
@@ -260,6 +260,15 @@ impl Ct {
         }
     }
 
+    /// [`Ct::reencrypt`] with a fixed-base table for `Q`: the same points
+    /// (constant-time ladder), cheaper when one key re-encrypts a whole deck.
+    pub fn reencrypt_with_table(&self, q: &RistrettoBasepointTable, r_prime: &Scalar) -> Self {
+        Ct {
+            c1: self.c1 + r_prime * GT,
+            c2: self.c2 + r_prime * q,
+        }
+    }
+
     /// `C1.compress() ‖ C2.compress()` = 64 bytes (C1 first).
     pub fn to_bytes(&self) -> [u8; 64] {
         let mut out = [0u8; 64];
@@ -330,7 +339,12 @@ pub fn deck_hash(deck: &[Ct]) -> crate::hash::Hash {
 /// The canonical starting deck `D_0` = trivial encryption of card order
 /// `0..52` under any `Q` (the trivial encryption ignores `Q`, since `r = 0`).
 pub fn canonical_starting_deck() -> EncDeck {
-    (0..DECK_SIZE as u8)
-        .map(|id| Ct::trivial(&card_point(id)))
-        .collect()
+    // Public constants: computed once (52 fixed-base mults per hand otherwise).
+    static DECK: OnceLock<EncDeck> = OnceLock::new();
+    DECK.get_or_init(|| {
+        (0..DECK_SIZE as u8)
+            .map(|id| Ct::trivial(&card_point(id)))
+            .collect()
+    })
+    .clone()
 }

@@ -1,9 +1,9 @@
 //! Offline verification for ADR-064 commit-reveal provably-fair hands.
 //!
-//! This module is the offline counterpart of the server's `pf_dealing.rs`. It
-//! reproduces — byte-for-byte, in the same `engine` crate the server uses — the
-//! deck of any `existing_server` hand from its revealed secrets and confirms it
-//! matches the persisted cards.
+//! v1 (retired): the server now deals `pf2` (`pf-shuffle-v2`); this module only
+//! re-checks saved v1 records. It reproduces — byte-for-byte, in the same
+//! `engine` crate the server uses — the deck of a v1 hand from its revealed
+//! secrets and confirms it matches the persisted cards.
 //!
 //! Checks (must mirror the spec §3/§6 exactly):
 //!   1. `ds_hash("pf:seed-commit:v1",[server_seed]) == seed_commit`  (T2)
@@ -40,10 +40,7 @@ pub const DS_SEED_COMMIT: &str = "pf:seed-commit:v1";
 /// Domain string for the deck-seed derivation hash (LOCKED, ADR-064 §3).
 pub const DS_DECK_SEED: &str = "pf:deck-seed:v1";
 
-/// A persisted hand record. The canonical, end-to-end **verifiable** fixture
-/// source is `cargo run -p mental-poker --bin pf_demo_hand` (it deals a real
-/// engine hand and emits a record whose `server_seed`/`seed_commit`/cards all
-/// satisfy the verifier).
+/// A saved v1 hand record (`pf_demo_hand` now emits a v2 `pf2` bundle instead).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandRecord {
     /// UUID string (e.g. "01972f3a-...").

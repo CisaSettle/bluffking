@@ -8,8 +8,8 @@ use crate::proof::Reveal;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-pub const MIN_STAKE: i64 = 100;
-pub const MAX_STAKE: i64 = 100;
+pub const MIN_STAKE: i64 = 1;
+pub const MAX_STAKE: i64 = 1;
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -101,13 +101,12 @@ pub fn verify(value: &Value) -> Result<Value, String> {
     }
     match (proof.side, proof.stake, proof.won, proof.delta) {
         (Some(side), Some(stake), Some(won), Some(claimed_delta)) => {
-            // Historical practice receipts used 10..=1000. Proof verification
-            // preserves those accepted stakes; live wager admission still uses
-            // MIN_STAKE/MAX_STAKE for rooms; solo also permits an all-in wager.
+            // Rooms admit MIN_STAKE..=MAX_STAKE; solo also permits an all-in
+            // wager of the whole balance.
             let allowed = if proof.kind == "sicbo" {
                 1..=1_000_000_000_000
             } else {
-                10..=1_000
+                MIN_STAKE..=MAX_STAKE
             };
             if !allowed.contains(&stake) {
                 return Err("sicbo stake is outside the allowed range".into());

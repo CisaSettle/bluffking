@@ -4,34 +4,24 @@
 //! so the browser runs the real threshold-ElGamal / DKG / Chaum–Pedersen path
 //! locally. The server never receives plaintext cards.
 //!
-//! This first milestone proves the crypto **cross-compiles to wasm and runs with
-//! byte-parity** to the Rust KAT vectors (`mental-poker/tests/vectors/
-//! mp_phase4_ec.json`), and that the browser CSPRNG path (OsRng → getrandom js)
-//! drives a full DKG → encrypt → threshold-open roundtrip in-runtime.
+//! The browser CSPRNG path is OsRng → getrandom js.
 
 use wasm_bindgen::prelude::*;
 
-use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT as G;
-// PERF: precomputed fixed-base table for G (constant-time; `&s * GT`).
-use curve25519_dalek::constants::RISTRETTO_BASEPOINT_TABLE as GT;
 use curve25519_dalek::ristretto::RistrettoPoint;
-use curve25519_dalek::scalar::Scalar;
 use rand::rngs::OsRng;
 
-use mental_poker::crypto::{ShuffleProof, ShuffleProofProvider};
 use mental_poker::crypto_real::decrypt::{
     partial_decrypt, verify_and_open, DecryptionShare, ThresholdDecryptionProof, SCHEME,
 };
 use mental_poker::crypto_real::dkg::{
-    schnorr_prove, schnorr_sign_bound, schnorr_verify, schnorr_verify_bound, verify_dkg, DkgParty,
-    DkgRun, SchnorrPok,
+    schnorr_prove, schnorr_sign_bound, schnorr_verify, schnorr_verify_bound, DkgParty, SchnorrPok,
 };
 use mental_poker::crypto_real::ec::{
-    canonical_starting_deck, card_id_from_point, card_point, deck_hash, is_identity_pubkey,
-    pedersen_h, point_from_hex, point_to_hex, Ct, CtWire, EncDeck, DECK_SIZE,
+    deck_hash, is_identity_pubkey, point_from_hex, point_to_hex, Ct, CtWire, EncDeck, DECK_SIZE,
 };
 use mental_poker::crypto_real::ed25519_signer::Ed25519SignatureProvider;
-use mental_poker::crypto_real::shuffle::{RealShuffleProofProvider, Shuffle};
+use mental_poker::crypto_real::shuffle::Shuffle;
 use mental_poker::signing::{KeyDirectory, SignatureProvider};
 use rand::RngCore;
 use std::collections::BTreeMap;
@@ -394,12 +384,6 @@ pub fn coord_joint_key(pks_json: String) -> Result<String, String> {
     Ok(point_to_hex(&q))
 }
 
-/// Coordinator's canonical starting deck (public commitment to canonical order).
-#[wasm_bindgen]
-pub fn coord_canonical_deck() -> String {
-    serde_json::to_string(&deck_to_wires(&canonical_starting_deck())).unwrap()
-}
-
 /// Hex of `crypto_real::ec::deck_hash` over a JSON ciphertext deck (ADR-068 §2.5).
 ///
 /// This is the CANONICAL real-path deck hash the server uses as `ct_deck_hash`
@@ -418,60 +402,6 @@ pub fn coord_deck_hash(deck_json: String) -> String {
         Ok(deck) => hex::encode(deck_hash(&deck)),
         Err(e) => format!("ERR:{e}"),
     }
-}
-
-/// Coordinator verifies a shuffle proof against the pinned joint key (public-only).
-#[wasm_bindgen]
-pub fn coord_verify_shuffle(
-    party_id: String,
-    round: u32,
-    input_deck_json: String,
-    output_deck_json: String,
-    q_hex: String,
-    proof_json: String,
-) -> bool {
-    let parse = |s: &str| -> Option<EncDeck> {
-        let w: Vec<CtWire> = serde_json::from_str(s).ok()?;
-        wires_to_deck(&w).ok()
-    };
-    let (indeck, outdeck) = match (parse(&input_deck_json), parse(&output_deck_json)) {
-        (Some(a), Some(b)) => (a, b),
-        _ => return false,
-    };
-    let proof: ShuffleProof = match serde_json::from_str(&proof_json) {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-    let v = RealShuffleProofProvider::verifier_with_expected_key(q_hex);
-    v.verify_shuffle(
-        &party_id,
-        round,
-        &deck_hash(&indeck),
-        &deck_hash(&outdeck),
-        None,
-        &proof,
-    )
-}
-
-/// Coordinator's server-blindness self-check: how many cards a KEYLESS coordinator
-/// can recover from public data (attack menu). MUST be 0.
-#[wasm_bindgen]
-pub fn coord_blind_check(deck_json: String, pks_json: String) -> Result<usize, String> {
-    let wires: Vec<CtWire> = serde_json::from_str(&deck_json).map_err(|e| e.to_string())?;
-    let deck = wires_to_deck(&wires)?;
-    let pks = parse_pks(&pks_json)?;
-    let qsum: RistrettoPoint = pks.iter().map(|(_, k)| *k).sum();
-    let opens = |ct: &Ct| -> bool {
-        let mut cands = vec![ct.c2, ct.c2 - qsum, ct.c2 - ct.c1, ct.c1, -ct.c2];
-        for k in 0u64..64 {
-            let s = Scalar::from(k);
-            cands.push(ct.c2 - s * qsum);
-            cands.push(ct.c2 - s * ct.c1);
-            cands.push(ct.c2 - (&s * GT));
-        }
-        cands.iter().any(|m| card_id_from_point(m).is_some())
-    };
-    Ok(deck.iter().filter(|ct| opens(ct)).count())
 }
 
 /// Owner combines the n shares routed to it for a card it is entitled to → card id
@@ -567,78 +497,6 @@ pub fn owner_open_all(deck_json: String, pks_json: String, shares_json: String) 
     match serde_json::to_string(&ids) {
         Ok(json) => json,
         Err(e) => err(&e.to_string()),
-    }
-}
-
-/// KAT-1: the Pedersen generator H = hash_to_ristretto("mp:gen-H:v1").
-#[wasm_bindgen]
-pub fn kat_pedersen_h() -> String {
-    point_to_hex(pedersen_h())
-}
-
-/// KAT-2: all 52 card-point commitments, as a JSON array of compressed hex.
-#[wasm_bindgen]
-pub fn kat_card_points() -> String {
-    let pts: Vec<String> = (0..DECK_SIZE as u8)
-        .map(|id| format!("\"{}\"", point_to_hex(&card_point(id))))
-        .collect();
-    format!("[{}]", pts.join(","))
-}
-
-/// KAT-3: a fixed ElGamal ciphertext of card 7 under Q=12345·G, r=67890.
-#[wasm_bindgen]
-pub fn kat_fixed_ct() -> String {
-    let q = Scalar::from(12345u64) * G;
-    let r = Scalar::from(67890u64);
-    let w = Ct::encrypt_card(7, &q, &r).to_wire();
-    format!("{{\"c1\":\"{}\",\"c2\":\"{}\"}}", w.c1, w.c2)
-}
-
-/// KAT-4: deck_hash v2 of a fixed 52-card encrypted deck.
-#[wasm_bindgen]
-pub fn kat_deck_hash_v2() -> String {
-    let q = Scalar::from(12345u64) * G;
-    let deck: Vec<Ct> = (0..DECK_SIZE as u8)
-        .map(|id| Ct::encrypt_card(id, &q, &Scalar::from((id as u64) + 1)))
-        .collect();
-    hex::encode(deck_hash(&deck))
-}
-
-/// Full server-blind roundtrip driven by the browser CSPRNG (OsRng → getrandom
-/// js): DKG(n=3) → encrypt card 7 under the joint key → each party
-/// partial-decrypts with a Chaum–Pedersen proof → combine + verify → recover the
-/// card. Returns `"ok:7"` on success, `"ERR:..."` otherwise. Proves the RANDOM
-/// crypto paths (not just deterministic KATs) execute in the wasm runtime.
-#[wasm_bindgen]
-pub fn selftest_roundtrip() -> String {
-    let mut rng = OsRng;
-    let run = DkgRun::simulate(3, &mut rng);
-    match verify_dkg(&run.commitments, &run.shares) {
-        Ok(q) if q == run.joint_key => {}
-        Ok(_) => return "ERR:dkg-key-mismatch".to_string(),
-        Err(e) => return format!("ERR:dkg-verify:{e:?}"),
-    }
-    let pks: Vec<(String, RistrettoPoint)> = run
-        .parties
-        .iter()
-        .map(|p| (p.party_id.clone(), p.q_i))
-        .collect();
-
-    let card = 7u8;
-    let r = Scalar::random(&mut rng);
-    let ct = Ct::encrypt_card(card, &run.joint_key, &r);
-    let proof = ThresholdDecryptionProof {
-        scheme: SCHEME.to_string(),
-        shares: run
-            .parties
-            .iter()
-            .map(|p| partial_decrypt(p, 0, &ct, &mut rng))
-            .collect(),
-    };
-    match verify_and_open(0, &ct, &pks, &proof) {
-        Ok(id) if id == card => format!("ok:{id}"),
-        Ok(id) => format!("ERR:wrong-card:{id}"),
-        Err(e) => format!("ERR:open:{e:?}"),
     }
 }
 

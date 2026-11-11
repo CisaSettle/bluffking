@@ -64,7 +64,7 @@ pub use tool_math::{
 /// REQUIRES bumping `PREFLOP_V` (and the paired `server::coach::PROMPT_V`)
 /// whenever the data content changes, so any populated `coach_hints` cache is
 /// invalidated and stale prompt_v=2 hints over the OLD chart are never served.
-/// `server::main` asserts `PROMPT_V == PREFLOP_V` at startup — keep them in lock
+/// The server's startup config check asserts `PROMPT_V == PREFLOP_V` — keep them in lock
 /// step.
 ///
 /// v4 (2026-06-25, ADR-082): the preflop CHART DATA is unchanged — this bump is

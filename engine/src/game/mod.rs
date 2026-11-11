@@ -68,11 +68,6 @@ impl HoleSlot {
             HoleSlot::Empty | HoleSlot::Opaque => None,
         }
     }
-
-    /// True when this seat holds an opaque (value-unknown) blind handle.
-    pub fn is_opaque(self) -> bool {
-        matches!(self, HoleSlot::Opaque)
-    }
 }
 
 /// A player seat at the start of the hand.

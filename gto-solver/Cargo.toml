@@ -33,7 +33,6 @@ publish = false
 [dependencies]
 engine = { path = "../engine" }
 serde = { workspace = true }
-serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 # Open-source postflop CFR solver (b-inary/postflop-solver), AGPL-3.0-or-later.
@@ -49,6 +48,10 @@ thiserror = { workspace = true }
 # the crate building on our STABLE channel (the sole nightly gate is behind the
 # OFF-by-default `custom-alloc` feature).
 postflop-solver = { git = "https://github.com/b-inary/postflop-solver", rev = "9d1509fe5077d019825f833eed04b16d342dfda1", default-features = false, features = ["rayon"] }
+
+[dev-dependencies]
+# Only `examples/river_solve.rs` reads/writes JSON jobs.
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

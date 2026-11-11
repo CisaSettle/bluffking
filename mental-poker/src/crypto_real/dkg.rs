@@ -6,33 +6,39 @@
 //! quorum, threat T4). The coordinator holds **no** share, so
 //! it can decrypt nothing (threat T1).
 //!
-//! ## Mechanism (hand-rolled Feldman/Pedersen-committed DKG)
+//! ## Live engine-blind registration (single shot, no commit round)
 //!
-//! The spec (§2, §4.6) permits a hand-rolled Feldman DKG when the library shape
-//! fights the trait. The math here is small enough to review directly:
+//! Each real client runs its own [`DkgParty`] and registers its public share
+//! `Q_i = x_i·G` with a party-bound Schnorr proof of knowledge of `x_i` in one
+//! `mp_register_key` message. The coordinator verifies every proof and relays
+//! the full registry only after all `n` seats registered; every client re-checks
+//! each peer's proof and computes `Q = Σ Q_i` itself.
 //!
-//! 1. **Commit (DKG-1).** Each party `i` picks `x_i ← OsRng`, computes its
-//!    public share `Q_i = x_i·G`, and publishes a **Pedersen commitment**
-//!    `Cmt_i = Q_i + blind_i·H` (hides and binds `Q_i`). Commit-before-reveal is
-//!    what makes the joint key **unbiasable** (threat T10): a party cannot wait
-//!    to see others' `Q_j` and then choose `x_i` to steer `Q`, because every
-//!    contribution is locked first.
-//! 2. **Reveal (DKG-2).** After all commitments are in, each party reveals
-//!    `(Q_i, blind_i)` plus a **Schnorr proof of knowledge** of `x_i`
-//!    (rogue-key defense, threat T10 — a party cannot set `Q_i` to cancel
-//!    another's contribution without knowing the discrete log).
-//! 3. **Verify (DKG-3).** Every party checks each commitment opens to the
-//!    revealed `Q_i` (`Cmt_i == Q_i + blind_i·H`) and the Schnorr PoK holds.
-//! 4. **Joint key.** `Q = Σ Q_i`. The joint secret `x = Σ x_i` is never
-//!    assembled in one place in the real protocol — each party keeps only `x_i`.
+//! The PoK is the **rogue-key defence** (threat T10): a party cannot register
+//! `Q_i = x·G − Σ_{j≠i} Q_j` to make `Q` a key it alone controls, and cannot
+//! replay another party's proof. Decryption is n-of-n, so a card stays hidden
+//! while any one party keeps its `x_i` secret.
+//!
+//! The joint key is **not unbiasable** on this path. Without a commit round, a
+//! dishonest coordinator that sees `Q_i` values as they arrive (or a player it
+//! leaks them to) can grind a share, or abort and restart the deal, to steer the
+//! public `Q`. That bias reveals no honest share and does not allow decryption;
+//! it is a disclosed residual of the trusted-operator scope (spec §2).
+//!
+//! ## Commit-reveal primitive (not on the live wire)
+//!
+//! [`DkgParty::commitment`] / [`verify_dkg`] implement a Pedersen
+//! commit-before-reveal variant (`Cmt_i = Q_i + blind_i·H`, opened with the
+//! revealed `(Q_i, blind_i)` plus the PoK). Run in that order it locks every
+//! contribution before any is revealed; no live message carries a commitment.
+//! The joint secret `x = Σ x_i` is never assembled in one place in the real
+//! protocol — each party keeps only `x_i`.
 //!
 //! ## Status
 //!
 //! Cross-vendor AI-audited (ADR-076/077/078); open-source + verifiable. GA'd for
 //! the engine-blind table class by ADR-070; in
-//! production these run ONLY for engine-blind sessions (`resolve_mp_crypto_mode`). The
-//! increment-1 harness simulates all `n` parties locally with real `OsRng`; the
-//! interactive WS choreography is out of scope.
+//! production these run ONLY for engine-blind sessions (`resolve_mp_crypto_mode`).
 
 use crate::crypto_real::ec::{
     is_identity_pubkey, point_from_hex, point_to_hex, scalar_from_hex, scalar_to_hex,
@@ -208,7 +214,8 @@ pub fn schnorr_verify_bound(
 }
 
 // ---------------------------------------------------------------------------
-// Pedersen commitment to the public-key share (commit-before-reveal, T10)
+// Pedersen commitment to the public-key share (commit-reveal primitive; not on
+// the live engine-blind wire, see the module docs)
 // ---------------------------------------------------------------------------
 
 /// `Commit(Q_i, blind) = Q_i + blind·H`. Hiding (blind is secret until reveal)

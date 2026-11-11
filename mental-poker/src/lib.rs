@@ -3,8 +3,8 @@
 //! Pure, verifiable dealing primitives shared by the server, the browser
 //! (`mp-wasm`) and the offline verifiers:
 //!
-//! - [`pf`] — ADR-064 commit-reveal dealing for standard tables, checked
-//!   offline by the `pf_verify` binary;
+//! - [`pf`] — retired ADR-064 v1 commit-reveal records, still checked offline
+//!   by the `pf_verify` binary;
 //! - [`pf2`] / [`pf2_zjh`] / [`card_proof`] — verifiable-dealing bundles (locked
 //!   encrypted deck, shuffle proof, decryption proofs for opened cards);
 //! - [`crypto_real`] — the real cryptography (DKG, verifiable re-encryption
@@ -14,8 +14,8 @@
 //! ## Safety
 //!
 //! The real suite (`crypto_real`) is sound up to its stated bounds (the interim
-//! re-encryption-shuffle argument's soundness error is ~2⁻²⁶ at N=52, not
-//! negligible — see `crypto_real::shuffle`) and, since **ADR-070 (2026-06-23)**,
+//! re-encryption-shuffle argument's overall soundness error is ≈2⁻²⁴⁵ at N=52
+//! since BUG-125 — see `crypto_real::shuffle`) and, since **ADR-070 (2026-06-23)**,
 //! runs in production for the engine-blind table class — cross-vendor
 //! AI-audited (ADR-076/077/078), open-source + verifiable. The runtime
 //! engine-blind coordinator selects real crypto via `resolve_mp_crypto_mode`

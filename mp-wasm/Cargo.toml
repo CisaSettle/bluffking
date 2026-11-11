@@ -5,7 +5,7 @@ edition = "2021"
 # Explicit metadata (U17/U53, dual-AI OSS review): detached crate, cannot inherit
 # from the workspace root.
 license = "AGPL-3.0-only"
-description = "PROTOTYPE wasm-bindgen wrapper over mental_poker::crypto_real for in-browser DKG / shuffle / threshold decryption."
+description = "wasm-bindgen wrapper over mental_poker::crypto_real for in-browser DKG / shuffle / threshold decryption and proof verification."
 repository = "https://github.com/CisaSettle/bluffking"
 publish = false
 

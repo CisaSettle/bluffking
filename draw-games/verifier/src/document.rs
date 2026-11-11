@@ -42,12 +42,8 @@ fn match_receipt(proof: &Value, receipt: &Value) -> Result<(), String> {
                 .as_array()
                 .ok_or("Missing saved selections")?;
             if terms["all_in"].as_bool() == Some(true) {
-                // ALL-IN exists since the v2 minute protocol; v3 only rescales prizes.
-                let protocol = proof["plan"]["protocol"].as_str();
-                if !matches!(
-                    protocol,
-                    Some(crate::lottery::PROTOCOL | crate::lottery::V2_PROTOCOL)
-                ) || terms["multiplier"].as_i64() != Some(1)
+                if proof["plan"]["protocol"].as_str() != Some(crate::lottery::PROTOCOL)
+                    || terms["multiplier"].as_i64() != Some(1)
                 {
                     return Err("Invalid ALL-IN receipt mode or protocol".into());
                 }
@@ -61,7 +57,8 @@ fn match_receipt(proof: &Value, receipt: &Value) -> Result<(), String> {
                     .as_i64()
                     .filter(|balance| *balance >= game.unit())
                     .ok_or("Missing or invalid ALL-IN balance")?;
-                let copies = balance / game.unit();
+                // A balance above the cap buys the capped number of stakes.
+                let copies = (balance / game.unit()).min(crate::lottery::MAX_ALL_IN_STAKES);
                 let groups = selections.len() as i64;
                 if groups != copies.min(crate::lottery::MAX_ALL_IN_GROUPS as i64) || groups == 0 {
                     return Err("Invalid ALL-IN selection count".into());
@@ -75,7 +72,7 @@ fn match_receipt(proof: &Value, receipt: &Value) -> Result<(), String> {
                 }
                 let base = copies / groups;
                 let remainder = copies % groups;
-                if base + i64::from(remainder > 0) > crate::lottery::MAX_ALL_IN_MULTIPLIER {
+                if base + i64::from(remainder > 0) > crate::lottery::MAX_MULTIPLIER {
                     return Err("ALL-IN receipt exceeds ticket capacity".into());
                 }
                 let matches = selections.iter().enumerate().any(|(index, selection)| {
@@ -116,12 +113,11 @@ fn match_receipt(proof: &Value, receipt: &Value) -> Result<(), String> {
             if terms["all_in"].as_bool() == Some(true) {
                 let balance = terms["expected_balance"]
                     .as_i64()
-                    .filter(|balance| *balance >= 100)
+                    .filter(|balance| *balance >= crate::scratch::COST)
                     .ok_or("Missing or invalid scratch ALL-IN balance")?;
                 let count = terms["count"].as_u64().ok_or("Missing scratch count")?;
-                if terms["cost"].as_i64() != Some(100)
-                    || count != (balance / 100) as u64
-                    || !(1..=crate::scratch::MAX_BATCH_CARDS as u64).contains(&count)
+                if terms["cost"].as_i64() != Some(crate::scratch::COST)
+                    || count != crate::scratch::all_in_count(balance) as u64
                 {
                     return Err("Scratch ALL-IN count differs from saved balance".into());
                 }

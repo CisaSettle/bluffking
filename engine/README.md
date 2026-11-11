@@ -3,7 +3,7 @@
 Pure-logic Texas Hold'em rules engine. No IO, no async, no DB. Given a player list, a dealer position, and an RNG, plays a complete hand and returns a `HandResult`.
 
 <!-- U46 (dual-AI OSS review): self-contained wording — no private-repo paths/ADR links. -->
-This crate is the source of truth for poker rules in BluffKing. It drives the game server (one session task per table owns a `GameHand`), the deterministic replay viewer, and the post-hand coach — the same ruleset for live play, tests, and replay.
+This crate is the source of truth for poker rules in BluffKing. It drives the game server (one session task per table owns a `GameHand`), the deterministic replay viewer, and the post-hand coach — the same ruleset for live play and replay.
 
 ## Design constraints
 
@@ -16,7 +16,7 @@ This crate is the source of truth for poker rules in BluffKing. It drives the ga
 
 | File | What it owns |
 |---|---|
-| `game.rs` | Hand orchestration — `GameHand`, `HandResult`, blind positions |
+| `game/` | Hand orchestration — `GameHand`, `HandResult`, blind positions, side pots |
 | `hand.rs` | `BoardCards`, `HoleCards`, `Street` |
 | `round.rs` | Betting rounds + side-pot computation |
 | `action.rs` | `PlayerAction` enum, `ActionRecord`, action validation |
@@ -24,6 +24,7 @@ This crate is the source of truth for poker rules in BluffKing. It drives the ga
 | `rng.rs` | Seedable ChaCha20 CSPRNG (`PokerRng`) |
 | `deck.rs` | Deck + shuffle |
 | `event.rs` | `EngineEvent` stream for downstream persistence |
+| `solver/` | Local spot advisor, equity, preflop charts and preflop DCFR |
 
 ## Verification
 

@@ -50,17 +50,21 @@ fn decode_key(value: &str) -> Result<[u8; 32], String> {
         .ok_or_else(|| "sealed game key must be 32 bytes encoded as hex".into())
 }
 
-pub(super) fn configure_external_authority() -> Result<(), String> {
-    // Remote workers must pin the matching public key at boot. The old
-    // token-only configuration fails closed; a request cannot register a key.
+/// Remote workers must pin the matching public key at boot. The token-only
+/// configuration fails closed; a request cannot register a key.
+pub(super) fn external_authority_from_env() -> Result<GameAuthority, String> {
     let seed = std::env::var("SEALED_DEALER_GAME_SIGNING_KEY")
         .map_err(|_| "SEALED_DEALER_GAME_SIGNING_KEY is required with SEALED_DEALER_URL")?;
     let authority = GameAuthority::from_seed(&decode_key(&seed)?);
     if authority.public_key() != worker_verifying_key()? {
         return Err("sealed dealer game signing and verifying keys do not match".into());
     }
+    Ok(authority)
+}
+
+pub(super) fn configure_external_authority() -> Result<(), String> {
     AUTHORITY
-        .set(authority)
+        .set(external_authority_from_env()?)
         .map_err(|_| "sealed game authority already initialized".to_string())
 }
 
