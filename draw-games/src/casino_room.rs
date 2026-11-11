@@ -8,7 +8,7 @@
 //! transaction, in order, retrying until it lands. A points room (百家乐)
 //! keeps every player's stack inside its snapshot: nothing outside the room
 //! holds points. A bean room's seated wallets are the in-memory projection
-//! ([`crate::wallet::activate`]). Baccarat's memory lifecycle uses
+//! ([`crate::bean_ledger::activate`]). Baccarat's memory lifecycle uses
 //! the shared checkpoint membership epochs and ordered departure receipts.
 //! Other dealer games keep durable membership admission, including solo 押大小
 //! whose bean wallet is shared with non-table financial operations. The host table-owner lock (`crate::runtime_owner`)
@@ -45,11 +45,11 @@ use uuid::Uuid;
 
 use crate::app_state::AppState;
 use crate::auth::middleware::AuthUser;
+use crate::bean_ledger;
 use crate::game_hub::handlers::csrf;
 use crate::game_hub::spectators::{self, Spectators};
 use crate::game_hub::RoomError;
 use crate::room_clock::{IdleWatch, RoomClock};
-use crate::wallet;
 use crate::write_behind::Ordered;
 
 #[derive(Debug)]
@@ -78,7 +78,7 @@ pub trait DealerRoom: Send + Sync + Sized + 'static {
     const MAX_MEMBERS: usize;
     /// The stack every player starts with in a points room, whose points live
     /// only in the room snapshot ([`DealerRoom::stack`]). `None`: a gold-bean
-    /// room, which stakes from the bean wallet ([`crate::beans::POLICY`]).
+    /// room, which stakes from the bean wallet ([`crate::beans`]).
     const POINTS_STACK: Option<i64> = None;
     /// A committed draw must be durable before accepting a wager, and the
     /// accepted wager must be durable before its HTTP acknowledgement.
@@ -437,7 +437,7 @@ fn beans<R: DealerRoom>() -> bool {
 }
 
 fn memory_lifecycle<R: DealerRoom>() -> bool {
-    !beans::<R>() && crate::realtime_mode::enabled()
+    !beans::<R>()
 }
 
 fn checkpoint_value<R: DealerRoom>(state: &R::State, names: &BTreeMap<Uuid, String>) -> Value {
@@ -516,7 +516,7 @@ fn writer<R: DealerRoom>(
                             };
                             let bettors = snapshot.round.iter().flat_map(|round| R::deltas(round));
                             for user in snapshot.users.iter().copied().chain(bettors.map(|b| b.0)) {
-                                wallet::quarantine_user(crate::game_catalog::BEANS, user);
+                                bean_ledger::quarantine_user(crate::game_catalog::BEANS, user);
                             }
                             fenced
                         })?;
@@ -663,10 +663,10 @@ fn accept<R: DealerRoom>(
         // A points room's settled stacks are already in `next`.
         if let Some(round) = round {
             for (uid, delta) in R::deltas(&round) {
-                wallet::project_bean_settlement(uid, delta, true, delta > 0);
+                bean_ledger::project_bean_settlement(uid, delta, true, delta > 0);
             }
             for (uid, bonus) in R::bonus_credits(&round) {
-                wallet::project_external_credit(crate::game_catalog::BEANS, uid, bonus);
+                bean_ledger::project_external_credit(crate::game_catalog::BEANS, uid, bonus);
             }
         }
     } else {
@@ -789,7 +789,7 @@ fn settle_unwatched<R: DealerRoom>(code: &str, room: &mut Room<R>, now: i64) -> 
 /// the projected bean wallet in a bean room.
 fn balance<R: DealerRoom>(room: &Room<R>, uid: Uuid) -> i64 {
     if beans::<R>() {
-        wallet::projected(crate::game_catalog::BEANS, uid).map_or(0, |w| w.balance)
+        bean_ledger::projected(crate::game_catalog::BEANS, uid).map_or(0, |w| w.balance)
     } else {
         R::stack(&room.state, uid)
     }
@@ -885,76 +885,9 @@ fn watch_refusal<R: DealerRoom>(
 }
 
 /// `uid` now holds a seat here: their spectator sockets end with
-/// `already_seated` (those tabs reopen as the player), and every watcher is
-/// checked against the new player's block list off the room lock. Spectator
-/// delivery is held from now (before the new seat is ever broadcast) until
-/// that answer: a blocked watcher never sees a frame with the new player.
-fn took_seat<R: DealerRoom>(
-    pool: &PgPool,
-    code: &str,
-    shared: &Shared<R>,
-    room: &mut Room<R>,
-    uid: Uuid,
-) {
+/// `already_seated`, so those tabs reopen as the player.
+fn took_seat<R: DealerRoom>(room: &mut Room<R>, uid: Uuid) {
     if room.spectators.seated(uid) {
-        announce_spectators(room);
-    }
-    let watchers = room.spectators.users();
-    if watchers.is_empty() {
-        return;
-    }
-    room.spectators.hold();
-    let (pool, code, shared) = (pool.clone(), code.to_owned(), shared.clone());
-    tokio::spawn(async move {
-        let blocked: Vec<Uuid> = if memory_lifecycle::<R>() {
-            watchers
-                .into_iter()
-                .filter(|watcher| {
-                    !matches!(
-                        crate::player_directory::spectator_allowed(&pool, *watcher, &[uid]),
-                        Ok(true)
-                    )
-                })
-                .collect()
-        } else {
-            match sqlx::query_scalar(
-                "SELECT w.id FROM users w LEFT JOIN users p ON p.id = $1 \
-             WHERE w.id = ANY($2) \
-               AND ($1 = ANY(COALESCE(w.blocked_users, ARRAY[]::uuid[])) \
-                    OR w.id = ANY(COALESCE(p.blocked_users, ARRAY[]::uuid[])))",
-            )
-            .bind(uid)
-            .bind(&watchers)
-            .fetch_all(&pool)
-            .await
-            {
-                Ok(rows) => rows,
-                // Fail closed: an unreadable block list ends every watcher's view.
-                Err(error) => {
-                    tracing::warn!("[{}] spectator block check failed: {error}", R::DEALER);
-                    watchers
-                }
-            }
-        };
-        let mut room = shared.lock().await;
-        block_answer(&code, &mut room, &blocked);
-    });
-}
-
-/// The block lookup answered: refuse the blocked watchers, end the hold and,
-/// once nothing holds delivery, resync everyone left with the current frame.
-fn block_answer<R: DealerRoom>(code: &str, room: &mut Room<R>, blocked: &[Uuid]) {
-    let refused = room
-        .spectators
-        .refuse(blocked, RoomError::BlockedBySeatedPlayer);
-    if !room.spectators.release() {
-        return;
-    }
-    if !room.spectators.is_empty() {
-        let frame = spectator_view(code, room, room.spectators.count()).to_string();
-        room.spectators.send(&frame);
-    }
-    if refused {
         announce_spectators(room);
     }
 }
@@ -1005,7 +938,7 @@ async fn lock_wallet(
     conn: &mut PgConnection,
     game: i16,
     uid: Uuid,
-) -> sqlx::Result<Option<wallet::Wallet>> {
+) -> sqlx::Result<Option<bean_ledger::Wallet>> {
     let row = sqlx::query(
         "SELECT balance, hands_played, hands_won, net_won, refills FROM wallets \
          WHERE user_id=$1 AND game=$2 FOR UPDATE",
@@ -1014,7 +947,7 @@ async fn lock_wallet(
     .bind(game)
     .fetch_optional(conn.writer())
     .await?;
-    Ok(row.map(|r| wallet::Wallet {
+    Ok(row.map(|r| bean_ledger::Wallet {
         balance: r.get("balance"),
         hands_played: r.get("hands_played"),
         hands_won: r.get("hands_won"),
@@ -1029,7 +962,7 @@ async fn admission_wallet<R: DealerRoom>(
     pool: &PgPool,
     tx: &mut PgConnection,
     uid: Uuid,
-) -> std::result::Result<Option<wallet::Wallet>, Commit<Option<wallet::Wallet>>> {
+) -> std::result::Result<Option<bean_ledger::Wallet>, Commit<Option<bean_ledger::Wallet>>> {
     if !beans::<R>() {
         return Ok(None);
     }
@@ -1051,12 +984,12 @@ async fn admission_wallet<R: DealerRoom>(
 /// The seat of an admission whose commit is known to have landed: a bean
 /// room's wallet from committed storage (`None` if unreadable, so the sweep
 /// finishes it), nothing to load for a points room.
-async fn committed_seat<R: DealerRoom>(pool: &PgPool, uid: Uuid) -> Option<Option<wallet::Wallet>> {
+async fn committed_seat<R: DealerRoom>(
+    pool: &PgPool,
+    uid: Uuid,
+) -> Option<Option<bean_ledger::Wallet>> {
     if beans::<R>() {
-        wallet::ensure(pool, crate::beans::POLICY, uid)
-            .await
-            .ok()
-            .map(Some)
+        bean_ledger::ensure(pool, uid).await.ok().map(Some)
     } else {
         Some(None)
     }
@@ -1275,21 +1208,16 @@ async fn join_room_memory<R: DealerRoom>(
     // Settle an already-due round before adding a member; admission itself
     // carries no wager and cannot change a previous bettor's receipt.
     tick(code, &mut room, now_ms())?;
-    // Hold before the membership snapshot broadcasts: blocked spectators must
-    // never see this new player's first frame while their check is pending.
-    room.spectators.hold();
     room.members.insert(uid, Member::new(name, false));
     let next = room.state.as_ref().clone();
     if let Err(error) = accept(code, &mut room, next, None) {
         room.members.remove(&uid);
-        block_answer(code, &mut room, &[]);
         return Err(error);
     }
     admission.accepted = true;
     admission.owner.accepted();
     room.idle.activity();
-    took_seat(pool, code, &shared, &mut room, uid);
-    block_answer(code, &mut room, &[]);
+    took_seat(&mut room, uid);
     push(code, &mut room);
     Ok(())
 }
@@ -1367,7 +1295,7 @@ async fn open_room_now<R: DealerRoom>(
     let mut state = R::new_state(now, bots);
     let _beans_mutation = beans::<R>().then(|| crate::beans_read_memory::mutation(pool, [uid]));
     if beans::<R>() {
-        wallet::ensure(pool, crate::beans::POLICY, uid).await?;
+        bean_ledger::ensure(pool, uid).await?;
     }
     R::set_allow_spectators(&mut state, allow_spectators);
     // Rounds deal from the start, so the session clock does too.
@@ -1429,7 +1357,7 @@ async fn open_room_now<R: DealerRoom>(
     // Without a known seat it stays reserved; the sweep finishes it.
     let joining = seat.is_none();
     if let Some(Some(w)) = seat {
-        wallet::activate(crate::game_catalog::BEANS, uid, &code, w);
+        bean_ledger::activate(crate::game_catalog::BEANS, uid, &code, w);
     }
     let mut members = BTreeMap::new();
     members.insert(uid, Member::new(name, joining));
@@ -1505,7 +1433,7 @@ async fn join_room_now<R: DealerRoom>(
     let shared = registry.room(code).ok_or(Error::Code("room_not_found"))?;
     let _beans_mutation = beans::<R>().then(|| crate::beans_read_memory::mutation(pool, [uid]));
     if beans::<R>() {
-        wallet::ensure(pool, crate::beans::POLICY, uid).await?;
+        bean_ledger::ensure(pool, uid).await?;
     }
     if holds::<R>(uid, code) {
         // Seated already, or a join whose outcome is still unknown.
@@ -1572,13 +1500,13 @@ async fn join_room_now<R: DealerRoom>(
     match outcome {
         Ok(Some(wallet)) => {
             if let Some(w) = wallet {
-                wallet::activate(crate::game_catalog::BEANS, uid, code, w);
+                bean_ledger::activate(crate::game_catalog::BEANS, uid, code, w);
             }
             if let Some(m) = room.members.get_mut(&uid) {
                 m.joining = false;
             }
             room.idle.activity();
-            took_seat(pool, code, &shared, &mut room, uid);
+            took_seat(&mut room, uid);
             Ok(())
         }
         // Committed or unknown without a known seat: it stays reserved and
@@ -1651,7 +1579,7 @@ pub async fn place_bet<R: DealerRoom>(
         // projection: daily grants may arrive while a player stays seated.
         let _beans_mutation = crate::beans_read_memory::mutation(pool, [uid]);
         let mut tx = pool.begin().await?;
-        let current = wallet::lock(&mut tx, crate::game_catalog::BEANS, uid)
+        let current = bean_ledger::lock(&mut tx, crate::game_catalog::BEANS, uid)
             .await?
             .ok_or(Error::Code("storage_unavailable"))?;
         let available = crate::beans::available_on(pool, &mut tx, uid, current, Some(code)).await?;
@@ -1664,7 +1592,7 @@ pub async fn place_bet<R: DealerRoom>(
                 return Err(Error::Code("request_conflict"));
             }
         }
-        wallet::project_session_balance(crate::game_catalog::BEANS, uid, current);
+        bean_ledger::project_session_balance(crate::game_catalog::BEANS, uid, current);
         let changed = R::bet(&mut next, uid, bet, available, now_ms())?;
         if changed {
             // Publish the wager as a memory reservation before the wallet row
@@ -1811,7 +1739,7 @@ async fn leave_room_now<R: DealerRoom>(pool: &PgPool, uid: Uuid, code: &str) -> 
         empty_and_closed(pool, &code, &mut room)
     };
     if beans::<R>() {
-        wallet::retire(crate::game_catalog::BEANS, uid, &code);
+        bean_ledger::retire(crate::game_catalog::BEANS, uid, &code);
     }
     release_seat::<R>(uid, &code);
     if empty {
@@ -1864,9 +1792,9 @@ async fn unsubscribe<R: DealerRoom>(code: &str, id: u64) {
     }
 }
 
-/// Admits a spectator socket: registered, not blocked by or blocking any
-/// member (two-sided), the room open and spectatable, the viewer not seated
-/// here, within the per-room and per-person caps. Refusals are error frames.
+/// Admits a spectator socket: registered, the room open and spectatable, the
+/// viewer not seated here, within the per-room and per-person caps. Refusals
+/// are error frames.
 /// Admission touches no membership, wallet, presence or idle clock.
 async fn watch<R: DealerRoom>(
     pool: &PgPool,
@@ -1879,42 +1807,27 @@ async fn watch<R: DealerRoom>(
     let shared = R::registry()
         .room(code)
         .ok_or_else(|| refused(RoomError::RoomNotFound))?;
-    let mut roster: Vec<Uuid> = {
-        let room = shared.lock().await;
-        watch_refusal::<R>(&room, uid, now_ms()).map_err(refused)?;
-        room.members.keys().copied().collect()
-    };
-    // The block lookup runs off the room lock; a member who sat down during
-    // it is looked up again before admitting.
-    for _ in 0..3 {
-        match crate::game_hub::handlers::spectator_admission(pool, uid, &roster).await {
-            Ok(None) => {}
-            Ok(Some(code)) => return Err(json!({"t":"error","code":code}).to_string()),
-            Err(error) => {
-                tracing::error!("[{}] spectator admission lookup failed: {error}", R::DEALER);
-                return Err(refused(RoomError::StorageUnavailable));
-            }
+    watch_refusal::<R>(&*shared.lock().await, uid, now_ms()).map_err(refused)?;
+    match crate::game_hub::handlers::spectator_admission(pool, uid).await {
+        Ok(None) => {}
+        Ok(Some(code)) => return Err(json!({"t":"error","code":code}).to_string()),
+        Err(error) => {
+            tracing::error!("[{}] spectator admission lookup failed: {error}", R::DEALER);
+            return Err(refused(RoomError::StorageUnavailable));
         }
-        let mut room = shared.lock().await;
-        watch_refusal::<R>(&room, uid, now_ms()).map_err(refused)?;
-        let now: Vec<Uuid> = room.members.keys().copied().collect();
-        if now.iter().any(|m| !roster.contains(m)) {
-            roster = now;
-            continue;
-        }
-        let watching =
-            room.spectators.count() + usize::from(!room.spectators.users().contains(&uid));
-        let frame = spectator_view(code, &room, watching).to_string();
-        let count = json!({"t": "spectators", "n": watching}).to_string();
-        room.spectators
-            .admit(uid, id, out, count, frame)
-            .map_err(refused)?;
-        announce_spectators(&mut room);
-        // Bot wagers now show to someone as they are placed.
-        wake::<R>();
-        return Ok(());
     }
-    Err(refused(RoomError::StorageUnavailable))
+    let mut room = shared.lock().await;
+    watch_refusal::<R>(&room, uid, now_ms()).map_err(refused)?;
+    let watching = room.spectators.count() + usize::from(!room.spectators.users().contains(&uid));
+    let frame = spectator_view(code, &room, watching).to_string();
+    let count = json!({"t": "spectators", "n": watching}).to_string();
+    room.spectators
+        .admit(uid, id, out, count, frame)
+        .map_err(refused)?;
+    announce_spectators(&mut room);
+    // Bot wagers now show to someone as they are placed.
+    wake::<R>();
+    Ok(())
 }
 
 /// A spectator socket ended.
@@ -2690,12 +2603,17 @@ fn add_chips<R: DealerRoom>(
     accept(code, room, next, None)
 }
 
+/// A registered dealer-room game (`crate::games::Family::Dealer`).
+fn dealer_game(game: &str) -> bool {
+    crate::games::find(game).is_some_and(|entry| entry.family == crate::games::Family::Dealer)
+}
+
 pub(crate) async fn release_snapshot(
     pool: &PgPool,
     game: &str,
     code: &str,
 ) -> sqlx::Result<(i64, Value)> {
-    if !matches!(game, "baccarat" | "sicbo") {
+    if !dealer_game(game) {
         return Err(sqlx::Error::RowNotFound);
     }
     sqlx::query_as("SELECT revision,state FROM game_room_checkpoints WHERE code=$1 AND game=$2")
@@ -2709,7 +2627,7 @@ pub(crate) async fn release_members(
     game: &str,
     code: &str,
 ) -> sqlx::Result<Vec<Uuid>> {
-    if !matches!(game, "baccarat" | "sicbo") {
+    if !dealer_game(game) {
         return Err(sqlx::Error::RowNotFound);
     }
     sqlx::query_scalar("SELECT user_id FROM game_room_checkpoint_members WHERE code=$1 AND game=$2")

@@ -20,39 +20,24 @@ pub struct ScratchBuy {
     pub all_in: bool,
     #[serde(default)]
     pub expected_balance: Option<i64>,
-    /// Reward table the client saved in its pre-purchase receipt. Absent
-    /// (clients built before version 2) means version 1, whose Max bucket
-    /// now settles as the same top bean prize; see `scratch::Reward`.
-    #[serde(default)]
-    pub reward_version: Option<u8>,
+    /// Reward table the client saved in its pre-purchase receipt; must be
+    /// [`scratch::REWARD_VERSION`].
+    pub reward_version: u8,
 }
 
 impl ScratchBuy {
-    pub fn reward_version(&self) -> Result<u8, Error> {
-        match self.reward_version {
-            None => Ok(1),
-            Some(v) if (1..=scratch::REWARD_VERSION).contains(&v) => Ok(v),
-            Some(_) => Err(Error::InvalidEntry),
-        }
-    }
-    /// Idempotency identity. A declared reward version is part of it; an
-    /// absent one keeps the pre-version-2 hash so retries still replay.
+    /// Idempotency identity of the purchase.
     pub fn identity(&self) -> Value {
         let mut identity = json!({"game":"scratch", "cost":self.cost, "count":self.count,
+            "reward_version":self.reward_version,
             "fairness": {"offer_id":self.fairness.offer_id,"commitment":self.fairness.commitment,"client_seed":self.fairness.client_seed}});
         if self.all_in {
             identity["all_in"] = json!(true);
             identity["expected_balance"] = json!(self.expected_balance);
         }
-        if let Some(version) = self.reward_version {
-            identity["reward_version"] = json!(version);
-        }
         identity
     }
 }
-
-/// Matches every card stored with a service reward table (versions 1 and 2).
-pub const REWARD_VERSION_SQL: &str = "entry->'reward_version' IN ('1'::jsonb,'2'::jsonb)";
 
 pub fn project(out: &mut Value, ticket: &TicketRow) {
     let revealed = ticket.revealed.clone().unwrap_or_else(|| vec![false; 6]);
@@ -96,15 +81,9 @@ pub fn project(out: &mut Value, ticket: &TicketRow) {
     } else {
         Value::Null
     };
-    // Beans actually credited for the reward (a stored version-1 Max reward
-    // settles as beans), plus the legacy Max grant of cards settled before.
+    // Beans actually credited for the reward.
     out["reward_beans"] = if all && ticket.settled_at.is_some() {
         ticket.entry["reward_beans"].clone()
-    } else {
-        Value::Null
-    };
-    out["reward_grant"] = if all && ticket.settled_at.is_some() {
-        ticket.entry["reward_grant"].clone()
     } else {
         Value::Null
     };
@@ -118,13 +97,12 @@ pub fn project(out: &mut Value, ticket: &TicketRow) {
 }
 
 pub async fn my_cards(conn: &mut PgConnection, user: Uuid) -> sqlx::Result<Vec<TicketRow>> {
-    let rows = sqlx::query(&format!("SELECT {TICKET_COLUMNS} FROM lottery_tickets WHERE game='scratch' AND period=0 AND user_id=$1 AND cost=100 AND {REWARD_VERSION_SQL} AND settled_at IS NULL UNION SELECT {TICKET_COLUMNS} FROM lottery_tickets WHERE purchase_id=(SELECT purchase_id FROM lottery_tickets WHERE game='scratch' AND user_id=$1 AND cost=100 AND {REWARD_VERSION_SQL} ORDER BY bought_at DESC,id DESC LIMIT 1) ORDER BY bought_at DESC,id LIMIT 1051"))
+    let rows = sqlx::query(&format!("SELECT {TICKET_COLUMNS} FROM lottery_tickets WHERE game='scratch' AND period=0 AND user_id=$1 AND settled_at IS NULL UNION SELECT {TICKET_COLUMNS} FROM lottery_tickets WHERE purchase_id=(SELECT purchase_id FROM lottery_tickets WHERE game='scratch' AND user_id=$1 ORDER BY bought_at DESC,id DESC LIMIT 1) ORDER BY bought_at DESC,id LIMIT 1051"))
         .bind(user).fetch_all(conn).await?;
     Ok(rows.iter().map(TicketRow::from_row).collect())
 }
 
-/// Beans credited for a card's stored service reward. A version-1 Max reward
-/// is no longer granted: it pays the top bean prize that replaced it.
+/// Beans credited for a card's stored service reward.
 pub(super) fn reward_beans(card: &TicketRow) -> Result<i64, Error> {
     let reward: Option<scratch::Reward> =
         serde_json::from_value(card.entry["reward"].clone()).map_err(|_| Error::InvalidEntry)?;
@@ -190,7 +168,7 @@ pub(super) async fn notify_winners(
             "game": "scratch", "period": 0, "ticket_id": first.id,
             "purchase_id": first.purchase_id,
             "prize": prize, "bonus_beans": bonus, "credited_beans": credited,
-            "ticket_count": cards.len(), "winning_tickets": winning_tickets, "membership": Value::Null,
+            "ticket_count": cards.len(), "winning_tickets": winning_tickets,
         },
         "i18n": {"zh": {"title": zh_title, "body": zh_body}, "en": {"title": en_title, "body": en_body}},
     }))

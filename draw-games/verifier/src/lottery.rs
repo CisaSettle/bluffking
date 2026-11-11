@@ -8,11 +8,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 pub const MAX_STAKES: i64 = 100;
-pub const MAX_MULTIPLIER: i64 = 10;
-/// Current ALL-IN compresses repeated basic stakes into bounded smallint rows.
-pub const MAX_ALL_IN_MULTIPLIER: i64 = i16::MAX as i64;
+/// Highest ticket multiplier (倍投), as in real lotteries. Only ALL-IN uses
+/// more than 1: it compresses repeated basic stakes into multiplied rows.
+pub const MAX_MULTIPLIER: i64 = 99;
 /// ALL-IN keeps its existing receipt grouping independently of manual purchases.
 pub const MAX_ALL_IN_GROUPS: usize = 10;
+/// Most basic stakes one ALL-IN buys; a larger balance buys this many.
+pub const MAX_ALL_IN_STAKES: i64 = MAX_ALL_IN_GROUPS as i64 * MAX_MULTIPLIER;
 pub const MAX_TICKETS_PER_PURCHASE: usize = 100;
 pub const MAX_TICKETS_PER_PERIOD: i64 = 100;
 pub const MAX_STAKES_PER_PERIOD: i64 = 1_000;
@@ -25,61 +27,61 @@ pub const TOTO_MAX: u8 = 49;
 pub const HAPPY8_MAX: u8 = 80;
 pub const HAPPY8_DRAW: usize = 20;
 
-/// Base beans per winning 注 by prize group. These are the v1/v2 tables, which
-/// were sized for the old 10-bean 注; v3 plans multiply every base prize by
-/// [`prize_scale`] so that the 100-bean 注 keeps the original return rate.
-pub const SSQ_PRIZE: [i64; 7] = [0, 10_000_000, 1_000_000, 15_000, 1_000, 50, 25];
+/// Beans per winning 注 (stake included) by prize group, at [`Game::unit`]
+/// beans per 注 (SSQ/DLT 2, TOTO 1).
+pub const SSQ_PRIZE: [i64; 7] = [0, 2_000_000, 200_000, 3_000, 200, 10, 5];
 /// Seven prize tiers under the 2026 DLT matching rules, in practice beans.
-pub const DLT_PRIZE: [i64; 8] = [0, 10_000_000, 1_000_000, 25_000, 1_500, 750, 75, 25];
-pub const TOTO_PRIZE: [i64; 8] = [0, 10_000_000, 1_000_000, 10_000, 3_000, 500, 250, 100];
+pub const DLT_PRIZE: [i64; 8] = [0, 2_000_000, 200_000, 5_000, 300, 150, 15, 5];
+pub const TOTO_PRIZE: [i64; 8] = [0, 1_000_000, 100_000, 1_000, 300, 50, 25, 10];
+/// 福彩3D at 2 beans per 注: 520×, 173× and 86.5× the stake (return ~52%).
 pub const FC3D_STRAIGHT: i64 = 1_040;
 pub const FC3D_GROUP3: i64 = 346;
 pub const FC3D_GROUP6: i64 = 173;
 /// A jackpot ticket also earns this many times one top-tier stake prize.
 pub const JACKPOT_BONUS_FACTOR: i64 = 5;
 
-/// Happy8 base beans per 注 (stake included) by picks × hits; see [`prize_scale`].
+/// Happy8 beans per 2-bean 注 (stake included) by picks × hits.
 pub fn happy8_prize(picks: usize, hits: usize) -> i64 {
     match (picks, hits) {
-        (1, 1) => 9,
-        (2, 2) => 38,
-        (3, 2) => 6,
-        (3, 3) => 104,
-        (4, 2) => 6,
-        (4, 3) => 10,
-        (4, 4) => 186,
-        (5, 3) => 6,
-        (5, 4) => 40,
-        (5, 5) => 2_000,
-        (6, 3) => 6,
-        (6, 4) => 20,
-        (6, 5) => 60,
-        (6, 6) => 5_760,
-        (7, 0) => 4,
-        (7, 4) => 8,
-        (7, 5) => 60,
-        (7, 6) => 600,
-        (7, 7) => 17_000,
-        (8, 0) => 4,
-        (8, 4) => 6,
-        (8, 5) => 20,
-        (8, 6) => 160,
-        (8, 7) => 1_600,
-        (8, 8) => 100_000,
-        (9, 0) => 4,
-        (9, 4) => 6,
-        (9, 5) => 10,
-        (9, 6) => 44,
-        (9, 7) => 450,
-        (9, 8) => 4_000,
-        (9, 9) => 500_000,
-        (10, 0) => 4,
-        (10, 5) => 6,
-        (10, 6) => 10,
-        (10, 7) => 160,
-        (10, 8) => 1_440,
-        (10, 9) => 16_000,
-        (10, 10) => 10_000_000,
+        (1, 1) => 5,
+        (2, 2) => 19,
+        (3, 2) => 3,
+        (3, 3) => 52,
+        (4, 2) => 3,
+        (4, 3) => 5,
+        (4, 4) => 93,
+        (5, 3) => 3,
+        (5, 4) => 20,
+        (5, 5) => 1_000,
+        (6, 3) => 3,
+        (6, 4) => 10,
+        (6, 5) => 30,
+        (6, 6) => 2_880,
+        (7, 0) => 2,
+        (7, 4) => 4,
+        (7, 5) => 30,
+        (7, 6) => 300,
+        (7, 7) => 8_500,
+        (8, 0) => 2,
+        (8, 4) => 3,
+        (8, 5) => 10,
+        (8, 6) => 80,
+        (8, 7) => 800,
+        (8, 8) => 50_000,
+        (9, 0) => 2,
+        (9, 4) => 3,
+        (9, 5) => 5,
+        (9, 6) => 22,
+        (9, 7) => 225,
+        (9, 8) => 2_000,
+        (9, 9) => 250_000,
+        (10, 0) => 2,
+        (10, 5) => 3,
+        (10, 6) => 5,
+        (10, 7) => 80,
+        (10, 8) => 720,
+        (10, 9) => 8_000,
+        (10, 10) => 5_000_000,
         _ => 0,
     }
 }
@@ -246,29 +248,24 @@ impl Entry {
     }
 
     /// Whether a settled result hit this game's jackpot: one award per
-    /// winning ticket, regardless of its stake count. Tickets settled before
-    /// the jackpot bonus carried a Max 30-day membership grant instead.
+    /// winning ticket, regardless of its stake count. Only the pooled-style
+    /// draws (SSQ/DLT/TOTO first prize) have one; Happy8 and 福彩3D pay
+    /// their fixed table only.
     pub fn awards_jackpot(&self, prize: i64, tier: i16) -> bool {
         prize > 0
             && match self {
                 Entry::Ssq { .. } | Entry::Dlt { .. } | Entry::Toto { .. } => tier == 1,
-                Entry::Happy8 { numbers } => numbers.len() == 10 && tier == 10,
-                Entry::Straight(_) => tier == 1,
-                Entry::Group3(_) | Entry::Group6(_) => false,
+                Entry::Happy8 { .. } | Entry::Straight(_) | Entry::Group3(_) | Entry::Group6(_) => {
+                    false
+                }
             }
     }
 
     /// Extra beans for a jackpot ticket: [`JACKPOT_BONUS_FACTOR`] × ONE
-    /// top-tier stake prize at this ticket's multiplier under `protocol`
-    /// (never a multiple of a compound ticket's whole payout). `Some(0)` when
-    /// the result is not a jackpot; `None` on overflow or an unknown protocol.
-    pub fn jackpot_bonus(
-        &self,
-        protocol: &str,
-        multiplier: i64,
-        prize: i64,
-        tier: i16,
-    ) -> Option<i64> {
+    /// top-tier stake prize at this ticket's multiplier (never a multiple of a
+    /// compound ticket's whole payout). `Some(0)` when the result is not a
+    /// jackpot; `None` on overflow.
+    pub fn jackpot_bonus(&self, multiplier: i64, prize: i64, tier: i16) -> Option<i64> {
         if !self.awards_jackpot(prize, tier) {
             return Some(0);
         }
@@ -276,28 +273,25 @@ impl Entry {
             Entry::Ssq { .. } => SSQ_PRIZE[1],
             Entry::Dlt { .. } => DLT_PRIZE[1],
             Entry::Toto { .. } => TOTO_PRIZE[1],
-            Entry::Happy8 { .. } => happy8_prize(10, 10),
-            Entry::Straight(_) => FC3D_STRAIGHT,
-            Entry::Group3(_) | Entry::Group6(_) => return Some(0),
+            Entry::Happy8 { .. } | Entry::Straight(_) | Entry::Group3(_) | Entry::Group6(_) => {
+                return Some(0)
+            }
         };
-        top.checked_mul(prize_scale(self.game(), protocol)?)?
-            .checked_mul(multiplier)?
+        top.checked_mul(multiplier)?
             .checked_mul(JACKPOT_BONUS_FACTOR)
     }
 
-    /// Prize in beans and tier for `multiplier` × this ticket against a draw
-    /// planned under `protocol` (see [`prize_scale`]). `None` when the stored
-    /// draw does not fit the game (never for rows the draw loop wrote) or the
-    /// protocol is unknown.
+    /// Prize in beans and tier for `multiplier` × this ticket. `None` when
+    /// the stored draw does not fit the game (never for rows the draw loop
+    /// wrote) or the multiplier is out of range.
     pub fn prize(
         &self,
-        protocol: &str,
         multiplier: i64,
         numbers: &[i16],
         bonus: Option<i16>,
         bonus_numbers: &[i16],
     ) -> Option<(i64, i16)> {
-        if !(1..=MAX_ALL_IN_MULTIPLIER).contains(&multiplier) {
+        if !(1..=MAX_MULTIPLIER).contains(&multiplier) {
             return None;
         }
         let (per_multiplier, tier) = match self {
@@ -458,21 +452,7 @@ impl Entry {
                 (prize, i16::from(won))
             }
         };
-        let scale = prize_scale(self.game(), protocol)?;
-        Some((
-            per_multiplier.checked_mul(scale)?.checked_mul(multiplier)?,
-            tier,
-        ))
-    }
-
-    fn game(&self) -> Game {
-        match self {
-            Entry::Ssq { .. } => Game::Ssq,
-            Entry::Dlt { .. } => Game::Dlt,
-            Entry::Toto { .. } => Game::Toto,
-            Entry::Happy8 { .. } => Game::Happy8,
-            Entry::Straight(_) | Entry::Group3(_) | Entry::Group6(_) => Game::Fucai3d,
-        }
+        Some((per_multiplier.checked_mul(multiplier)?, tier))
     }
 }
 
@@ -601,42 +581,20 @@ impl Game {
             Game::Scratch => "scratch",
         }
     }
-    /// Chips per 注 (scratch: the current service card).
+    /// Beans per 注 (scratch: per card): the smallest price at which every
+    /// prize tier is a whole number of beans.
     pub fn unit(self) -> i64 {
-        100
+        match self {
+            Game::Ssq | Game::Dlt | Game::Happy8 | Game::Fucai3d => 2,
+            Game::Toto => 1,
+            Game::Scratch => crate::scratch::COST,
+        }
     }
     /// All current number lotteries share the minute boundary.
     pub fn schedule(self) -> Option<Schedule> {
         (self != Game::Scratch).then_some(Schedule {
             interval_ms: 60_000,
             offset_ms: 0,
-        })
-    }
-
-    /// Only persisted v1 draws/receipts and historical labels use this schedule.
-    pub fn legacy_schedule(self) -> Option<Schedule> {
-        Some(match self {
-            Game::Ssq => Schedule {
-                interval_ms: 300_000,
-                offset_ms: 0,
-            },
-            Game::Dlt => Schedule {
-                interval_ms: 300_000,
-                offset_ms: 75_000,
-            },
-            Game::Toto => Schedule {
-                interval_ms: 300_000,
-                offset_ms: 150_000,
-            },
-            Game::Happy8 => Schedule {
-                interval_ms: 120_000,
-                offset_ms: 0,
-            },
-            Game::Fucai3d => Schedule {
-                interval_ms: 180_000,
-                offset_ms: 0,
-            },
-            Game::Scratch => return None,
         })
     }
 }
@@ -703,28 +661,8 @@ pub fn sgt() -> FixedOffset {
     FixedOffset::east_opt(SGT_OFFSET_SECS).expect("Singapore UTC offset is valid")
 }
 
-/// v3 = the v2 minute schedule with prize tables scaled to the 100-bean 注.
-pub const PROTOCOL: &str = "bluffking-lottery-drand-v3-minute";
-/// Minute draws with the unscaled base tables (2026-10-25 until v3).
-pub const V2_PROTOCOL: &str = "bluffking-lottery-drand-v2-minute";
-pub const LEGACY_PROTOCOL: &str = "bluffking-lottery-drand-v1";
-
-/// Multiplier applied to every base prize table entry under `protocol`.
-/// v1/v2 plans keep their original tables so saved receipts still verify.
-/// v3 restores the return rate the base tables had at the old 注 price:
-/// SSQ/DLT/TOTO 10 → 100 beans (×10), Happy8 4 → 100 (×25), Fucai3D 2 → 100 (×50).
-pub fn prize_scale(game: Game, protocol: &str) -> Option<i64> {
-    match protocol {
-        PROTOCOL => Some(match game {
-            Game::Ssq | Game::Dlt | Game::Toto => 10,
-            Game::Happy8 => 25,
-            Game::Fucai3d => 50,
-            Game::Scratch => 1,
-        }),
-        V2_PROTOCOL | LEGACY_PROTOCOL => Some(1),
-        _ => None,
-    }
-}
+/// v4 = the minute schedule with the 1-bean-scale prize tables above.
+pub const PROTOCOL: &str = "bluffking-lottery-drand-v4-minute";
 
 /// All choice points are derived from the game and wall-clock period. The
 /// commitment binds the protocol version, sales deadline and exact future pulse.
@@ -743,20 +681,7 @@ pub struct Plan {
 
 impl Plan {
     pub fn new(game: Game, period: i64) -> Result<Self, String> {
-        Self::with_protocol(game, period, PROTOCOL)
-    }
-
-    fn schedule_for(game: Game, protocol: &str) -> Result<Schedule, String> {
-        match protocol {
-            PROTOCOL | V2_PROTOCOL => game.schedule(),
-            LEGACY_PROTOCOL => game.legacy_schedule(),
-            _ => return Err("unsupported lottery protocol".into()),
-        }
-        .ok_or_else(|| "not a scheduled lottery".into())
-    }
-
-    pub fn with_protocol(game: Game, period: i64, protocol: &str) -> Result<Self, String> {
-        let schedule = Self::schedule_for(game, protocol)?;
+        let schedule = game.schedule().ok_or("not a scheduled lottery")?;
         let draw_at_ms = period
             .checked_add(1)
             .and_then(|n| n.checked_mul(schedule.interval_ms))
@@ -765,7 +690,7 @@ impl Plan {
         let closes_at_ms = draw_at_ms.checked_sub(CLOSE_MS).ok_or("period overflow")?;
         let beacon_round = crate::beacon::round_at_or_after(draw_at_ms)?;
         let commitment = hex::encode(sha256_fields(&[
-            protocol.as_bytes(),
+            PROTOCOL.as_bytes(),
             game.as_str().as_bytes(),
             &period.to_be_bytes(),
             &draw_at_ms.to_be_bytes(),
@@ -774,7 +699,7 @@ impl Plan {
             &beacon_round.to_be_bytes(),
         ]));
         Ok(Self {
-            protocol: protocol.into(),
+            protocol: PROTOCOL.into(),
             game: game.as_str().into(),
             period,
             draw_at_ms,
@@ -787,7 +712,10 @@ impl Plan {
 
     pub fn validate(&self) -> Result<Game, String> {
         let game = Game::parse(&self.game).ok_or("unknown lottery game")?;
-        if *self != Self::with_protocol(game, self.period, &self.protocol)? {
+        if self.protocol != PROTOCOL {
+            return Err("unsupported lottery protocol".into());
+        }
+        if *self != Self::new(game, self.period)? {
             return Err("plan does not match the fixed public schedule and protocol".into());
         }
         Ok(game)
@@ -797,13 +725,20 @@ impl Plan {
     pub fn sales_opens_at_ms(&self) -> Result<i64, String> {
         let game = self.validate()?;
         self.draw_at_ms
-            .checked_sub(Self::schedule_for(game, &self.protocol)?.interval_ms)
+            .checked_sub(
+                game.schedule()
+                    .ok_or("not a scheduled lottery")?
+                    .interval_ms,
+            )
             .ok_or_else(|| "sales window overflow".into())
     }
 
     pub fn label(&self) -> Result<String, String> {
         let game = self.validate()?;
-        Ok(Self::schedule_for(game, &self.protocol)?.label(self.draw_at_ms))
+        Ok(game
+            .schedule()
+            .ok_or("not a scheduled lottery")?
+            .label(self.draw_at_ms))
     }
 }
 
@@ -929,14 +864,9 @@ pub fn verify(value: &Value) -> Result<Value, String> {
         if entry.to_value() != ticket["entry"] {
             return Err("ticket entry is not normalized".into());
         }
-        let max_multiplier = if plan.protocol == LEGACY_PROTOCOL {
-            MAX_MULTIPLIER
-        } else {
-            MAX_ALL_IN_MULTIPLIER
-        };
         let multiplier = ticket["multiplier"]
             .as_i64()
-            .filter(|m| (1..=max_multiplier).contains(m))
+            .filter(|m| (1..=MAX_MULTIPLIER).contains(m))
             .ok_or("invalid ticket multiplier")?;
         let cost = entry
             .stakes()
@@ -950,7 +880,6 @@ pub fn verify(value: &Value) -> Result<Value, String> {
         }
         let (prize, tier) = entry
             .prize(
-                &plan.protocol,
                 multiplier,
                 &proof.numbers,
                 proof.bonus,
@@ -969,46 +898,21 @@ pub fn verify(value: &Value) -> Result<Value, String> {
         if !settled && (!ticket["prize"].is_null() || !ticket["tier"].is_null()) {
             return Err("unsettled ticket claims a credited prize".into());
         }
-        let jackpot = entry.awards_jackpot(prize, tier);
+        let jackpot = settled && entry.awards_jackpot(prize, tier);
         let expected_bonus = entry
-            .jackpot_bonus(&plan.protocol, multiplier, prize, tier)
+            .jackpot_bonus(multiplier, prize, tier)
             .ok_or("jackpot bonus overflow")?;
-        let grant = &ticket["reward_grant"];
         let bonus = &ticket["jackpot_bonus"];
-        // A settled jackpot carries exactly one award: the bean bonus, or the
-        // Max 30-day grant that tickets settled before the bonus received.
-        let legacy_max = settled && jackpot && !grant.is_null() && bonus.is_null();
-        if legacy_max {
-            let start = grant["starts_at_ms"]
-                .as_i64()
-                .ok_or("missing Max reward start")?;
-            let end = grant["ends_at_ms"]
-                .as_i64()
-                .ok_or("missing Max reward end")?;
-            if start <= 0
-                || start.checked_add(30 * 86_400_000) != Some(end)
-                || grant["entitlement_id"].as_str().is_none_or(str::is_empty)
-            {
-                return Err("invalid Max 30-day reward grant".into());
-            }
-        } else if !grant.is_null() {
-            return Err("ticket claims an unearned membership reward".into());
-        } else if settled && jackpot {
+        if jackpot {
             if bonus.as_i64() != Some(expected_bonus) {
                 return Err("jackpot bonus mismatch".into());
             }
         } else if !bonus.is_null() {
             return Err("ticket claims an unearned jackpot bonus".into());
         }
-        let credited_bonus = if settled && jackpot && !legacy_max {
-            expected_bonus
-        } else {
-            0
-        };
+        let credited_bonus = if jackpot { expected_bonus } else { 0 };
         receipt_result = json!({ "stakes": entry.stakes(), "cost": cost, "prize": prize, "tier": tier,
-            "jackpot_bonus": credited_bonus,
-            "max_membership_days": if legacy_max { 30 } else { 0 },
-            "reward_grant": grant, "settled": settled, "credited_prize_checked": settled });
+            "jackpot_bonus": credited_bonus, "settled": settled, "credited_prize_checked": settled });
     }
     Ok(
         json!({ "kind": "lottery", "valid": true, "game": game.as_str(), "period": proof.plan.period,

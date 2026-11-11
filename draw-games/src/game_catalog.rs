@@ -21,6 +21,9 @@ pub struct Game {
     pub lottery: bool,
     /// Its rooms can be published to a club's room list.
     pub club_rooms: bool,
+    /// A sign-up invited from one of its live rooms credits the room host
+    /// (`handlers::registration_referral`).
+    pub room_referral: bool,
     /// A room game that also has a no-table route reporting `solo_game_play`.
     pub solo_play: bool,
     /// Singapore release day of a recently shipped game.
@@ -112,9 +115,6 @@ pub fn from_name(name: &str) -> Option<i16> {
 pub fn game(id: &str) -> Option<&'static Game> {
     GAMES.iter().find(|game| game.id == id)
 }
-
-/// The hub lists a game under 新游戏 for this many days after `launched`.
-pub const NEW_GAME_WINDOW_DAYS: i64 = 30;
 
 /// `/ws/<id>` for a room game other than poker (poker's table socket is
 /// `/ws`). Those games serve their socket and `/api/games/<id>/rooms…` from

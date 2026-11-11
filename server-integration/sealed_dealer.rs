@@ -336,6 +336,8 @@ struct SealedHand {
     /// The street a run-twice runout diverged at, once revealed. Fixed after
     /// the first reveal so a retry returns the same cards.
     second_run_from: Option<engine::Street>,
+    /// Last create or mutating call, for [`HAND_IDLE_TTL`].
+    touched: std::time::Instant,
 }
 
 impl SealedHand {
@@ -436,6 +438,7 @@ impl SealedHand {
                 stage: DealerStage::Preflop,
                 showdown_seats: None,
                 second_run_from: None,
+                touched: std::time::Instant::now(),
             },
             response_tickets,
         ))
@@ -524,11 +527,75 @@ struct PendingCommit {
 /// or crashed between the two phases).
 const COMMIT_TTL: Duration = Duration::from_secs(120);
 
+/// Hands with no create or mutating call for this long are dropped (the game
+/// server voided or crashed without deleting them). Far above the longest gap
+/// between two calls in a live hand: one betting decision with every time-bank
+/// extension.
+const HAND_IDLE_TTL: Duration = Duration::from_secs(60 * 60);
+
+/// Live hands plus a ticket index, so a hole-socket ticket resolves without
+/// scanning every hand. Both maps change only through these methods.
+#[derive(Default)]
+struct HandTable {
+    hands: HashMap<Uuid, SealedHand>,
+    tickets: HashMap<String, Uuid>,
+}
+
+impl HandTable {
+    fn get(&self, hand_id: &Uuid) -> Option<&SealedHand> {
+        self.hands.get(hand_id)
+    }
+
+    fn contains_key(&self, hand_id: &Uuid) -> bool {
+        self.hands.contains_key(hand_id)
+    }
+
+    /// Mutable access counts as activity for [`HAND_IDLE_TTL`].
+    fn get_mut(&mut self, hand_id: &Uuid) -> Option<&mut SealedHand> {
+        let hand = self.hands.get_mut(hand_id)?;
+        hand.touched = std::time::Instant::now();
+        Some(hand)
+    }
+
+    fn by_ticket(&self, ticket: &str) -> Option<(Uuid, &SealedHand)> {
+        let hand_id = *self.tickets.get(ticket)?;
+        Some((hand_id, self.hands.get(&hand_id)?))
+    }
+
+    fn insert(&mut self, hand_id: Uuid, hand: SealedHand) {
+        self.remove(&hand_id);
+        for ticket in hand.tickets.keys() {
+            self.tickets.insert(ticket.clone(), hand_id);
+        }
+        self.hands.insert(hand_id, hand);
+    }
+
+    fn remove(&mut self, hand_id: &Uuid) {
+        if let Some(hand) = self.hands.remove(hand_id) {
+            for ticket in hand.tickets.keys() {
+                self.tickets.remove(ticket);
+            }
+        }
+    }
+
+    fn drop_idle(&mut self, now: std::time::Instant) {
+        let idle: Vec<Uuid> = self
+            .hands
+            .iter()
+            .filter(|(_, hand)| now.duration_since(hand.touched) >= HAND_IDLE_TTL)
+            .map(|(hand_id, _)| *hand_id)
+            .collect();
+        for hand_id in idle {
+            self.remove(&hand_id);
+        }
+    }
+}
+
 #[derive(Clone)]
 struct WorkerState {
     game_verifier: Arc<mental_poker::crypto_real::Ed25519SignatureProvider>,
     internal_token: Arc<str>,
-    hands: Arc<RwLock<HashMap<Uuid, SealedHand>>>,
+    hands: Arc<RwLock<HandTable>>,
     commits: Arc<RwLock<HashMap<Uuid, PendingCommit>>>,
     hole_connections: Arc<Semaphore>,
 }
@@ -574,6 +641,7 @@ async fn create_hand(
     // must recover the original deal, never replace it or fail with hand_exists.
     // Keep lookup and insertion atomic, including concurrent retries.
     let mut hands = state.hands.write().await;
+    hands.drop_idle(std::time::Instant::now());
     if let Some(existing) = hands.get(&request.hand_id) {
         if existing.seats != seats
             || existing.bot_seats != bot_seats
@@ -899,11 +967,11 @@ async fn deliver_holes(
         let lookup_started = std::time::Instant::now();
         let delivery = {
             let hands = state.hands.read().await;
-            hands.iter().find_map(|(hand_id, hand)| {
+            hands.by_ticket(&auth.ticket).and_then(|(hand_id, hand)| {
                 let seat = *hand.tickets.get(&auth.ticket)?;
                 let cards = hand.hole_cards(seat)?;
                 Some(HoleDelivery {
-                    hand_id: *hand_id,
+                    hand_id,
                     seat,
                     cards,
                     commitment: hand.commitment.clone(),
@@ -1070,7 +1138,7 @@ pub async fn run_worker(
     let state = WorkerState {
         game_verifier: Arc::new(authorization::verifier(&verifying_key)?),
         internal_token: Arc::from(internal_token),
-        hands: Arc::new(RwLock::new(HashMap::new())),
+        hands: Arc::new(RwLock::new(HandTable::default())),
         commits: Arc::new(RwLock::new(HashMap::new())),
         hole_connections: Arc::new(Semaphore::new(MAX_HOLE_CONNECTIONS)),
     };
@@ -1396,6 +1464,31 @@ pub fn public_ws_endpoint() -> Result<&'static str, &'static str> {
         .ok_or("sealed dealer public websocket is not configured")
 }
 
+fn external_internal_token() -> Result<String, String> {
+    std::env::var("SEALED_DEALER_INTERNAL_TOKEN")
+        .map_err(|_| "SEALED_DEALER_INTERNAL_TOKEN is required with SEALED_DEALER_URL".to_string())
+}
+
+fn local_worker_addr() -> Result<SocketAddr, String> {
+    std::env::var("SEALED_DEALER_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1:3012".to_string())
+        .parse()
+        .map_err(|e| format!("invalid SEALED_DEALER_ADDR: {e}"))
+}
+
+/// The environment-only part of [`configure_or_launch`]: the same parsers,
+/// without installing an authority, spawning the worker or opening sockets.
+/// The release preflight runs it before the predecessor is drained.
+pub fn validate_config() -> Result<(), String> {
+    if std::env::var("SEALED_DEALER_URL").is_ok() {
+        authorization::external_authority_from_env()?;
+        external_internal_token()?;
+    } else {
+        local_worker_addr()?;
+    }
+    Ok(())
+}
+
 /// Configure an externally managed dealer, or launch the default sibling
 /// process on loopback. The returned child guard must live as long as the main
 /// server; dropping it kills only the worker launched by this process.
@@ -1405,10 +1498,9 @@ pub async fn configure_or_launch() -> Result<Option<tokio::process::Child>, Stri
 
     if let Ok(base_url) = std::env::var("SEALED_DEALER_URL") {
         authorization::configure_external_authority()?;
-        let token = std::env::var("SEALED_DEALER_INTERNAL_TOKEN")
-            .map_err(|_| "SEALED_DEALER_INTERNAL_TOKEN is required with SEALED_DEALER_URL")?;
+        let internal_auth = external_internal_token()?;
         CLIENT
-            .set(SealedDealerClient::new(base_url, token))
+            .set(SealedDealerClient::new(base_url, internal_auth))
             .map_err(|_| "sealed dealer configured twice")?;
         PUBLIC_WS_ENDPOINT
             .set(Arc::from(public_endpoint))
@@ -1416,10 +1508,7 @@ pub async fn configure_or_launch() -> Result<Option<tokio::process::Child>, Stri
         return Ok(None);
     }
 
-    let addr: SocketAddr = std::env::var("SEALED_DEALER_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:3012".to_string())
-        .parse()
-        .map_err(|e| format!("invalid SEALED_DEALER_ADDR: {e}"))?;
+    let addr = local_worker_addr()?;
     let mut raw_token = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut raw_token);
     let worker_credential = URL_SAFE_NO_PAD.encode(raw_token);
@@ -1518,48 +1607,14 @@ pub struct ActiveHand {
 
 impl ActiveHand {
     pub async fn create(
-        session_id: Uuid,
         hand_id: Uuid,
         hand: &engine::GameHand,
         bots: &std::collections::HashSet<u8>,
         users: &HashMap<Uuid, u8>,
         commit: Option<SeedCommitInput>,
     ) -> Result<Self, String> {
-        let test_seed = {
-            let _ = session_id;
-            None
-        };
-        Self::create_with(
-            hand_id,
-            hand,
-            bots,
-            users,
-            client()?.clone(),
-            public_ws_endpoint()?.to_string(),
-            test_seed,
-            commit,
-        )
-        .await
-    }
-
-    /// Phase one: obtain the dealer's seed commitment for `hand_id`.
-    pub async fn commit(hand_id: Uuid) -> Result<[u8; 32], String> {
-        client()?.commit_hand(hand_id).await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn create_with(
-        hand_id: Uuid,
-        hand: &engine::GameHand,
-        bots: &std::collections::HashSet<u8>,
-        users: &HashMap<Uuid, u8>,
-        client: SealedDealerClient,
-        endpoint: String,
-        _test_seed: Option<u64>,
-        commit: Option<SeedCommitInput>,
-    ) -> Result<Self, String> {
-        let pinned = false;
-        let commit = commit.filter(|_| !pinned);
+        let client = client()?.clone();
+        let endpoint = public_ws_endpoint()?.to_string();
         let client_seeds = commit
             .as_ref()
             .map(|c| c.client_seeds.clone())
@@ -1602,6 +1657,11 @@ impl ActiveHand {
             client,
             sent_connections: Default::default(),
         })
+    }
+
+    /// Phase one: obtain the dealer's seed commitment for `hand_id`.
+    pub async fn commit(hand_id: Uuid) -> Result<[u8; 32], String> {
+        client()?.commit_hand(hand_id).await
     }
 
     pub async fn sync_tickets(
@@ -1671,8 +1731,10 @@ impl ActiveHand {
         Ok(())
     }
 
-    /// Settle the hand. Also returns the verified dealing secrets of the
-    /// committed hand (`None` for a pinned test deck).
+    /// Settle the hand and release the dealer's copy once it has settled (an
+    /// earlier failure leaves deletion to the caller's void path). Also returns
+    /// the verified dealing secrets of the committed hand (`None` for a pinned
+    /// test deck).
     pub async fn finish(
         &self,
         hand: &mut engine::GameHand,
@@ -1716,9 +1778,19 @@ impl ActiveHand {
                 .find(|s| s.player_id == pid)
                 .map(|s| s.seat)
         })?;
-        let pf = match &self.commit {
-            Some(commit) => {
-                let mut pf = verified_reveal(self.hand_id, commit.seed_commit, &deck).await?;
+        // The dealer's copy is done once it has settled: release it while the
+        // commitment is re-derived locally instead of after it, one round trip sooner.
+        let verify = async {
+            match &self.commit {
+                Some(commit) => verified_reveal(self.hand_id, commit.seed_commit, &deck)
+                    .await
+                    .map(Some),
+                None => Ok(None),
+            }
+        };
+        let (verified, ()) = tokio::join!(verify, self.delete());
+        let pf = match (verified?, &self.commit) {
+            (Some(mut pf), Some(commit)) => {
                 if pf.client_seeds != commit.client_seeds {
                     return Err("sealed dealer mixed different player seeds".into());
                 }
@@ -1726,7 +1798,7 @@ impl ActiveHand {
                 pf.withheld_seats = commit.withheld_seats.clone();
                 Some(pf)
             }
-            None => None,
+            _ => None,
         };
         result.deck_seed = deck.seed;
         for seat in hand.seats() {
@@ -1787,8 +1859,4 @@ pub fn completed_holes(result: &engine::game::HandResult) -> HashMap<u64, [engin
             .map(|s| (s.player_id.inner(), s.hole_cards.as_array())),
     );
     holes
-}
-
-pub fn next_deck_is_pinned(_session_id: Uuid) -> bool {
-    false
 }

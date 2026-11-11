@@ -3,7 +3,7 @@
 //! statement is an index lookup or a bounded index range. Purchases, draws
 //! and settlements are accepted and written by [`super::runtime`] only.
 use super::handlers::Error;
-use super::{Game, Period, POLICY};
+use super::{Game, Period};
 use crate::db_writer::{PgConnection, PgPool};
 use chrono::{DateTime, Utc};
 use draw_games::lottery::Plan;
@@ -57,23 +57,13 @@ impl TicketRow {
     }
 }
 
-/// Existing period IDs used each game's old interval. Never reinterpret them
-/// through today's minute schedule: the immutable plan identifies its version.
+/// The label of a ticket's period, from the plan it was sold under.
 fn period_label(game: Game, period: i64, stored: Option<&Value>) -> Option<String> {
-    if let Some(stored) = stored {
-        let plan: Plan = serde_json::from_value(stored.clone()).ok()?;
-        if plan.game != game.as_str() || plan.period != period {
-            return None;
-        }
-        return plan.label().ok();
+    let plan: Plan = serde_json::from_value(stored?.clone()).ok()?;
+    if plan.game != game.as_str() || plan.period != period {
+        return None;
     }
-    // Every current period is created with a plan; plan-less rows predate it.
-    let schedule = game.legacy_schedule()?;
-    let draw_ms = period
-        .checked_add(1)?
-        .checked_mul(schedule.interval_ms)?
-        .checked_add(schedule.offset_ms)?;
-    Some(schedule.label(draw_ms))
+    plan.label().ok()
 }
 
 /// The contract's `Ticket` (scratch numbers projected by `revealed`).
@@ -88,12 +78,9 @@ pub fn ticket_json(game: Game, t: &TicketRow) -> Value {
     if game == Game::Scratch {
         super::scratch::project(&mut out, t);
     } else {
-        // Max grants are legacy (pre-bonus) jackpot rewards; new ones are beans.
-        out["reward_grant"] = t.entry["reward_grant"].clone();
         out["jackpot_bonus"] = t.entry["jackpot_bonus"].clone();
         // Public entries remain the normalized selected numbers used by proofs.
         if let Some(entry) = out["entry"].as_object_mut() {
-            entry.remove("reward_grant");
             entry.remove("jackpot_bonus");
         }
         out["proof_plan"] = json!(t.proof_plan);
@@ -219,7 +206,7 @@ async fn replay_stored(
     }
     let ids: Vec<Uuid> = serde_json::from_value(details["ticket_ids"].clone()).unwrap_or_default();
     let rows = sqlx::query(&format!(
-        "SELECT {TICKET_COLUMNS} FROM lottery_tickets WHERE purchase_id=$1 AND (game<>'scratch' OR (cost=100 AND entry->'reward_version' IN ('1'::jsonb,'2'::jsonb)))"
+        "SELECT {TICKET_COLUMNS} FROM lottery_tickets WHERE purchase_id=$1"
     ))
     .bind(record_id)
     .fetch_all(conn)
@@ -267,7 +254,7 @@ pub(super) async fn replay_request_and_wallet(
                  WHERE game = $1 AND record_id = ANY($2) AND user_id=$3 \
                  ORDER BY array_position($2, record_id) LIMIT 1) l ON TRUE",
     )
-    .bind(POLICY.game)
+    .bind(crate::game_catalog::BEANS)
     .bind(&ids[..])
     .bind(user)
     .bind(crate::game_catalog::BEANS)
@@ -359,7 +346,7 @@ struct FeedScan {
 const FEED_SQL: &str = "SELECT t.purchase_id, t.user_id, t.bought_at, t.stakes, t.multiplier, t.prize, t.tier, t.settled_at, \
         u.id IS NOT NULL AS user_found, u.display_name \
    FROM (SELECT purchase_id, user_id, bought_at, stakes, multiplier, prize, tier, settled_at FROM lottery_tickets \
-          WHERE game=$1 AND (game<>'scratch' OR (cost=100 AND entry->'reward_version' IN ('1'::jsonb,'2'::jsonb))) \
+          WHERE game=$1 \
           ORDER BY bought_at DESC LIMIT $2) t \
    LEFT JOIN users u ON u.id = t.user_id \
   ORDER BY t.bought_at DESC";
@@ -496,8 +483,8 @@ impl TicketFilter {
         match self {
             Self::All => "TRUE",
             Self::Pending => "t.settled_at IS NULL",
-            Self::Won => "t.settled_at IS NOT NULL AND (COALESCE(t.prize,0)>0 OR (t.game='scratch' AND t.entry->'reward'->>'kind' IN ('beans','membership')) OR (t.entry->'reward_grant' IS NOT NULL AND t.entry->'reward_grant'<>'null'::jsonb))",
-            Self::Lost => "t.settled_at IS NOT NULL AND NOT (COALESCE(t.prize,0)>0 OR (t.game='scratch' AND COALESCE(t.entry->'reward'->>'kind','') IN ('beans','membership')) OR (t.entry->'reward_grant' IS NOT NULL AND t.entry->'reward_grant'<>'null'::jsonb))",
+            Self::Won => "t.settled_at IS NOT NULL AND (COALESCE(t.prize,0)>0 OR (t.game='scratch' AND t.entry->'reward'->>'kind'='beans'))",
+            Self::Lost => "t.settled_at IS NOT NULL AND NOT (COALESCE(t.prize,0)>0 OR (t.game='scratch' AND COALESCE(t.entry->'reward'->>'kind','')='beans'))",
         }
     }
 }
@@ -516,7 +503,7 @@ pub async fn tickets(
         "SELECT t.{} , p.numbers AS result_numbers, p.bonus AS result_bonus, p.bonus_numbers AS result_bonus_numbers, p.draw_proof AS result_proof \
          FROM lottery_tickets t LEFT JOIN lottery_periods p \
            ON p.game = t.game AND p.period = t.period AND p.status <> 'open' \
-         WHERE t.user_id=$1 AND t.game=$2 AND (t.game<>'scratch' OR (t.cost=100 AND t.entry->'reward_version' IN ('1'::jsonb,'2'::jsonb))) AND ({}) ORDER BY t.bought_at DESC, t.id LIMIT $3 OFFSET $4",
+         WHERE t.user_id=$1 AND t.game=$2 AND ({}) ORDER BY t.bought_at DESC, t.id LIMIT $3 OFFSET $4",
         TICKET_COLUMNS.replace(", ", ", t."),
         filter.predicate()
     ))

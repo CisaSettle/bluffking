@@ -10,7 +10,7 @@
 //!   `Debug + Clone` and usually `PartialEq`; stateful handles such as
 //!   [`GameHand`] and [`rng::PokerRng`] intentionally derive none of these.
 //!   (U44, dual-AI OSS review: the old "all public types" claim was false.)
-//! - `cargo test -p engine` runs without a live DB.
+//! - `cargo build -p engine` needs no live DB.
 
 // Rust review standard (L2): pure-logic crate — forbid `unsafe` outright so any
 // future `unsafe` is a hard compile error, not a review judgement call.

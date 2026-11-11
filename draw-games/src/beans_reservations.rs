@@ -9,6 +9,42 @@ pub(super) struct Reservations {
     poker: HashMap<(Uuid, Uuid, DateTime<Utc>), (u64, i64)>,
     sicbo: HashMap<String, (u64, HashMap<Uuid, i64>)>,
     sicbo_locks: HashMap<(String, Uuid), std::fs::File>,
+    /// Each room's checkpoint seats as [`reserved`] reads them, parsed once
+    /// per checkpoint revision. A room's checkpoint only ever advances to a
+    /// higher revision (directory overlay and the guarded durable write), so
+    /// one revision always names the same seats. Read under the bean mutex.
+    seats: std::cell::RefCell<HashMap<Uuid, CheckpointSeats>>,
+}
+
+/// Bound on cached rooms; past it the cache restarts empty.
+const MAX_CACHED_CHECKPOINTS: usize = 16_384;
+
+/// Occupied seats of one runtime checkpoint: `(user, joined_at)` to the seat's
+/// stack plus pending chips (the first seat in seat order when repeated).
+struct CheckpointSeats {
+    revision: u64,
+    seats: HashMap<(Uuid, DateTime<Utc>), i64>,
+}
+
+impl CheckpointSeats {
+    fn parse(value: &Value) -> sqlx::Result<Self> {
+        let checkpoint = serde_json::from_value::<RuntimeCheckpoint>(value.clone())
+            .map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
+        let mut seats = HashMap::new();
+        for seat in checkpoint.seats.values() {
+            if let Some(owner) = &seat.occupant {
+                seats.entry((owner.user_id, owner.joined_at)).or_insert(
+                    seat.stack
+                        .saturating_add(seat.pending_chips)
+                        .min(i64::MAX as u64) as i64,
+                );
+            }
+        }
+        Ok(Self {
+            revision: checkpoint.revision,
+            seats,
+        })
+    }
 }
 
 impl Reservations {
@@ -19,6 +55,30 @@ impl Reservations {
                 .values()
                 .flat_map(|(_, bets)| bets.keys().copied()),
         )
+    }
+    /// `(revision, seat amount)` of `user`'s seat generation in `room`'s
+    /// checkpoint, parsing the checkpoint only when its revision is new.
+    fn checkpoint_seat(
+        &self,
+        room: Uuid,
+        checkpoint: &Value,
+        user: Uuid,
+        joined_at: DateTime<Utc>,
+    ) -> sqlx::Result<(u64, Option<i64>)> {
+        let mut cache = self.seats.borrow_mut();
+        let revision = checkpoint.get("revision").and_then(Value::as_u64);
+        let cached = cache
+            .get(&room)
+            .is_some_and(|seats| Some(seats.revision) == revision);
+        if !cached {
+            let parsed = CheckpointSeats::parse(checkpoint)?;
+            if cache.len() >= MAX_CACHED_CHECKPOINTS && !cache.contains_key(&room) {
+                cache.clear();
+            }
+            cache.insert(room, parsed);
+        }
+        let seats = &cache[&room];
+        Ok((seats.revision, seats.seats.get(&(user, joined_at)).copied()))
     }
     pub(super) fn remove_user(&mut self, user: Uuid) {
         self.poker.retain(|(_, owner, _), _| *owner != user);
@@ -147,13 +207,13 @@ pub fn sync_poker_checkpoint(pool: &PgPool, session: Uuid, checkpoint: &RuntimeC
 
 /// Called after directory closure and after dropping its publication lock.
 pub(crate) fn release_poker_session(pool: &PgPool, session: Uuid) {
-    state(pool)
-        .inner
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    let state = state(pool);
+    let mut inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
+    inner
         .reservations
         .poker
         .retain(|(room, _, _), _| *room != session);
+    inner.reservations.seats.get_mut().remove(&session);
 }
 
 fn is_beans(room: &crate::live_directory::LiveSession) -> bool {
@@ -198,19 +258,14 @@ pub(super) fn reserved(
             continue;
         }
         let amount = if member.left_at.is_none() {
-            let checkpoint = room
-                .runtime_checkpoint
-                .as_ref()
-                .map(|value| serde_json::from_value::<RuntimeCheckpoint>(value.clone()))
-                .transpose()
-                .map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
-            let seat = checkpoint.as_ref().and_then(|c| {
-                c.seats.values().find(|s| {
-                    s.occupant
-                        .as_ref()
-                        .is_some_and(|o| o.user_id == user && o.joined_at == member.joined_at)
-                })
-            });
+            let (revision, seat) = match &room.runtime_checkpoint {
+                Some(value) => {
+                    inner
+                        .reservations
+                        .checkpoint_seat(room.id, value, user, member.joined_at)?
+                }
+                None => (0, None),
+            };
             // Admission publishes the restored stack before WS binding creates
             // its checkpoint seat. Reserve that full amount during this gap.
             let admitted_stack = member
@@ -223,14 +278,12 @@ pub(super) fn reserved(
                 .map_or(i64::from(room.starting_stack), |saved| {
                     (saved.stack + saved.pending_chips) as i64
                 });
-            let base = seat.map_or(admitted_stack, |s| {
-                s.stack.saturating_add(s.pending_chips).min(i64::MAX as u64) as i64
-            });
+            let base = seat.unwrap_or(admitted_stack);
             inner
                 .reservations
                 .poker
                 .get(&(room.id, user, member.joined_at))
-                .filter(|(rev, _)| *rev >= checkpoint.as_ref().map_or(0, |c| c.revision))
+                .filter(|(rev, _)| *rev >= revision)
                 .map_or(base, |(_, amount)| *amount)
         } else {
             // Departure releases the wallet reservation, but retains the

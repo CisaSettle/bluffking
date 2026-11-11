@@ -1,16 +1,18 @@
-//! 金豆 (gold beans): the platform-wide practice wallet behind public tables.
+//! 金豆 (gold beans): the platform-wide wallet behind every bean game.
 //!
-//! Beans are shared by public quick-join tables and the lottery center;
-//! friend rooms and solo practice keep their own chip models. Every user
-//! starts with [`GRANT`] beans, may claim an extra [`DAILY_REFILL_TO`] per day
-//! and, only while [`pack_enabled`] is on, may buy a [`PACK_BEANS`] pack.
-//! Beans have no monetary value and cannot be
-//! cashed out; the only transfer is a seated player's fee-bearing gift to
-//! another human at the same public table ([`crate::bean_gift`]).
+//! One bean is priced like a US$1 casino chip (no currency is ever shown).
+//! Public quick-join tables, friend and card rooms, casino/casual games, the
+//! lottery center and tournaments all settle in the same wallet. Every user
+//! starts with [`GRANT`] beans and may claim an extra [`DAILY_REFILL_TO`] per
+//! day; registration, referrals, feedback and tournament prizes add more.
+//! Beans have no monetary value and cannot be cashed out; the only transfer
+//! is a seated player's fee-bearing gift to another human at the same public
+//! Hold'em table ([`crate::bean_gift`]).
 //!
 //! Accounting model: the wallet balance always INCLUDES the stack a player has
 //! on a public table. Each completed public-table hand settles its per-player
-//! delta into the wallet (idempotent on `(game, hand_id, user_id)`), so the
+//! delta into the wallet as one posting under the hand's record id
+//! (idempotent per `(record_id, user)`, [`crate::bean_ledger`] rule 3), so the
 //! invariant `balance >= stack on table` holds between hands. Sitting down
 //! requires `balance >= buy-in`; an explicit re-buy after a bust requires the
 //! same (the bust stack is 0). Mid-hand top-ups reserve only wallet headroom
@@ -25,12 +27,11 @@ use crate::db_writer::{PgConnection, PgPool};
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::bean_ledger::{self, Amount, Leg, Reason, Transfer};
+use crate::bean_ledger::{self, Amount, Leg, Reason, Transfer, Wallet};
 use crate::game_catalog::BEANS as GAME;
-use crate::wallet::{self, Policy, Wallet};
 
 /// First-use grant; existing balances are preserved.
-pub const GRANT: i64 = 2_000;
+pub const GRANT: i64 = 200;
 /// Keeps payouts and JSON integers bounded even for the largest solo multiplier.
 pub const MAX_ALL_IN: i64 = 1_000_000_000_000;
 pub fn solo_stake(base: i64, expected: Option<i64>) -> Option<i64> {
@@ -53,18 +54,17 @@ pub fn solo_record_id(game: &str, user: Uuid, request: Uuid) -> Uuid {
     )
 }
 /// Extra beans ADDED by the once-per-Singapore-day claim (not a refill-to
-/// target). Reduced alongside the deterministic membership exchange.
-pub const DAILY_REFILL_TO: i64 = 200;
+/// target).
+pub const DAILY_REFILL_TO: i64 = 100;
 /// Public beans table shape. One stake keeps the thin player pool together.
-pub const STAKE_KEY: &str = "10/20";
-pub const SB: u32 = 10;
-pub const BB: u32 = 20;
-/// Owner 2026-11-05: public tables play 10/20/40 — a forced straddle of
-/// 2 × BB on every hand with three or more dealt seats — plus a 10-bean ante
-/// per dealt seat. Applies to public sessions created from now on; a session
-/// already running keeps the rules it was created with.
+pub const STAKE_KEY: &str = "1/2";
+pub const SB: u32 = 1;
+pub const BB: u32 = 2;
+/// Public tables play 1/2/4 (owner 2026-11-12) — a forced straddle of
+/// 2 × BB on every hand with three or more dealt seats — plus a 1-bean ante
+/// per dealt seat.
 pub const STRADDLE_BB: u8 = 2;
-pub const ANTE: u32 = 10;
+pub const ANTE: u32 = 1;
 /// Owner 2026-11-11: new public tables also run 血战鱿鱼 (full squid,
 /// penalty in BB, default extra tokens) and a timed Bomb Pot (each dealt seat
 /// posts this many BB every 5-8 minutes). Same defaults as the friend-room
@@ -82,16 +82,15 @@ pub fn public_rule_config() -> serde_json::Map<String, serde_json::Value> {
     rules.insert("squid_mode".into(), "full".into());
     rules.insert("squid_extra_tokens".into(), SQUID_EXTRA_TOKENS.into());
     rules.insert("squid_funding".into(), "stack".into());
-    if crate::runtime_checkpoint::enabled() {
-        rules.insert("bomb_pot_bb".into(), BOMB_POT_BB.into());
-        rules.insert(
-            "bomb_pot_interval_minutes".into(),
-            serde_json::json!(BOMB_POT_INTERVAL_MINUTES),
-        );
-    }
+    rules.insert("bomb_pot_bb".into(), BOMB_POT_BB.into());
+    rules.insert(
+        "bomb_pot_interval_minutes".into(),
+        serde_json::json!(BOMB_POT_INTERVAL_MINUTES),
+    );
     rules
 }
-pub const BUY_IN: u32 = 2_000;
+/// 100 BB.
+pub const BUY_IN: u32 = 200;
 
 /// A departed member must bring back the same stack in this room generation.
 /// A NULL stack (legacy departures that recorded none, terminal departures)
@@ -117,15 +116,13 @@ pub(crate) fn reentry_chips(
 pub const SEATS: i16 = 9;
 /// New public tables run for 24 hours from the first deal.
 pub const PUBLIC_TABLE_DURATION_SECS: i64 = 86_400;
-/// Paid pack (owner anchor ¥100 ≈ US$13.99 for 10,000).
-pub const PACK_BEANS: i64 = 10_000;
+/// Paid pack, priced at the bean anchor (owner 2026-11-12: 「按照一美金=1金豆改」):
+/// 14 beans for US$13.99. A `BILLING_BEANS_PACK_USD_CENTS` override must keep
+/// the same 1 bean ≈ US$1 ratio, so change both together.
+pub const PACK_BEANS: i64 = 14;
 pub const PACK_USD_CENTS_DEFAULT: i64 = 1_399;
-const DAILY_FEATURE: &str = "beans_daily_refill";
-
-pub const POLICY: Policy = Policy {
-    game: GAME,
-    grant: GRANT,
-};
+/// The `daily_usage` feature of the once-per-Singapore-day claim.
+pub(crate) const DAILY_FEATURE: &str = "beans_daily_refill";
 
 pub fn pack_usd_cents() -> i64 {
     std::env::var("BILLING_BEANS_PACK_USD_CENTS")
@@ -148,7 +145,7 @@ pub fn pack_enabled() -> bool {
 
 /// Creates the wallet with its grant on first use; idempotent afterwards.
 pub async fn ensure(pool: &PgPool, user: Uuid) -> sqlx::Result<Wallet> {
-    wallet::ensure(pool, POLICY, user).await
+    bean_ledger::ensure(pool, user).await
 }
 
 /// Call with the shared wallet locked, before a new debit. Poker admission
@@ -162,36 +159,23 @@ pub async fn spendable(pool: &PgPool, conn: &mut PgConnection, user: Uuid) -> sq
     // Memory admission is visible before its SQL membership is persisted. All
     // debit callers hold beans_read_memory::Mutation before BEGIN, excluding
     // another admission until their transaction and publication are complete.
-    let seated = if crate::realtime_mode::enabled() {
-        let directory = crate::live_directory::memory_snapshot(pool)?;
-        let occupied = directory.memberships_for(user).any(|(room, member)| {
-            member.left_at.is_none()
-                && room.ended_at.is_none()
-                && room
-                    .session_config
-                    .as_ref()
-                    .is_some_and(|c| c["beans"] == true)
-        });
-        occupied
-    } else {
-        sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM session_users su JOIN game_sessions gs ON gs.id=su.session_id
-         LEFT JOIN public_tables pt ON pt.session_id=gs.id
-         WHERE su.user_id=$1 AND su.left_at IS NULL AND gs.ended_at IS NULL AND (pt.beans OR gs.session_config->>'beans'='true'))",
-    )
-    .bind(user)
-    .fetch_one(&mut *conn)
-    .await?
-    };
+    let directory = crate::live_directory::memory_snapshot(pool)?;
+    let seated = directory.memberships_for(user).any(|(room, member)| {
+        member.left_at.is_none()
+            && room.ended_at.is_none()
+            && room
+                .session_config
+                .as_ref()
+                .is_some_and(|c| c["beans"] == true)
+    });
     Ok(!seated
         && !sicbo_seated(conn, user).await?
         && !holds::outstanding(user)
         && !crate::local_runtime::beans_held(user).map_err(sqlx::Error::Io)?)
 }
 
-/// One affordability rule for every SQL bean debit. The old overlapping-owner
-/// mode keeps its exclusive-wallet guard; numeric reservations require the
-/// current single-owner runtime and its checkpoint authority.
+/// One affordability rule for every SQL bean debit: numeric reservations held
+/// by the single-owner runtime and its checkpoint authority.
 pub async fn available_on(
     pool: &PgPool,
     conn: &mut PgConnection,
@@ -199,28 +183,6 @@ pub async fn available_on(
     balance: i64,
     excluding_sicbo: Option<&str>,
 ) -> sqlx::Result<i64> {
-    if !crate::realtime_mode::enabled() {
-        if excluding_sicbo.is_some() {
-            let poker_seated: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM session_users su JOIN game_sessions gs ON gs.id=su.session_id LEFT JOIN public_tables pt ON pt.session_id=gs.id WHERE su.user_id=$1 AND su.left_at IS NULL AND gs.ended_at IS NULL AND (pt.beans OR gs.session_config->>'beans'='true'))",
-            ).bind(user).fetch_one(&mut *conn).await?;
-            return Ok(
-                if poker_seated
-                    || holds::outstanding(user)
-                    || crate::local_runtime::beans_held(user).map_err(sqlx::Error::Io)?
-                {
-                    0
-                } else {
-                    balance
-                },
-            );
-        }
-        return Ok(if spendable(pool, conn, user).await? {
-            balance
-        } else {
-            0
-        });
-    }
     if crate::local_runtime::enabled() {
         let code: Option<String> = sqlx::query_scalar(
             "SELECT code FROM game_room_checkpoint_members WHERE game='sicbo' AND user_id=$1",
@@ -293,11 +255,7 @@ pub async fn profile(pool: &PgPool, user: Uuid) -> sqlx::Result<Profile> {
         straddle: BB * u32::from(STRADDLE_BB),
         ante: ANTE,
         squid_penalty: BB * u32::from(SQUID_PENALTY_BB),
-        bomb_pot: if crate::runtime_checkpoint::enabled() {
-            BB * BOMB_POT_BB as u32
-        } else {
-            0
-        },
+        bomb_pot: BB * BOMB_POT_BB as u32,
         daily_refill_to: DAILY_REFILL_TO,
         initial_grant: crate::auth::registration_reward::BEANS,
         daily_available,
@@ -305,10 +263,6 @@ pub async fn profile(pool: &PgPool, user: Uuid) -> sqlx::Result<Profile> {
         pack_usd_cents: pack_usd_cents(),
         pack_available: pack_enabled(),
     })
-}
-
-pub async fn balance(pool: &PgPool, user: Uuid) -> sqlx::Result<i64> {
-    Ok(ensure(pool, user).await?.balance)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -332,14 +286,12 @@ pub async fn claim_daily(pool: &PgPool, user: Uuid) -> sqlx::Result<DailyOutcome
             balance: crate::beans_read_memory::ensure(pool, user)?.balance,
         });
     }
-    if crate::realtime_mode::enabled() {
-        crate::beans_read_memory::ensure(pool, user)?;
-        crate::beans_read_memory::initial_grant_ready(pool, user).await?;
-    }
+    crate::beans_read_memory::ensure(pool, user)?;
+    crate::beans_read_memory::initial_grant_ready(pool, user).await?;
     let beans_mutation = crate::beans_read_memory::daily_mutation(pool, user);
     ensure(pool, user).await?;
     let mut tx = pool.begin().await?;
-    let before = wallet::lock(&mut tx, GAME, user)
+    let before = bean_ledger::lock(&mut tx, GAME, user)
         .await?
         .ok_or(sqlx::Error::RowNotFound)?;
     let (consumed, day): (Option<chrono::NaiveDate>, chrono::NaiveDate) = sqlx::query_as(
@@ -378,7 +330,7 @@ pub async fn claim_daily(pool: &PgPool, user: Uuid) -> sqlx::Result<DailyOutcome
         beans_mutation.publish_daily(day, before);
         return Ok(DailyOutcome::AlreadyClaimed { balance: before });
     }
-    wallet::project_session_balance(GAME, user, after);
+    bean_ledger::project_session_balance(GAME, user, after);
     beans_mutation.publish_daily(day, after);
     Ok(DailyOutcome::Granted {
         granted,
@@ -499,7 +451,7 @@ pub async fn settle_hand_on(
     match bean_ledger::settle(conn, &posting).await? {
         Posted::Applied(receipts) => {
             for receipt in receipts {
-                wallet::project_session_balance(GAME, receipt.user, receipt.balance_after);
+                bean_ledger::project_session_balance(GAME, receipt.user, receipt.balance_after);
             }
             Ok(())
         }
@@ -517,7 +469,7 @@ pub async fn settle_hand_on(
 /// or an unknown COMMIT outcome) the tentative value must not stay visible.
 /// Arm each user right after an in-transaction projection and call
 /// [`ProjectionFence::finish`] with the commit result. Dropped armed, it
-/// fences each still-seated projection ([`wallet::quarantine_user`]): no
+/// fences each still-seated projection ([`bean_ledger::quarantine_user`]): no
 /// reload, because neither room-accepted effects nor post-commit delta
 /// publishers are ordered by the wallet row lock. Fenced readers use durable
 /// balances until the seat retires; money and the ledger are never touched.
@@ -543,8 +495,8 @@ impl ProjectionFence {
 impl Drop for ProjectionFence {
     fn drop(&mut self) {
         for user in self.users.drain(..) {
-            if wallet::held(GAME, user) {
-                wallet::quarantine_user(GAME, user);
+            if bean_ledger::held(GAME, user) {
+                bean_ledger::quarantine_user(GAME, user);
                 tracing::error!(user = %user, "beans_projection_fenced_uncommitted");
             }
         }
@@ -620,7 +572,7 @@ pub async fn credit_purchase_on(
     )
     .await?;
     let after = posted.of(user)?.balance_after;
-    wallet::project_session_balance(GAME, user, after);
+    bean_ledger::project_session_balance(GAME, user, after);
     Ok(after)
 }
 
@@ -639,7 +591,7 @@ pub async fn debit_refund_on(
     refund_id: &str,
     beans: i64,
 ) -> sqlx::Result<i64> {
-    wallet::lock(conn, GAME, user)
+    bean_ledger::lock(conn, GAME, user)
         .await?
         .ok_or(sqlx::Error::RowNotFound)?;
     if !spendable(pool, conn, user).await? {
@@ -659,7 +611,7 @@ pub async fn debit_refund_on(
     )
     .await?;
     let receipt = posted.of(user)?;
-    wallet::project_session_balance(GAME, user, receipt.balance_after);
+    bean_ledger::project_session_balance(GAME, user, receipt.balance_after);
     Ok(-receipt.delta)
 }
 
@@ -759,7 +711,8 @@ pub mod holds {
         Ok(())
     }
 
-    /// The hand completed and its settlement is queued.
+    /// The live hand of `session` that `user` was dealt into and that has
+    /// not started settling.
     pub(crate) fn active_hand(session: Uuid, user: Uuid) -> Option<Uuid> {
         open_hands().iter().find_map(|(id, hand)| {
             (hand.session == session

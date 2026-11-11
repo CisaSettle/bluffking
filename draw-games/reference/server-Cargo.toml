@@ -8,10 +8,6 @@ publish = false
 [lints]
 workspace = true
 
-[target.'cfg(target_os = "linux")'.dependencies]
-# Lower only the dedicated, optional hand-analysis thread's scheduling priority.
-libc = "0.2"
-
 [[bin]]
 name = "server"
 path = "src/main.rs"
@@ -29,6 +25,8 @@ path = "examples/generate_bnb_hd_xpub.rs"
 
 [dependencies]
 draw-games = { path = "../draw-games/verifier" }
+# Thread CPU clocks, O_NOFOLLOW handoff files, and (Linux) lowering the
+# optional hand-analysis/solver threads' scheduling priority.
 libc = "0.2"
 engine = { path = "../engine" }
 mental-poker = { path = "../mental-poker" }

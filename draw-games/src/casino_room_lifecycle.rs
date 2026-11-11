@@ -62,8 +62,8 @@ pub async fn recover<R: DealerRoom>(pool: &PgPool) -> sqlx::Result<()> {
                     for (uid, code) in users {
                         // Only seats of rooms this process installed.
                         if registry.room(&code).is_some() && super::holds::<R>(uid, &code) {
-                            let w = wallet::ensure(pool, crate::beans::POLICY, uid).await?;
-                            wallet::activate(crate::game_catalog::BEANS, uid, &code, w);
+                            let w = bean_ledger::ensure(pool, uid).await?;
+                            bean_ledger::activate(crate::game_catalog::BEANS, uid, &code, w);
                         }
                     }
                 }
@@ -426,18 +426,18 @@ pub(super) async fn sweep<R: DealerRoom>(pool: &PgPool) -> Result<()> {
         }
         for uid in finish_join {
             if beans::<R>() {
-                let w = wallet::ensure(pool, crate::beans::POLICY, uid).await?;
-                wallet::activate(crate::game_catalog::BEANS, uid, &code, w);
+                let w = bean_ledger::ensure(pool, uid).await?;
+                bean_ledger::activate(crate::game_catalog::BEANS, uid, &code, w);
             }
             if let Some(m) = room.members.get_mut(&uid) {
                 m.joining = false;
             }
-            took_seat(pool, &code, &shared, &mut room, uid);
+            took_seat(&mut room, uid);
         }
         for uid in &gone {
             room.members.remove(uid);
             if beans::<R>() {
-                wallet::retire(crate::game_catalog::BEANS, *uid, &code);
+                bean_ledger::retire(crate::game_catalog::BEANS, *uid, &code);
             }
             super::release_seat::<R>(*uid, &code);
         }
@@ -670,7 +670,7 @@ pub(super) async fn finish_close<R: DealerRoom>(
     }
     for uid in &closing.members {
         if beans::<R>() {
-            wallet::retire(crate::game_catalog::BEANS, *uid, &code);
+            bean_ledger::retire(crate::game_catalog::BEANS, *uid, &code);
         }
         super::release_seat::<R>(*uid, &code);
     }

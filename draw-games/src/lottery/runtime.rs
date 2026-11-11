@@ -83,7 +83,6 @@ struct Event {
     effect: Option<PendingEffect>,
     before: i64,
     bonus: i64,
-    max_cards: Vec<Uuid>,
     offer: Option<Offer>,
     claim: Option<Uuid>,
 }
@@ -101,7 +100,6 @@ impl Event {
             effect: None,
             before: 0,
             bonus: 0,
-            max_cards: vec![],
             offer: None,
             claim: None,
         }
@@ -237,7 +235,7 @@ pub fn ready(pool: &PgPool) -> bool {
 /// The lottery exists only on the single realtime owner: a process that is
 /// not (or not yet) that owner accepts nothing and serves no view.
 fn check_owner() -> Result<(), Error> {
-    if !crate::write_behind::accepting() || !crate::realtime_mode::enabled() {
+    if !crate::write_behind::accepting() || !crate::runtime_owner::owns_runtime() {
         return Err(unavailable());
     }
     Ok(())
@@ -589,7 +587,7 @@ pub async fn hydrate(pool: &PgPool) -> sqlx::Result<()> {
         async move {
             if let Some(job) = &next {
                 let mut held = worker_conn.lock().await;
-                let grants = persist_on_held(&pool, &mut held, &job.event)
+                persist_on_held(&pool, &mut held, &job.event)
                     .await
                     .map_err(|e| {
                         let error = format!(
@@ -611,14 +609,8 @@ pub async fn hydrate(pool: &PgPool) -> sqlx::Result<()> {
                     let mut inner = state.data.lock().unwrap_or_else(|e| e.into_inner());
                     let mut public = state.published.lock().unwrap_or_else(|e| e.into_inner());
                     if let (Some(data), Some(public)) = (inner.as_mut(), public.as_mut()) {
-                        for (id, grant) in &grants {
-                            if let Some(mut t) = data.tickets.get(id).cloned() {
-                                t.card.entry["reward_grant"] = json!(grant);
-                                data.insert(t);
-                            }
-                        }
                         data.durable += 1;
-                        public.commit(&job.event, &grants);
+                        public.commit(&job.event);
                         if let Some(owner) = job.event.owner {
                             if job.event.effect.is_some() {
                                 beans_read_memory::effect_committed(&pool, owner, job.event.id);
@@ -631,13 +623,8 @@ pub async fn hydrate(pool: &PgPool) -> sqlx::Result<()> {
                         });
                     }
                     // Replay may stop waiting only after the projection is visible.
-                    let mut cards = job.event.cards.clone();
-                    for (id, grant) in &grants {
-                        if let Some(card) = cards.iter_mut().find(|t| t.card.id == *id) {
-                            card.card.entry["reward_grant"] = json!(grant);
-                        }
-                    }
-                    job.committed.send_replace(Some(Arc::new(cards)));
+                    job.committed
+                        .send_replace(Some(Arc::new(job.event.cards.clone())));
                     accepted(&state).retain(|queued| !Arc::ptr_eq(queued, job));
                 }
                 if let Some(work) = &job.work {
@@ -714,14 +701,14 @@ async fn persist_on_held(
     pool: &PgPool,
     held: &mut Option<WriterConnection>,
     event: &Event,
-) -> sqlx::Result<Vec<(Uuid, crate::game_rewards::Grant)>> {
+) -> sqlx::Result<()> {
     if event.kind == "retention" {
         // Runs on its own pool transactions; taking the writer connection too
         // would only cost the pool a second one meanwhile.
         if persistence::retention(pool).await? {
             state(pool).retention_more.store(true, Ordering::Release);
         }
-        return Ok(vec![]);
+        return Ok(());
     }
     let hold = pool.options().get_max_connections() >= HOLD_MIN_POOL_CONNECTIONS;
     if held
@@ -1102,7 +1089,7 @@ fn current_view(pool: &PgPool, user: Uuid, game: Game) -> Result<Value, Error> {
     let present = members.len();
     members.truncate(12);
     Ok(
-        json!({"game":game.as_str(),"runtime_epoch":crate::server_performance::process_instance_id(),"revision":data.revision,"durable_revision":data.durable,"now_ms":super::now_ms(),"balance":balance,"available_balance":available,"unit":game.unit(),"period":period,"my_tickets":my,"last_draw":null,"recent":[],"crowd":{"present":present,"members":members.iter().map(|((_,u),at)|json!({"user_id":u,"name":name(pool,*u),"seen_at_ms":at.timestamp_millis()})).collect::<Vec<_>>()},"feed":[],"fairness_offer":fairness}),
+        json!({"game":game.as_str(),"runtime_epoch":crate::server_performance::process_instance_id(),"revision":data.revision,"durable_revision":data.durable,"now_ms":super::now_ms(),"balance":balance,"available_balance":available,"unit":game.unit(),"daily_refill":super::REFILL,"period":period,"my_tickets":my,"last_draw":null,"recent":[],"crowd":{"present":present,"members":members.iter().map(|((_,u),at)|json!({"user_id":u,"name":name(pool,*u),"seen_at_ms":at.timestamp_millis()})).collect::<Vec<_>>()},"feed":[],"fairness_offer":fairness}),
     )
 }
 
@@ -1158,8 +1145,15 @@ async fn prepare_scratch(pool: &PgPool, user: Uuid, ticket: Option<Uuid>) -> Res
     let mut cards = super::scratch::my_cards(&mut conn, user).await?;
     if let Some(id) = ticket {
         if !cards.iter().any(|c| c.id == id) {
-            if let Some(row) = sqlx::query(&format!("SELECT {} FROM lottery_tickets WHERE id=$1 AND user_id=$2 AND game='scratch' AND cost=100 AND {}", store::TICKET_COLUMNS, super::scratch::REWARD_VERSION_SQL))
-                .bind(id).bind(user).fetch_optional(&mut *conn).await? {
+            if let Some(row) = sqlx::query(&format!(
+                "SELECT {} FROM lottery_tickets WHERE id=$1 AND user_id=$2 AND game='scratch'",
+                store::TICKET_COLUMNS
+            ))
+            .bind(id)
+            .bind(user)
+            .fetch_optional(&mut *conn)
+            .await?
+            {
                 cards.push(TicketRow::from_row(&row));
             }
         }
@@ -1351,8 +1345,8 @@ pub async fn buy_scratch(
 ) -> Result<Purchase, Error> {
     let validation = lottery_span(LotteryStage::Validate);
     player(pool, user)?;
-    // The same normalised identity the purchase stored (reward_version
-    // included), so a retried request replays instead of conflicting.
+    // The same normalised identity the purchase stored, so a retried
+    // request replays instead of conflicting.
     let hash = store::body_sha256(&body.identity());
     let state = state(pool);
     drop(validation);
@@ -1480,10 +1474,7 @@ fn accept_numbers(
         serde_json::from_value(row.proof_plan.clone().ok_or(Error::FairnessRequired)?)
             .map_err(|_| Error::InvalidEntry)?;
     plan.validate().map_err(|_| Error::InvalidEntry)?;
-    if (plan.protocol != draw_games::lottery::PROTOCOL
-        && plan.protocol != draw_games::lottery::V2_PROTOCOL)
-        || plan.commitment != body.proof_commitment
-    {
+    if plan.commitment != body.proof_commitment {
         return Err(Error::RequestConflict);
     }
     let before = beans_read_memory::ensure(pool, user)?.balance;
@@ -1504,7 +1495,8 @@ fn accept_numbers(
         if body.expected_balance != Some(available) {
             return Err(Error::RequestConflict);
         }
-        let copies = available / game.unit();
+        // A balance above the cap buys the capped number of stakes.
+        let copies = (available / game.unit()).min(rules::MAX_ALL_IN_STAKES);
         if copies <= 0 {
             return Err(Error::InsufficientBalance);
         }
@@ -1515,7 +1507,7 @@ fn accept_numbers(
         (0..groups)
             .map(|i| {
                 let n = copies / groups + i64::from(i < copies % groups);
-                if !(1..=rules::MAX_ALL_IN_MULTIPLIER).contains(&n) {
+                if !(1..=rules::MAX_MULTIPLIER).contains(&n) {
                     return Err(Error::TooManyTickets);
                 }
                 i16::try_from(n).map_err(|_| Error::TooManyTickets)
@@ -1616,8 +1608,7 @@ fn accept_numbers(
     ))
 }
 
-/// Beans for a settling card's service reward, recorded on the card so a
-/// converted version-1 Max reward stays auditable. No membership is granted.
+/// Beans for a settling card's service reward, recorded on the card.
 fn scratch_reward(card: &mut TicketRow) -> Result<i64, Error> {
     let amount = super::scratch::reward_beans(card)?;
     if amount > 0 {
@@ -1632,14 +1623,17 @@ fn accept_scratch(
 ) -> Result<(Purchase, CommitReceipt), Error> {
     player(pool, user)?;
     if body.request_id.is_nil()
-        || body.cost != 100
+        || body.cost != draw_games::scratch::COST
         || (!body.all_in && ![1, 5, 10].contains(&body.count))
         || (body.all_in && (body.count == 0 || body.expected_balance.is_none()))
         || (!body.all_in && body.expected_balance.is_some())
     {
         return Err(Error::InvalidEntry);
     }
-    let reward_version = body.reward_version()?;
+    if body.reward_version != draw_games::scratch::REWARD_VERSION {
+        return Err(Error::InvalidEntry);
+    }
+    let reward_version = body.reward_version;
     if body.count > draw_games::scratch::MAX_BATCH_CARDS {
         return Err(Error::TooManyTickets);
     }
@@ -1662,7 +1656,7 @@ fn accept_scratch(
         if body.expected_balance != Some(available) {
             return Err(Error::RequestConflict);
         }
-        if available / body.cost != body.count as i64 {
+        if draw_games::scratch::all_in_count(available) != body.count {
             return Err(Error::InvalidEntry);
         }
     }
@@ -1740,7 +1734,7 @@ fn accept_scratch(
             entry,
             stakes: 1,
             multiplier: 1,
-            cost: 100,
+            cost: body.cost,
             revealed: Some(vec![batch; 6]),
             prize: batch.then_some(card.prize),
             tier: batch.then_some(card.hits),
@@ -1820,12 +1814,7 @@ fn reveal_card(
     let mut owned = data
         .tickets
         .get(&ticket)
-        .filter(|t| {
-            t.user == user
-                && t.game == "scratch"
-                && t.card.cost == 100
-                && matches!(t.card.entry["reward_version"].as_u64(), Some(1 | 2))
-        })
+        .filter(|t| t.user == user && t.game == "scratch")
         .cloned()
         .ok_or(Error::TicketNotFound)?;
     if owned.card.settled_at.is_some() {
@@ -1904,8 +1893,8 @@ fn reveal_card(
         let lucky = owned.card.entry["lucky"]
             .as_i64()
             .ok_or(Error::InvalidEntry)? as i16;
-        let (paid, tier) =
-            draw_games::scratch::payout(100, lucky, &numbers).map_err(|_| Error::InvalidEntry)?;
+        let (paid, tier) = draw_games::scratch::payout(owned.card.cost, lucky, &numbers)
+            .map_err(|_| Error::InvalidEntry)?;
         owned.card.prize = Some(paid);
         owned.card.tier = Some(tier);
         owned.card.settled_at = Some(event.at);
@@ -2014,7 +2003,7 @@ async fn gates_ready(pool: &PgPool) -> bool {
             return false;
         }
         let configured = crate::runtime_owner::configured();
-        if crate::realtime_mode::enabled()
+        if crate::runtime_owner::owns_runtime()
             && (!configured || crate::runtime_owner::recovery_ready(pool))
             && beans_read_memory::ready(pool)
             && crate::player_directory::ready(pool)
@@ -2027,9 +2016,6 @@ async fn gates_ready(pool: &PgPool) -> bool {
                 _ = crate::runtime_owner::wait_active() => {}
                 _ = crate::write_behind::shutdown_started() => {}
             }
-        } else if !configured && !crate::realtime_mode::enabled() {
-            // No single owner configured: the lottery never runs here.
-            crate::write_behind::shutdown_started().await;
         } else if configured && !crate::runtime_owner::recovery_ready(pool) {
             tokio::select! {
                 _ = crate::runtime_owner::wait_recovery_ready(pool) => {}
@@ -2207,7 +2193,7 @@ async fn settle_all(pool: &PgPool) -> bool {
         match settle(pool) {
             Ok(true) => {
                 settled += 1;
-                if settled % SETTLE_BATCH == 0 {
+                if settled.is_multiple_of(SETTLE_BATCH) {
                     tokio::task::yield_now().await;
                 }
             }
@@ -2264,7 +2250,7 @@ fn drawn_deadline(pool: &PgPool) -> (i64, bool) {
 /// unsettled card expires (at most a day, at least `SCRATCH_RETRY`).
 async fn expire_scratch(pool: &PgPool) -> Duration {
     let skip: Vec<Uuid> = parked().cards.iter().copied().collect();
-    let rows = match sqlx::query(&format!("SELECT id,user_id FROM lottery_tickets WHERE game='scratch' AND cost=100 AND {} AND settled_at IS NULL AND bought_at < now()-interval '30 days' AND NOT (id=ANY($1)) ORDER BY bought_at,id LIMIT {SCRATCH_BATCH}", super::scratch::REWARD_VERSION_SQL)).bind(&skip).fetch_all(pool).await {
+    let rows = match sqlx::query(&format!("SELECT id,user_id FROM lottery_tickets WHERE game='scratch' AND settled_at IS NULL AND bought_at < now()-interval '30 days' AND NOT (id=ANY($1)) ORDER BY bought_at,id LIMIT {SCRATCH_BATCH}")).bind(&skip).fetch_all(pool).await {
         Ok(rows) => rows,
         Err(error) => {
             tracing::warn!(%error, "lottery_scratch_expiry_retry");
@@ -2297,7 +2283,7 @@ async fn expire_scratch(pool: &PgPool) -> Duration {
         return SCRATCH_RETRY;
     }
     let skip: Vec<Uuid> = parked().cards.iter().copied().collect();
-    match sqlx::query_scalar::<_, Option<DateTime<Utc>>>(&format!("SELECT min(bought_at) FROM lottery_tickets WHERE game='scratch' AND cost=100 AND {} AND settled_at IS NULL AND NOT (id=ANY($1))", super::scratch::REWARD_VERSION_SQL)).bind(&skip).fetch_one(pool).await {
+    match sqlx::query_scalar::<_, Option<DateTime<Utc>>>("SELECT min(bought_at) FROM lottery_tickets WHERE game='scratch' AND settled_at IS NULL AND NOT (id=ANY($1))").bind(&skip).fetch_one(pool).await {
         // A card bought from now on expires after a full 30 days.
         Ok(oldest) => (oldest.unwrap_or_else(Utc::now) + chrono::Duration::days(30) - Utc::now())
             .to_std()
@@ -2540,8 +2526,6 @@ fn settle(pool: &PgPool) -> Result<bool, Error> {
         .collect::<Vec<_>>();
     for ((g, period), mut row) in periods {
         let game = Game::parse(&g).ok_or(Error::InvalidEntry)?;
-        // The period's plan fixes which prize table applies (see `prize_scale`).
-        let protocol = super::prize_protocol(row.proof_plan.as_ref());
         let pending = data
             .by_period
             .get(&(g.clone(), period))
@@ -2612,7 +2596,6 @@ fn settle(pool: &PgPool) -> Result<bool, Error> {
                         Entry::from_stored(game, &t.card.entry).ok_or(Error::InvalidEntry)?;
                     let (prize, tier) = entry
                         .prize(
-                            &protocol,
                             i64::from(t.card.multiplier),
                             row.numbers.as_deref().ok_or(Error::InvalidEntry)?,
                             row.bonus,
@@ -2621,7 +2604,7 @@ fn settle(pool: &PgPool) -> Result<bool, Error> {
                         .ok_or(Error::InvalidEntry)?;
                     paid = paid.checked_add(prize).ok_or(Error::InvalidEntry)?;
                     let bonus = entry
-                        .jackpot_bonus(&protocol, i64::from(t.card.multiplier), prize, tier)
+                        .jackpot_bonus(i64::from(t.card.multiplier), prize, tier)
                         .ok_or(Error::InvalidEntry)?;
                     if bonus > 0 {
                         // Credited by the writer as its own non-play ledger row,

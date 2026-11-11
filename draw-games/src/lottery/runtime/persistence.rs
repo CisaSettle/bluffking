@@ -257,10 +257,10 @@ pub(super) async fn persist(
     pool: &PgPool,
     conn: &mut crate::db_writer::PgConnection,
     event: &Event,
-) -> sqlx::Result<Vec<(Uuid, crate::game_rewards::Grant)>> {
+) -> sqlx::Result<()> {
     if event.kind == "retention" {
         retention(pool).await?;
-        return Ok(vec![]);
+        return Ok(());
     }
     let game = Game::parse(&event.game).ok_or_else(|| permanent("game"))?;
     let fingerprint =
@@ -272,7 +272,7 @@ pub(super) async fn persist(
         .await?;
     if let Some(user) = event.owner {
         crate::db::lock_game_participants(&mut tx, &[user]).await?;
-        crate::wallet::lock(&mut tx, BEANS, user)
+        crate::bean_ledger::lock(&mut tx, BEANS, user)
             .await?
             .ok_or_else(|| permanent("wallet row missing"))?;
     }
@@ -295,12 +295,11 @@ pub(super) async fn persist(
             {
                 return Err(permanent("ledger fingerprint mismatch"));
             }
-            let grants = read_grants(&mut tx, &event.max_cards).await?;
             tx.commit().await?;
             publish(pool, event);
             // The attempt that committed never reached its statistics.
             statistics(event, game);
-            return Ok(grants);
+            return Ok(());
         }
         if effect.bonus > 0 {
             let reason = if game == Game::Scratch {
@@ -348,16 +347,7 @@ pub(super) async fn persist(
             return Err(permanent("scratch commitment replaced"));
         }
     }
-    let mut cards = event.cards.clone();
-    let mut grants = vec![];
-    for id in &event.max_cards {
-        let user = event.owner.ok_or_else(|| permanent("max card owner"))?;
-        let grant = crate::game_rewards::grant_max_on(&mut tx, user, &event.game, *id).await?;
-        if let Some(card) = cards.iter_mut().find(|t| t.card.id == *id) {
-            card.card.entry["reward_grant"] = json!(grant)
-        }
-        grants.push((*id, grant));
-    }
+    let cards = &event.cards;
     if let Some(row) = &event.period {
         let plan: draw_games::lottery::Plan = serde_json::from_value(
             row.proof_plan
@@ -436,7 +426,7 @@ pub(super) async fn persist(
     tx.commit().await?;
     publish(pool, event);
     statistics(event, game);
-    Ok(grants)
+    Ok(())
 }
 /// Day statistics of a committed event, sent once: by the attempt that saw
 /// the commit succeed, or by the replay of one whose acknowledgement was lost.
@@ -536,36 +526,8 @@ async fn stored_fingerprint(
     .await
 }
 
-async fn read_grants(
-    conn: &mut crate::db_writer::PgConnection,
-    ids: &[Uuid],
-) -> sqlx::Result<Vec<(Uuid, crate::game_rewards::Grant)>> {
-    if ids.is_empty() {
-        return Ok(vec![]);
-    }
-    let rows = sqlx::query("SELECT id,entry FROM lottery_tickets WHERE id=ANY($1)")
-        .bind(ids)
-        .fetch_all(conn)
-        .await?;
-    let mut result = vec![];
-    for row in rows {
-        let entry: Value = row.get("entry");
-        if !entry["reward_grant"].is_null() {
-            result.push((
-                row.get("id"),
-                serde_json::from_value(entry["reward_grant"].clone())
-                    .map_err(|_| permanent("stored reward grant"))?,
-            ))
-        }
-    }
-    Ok(result)
-}
-
 fn publish(pool: &PgPool, event: &Event) {
     if let Some(user) = event.owner {
-        if !event.max_cards.is_empty() {
-            crate::entitlement::invalidate_tier(pool, user);
-        }
         crate::read_cache::invalidate_unread_count(pool, user);
     }
 }

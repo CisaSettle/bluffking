@@ -58,8 +58,8 @@ pub struct RecordEntry {
 pub struct RecordsResponse {
     pub summary: Vec<GameSummary>,
     pub entries: Vec<RecordEntry>,
-    /// Pass back as `before` to fetch the next page; `null` at the end.
-    pub next_before: Option<DateTime<Utc>>,
+    /// Pass back as `before`, `before_id`, `before_game` to fetch the next
+    /// page; `null` at the end.
     pub next_cursor: Option<RecordCursor>,
 }
 
@@ -109,6 +109,46 @@ pub async fn record(
     Ok(())
 }
 
+/// [`record`] for a round that gives every participant a record of their own:
+/// `rows` are `(user, record_id, delta)`, written in one statement. The caller
+/// already holds these participants' locks ([`crate::db::lock_game_participants`]).
+pub async fn record_each(
+    conn: &mut PgConnection,
+    game: i16,
+    session_id: Option<Uuid>,
+    played_at: DateTime<Utc>,
+    has_bots: bool,
+    rows: &[(Uuid, Uuid, i64)],
+) -> sqlx::Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let users: Vec<Uuid> = rows.iter().map(|r| r.0).collect();
+    let records: Vec<Uuid> = rows.iter().map(|r| r.1).collect();
+    let amounts: Vec<i64> = rows.iter().map(|r| r.2).collect();
+    let inserted: Vec<Uuid> = sqlx::query_scalar(
+        "INSERT INTO game_records (user_id, game, record_id, session_id, played_at, delta, has_bots) \
+         SELECT t.user_id, $1, t.record_id, $2, $3, t.delta, $4 \
+         FROM unnest($5::uuid[], $6::uuid[], $7::bigint[]) WITH ORDINALITY AS t(user_id, record_id, delta, n) \
+         ORDER BY t.n \
+         ON CONFLICT (user_id, game, record_id) DO NOTHING RETURNING record_id",
+    )
+    .bind(game)
+    .bind(session_id)
+    .bind(played_at)
+    .bind(has_bots)
+    .bind(&users)
+    .bind(&records)
+    .bind(&amounts)
+    .fetch_all(conn.writer())
+    .await?;
+    // ON CONFLICT DO NOTHING: only a record that was inserted counts.
+    for record_id in inserted {
+        crate::stats_writer::send(crate::stats_writer::StatsEvent::Record(game, record_id));
+    }
+    Ok(())
+}
+
 /// [`record`] for a gold-bean round whose record-centre detail lives on the
 /// record itself: `rows` are `(user, delta, detail)`, the detail being the
 /// game's own receipt (`unit = "beans"`), so no reader joins the ledger.
@@ -148,77 +188,15 @@ pub async fn record_beans(
     Ok(())
 }
 
-pub async fn load(
-    pool: &PgPool,
-    user_id: Uuid,
-    game_code: Option<i16>,
-    limit: i64,
-    before: Option<DateTime<Utc>>,
-) -> sqlx::Result<RecordsResponse> {
-    load_page(pool, user_id, game_code, limit, before, None, None).await
-}
-
-pub async fn load_page(
-    pool: &PgPool,
-    user_id: Uuid,
-    game_code: Option<i16>,
-    limit: i64,
-    before: Option<DateTime<Utc>>,
-    before_id: Option<Uuid>,
-    before_game: Option<i16>,
-) -> sqlx::Result<RecordsResponse> {
-    load_history_page(
-        pool,
-        user_id,
-        game_code,
-        limit,
-        before,
-        before_id,
-        before_game,
-        false,
-        None,
-    )
-    .await
-}
-
 /// Session groups use immutable lifetime ids; records without one are independent rounds.
 // Each argument is one history filter; callers pass them positionally.
-#[allow(clippy::too_many_arguments)]
-pub async fn load_history_page(
-    pool: &PgPool,
-    user_id: Uuid,
-    game_code: Option<i16>,
-    limit: i64,
-    before: Option<DateTime<Utc>>,
-    before_id: Option<Uuid>,
-    before_game: Option<i16>,
-    sessions: bool,
-    session_id: Option<Uuid>,
-) -> sqlx::Result<RecordsResponse> {
-    load_history_page_filtered(
-        pool,
-        user_id,
-        game_code,
-        limit,
-        before,
-        before_id,
-        before_game,
-        sessions,
-        session_id,
-        Opponent::All,
-    )
-    .await
-}
-
 #[allow(clippy::too_many_arguments)]
 pub async fn load_history_page_filtered(
     pool: &PgPool,
     user_id: Uuid,
     game_code: Option<i16>,
     limit: i64,
-    before: Option<DateTime<Utc>>,
-    before_id: Option<Uuid>,
-    before_game: Option<i16>,
+    before: Option<(DateTime<Utc>, Uuid, i16)>,
     sessions: bool,
     session_id: Option<Uuid>,
     opponent: Opponent,
@@ -283,19 +261,15 @@ pub async fn load_history_page_filtered(
     } else {
         ("r.played_at", "r.record_id", "r.game")
     };
-    if let Some(before) = before {
-        if let (Some(id), Some(code)) = (before_id, before_game) {
-            query
-                .push(format!(" AND ({at}, {id_col}, {game_col}) < ("))
-                .push_bind(before)
-                .push(", ")
-                .push_bind(id)
-                .push(", ")
-                .push_bind(code)
-                .push(")");
-        } else {
-            query.push(format!(" AND {at} < ")).push_bind(before);
-        }
+    if let Some((before, id, code)) = before {
+        query
+            .push(format!(" AND ({at}, {id_col}, {game_col}) < ("))
+            .push_bind(before)
+            .push(", ")
+            .push_bind(id)
+            .push(", ")
+            .push_bind(code)
+            .push(")");
     }
     query
         .push(format!(
@@ -325,11 +299,14 @@ pub async fn load_history_page_filtered(
         // The room games whose session is a points or a gold-bean room, and
         // 百家乐 (see above); the bean receipt tells which.
         let unit_codes = crate::games::code_list(|entry| entry.table() || entry.id == "baccarat");
-        query.push("jsonb_build_object('hands', CASE WHEN page.game=5 THEN COALESCE((SELECT jsonb_array_length(r.detail->'results') FROM filtered_records r WHERE r.game=5 AND r.user_id=$1 AND r.record_id=page.record_id),page.hands) ELSE page.hands END, 'started_at', page.started_at, \
-             'unit', CASE WHEN page.game IN (").push(unit_codes).push(") THEN (SELECT CASE WHEN EXISTS (SELECT 1 FROM wallet_ledger l WHERE l.game=10 AND l.record_id=f.record_id AND l.user_id=$1 \
+        // A 掼蛋 match is one record holding all of its deals.
+        let guandan = game::GUANDAN;
+        let beans = game::BEANS;
+        query.push(format!("jsonb_build_object('hands', CASE WHEN page.game={guandan} THEN COALESCE((SELECT jsonb_array_length(r.detail->'results') FROM filtered_records r WHERE r.game={guandan} AND r.user_id=$1 AND r.record_id=page.record_id),page.hands) ELSE page.hands END, 'started_at', page.started_at, \
+             'unit', CASE WHEN page.game IN (")).push(unit_codes).push(format!(") THEN (SELECT CASE WHEN EXISTS (SELECT 1 FROM wallet_ledger l WHERE l.game={beans} AND l.record_id=f.record_id AND l.user_id=$1 \
              AND l.kind='play') \
              THEN 'beans' ELSE 'practice' END FROM (SELECT r.record_id FROM game_records r WHERE r.user_id=$1 AND r.game=page.game \
-             AND COALESCE(r.session_id,r.record_id)=page.session_id LIMIT 1) f) END)");
+             AND COALESCE(r.session_id,r.record_id)=page.session_id LIMIT 1) f) END)"));
     } else {
         // Hydrated below by a statement planned only for this page's games.
         query.push("NULL::jsonb");
@@ -397,12 +374,6 @@ pub async fn load_history_page_filtered(
             }
         })
         .collect();
-    let next_before = if has_more {
-        entries.last().map(|e| e.played_at)
-    } else {
-        None
-    };
-
     let next_cursor = if has_more {
         entries.last().map(|entry| RecordCursor {
             before: entry.played_at,
@@ -415,7 +386,6 @@ pub async fn load_history_page_filtered(
     Ok(RecordsResponse {
         summary,
         entries,
-        next_before,
         next_cursor,
     })
 }
@@ -424,78 +394,24 @@ fn card_codes() -> String {
     crate::games::code_list(|entry| entry.family == crate::games::Family::Card)
 }
 
-/// A card hand's detail, from its `game_rounds` row.
-const CARD_DETAIL: &str = r#"(SELECT jsonb_build_object(
-    'room_code', h.room_code, 'pot', h.pot, 'ante', h.ante, 'showdown', h.showdown,
-    'unit', CASE WHEN EXISTS(SELECT 1 FROM wallet_ledger l WHERE l.game=10 AND l.user_id=$1 AND l.record_id=h.id AND l.kind='play') THEN 'beans' ELSE 'practice' END,
-    'players', jsonb_array_length(h.players),
-    'cards', (SELECT p->'cards' FROM jsonb_array_elements(h.players) p WHERE p->>'user_id'=$1::text LIMIT 1),
-    'has_bots', (h.game=24 OR (SELECT bool_or(p->'user_id'='null'::jsonb) FROM jsonb_array_elements(h.players) p)))
-    FROM game_rounds h WHERE h.game=page.game AND h.id=page.record_id)"#;
-
-/// Every other game keeps its detail, unit included, on the record itself
-/// (match results, 百家乐 hands and room rounds, 押大小 rolls).
+/// Every game without its own [`crate::games::Entry::record_detail`] keeps
+/// its detail, unit included, on the record itself (match results, 百家乐
+/// hands and room rounds, 押大小 rolls).
 const RECORD_DETAIL: &str = r#"(SELECT r.detail FROM game_records r WHERE r.user_id=$1 AND r.game=page.game AND r.record_id=page.record_id)"#;
 
-/// Games whose detail is assembled from their own storage, for one page row
-/// `page(game, record_id)`; `$1` is the viewer. Each arm retains the original
-/// caller filter; missing legacy detail stays null. Ledger record ids can
-/// appear more than once, so choose the latest entry deterministically
-/// instead of relying on an unordered HashMap overwrite. A game without an
-/// arm is a card game ([`CARD_DETAIL`]) or reads [`RECORD_DETAIL`].
-const DETAIL_ARMS: &[(&[i16], &str)] = &[
-    (
-        &[0],
-        r#"(SELECT jsonb_build_object(
-    'bb_size', h.bb_size, 'bot_count', h.bot_count,
-    'position', p.position, 'rank_name', p.rank_name, 'engine_blind', h.engine_blind)
-    FROM hands h JOIN hand_players p ON p.hand_id=h.id AND p.user_id=$1
-    WHERE h.id=page.record_id)"#,
-    ),
-    (
-        &[3],
-        // A points hand carries its own detail; a gold-bean hand's room is on
-        // its bean receipt.
-        r#"(SELECT COALESCE(r.detail, (SELECT jsonb_build_object(
-    'room_code', l.room_code, 'revision', l.revision, 'has_bots', l.has_bots)
-    FROM wallet_ledger l WHERE l.game=10 AND l.details->>'game'='kwx' AND l.user_id=$1 AND l.record_id=page.record_id ORDER BY l.id DESC LIMIT 1))
-    FROM game_records r WHERE r.game=3 AND r.user_id=$1 AND r.record_id=page.record_id)"#,
-    ),
-    (
-        &[4],
-        r#"(SELECT jsonb_build_object(
+/// 鱿鱼 rounds are a poker side game, not a registry entry.
+const SQUID_DETAIL: &str = r#"(SELECT jsonb_build_object(
     'round_number', r.round_number, 'mode', r.mode, 'calculation', r.calculation,
     'bb_size', r.bb_size, 'total_amount', abs(r.delta), 'lost', r.delta<0)
-    FROM squid_player_rounds r WHERE r.id=page.record_id AND r.user_id=$1)"#,
-    ),
-    (
-        &[5],
-        r#"(SELECT jsonb_build_object(
-    'code', r.detail->'code', 'team', r.detail->'team', 'winner', r.detail->'winner',
-    'deals', r.detail->'deals', 'results', r.detail->'results', 'levels', r.detail->'levels', 'has_bots', r.detail->'has_bots',
-    'won', (r.detail->'winner')=(r.detail->'team'))
-    FROM (SELECT * FROM game_records WHERE game=5) r WHERE r.user_id=$1 AND r.record_id=page.record_id)"#,
-    ),
-    (
-        &[6],
-        r#"(SELECT jsonb_build_object(
-    'code', r.detail->'code', 'stone', r.detail->'stone', 'outcome', r.detail->'outcome',
-    'reason', r.detail->'reason', 'moves', r.detail->'moves', 'opponent', r.detail->'opponent',
-    'level', r.detail->'level', 'has_bots', r.detail->'has_bots')
-    FROM (SELECT * FROM game_records WHERE game=6) r WHERE r.user_id=$1 AND r.record_id=page.record_id)"#,
-    ),
-    (
-        &[7],
-        r#"(SELECT jsonb_build_object(
-    'room_code', m.room_code, 'stake', m.stake, 'reason', m.reason,
-    'moves', jsonb_array_length(m.moves),
-    'side', CASE WHEN m.red_user_id=$1 THEN 'red' ELSE 'black' END,
-    'result', CASE WHEN m.winner IS NULL THEN 'draw'
-                  WHEN (m.winner='red' AND m.red_user_id=$1) OR (m.winner='black' AND m.black_user_id=$1) THEN 'win' ELSE 'loss' END,
-    'has_bots', (m.red_user_id IS NULL OR m.black_user_id IS NULL))
-    FROM (SELECT id,room_code,started_at,ended_at,(detail->>'stake')::bigint AS stake,(detail->>'red_user_id')::uuid AS red_user_id,(detail->>'black_user_id')::uuid AS black_user_id,detail->>'red_name' AS red_name,detail->>'black_name' AS black_name,detail->>'winner' AS winner,detail->>'reason' AS reason,detail->'moves' AS moves FROM game_rounds WHERE game=7) m WHERE m.id=page.record_id)"#,
-    ),
-];
+    FROM squid_player_rounds r WHERE r.id=page.record_id AND r.user_id=$1)"#;
+
+/// The detail expression of one record code; `None` for an unknown code.
+fn detail_expression(code: i16) -> Option<&'static str> {
+    if code == game::SQUID {
+        return Some(SQUID_DETAIL);
+    }
+    crate::games::by_code(code).map(|entry| entry.record_detail.unwrap_or(RECORD_DETAIL))
+}
 
 /// Details for one bounded page, in a second statement whose CASE carries only
 /// the arms for games on this page. Planning every game's correlated lookup
@@ -508,26 +424,17 @@ async fn load_page_details(
 ) -> sqlx::Result<std::collections::HashMap<(i16, Uuid), Option<Value>>> {
     use crate::request_timing::{http_phase, HttpPhase};
     let prepare = http_phase(HttpPhase::Processing).operation("records_details_prepare");
-    let cards = crate::games::codes(|entry| entry.family == crate::games::Family::Card);
-    let own = |code: &i16| DETAIL_ARMS.iter().any(|(games, _)| games.contains(code));
-    let mut arms: Vec<(Vec<i16>, &str)> = DETAIL_ARMS
-        .iter()
-        .filter(|(games, _)| keys.iter().any(|(code, _)| games.contains(code)))
-        .map(|(games, expression)| (games.to_vec(), *expression))
-        .collect();
-    if keys.iter().any(|(code, _)| cards.contains(code)) {
-        arms.push((cards.clone(), CARD_DETAIL));
-    }
-    let mut plain: Vec<i16> = keys
-        .iter()
-        .map(|(code, _)| *code)
-        .filter(|code| !own(code) && !cards.contains(code))
-        .filter(|code| crate::games::by_code(*code).is_some())
-        .collect();
-    plain.sort_unstable();
-    plain.dedup();
-    if !plain.is_empty() {
-        arms.push((plain, RECORD_DETAIL));
+    // One CASE arm per distinct expression on this page (all card games share one).
+    let mut arms: Vec<(Vec<i16>, &str)> = Vec::new();
+    for &(code, _) in keys {
+        let Some(expression) = detail_expression(code) else {
+            continue;
+        };
+        match arms.iter_mut().find(|(_, e)| *e == expression) {
+            Some((codes, _)) if codes.contains(&code) => {}
+            Some((codes, _)) => codes.push(code),
+            None => arms.push((vec![code], expression)),
+        }
     }
     if arms.is_empty() {
         return Ok(std::collections::HashMap::new());
@@ -541,7 +448,7 @@ async fn load_page_details(
         ));
     }
     sql.push_str(
-        " ELSE NULL END, '{}'::jsonb) || CASE WHEN EXISTS(SELECT 1 FROM wallet_ledger l WHERE l.game=10 AND l.record_id=page.record_id AND l.user_id=$1 AND l.kind='play') OR EXISTS(SELECT 1 FROM game_records kept WHERE kept.user_id=$1 AND kept.game=page.game AND kept.record_id=page.record_id AND kept.detail->>'unit'='beans') THEN jsonb_build_object('unit','beans') ELSE '{}'::jsonb END AS detail FROM unnest($2::smallint[], $3::uuid[]) AS page(game, record_id)",
+        " ELSE NULL END, '{}'::jsonb) || CASE WHEN EXISTS(SELECT 1 FROM wallet_ledger l WHERE l.game=$4 AND l.record_id=page.record_id AND l.user_id=$1 AND l.kind='play') OR EXISTS(SELECT 1 FROM game_records kept WHERE kept.user_id=$1 AND kept.game=page.game AND kept.record_id=page.record_id AND kept.detail->>'unit'='beans') THEN jsonb_build_object('unit','beans') ELSE '{}'::jsonb END AS detail FROM unnest($2::smallint[], $3::uuid[]) AS page(game, record_id)",
     );
     let (games, ids): (Vec<i16>, Vec<Uuid>) = keys.iter().copied().unzip();
     drop(prepare);
@@ -550,6 +457,7 @@ async fn load_page_details(
         .bind(user_id)
         .bind(games)
         .bind(ids)
+        .bind(game::BEANS)
         .fetch_all(conn)
         .await?;
     drop(query);

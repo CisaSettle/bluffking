@@ -2,7 +2,7 @@
 //! the [`crate::bean_ledger`] posting commits together with the game record.
 use crate::db_writer::PgPool;
 use crate::handlers::respond::error_code;
-use crate::{app_state::AppState, auth::middleware::AuthUser, wallet};
+use crate::{app_state::AppState, auth::middleware::AuthUser, bean_ledger};
 use axum::{
     extract::{rejection::JsonRejection, Query, State},
     http::StatusCode,
@@ -14,8 +14,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::Row;
 use uuid::Uuid;
-
-pub const POLICY: wallet::Policy = crate::beans::POLICY;
 
 /// A separate purpose-bound stream preserves a room prize across checkpoint recovery.
 /// The draw proof and the base bean payout use their original entropy stream.
@@ -33,11 +31,13 @@ pub(crate) fn wins_jackpot(reveal: &draw_games::proof::Reveal, user: Uuid) -> bo
     draw_games::proof::Entropy::new(seed).below(10_000) == 0
 }
 
-/// A jackpot pays 5 × the highest bean payout this stake can win: a winning
-/// small/big returns the stake plus an equal win (2 × stake), so the bonus is
-/// 10 × stake (1,000 beans on a 100-bean wager). `None` only on overflow.
+/// A jackpot pays 5 × the highest bean payout a normal stake can win: a
+/// winning small/big returns the stake plus an equal win (2 × stake), so the
+/// bonus is 10 × stake. The stake it multiplies is capped at [`MAX_STAKE`], so
+/// a solo all-in wager draws the same 10-bean jackpot as a 1-bean one.
 pub(crate) fn jackpot_bonus(stake: i64) -> Option<i64> {
     stake
+        .min(MAX_STAKE)
         .checked_mul(2)?
         .checked_mul(5)
         .filter(|bonus| *bonus > 0)
@@ -150,7 +150,7 @@ async fn saved(
     let row = sqlx::query(
         "SELECT details, balance_after, delta FROM wallet_ledger WHERE game=$1 AND user_id=$2 AND record_id=$3",
     )
-    .bind(POLICY.game)
+    .bind(crate::game_catalog::BEANS)
     .bind(user)
     .bind(record_id(user, bet.request_id))
     .fetch_optional(conn)
@@ -198,10 +198,10 @@ pub async fn play(pool: &PgPool, user: Uuid, bet: &Bet) -> Result<BetResult, Err
         return Err(Error::Invalid);
     }
     let _beans_mutation = crate::beans_read_memory::mutation(pool, [user]);
-    wallet::ensure(pool, POLICY, user).await?;
+    bean_ledger::ensure(pool, user).await?;
     let mut tx = pool.begin().await?;
     crate::db::lock_active_users(&mut tx, &[user]).await?;
-    let balance = wallet::lock(&mut tx, POLICY.game, user)
+    let balance = bean_ledger::lock(&mut tx, crate::game_catalog::BEANS, user)
         .await?
         .ok_or(sqlx::Error::RowNotFound)?;
     // Lookup MUST follow the wallet lock, including retries from another tab.
@@ -293,7 +293,7 @@ pub async fn play(pool: &PgPool, user: Uuid, bet: &Bet) -> Result<BetResult, Err
     let committed = tx.commit().await;
     crate::beans_read_memory::invalidate_user(pool, user);
     committed?;
-    wallet::project_session_balance(POLICY.game, user, balance_after);
+    bean_ledger::project_session_balance(crate::game_catalog::BEANS, user, balance_after);
     Ok(BetResult {
         receipt,
         balance_after,
@@ -305,7 +305,7 @@ pub async fn profile(
     State(state): State<AppState>,
     auth: AuthUser,
 ) -> Result<Json<serde_json::Value>, Error> {
-    let wallet = wallet::ensure(&state.pool, POLICY, auth.user_id).await?;
+    let wallet = bean_ledger::ensure(&state.pool, auth.user_id).await?;
     crate::casino_room::recover::<crate::sicbo_room::SicboRoom>(&state.pool).await?;
     let fairness_offer = crate::draw_fairness::offer(&state.pool, auth.user_id, "sicbo").await?;
     let mut body = json!({ "wallet":wallet, "min_stake":MIN_STAKE, "max_stake":MAX_STAKE,
@@ -329,19 +329,13 @@ pub async fn ledger(
     Query(query): Query<LedgerQuery>,
 ) -> Result<Json<serde_json::Value>, Error> {
     // This game's own plays (solo rolls and room rounds).
-    let entries: Vec<serde_json::Value> = sqlx::query_scalar(&format!(
-        "SELECT to_jsonb(l) FROM (SELECT id,kind,record_id,room_code,revision,delta,
-         balance_after,{} AS details,
-         hand_completed,has_bots,created_at FROM wallet_ledger
-         WHERE user_id=$1 AND kind='play' AND game=$2 AND details->>'game'='sicbo'
-         ORDER BY id DESC LIMIT $3 OFFSET $4) l",
-        crate::bean_ledger::RECEIPT_SQL
-    ))
-    .bind(auth.user_id)
-    .bind(POLICY.game)
-    .bind(query.limit())
-    .bind(query.offset())
-    .fetch_all(&state.pool)
+    let entries = bean_ledger::game_plays(
+        &state.pool,
+        auth.user_id,
+        "sicbo",
+        &["revision", "hand_completed", "has_bots"],
+        query,
+    )
     .await?;
     Ok(Json(json!({"entries":entries})))
 }
@@ -356,9 +350,9 @@ pub async fn open_session(pool: &PgPool, user: Uuid, session: Uuid) -> Result<i6
         return Err(Error::Invalid);
     }
     crate::casino_room::recover::<crate::sicbo_room::SicboRoom>(pool).await?;
-    wallet::ensure(pool, POLICY, user).await?;
+    bean_ledger::ensure(pool, user).await?;
     let mut tx = pool.begin().await?;
-    let balance = wallet::lock(&mut tx, POLICY.game, user)
+    let balance = bean_ledger::lock(&mut tx, crate::game_catalog::BEANS, user)
         .await?
         .ok_or(sqlx::Error::RowNotFound)?;
     tx.commit().await?;

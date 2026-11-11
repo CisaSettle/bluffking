@@ -26,7 +26,6 @@ pub mod store;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-pub const POLICY: crate::wallet::Policy = crate::beans::POLICY;
 /// Namespace of every derived ledger record id (v5 UUIDs).
 pub const LOTTERY_NS: Uuid = Uuid::from_u128(0x3f1b_5a7c_9d2e_4b86_a5c0_7e1d_2f3a_4b5c);
 /// Extra daily grant shared with every beans game.
@@ -36,14 +35,6 @@ pub use draw_games::lottery::{sgt, Game, Period};
 /// The SGT calendar day of an instant (report day of purchases/settlements).
 pub fn sgt_day(at: DateTime<Utc>) -> chrono::NaiveDate {
     at.with_timezone(&sgt()).date_naive()
-}
-
-/// Protocol whose prize table settles a period. Periods drawn before plans
-/// existed keep the unscaled base table, as when they were sold.
-pub fn prize_protocol(plan: Option<&serde_json::Value>) -> String {
-    plan.and_then(|plan| plan["protocol"].as_str())
-        .unwrap_or(draw_games::lottery::LEGACY_PROTOCOL)
-        .to_owned()
 }
 
 pub fn now_ms() -> i64 {

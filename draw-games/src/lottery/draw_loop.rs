@@ -16,14 +16,12 @@ pub(super) async fn notify_winner(
     paid: i64,
     tickets: &[TicketRow],
 ) -> sqlx::Result<()> {
-    let (zh_game, en_game) = match game {
-        Game::Ssq => ("双色球", "Double Color Ball"),
-        Game::Dlt => ("超级大乐透", "Super Lotto"),
-        Game::Toto => ("TOTO", "TOTO"),
-        Game::Happy8 => ("快乐8", "Happy 8"),
-        Game::Fucai3d => ("福彩3D", "Welfare 3D"),
-        Game::Scratch => return Ok(()),
-    };
+    if game == Game::Scratch {
+        return Ok(());
+    }
+    // The registry's display name, as the hub and lottery center show it.
+    let (zh_game, en_game) = crate::game_catalog::game(game.as_str())
+        .map_or((game.as_str(), game.as_str()), |entry| (entry.zh, entry.en));
     let mut bonus = 0i64;
     let mut jackpots = 0usize;
     for ticket in tickets {
@@ -66,7 +64,6 @@ pub(super) async fn notify_winner(
             "credited_beans": credited,
             "ticket_count": tickets.len(),
             "winning_tickets": tickets.iter().filter(|t| t.prize.unwrap_or(0) > 0).count(),
-            "membership": serde_json::Value::Null,
         },
         "i18n": {"zh": {"title": zh_title, "body": zh_body}, "en": {"title": en_title, "body": en_body}},
     }))

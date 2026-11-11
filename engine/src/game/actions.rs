@@ -354,27 +354,6 @@ impl GameHand {
         Ok((self.snapshot(), false))
     }
 
-    /// Returns all actions recorded on the **current street** as `(player_id, action)` pairs.
-    ///
-    /// Blind posts (`PlayerAction::Blind { .. }`) are excluded — they are not
-    /// voluntary betting actions and must not be treated as aggression when
-    /// building bot `DecisionContext.street_actions`.
-    ///
-    /// This is a raw compatibility view. `AllIn` and call-shaped `Raise` tokens
-    /// are semantically ambiguous, so strategy, coach, and aggressor consumers
-    /// must use [`Self::current_street_action_facts`] (or its strategy
-    /// projection) instead of inferring aggression from this method.
-    pub fn current_street_actions(&self) -> Vec<(PlayerId, PlayerAction)> {
-        let current = self.current_street();
-        self.actions
-            .iter()
-            .filter(|rec| {
-                rec.street == current && !matches!(rec.action, PlayerAction::Blind { .. })
-            })
-            .map(|rec| (rec.player_id, rec.action.clone()))
-            .collect()
-    }
-
     /// Current-street actions with authoritative wager semantics.
     ///
     /// An `AllIn` token alone is ambiguous.  This projection distinguishes an
@@ -495,18 +474,6 @@ impl GameHand {
         }
 
         facts
-    }
-
-    /// Strategy-facing current-street history.
-    ///
-    /// Full raises retain their `Raise` / `AllIn` shape.  A short raise or an
-    /// all-in call becomes `Call`, while its real aggressor identity remains
-    /// available from [`Self::current_street_action_facts`].
-    pub fn current_street_strategy_actions(&self) -> Vec<(PlayerId, PlayerAction)> {
-        self.current_street_action_facts()
-            .into_iter()
-            .map(|fact| (fact.player_id, fact.strategy_action()))
-            .collect()
     }
 
     /// The sequence number that the next successfully-applied action will

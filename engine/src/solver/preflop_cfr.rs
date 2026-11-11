@@ -6,16 +6,14 @@
 //! *approximate equilibrium* of a deliberately simplified game whose terminal
 //! values substitute **all-in equity** + a documented **per-class
 //! equity-realization factor** `R` for true postflop EV. The engine has no
-//! postflop solver (none exists in the repo), so a postflop-coupled terminal EV
-//! is out of scope; building one would be research-grade. Therefore:
+//! postflop solver (the separate `gto-solver` crate solves postflop spots on
+//! demand), so a postflop-coupled terminal EV is out of scope here. Therefore:
 //!
 //! * The equilibrium math is **real** — regret matching, discounted regret/
 //!   strategy accumulation, opponent reactions modelled inside the tree, and the
-//!   converged average strategy is **low-exploitability *within this simplified
-//!   game*** — this is MEASURED, not asserted: `bucket_exploitability` computes a
-//!   NashConv-style best-response gap against the same model, and the test
-//!   `dcfr_exploitability_is_low_at_configured_iters` asserts it is below a
-//!   documented threshold at [`CFR_ITERS`].
+//!   converged average strategy targets low exploitability *within this
+//!   simplified game* at [`CFR_ITERS`]. (The former best-response-gap check was
+//!   removed with the unit-test suite, owner decision 2026-10-21.)
 //! * The absolute action frequencies are only as correct as the `R` model.
 //! * The PUBLISHED chart is **CFR-derived then POST-PROCESSED**: the generator
 //!   (`gen_preflop_ranges::enforce_invariants`) rounds, drops sub-floor dust,
@@ -99,11 +97,8 @@ pub const EQUITY_TRIALS: u32 = 8_000;
 pub const EQUITY_SEED: u64 = 0xB1FF_C0DE_1234_5678;
 
 /// DCFR iteration count. Fixed for reproducibility AND chosen so the strategy
-/// has converged to low exploitability *of this simplified model* — MEASURED by
-/// the test `dcfr_exploitability_is_low_at_configured_iters` (via
-/// `bucket_exploitability`, a NashConv-style best-response gap), NOT merely
-/// asserted. DCFR converges fast on a 2-action tree; 2000 iters is well past the
-/// knee (the measured per-bucket gap is a small fraction of a big blind).
+/// has converged to low exploitability *of this simplified model*. DCFR
+/// converges fast on a 2-action tree; 2000 iters is well past the knee.
 pub const CFR_ITERS: u32 = 2_000;
 
 /// Discounted-CFR-style exponents (Brown & Sandholm 2019, "Discounted CFR").
@@ -805,11 +800,8 @@ fn pot_model(pos: Position, bucket: Bucket) -> PotModel {
 /// per-player realization haircuts — hero share `e*R_hero`, villain share
 /// `(1-e)*R_vill` — which do NOT sum to 1 when `R ≠ 1`, so that terminal (and
 /// therefore the bucket as a whole) is GENERAL-SUM. DCFR / regret matching still
-/// converges each player toward its own best response, and `bucket_exploitability`
-/// reports the per-player best-response gap (a valid deviation-incentive /
-/// NashConv measure in a general-sum game), but there is no single zero-sum "game
-/// value" to quote. See `non_allin_terminal_is_general_sum` for the asserted
-/// distinction from the all-in zero-sum line.
+/// converges each player toward its own best response, but there is no single
+/// zero-sum "game value" to quote.
 ///
 /// Players: HERO (the seat we publish a strategy for) and VILLAIN (the single
 /// opponent that created this spot). Hero is dealt a class with the natural
@@ -836,44 +828,16 @@ fn solve_bucket(
     matrix: &EquityMatrix,
     villain_range: &VillainRange,
 ) -> SolvedBucket {
-    let full = solve_bucket_full(pos, bucket, keys, matrix, villain_range);
     SolvedBucket {
-        freq: full.hero_freq,
+        freq: solve_bucket_full(pos, bucket, keys, matrix, villain_range),
     }
-}
-
-/// Both players' converged AVERAGE strategies for one (position, bucket), plus the
-/// fixed model needed to measure exploitability against them. `hero_freq[h]` is
-/// hero's average CONTINUE frequency; `vill_call[v]` is the villain's average CALL
-/// frequency (only meaningful where `vrange[v] > 0`). `vrange` is the normalized
-/// line-anchored villain participation distribution. The chart-published value is
-/// exactly `hero_freq` — `solve_bucket` is a thin wrapper, so adding this does NOT
-/// change any emitted frequency.
-///
-/// Only `hero_freq` is consumed by the shipped solver; the remaining fields
-/// describe the model an exploitability measurement would need and are kept
-/// for that purpose, so they are allowed dead.
-#[allow(dead_code)]
-struct BucketSolution {
-    hero_freq: [f64; N_CLASSES],
-    /// Villain's converged average CALL frequency per class.
-    vill_call: [f64; N_CLASSES],
-    /// Normalized villain participation distribution (probability per class).
-    vrange: Vec<f64>,
-    /// The pot/sizing model for this bucket (terminal EV inputs).
-    pm: PotModel,
-    /// Hero's per-class realization multiplier (R), already 1.0 on all-in lines.
-    hero_r: Vec<f64>,
-    /// Villain's per-class realization multiplier (R).
-    vill_r: Vec<f64>,
 }
 
 /// HERO's showdown-terminal bb EV vs a single villain class, given hero's raw
 /// equity `e`, hero's realization multiplier `r`, whether the terminal is ALL-IN,
 /// the `final_pot`, and hero's invested `cont`. ALL-IN ⇒ RAW equity (no `R`
 /// haircut); see-flop ⇒ `(e·r)` clamped to a probability. THE single definition
-/// of the hero terminal — `solve_bucket_full_iters` calls THIS so any
-/// exploitability measurement can never drift apart from it (F7).
+/// of the hero terminal — `solve_bucket_full` calls THIS (F7).
 #[inline]
 fn hero_showdown_ev(e: f64, r: f64, allin: bool, final_pot: f64, cont: f64) -> f64 {
     let realized = if allin { e } else { (e * r).clamp(0.0, 1.0) };
@@ -901,18 +865,7 @@ fn solve_bucket_full(
     keys: &[String],
     matrix: &EquityMatrix,
     villain_range: &VillainRange,
-) -> BucketSolution {
-    solve_bucket_full_iters(pos, bucket, keys, matrix, villain_range, CFR_ITERS)
-}
-
-fn solve_bucket_full_iters(
-    pos: Position,
-    bucket: Bucket,
-    keys: &[String],
-    matrix: &EquityMatrix,
-    villain_range: &VillainRange,
-    iters: u32,
-) -> BucketSolution {
+) -> [f64; N_CLASSES] {
     let n = N_CLASSES;
     let pm = pot_model(pos, bucket);
 
@@ -948,9 +901,8 @@ fn solve_bucket_full_iters(
 
     // ---- terminal EV helpers (each player's bb EV; GENERAL-SUM at a see-flop
     // terminal because hero/villain use independent `R`, ZERO-SUM only all-in) ----
-    // Terminals go through the SHARED `hero_showdown_ev` / `villain_call_ev` so the
-    // solver and `bucket_exploitability` can never diverge (F7). Both skip the `R`
-    // realization haircut on an all-in line — the F2 symmetry.
+    // Terminals go through the SHARED `hero_showdown_ev` / `villain_call_ev`. Both
+    // skip the `R` realization haircut on an all-in line — the F2 symmetry.
     let hero_ev_showdown = |h: usize, v: usize| -> f64 {
         hero_showdown_ev(
             matrix.get(h, v),
@@ -992,7 +944,6 @@ fn solve_bucket_full_iters(
     let mut hero_regret = vec![[0.0f64; 2]; n];
     let mut hero_strat_sum = vec![[0.0f64; 2]; n];
     let mut vill_regret = vec![[0.0f64; 2]; n];
-    let mut vill_strat_sum = vec![[0.0f64; 2]; n];
 
     let regret_match = |r: &[f64; 2]| -> [f64; 2] {
         let p0 = r[0].max(0.0);
@@ -1005,7 +956,7 @@ fn solve_bucket_full_iters(
         }
     };
 
-    for t in 1..=iters {
+    for t in 1..=CFR_ITERS {
         let tf = t as f64;
         let pos_disc = {
             let ta = tf.powf(DCFR_ALPHA);
@@ -1117,17 +1068,9 @@ fn solve_bucket_full_iters(
             let strat = vill_strat[v];
             let node_ev = strat[0] * ev_fold + strat[1] * ev_call;
             let regrets = [ev_fold - node_ev, ev_call - node_ev];
-            // Reach weight for the average strategy: the villain's range mass ×
-            // how often it is actually facing a continue this iteration.
-            let reach = vrange[v] * cont_mass.max(1e-12);
-            for a in 0..2 {
-                let disc = if regrets[a] >= 0.0 {
-                    pos_disc
-                } else {
-                    neg_disc
-                };
-                vill_regret[v][a] = (vill_regret[v][a] + regrets[a]) * disc;
-                vill_strat_sum[v][a] += strat_disc * reach * strat[a];
+            for (a, &regret) in regrets.iter().enumerate() {
+                let disc = if regret >= 0.0 { pos_disc } else { neg_disc };
+                vill_regret[v][a] = (vill_regret[v][a] + regret) * disc;
             }
         }
     }
@@ -1142,25 +1085,7 @@ fn solve_bucket_full_iters(
             0.0
         };
     }
-    // Average villain strategy → call frequency per class (used by the
-    // exploitability measurement; does NOT affect the published hero chart).
-    let mut vill_call = [0.0f64; N_CLASSES];
-    for (v, slot) in vill_call.iter_mut().enumerate() {
-        let s = vill_strat_sum[v][0] + vill_strat_sum[v][1];
-        *slot = if s > 0.0 {
-            vill_strat_sum[v][1] / s
-        } else {
-            0.0
-        };
-    }
-    BucketSolution {
-        hero_freq,
-        vill_call,
-        vrange,
-        pm,
-        hero_r,
-        vill_r,
-    }
+    hero_freq
 }
 
 // --------------------------------------------------------------------------

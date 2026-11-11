@@ -312,12 +312,6 @@ impl GameHand {
         self.run_twice_from.is_some() && self.second_board.is_none()
     }
 
-    /// How many fresh cards the second run deals (5 from the flop, 2 from the
-    /// turn, 1 from the river; 0 when not running twice).
-    pub fn second_run_card_count(&self) -> usize {
-        self.run_twice_from.map_or(0, second_run_cards_from)
-    }
-
     /// Feed the second run's own cards, in deal order, after the first board
     /// is complete. Cards dealt before [`Self::run_twice_from`] are shared with
     /// the first board.

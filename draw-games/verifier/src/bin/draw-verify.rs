@@ -16,7 +16,7 @@ fn read(path: &str) -> Result<Value, String> {
 
 fn run() -> Result<Value, String> {
     let args: Vec<String> = env::args().skip(1).collect();
-    if (args.len() == 4 || args.len() == 5) && args[0] == "--derive-lottery" {
+    if args.len() == 4 && args[0] == "--derive-lottery" {
         let game = draw_games::lottery::Game::parse(&args[1]).ok_or("Unknown lottery game")?;
         let period: i64 = args[2].parse().map_err(|_| "Invalid period number")?;
         let pulse = read(&args[3])?;
@@ -27,19 +27,14 @@ fn run() -> Result<Value, String> {
                 .ok_or("Missing beacon signature")?
                 .into(),
         };
-        // The protocol is part of the commitment; pass the period's saved
-        // `plan.protocol` to re-derive an older (v1/v2) draw.
-        let protocol = args
-            .get(4)
-            .map_or(draw_games::lottery::PROTOCOL, String::as_str);
         let proof = draw_games::lottery::DrawProof::new(
-            draw_games::lottery::Plan::with_protocol(game, period, protocol)?,
+            draw_games::lottery::Plan::new(game, period)?,
             beacon,
         )?;
         return serde_json::to_value(proof).map_err(|e| e.to_string());
     }
     if args.len() != 1 && !(args.len() == 3 && args[1] == "--receipt") {
-        return Err("Usage: draw-verify proof.json [--receipt pre-draw-receipt.json]\n       draw-verify --derive-lottery GAME PERIOD beacon.json [PROTOCOL]".into());
+        return Err("Usage: draw-verify proof.json [--receipt pre-draw-receipt.json]\n       draw-verify --derive-lottery GAME PERIOD beacon.json".into());
     }
     let document = read(&args[0])?;
     let external_receipt = if args.len() == 3 {

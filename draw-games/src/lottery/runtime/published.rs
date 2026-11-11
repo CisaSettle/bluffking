@@ -126,13 +126,8 @@ impl Published {
         Ok(())
     }
 
-    pub(super) fn commit(&mut self, event: &Event, grants: &[(Uuid, crate::game_rewards::Grant)]) {
+    pub(super) fn commit(&mut self, event: &Event) {
         let mut event = event.clone();
-        for (id, grant) in grants {
-            if let Some(card) = event.cards.iter_mut().find(|t| t.card.id == *id) {
-                card.card.entry["reward_grant"] = json!(grant);
-            }
-        }
         // Replays belong to the command working set/SQL, not to read memory.
         event.receipt = None;
         self.data.apply(&event);

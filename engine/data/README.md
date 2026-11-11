@@ -27,8 +27,8 @@ contradicted the file's own `_source` field. This README now matches the data.
   *directionally sound, model-dependent.*
 - **Schema:** the in-file `version` field is now **3** (mixed frequencies). The
   filename stays `preflop_v2.json` (the consumer's `include_str!` path), but
-  `engine::solver::PREFLOP_V` (and the paired `server::coach::PROMPT_V`) are now
-  **3** to invalidate the `coach_hints` cache per ADR-043 §5 (see "Versioning
+  `engine::solver::PREFLOP_V` (and the paired `server::coach::PROMPT_V`) were
+  bumped to **3** for this chart (now **5** after later estimator/template bumps) to invalidate the `coach_hints` cache per ADR-043 §5 (see "Versioning
   note" below). Each cell is hero's CONTINUE frequency in `[0,1]` (mixed
   strategies — an upgrade over the v1/v2 binary `{0.0, 1.0}` chart). Absent = fold.
 - **Shape:** 6 positions (UTG, MP, CO, BTN, SB, BB) × **5** action buckets (RFI,
@@ -91,7 +91,7 @@ regenerated `preflop_v2.json` IN PLACE and bumped only the in-file `version` fie
 chart content changed twice — the DCFR mixed-frequency rewrite AND the F2
 all-in-symmetry math fix that shifted the `vs_4bet` / `vs_3bet` ranges — so per
 ADR-043 §5 the cache MUST be invalidated; serving stale `prompt_v=2` hints over
-the new chart would mis-grade hands. `server/src/main.rs` asserts
+the new chart would mis-grade hands. `server/src/startup_config.rs` asserts
 `PROMPT_V == PREFLOP_V` at startup, so the two move in lock step. The filename
 stays `preflop_v2.json` (the `include_str!` path is not a cache key).
 *Architect / cross-vendor sign-off requested for the prod cache impact* — see the

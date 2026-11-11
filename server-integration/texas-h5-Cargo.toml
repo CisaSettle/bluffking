@@ -13,14 +13,12 @@ authors = ["BluffKing Contributors"]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-anyhow = "1"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 
 # Rust review standard (L0/L1): in-repo Clippy policy so a bare `cargo clippy`
-# is strict in local verification. Main-push CI is intentionally a
-# build-only deploy gate and does not run Clippy. Crates opt in with
+# is strict in local verification. Crates opt in with
 # `[lints] workspace = true`.
 # NOTE: do NOT add `pedantic`/`nursery`/`restriction` here: local
 # `clippy -- -D warnings` would promote those noisy, allow-by-default groups to
@@ -30,21 +28,18 @@ all = "deny"
 
 [profile.dev]
 opt-level = 0
-# Match test dependency artifacts; full debug symbols made each server build
-# hundreds of MB. Opt in locally with CARGO_PROFILE_DEV_DEBUG when needed.
+# Full debug symbols made each server build hundreds of MB. Opt in locally
+# with CARGO_PROFILE_DEV_DEBUG when needed.
 debug = 0
 
 # Argon2id at the production parameters takes ~200 ms per hash unoptimized vs
 # ~11 ms optimized, so debug-server register/login crossed the 100 ms latency
-# alert. Optimize only the hashing crates; dev/test then match release cost.
+# alert. Optimize only the hashing crates; dev then matches release cost.
 [profile.dev.package.argon2]
 opt-level = 3
 
 [profile.dev.package.blake2]
 opt-level = 3
-
-[profile.test]
-debug = 0
 
 [profile.release]
 opt-level = 3

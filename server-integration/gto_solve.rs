@@ -497,8 +497,8 @@ const MAX_CACHE_BYTES: usize = 96 * 1024 * 1024;
 /// together — a concurrent insert can't race the byte total past the cap. A single
 /// entry larger than the whole budget is simply not cached (it would force an
 /// empty cache); that never happens for a public-tier solve, whose per-hand table
-/// is far under 96 MB. Returns the entry's estimated byte cost (for tests/metrics).
-fn cache_insert(key: u64, spot: CachedSpot) -> usize {
+/// is far under 96 MB.
+fn cache_insert(key: u64, spot: CachedSpot) {
     let bytes = cached_spot_bytes(&spot);
     let cache = solve_cache();
     let order = cache_order();
@@ -517,28 +517,28 @@ fn cache_insert(key: u64, spot: CachedSpot) -> usize {
     // An entry that alone exceeds the whole budget is not worth caching (it would
     // evict everything and still be over). Skip it; the solve still returns.
     if bytes > MAX_CACHE_BYTES {
-        return bytes;
+        return;
     }
 
     // Same spot already cached: apply the final-beats-provisional precedence.
     // (A different `key_repr` under the same key is a hash collision; the new
     // entry replaces it as before.) The shard guard is dropped before any
     // `remove` below.
-    let decision = cache.get_mut(&key).and_then(|mut existing| {
+    let keep_existing = cache.get_mut(&key).is_some_and(|mut existing| {
         if existing.key_repr != spot.key_repr {
-            return None;
+            return false;
         }
         match supersede(&existing, &spot) {
-            Supersede::Replace => None,
-            Supersede::KeepExisting => Some(existing.bytes),
+            Supersede::Replace => false,
+            Supersede::KeepExisting => true,
             Supersede::RefreshExisting(until) => {
                 existing.provisional_until = Some(until);
-                Some(existing.bytes)
+                true
             }
         }
     });
-    if let Some(existing_bytes) = decision {
-        return existing_bytes;
+    if keep_existing {
+        return;
     }
 
     // If this key already has an entry (a benign re-solve race), drop the old one
@@ -568,7 +568,6 @@ fn cache_insert(key: u64, spot: CachedSpot) -> usize {
     cache.insert(key, spot);
     q.push_back(key);
     accountant.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
-    bytes
 }
 
 /// The AGPL §13 Corresponding-Source URL for the deployed solver version (F4).
@@ -960,10 +959,8 @@ fn player_str(p: Player) -> &'static str {
 /// proxy-aware client-IP extraction). Behind a trusted proxy every request shares
 /// the edge peer, which only makes this guard STRICTER (more conservative), never
 /// looser, so it cannot be bypassed by forging headers. A missing `ConnectInfo`
-/// (focused unit test without `into_make_service_with_connect_info`) falls back to
-/// a loopback sentinel so those tests share one bucket — acceptable, since the
-/// real per-IP behavior is covered by the integration tests + the unit tests for
-/// the guard itself.
+/// (a router mounted without `into_make_service_with_connect_info`) falls back to
+/// a shared loopback sentinel bucket.
 fn client_ip(connect_info: Option<&ConnectInfo<SocketAddr>>) -> IpAddr {
     connect_info
         .map(|ci| ci.0.ip())
@@ -1178,7 +1175,7 @@ pub async fn solve_handler(
     State(state): State<AppState>,
     // F1: the source IP gates the per-IP in-flight cap. Optional so a router that
     // mounts the handler WITHOUT `into_make_service_with_connect_info`
-    // (e.g. a focused unit test) still works — a missing peer falls back to a
+    // still works — a missing peer falls back to a
     // shared loopback sentinel (see `client_ip`). Production wires ConnectInfo via
     // `axum::serve(.., app.into_make_service_with_connect_info::<SocketAddr>())`.
     connect_info: Option<ConnectInfo<SocketAddr>>,
@@ -1215,7 +1212,7 @@ pub async fn solve_handler(
         // N4 (codex LOW): CONSTANT reason — never reflect the raw `street` token
         // back to the caller. JSON-only + the UI localizes by error CODE, so the
         // reason is advisory; keeping it constant matches the sibling
-        // `analyze_handler` (codex r2 F1 proved `<script>` reflection there).
+        // `entitled_analyze_handler` (codex r2 F1 proved `<script>` reflection there).
         _ => {
             return bad_request(
                 "invalid_street",

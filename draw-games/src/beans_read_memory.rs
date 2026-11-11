@@ -4,7 +4,7 @@
 
 use crate::db_writer::PgPool;
 use crate::request_timing::{http_phase, HttpPhase};
-use crate::{beans, wallet::Wallet};
+use crate::{bean_ledger::Wallet, beans};
 use chrono::NaiveDate;
 use futures::TryStreamExt;
 use serde_json::Value;
@@ -40,7 +40,11 @@ const MAX_ROWS: usize = 2_000_000;
 const MAX_BYTES: usize = 512 * 1024 * 1024;
 const MAX_POKER_HANDS: usize = 131_072;
 const RECENT_POKER_ACKS: usize = 4096;
-const DAILY: &str = "beans_daily_refill";
+/// Oldest daily-refill day worth holding: yesterday in Singapore time.
+fn daily_floor() -> NaiveDate {
+    let today = crate::lottery::sgt_day(chrono::Utc::now());
+    today.pred_opt().unwrap_or(today)
+}
 const READ_PUBLICATION_WAIT: Duration = Duration::from_secs(2);
 static READ_WAITERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(256);
 /// Leaderboard reads wait on their own small pool so a burst of rankings
@@ -686,21 +690,24 @@ pub(crate) fn over_reserved(pool: &PgPool) -> Vec<Uuid> {
         })
         .collect()
 }
+/// The id a ledger row is kept under; `None` rows are not kept at all.
+/// A 2048 reward (a bonus row without a record id) is kept beside its
+/// entry, under the id derived from that entry's record.
+fn ledger_record(record: Option<Uuid>, details: &Value) -> Option<Uuid> {
+    record.or_else(|| {
+        (details["reason"] == "casual_reward")
+            .then(|| details["meta"]["entry_record"].as_str()?.parse().ok())
+            .flatten()
+            .map(crate::handlers::casual_beans::reward_id)
+    })
+}
 fn add_ledger(
     user: &mut User,
     record: Option<Uuid>,
     balance: i64,
     details: Value,
 ) -> sqlx::Result<()> {
-    // A 2048 reward (a bonus row without a record id) is kept beside its
-    // entry, under the id derived from that entry's record.
-    let record = record.or_else(|| {
-        (details["reason"] == "casual_reward")
-            .then(|| details["meta"]["entry_record"].as_str()?.parse().ok())
-            .flatten()
-            .map(crate::handlers::casual_beans::reward_id)
-    });
-    let Some(record) = record else {
+    let Some(record) = ledger_record(record, &details) else {
         return Ok(());
     };
     let bytes = details
@@ -797,8 +804,10 @@ pub async fn hydrate(pool: &PgPool) -> sqlx::Result<()> {
             }
         }
         {
-            let mut rows = sqlx::query_as::<_, (String, NaiveDate)>("SELECT subject_key,usage_date FROM daily_usage WHERE scope='feature_user' AND feature=$1 ORDER BY subject_key,usage_date")
-                .bind(DAILY).fetch(&mut *tx);
+            // Only today's Singapore day is ever checked (`profile`,
+            // `daily_claimed`); yesterday covers a load that spans midnight.
+            let mut rows = sqlx::query_as::<_, (String, NaiveDate)>("SELECT subject_key,usage_date FROM daily_usage WHERE scope='feature_user' AND feature=$1 AND usage_date>=$2 ORDER BY subject_key,usage_date")
+                .bind(crate::beans::DAILY_FEATURE).bind(daily_floor()).fetch(&mut *tx);
             while let Some((id, day)) = rows.try_next().await? {
                 let id = Uuid::parse_str(&id).map_err(|_| unavailable())?;
                 if let Some(user) = loaded.users.get_mut(&id) {
@@ -1019,28 +1028,55 @@ async fn read_user(
         let row = sqlx::query(&query).bind(crate::game_catalog::BEANS).bind(id).fetch_optional(&mut *tx).await?;
         let mut user = User { wallet: row.as_ref().map(wallet), available: true, bytes: 512, ..User::default() };
         evidence.stage("daily_history");
-        let mut after = None::<NaiveDate>;
+        let mut after = daily_floor().pred_opt();
         loop {
             let rows: Vec<NaiveDate> = sqlx::query_scalar("SELECT usage_date FROM daily_usage WHERE scope='feature_user' AND subject_key=$1 AND feature=$2 AND ($3::date IS NULL OR usage_date>$3) ORDER BY usage_date LIMIT $4")
-                .bind(id.to_string()).bind(DAILY).bind(after).bind(PAGE).fetch_all(&mut *tx).await?;
+                .bind(id.to_string()).bind(crate::beans::DAILY_FEATURE).bind(after).bind(PAGE).fetch_all(&mut *tx).await?;
             if rows.is_empty() { break; }
             after = rows.last().copied();
             for day in rows { user.days.insert(day); user.bytes += 64; }
             if count(&user) > MAX_ROWS || user.bytes > MAX_BYTES { return Err(unavailable()); }
         }
         evidence.stage("ledger_history");
+        // Literal game and predicate: every statement below repeats the partial
+        // index wallet_ledger_beans_read_user (schema 0135) predicate verbatim,
+        // so even a generic plan reads only this account's casual rows.
+        const _: () = assert!(crate::game_catalog::BEANS == 10);
+        // Casual receipts are looked up by any past request id, so all are kept.
         let mut after = 0i64;
         loop {
-            // Literal game and predicate: they match the partial index
-            // wallet_ledger_beans_read_user (schema 0135) exactly, so even a
-            // generic plan reads only this account's casual rows.
-            const _: () = assert!(crate::game_catalog::BEANS == 10);
-            let rows: Vec<(i64, Option<Uuid>, i64, Value)> = sqlx::query_as("SELECT id,record_id,balance_after,details FROM wallet_ledger WHERE user_id=$1 AND game=10 AND details->>'v'='2' AND details->>'game' IN ('slots','roulette','claw','2048','call-fold','lucky-draw') AND (kind='play' OR details->>'reason'='casual_reward') AND id>$2 ORDER BY id LIMIT $3")
+            let rows: Vec<(i64, Option<Uuid>, i64, Value)> = sqlx::query_as("SELECT id,record_id,balance_after,details FROM wallet_ledger WHERE user_id=$1 AND game=10 AND details->>'v'='2' AND details->>'game' IN ('slots','roulette','claw','2048','call-fold','lucky-draw') AND (kind='play' OR details->>'reason'='casual_reward') AND details->>'game' IN ('2048','call-fold','lucky-draw') AND id>$2 ORDER BY id LIMIT $3")
                 .bind(id).bind(after).bind(PAGE).fetch_all(&mut *tx).await?;
             if rows.is_empty() { break; }
             for (cursor, record, balance, details) in rows { after = cursor; add_ledger(&mut user, record, balance, details)?; }
             if count(&user) > MAX_ROWS || user.bytes > MAX_BYTES { return Err(unavailable()); }
         }
+        // A cabinet keeps only its newest kept row (`add_ledger`), the one a
+        // full replay in id order would leave: fetch just that row per game.
+        let newest: Vec<(i64, Option<Uuid>, i64, Value)> = sqlx::query_as("SELECT DISTINCT ON (details->>'game') id,record_id,balance_after,details FROM wallet_ledger WHERE user_id=$1 AND game=10 AND details->>'v'='2' AND details->>'game' IN ('slots','roulette','claw','2048','call-fold','lucky-draw') AND (kind='play' OR details->>'reason'='casual_reward') AND details->>'game' IN ('slots','roulette','claw') ORDER BY details->>'game',id DESC")
+            .bind(id).fetch_all(&mut *tx).await?;
+        for (mut before, record, balance, details) in newest {
+            if ledger_record(record, &details).is_some() {
+                add_ledger(&mut user, record, balance, details)?;
+                continue;
+            }
+            // Only a record-less non-reward row is skipped by `add_ledger`; walk
+            // back to that game's newest kept row, exactly as a replay would.
+            let game = details["game"].as_str().ok_or_else(unavailable)?.to_owned();
+            'older: loop {
+                let rows: Vec<(i64, Option<Uuid>, i64, Value)> = sqlx::query_as("SELECT id,record_id,balance_after,details FROM wallet_ledger WHERE user_id=$1 AND game=10 AND details->>'v'='2' AND details->>'game' IN ('slots','roulette','claw','2048','call-fold','lucky-draw') AND (kind='play' OR details->>'reason'='casual_reward') AND details->>'game'=$2 AND id<$3 ORDER BY id DESC LIMIT $4")
+                    .bind(id).bind(&game).bind(before).bind(PAGE).fetch_all(&mut *tx).await?;
+                if rows.is_empty() { break; }
+                for (cursor, record, balance, details) in rows {
+                    before = cursor;
+                    if ledger_record(record, &details).is_some() {
+                        add_ledger(&mut user, record, balance, details)?;
+                        break 'older;
+                    }
+                }
+            }
+        }
+        if count(&user) > MAX_ROWS || user.bytes > MAX_BYTES { return Err(unavailable()); }
         // The wallet and receipt membership come from this same MVCC snapshot.
         // A lost acknowledgement may already be present in SQL; overlay only
         // the accepted hands that this snapshot has not committed yet.
@@ -1321,7 +1357,7 @@ pub(crate) fn with_admission_balance<R>(
 
 pub fn profile(pool: &PgPool, id: Uuid) -> sqlx::Result<(Wallet, bool)> {
     ensure(pool, id)?;
-    let day = (chrono::Utc::now() + chrono::Duration::hours(8)).date_naive();
+    let day = crate::lottery::sgt_day(chrono::Utc::now());
     let state = {
         let _phase = http_phase(HttpPhase::Processing).operation("beans_state_lookup");
         state(pool)

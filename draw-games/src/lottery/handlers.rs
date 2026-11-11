@@ -152,19 +152,9 @@ pub async fn reveal(
         runtime::reveal(&state.pool, auth.user_id, body.ticket_id, body.index).await?;
     Ok(Json(json!({"ticket":ticket,"balance":balance})))
 }
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Refill {
-    /// Part of the wire contract; the daily claim is idempotent per day.
-    #[allow(dead_code)]
-    request_id: Uuid,
-}
-pub async fn refill(
-    State(state): State<AppState>,
-    auth: AuthUser,
-    body: Result<Json<Refill>, JsonRejection>,
-) -> Result<Json<Value>, Error> {
-    let _request: Json<Refill> = body.map_err(|_| Error::InvalidEntry)?;
+/// The daily claim is idempotent per day; like `/api/wallet/beans-daily` it
+/// reads no request body.
+pub async fn refill(State(state): State<AppState>, auth: AuthUser) -> Result<Json<Value>, Error> {
     Ok(Json(
         json!({"granted": super::REFILL, "balance": runtime::refill(&state.pool, auth.user_id).await?}),
     ))

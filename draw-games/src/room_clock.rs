@@ -1,5 +1,4 @@
-//! Session length for the non-poker game rooms (炸金花 / 斗地主 / 卡五星 / 掼蛋 /
-//! 五子棋 / 象棋).
+//! Session length for the non-poker game rooms.
 //!
 //! The host picks a duration at creation (same 1h–8h grid as poker rooms,
 //! validated by [`crate::handlers::validate_room_duration_secs`]). The
@@ -237,7 +236,7 @@ impl RoomClock {
             .map(|at| u64::try_from(at.saturating_sub(now_ms)).unwrap_or(0))
     }
 
-    /// Wire projection shared by all six games. Clients pin `remaining_ms`
+    /// Wire projection shared by every game room. Clients pin `remaining_ms`
     /// to snapshot arrival, like the per-turn timers.
     pub fn view(&self, now_ms: i64) -> Value {
         json!({

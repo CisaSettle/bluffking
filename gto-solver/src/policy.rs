@@ -48,7 +48,7 @@ pub enum PolicyStep {
     Deal(Card),
 }
 
-/// Measured quality of the unlocked ROOT policy, for exactly `root_request()`
+/// Measured quality of the unlocked ROOT policy, for exactly the root request
 /// and the wrapper's disclosed tree settings. This is neither a full-game
 /// certificate nor a bound on a queried node's conditional exploitability.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
@@ -181,14 +181,6 @@ impl SolvedPostflop {
             request,
             quality,
         })
-    }
-
-    /// Immutable root input. The tree uses zero rake; its fixed all-in addition,
-    /// force-all-in and sizing-merge thresholds are 1.5, 0.15 and 0.1 respectively
-    /// (the same configuration as `solve_spot`). Legal actions outside that tree
-    /// are rejected, including sizes removed by the merge threshold.
-    pub fn root_request(&self) -> &SolveRequest {
-        &self.request
     }
 
     pub fn root_quality(&self) -> RootQuality {

@@ -10,35 +10,40 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 pub const MAX_BATCH_CARDS: usize = 1_000;
+/// Beans per card.
+pub const COST: i64 = 1;
 
+/// Number-match prize per spot showing the lucky number, in multiples of
+/// [`COST`]. Each spot matches with probability 1/30: return 21/30 = 70%.
 pub const PRIZES: [i64; 6] = [1, 1, 2, 2, 5, 10];
 
-/// Service prizes are additive to the unchanged number-match payout.
-/// Version 1 drew 30 days of Max in bucket 31; version 2 (current) draws
-/// [`TOP_REWARD_BEANS`] there instead. `Membership` only appears in stored
-/// version-1 cards; it is no longer granted and settles as beans.
+/// Cards an ALL-IN of `balance` beans buys (capped at [`MAX_BATCH_CARDS`]).
+pub fn all_in_count(balance: i64) -> usize {
+    usize::try_from(balance.max(0) / COST)
+        .unwrap_or(MAX_BATCH_CARDS)
+        .min(MAX_BATCH_CARDS)
+}
+
+/// Service prize drawn per card, additive to the number-match payout.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Reward {
     Beans { amount: i64 },
-    Membership { tier: String, days: i64 },
 }
 
-/// Reward table used for new purchases.
-pub const REWARD_VERSION: u8 = 2;
-/// Five times the highest ordinary service prize (100,000 beans).
-pub const TOP_REWARD_BEANS: i64 = 500_000;
+/// The one reward table: saved in pre-purchase receipts and sent with purchases.
+pub const REWARD_VERSION: u8 = 3;
+/// Service reward buckets out of 10,000 draws per card: (draws, beans).
+/// Expected value 0.15 beans per 1-bean card, so a card returns 85% in all.
+pub const REWARD_TABLE: [(u64, i64); 3] = [(10, 10), (4, 100), (1, 1_000)];
+/// The highest service reward.
+pub const TOP_REWARD_BEANS: i64 = 1_000;
 
 impl Reward {
-    /// Beans credited when a card holding this stored reward settles. A
-    /// version-1 Max reward no longer grants membership: it pays the top
-    /// bean prize that replaced it.
+    /// Beans credited when a card holding this stored reward settles.
     pub fn settled_beans(&self) -> Result<i64, String> {
         match self {
             Reward::Beans { amount } if *amount > 0 => Ok(*amount),
-            Reward::Membership { tier, days } if tier == "max" && *days == 30 => {
-                Ok(TOP_REWARD_BEANS)
-            }
             _ => Err("invalid scratch service reward".into()),
         }
     }
@@ -52,9 +57,9 @@ pub fn rewards(
     version: u8,
 ) -> Result<Vec<Option<Reward>>, String> {
     if reveal.commitment.game != "scratch"
-        || cost != 100
+        || cost != COST
         || !(1..=MAX_BATCH_CARDS).contains(&count)
-        || !(1..=REWARD_VERSION).contains(&version)
+        || version != REWARD_VERSION
     {
         return Err("invalid service reward purchase".into());
     }
@@ -63,18 +68,15 @@ pub fn rewards(
         entropy.below(30);
     }
     Ok((0..count)
-        .map(|_| match entropy.below(10_000) {
-            0..=19 => Some(Reward::Beans { amount: 10_000 }),
-            20 => Some(Reward::Beans { amount: 100_000 }),
-            21..=30 => Some(Reward::Beans { amount: 1_000 }),
-            31 if version == 1 => Some(Reward::Membership {
-                tier: "max".into(),
-                days: 30,
-            }),
-            31 => Some(Reward::Beans {
-                amount: TOP_REWARD_BEANS,
-            }),
-            _ => None,
+        .map(|_| {
+            let mut draw = entropy.below(10_000);
+            for (draws, amount) in REWARD_TABLE {
+                if draw < draws {
+                    return Some(Reward::Beans { amount });
+                }
+                draw -= draws;
+            }
+            None
         })
         .collect())
 }
@@ -89,7 +91,7 @@ pub struct Card {
 
 /// The same award calculation is used by the server and independent verifier.
 pub fn payout(cost: i64, lucky: i16, numbers: &[i16; 6]) -> Result<(i64, i16), String> {
-    if cost != 100
+    if cost != COST
         || !(1..=30).contains(&lucky)
         || numbers.iter().any(|number| !(1..=30).contains(number))
     {
@@ -111,7 +113,7 @@ pub fn generate(reveal: &Reveal, cost: i64, count: usize) -> Result<Vec<Card>, S
     if reveal.commitment.game != "scratch" {
         return Err("scratch proof has a different game".into());
     }
-    if cost != 100 || !(1..=MAX_BATCH_CARDS).contains(&count) {
+    if cost != COST || !(1..=MAX_BATCH_CARDS).contains(&count) {
         return Err("invalid scratch purchase".into());
     }
     let mut entropy = reveal.entropy()?;
@@ -174,7 +176,7 @@ pub fn verify(value: &Value) -> Result<Value, String> {
     {
         return Err("scratch card or prize differs from the committed draw".into());
     }
-    if !(1..=REWARD_VERSION).contains(&receipt.reward_version) {
+    if receipt.reward_version != REWARD_VERSION {
         return Err("unsupported scratch reward version".into());
     }
     let expected = rewards(
