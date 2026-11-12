@@ -1229,7 +1229,17 @@ async fn prepare_scratch(pool: &PgPool, user: Uuid, ticket: Option<Uuid>) -> Res
 /// Only committed memory, including on WebSocket sync/heartbeat. Cold scratch
 /// hydration and fairness commitment creation are explicit prepare commands.
 pub async fn view(pool: &PgPool, user: Uuid, game: Game) -> Result<Value, Error> {
-    current_view(pool, user, game)
+    published_view(pool, user, game).await
+}
+
+/// A wallet whose first grant is still committing is briefly not readable;
+/// wait for its publication (bounded, as other bean GETs do) instead of 503.
+async fn published_view(pool: &PgPool, user: Uuid, game: Game) -> Result<Value, Error> {
+    beans_read_memory::read_after_publication(pool, || match current_view(pool, user, game) {
+        Err(Error::Db(e)) if beans_read_memory::is_unavailable(&e) => Err(e),
+        other => Ok(other),
+    })
+    .await?
 }
 
 pub async fn prepare(pool: &PgPool, user: Uuid, game: Game) -> Result<Value, Error> {
@@ -1262,7 +1272,7 @@ pub async fn prepare(pool: &PgPool, user: Uuid, game: Game) -> Result<Value, Err
     };
     drop(command);
     receipt.wait().await?;
-    current_view(pool, user, game)
+    published_view(pool, user, game).await
 }
 
 pub async fn buy_numbers(

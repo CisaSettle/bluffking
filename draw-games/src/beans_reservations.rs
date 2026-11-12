@@ -7,13 +7,25 @@ use chrono::{DateTime, Utc};
 #[derive(Default)]
 pub(super) struct Reservations {
     poker: HashMap<(Uuid, Uuid, DateTime<Utc>), (u64, i64)>,
-    sicbo: HashMap<String, (u64, HashMap<Uuid, i64>)>,
-    sicbo_locks: HashMap<(String, Uuid), std::fs::File>,
+    /// Open wagers of gold-bean dealer rooms (百家乐, 押大小), by room.
+    dealer: HashMap<DealerKey, (u64, HashMap<Uuid, i64>)>,
+    dealer_locks: HashMap<(DealerKey, Uuid), std::fs::File>,
     /// Each room's checkpoint seats as [`reserved`] reads them, parsed once
     /// per checkpoint revision. A room's checkpoint only ever advances to a
     /// higher revision (directory overlay and the guarded durable write), so
     /// one revision always names the same seats. Read under the bean mutex.
     seats: std::cell::RefCell<HashMap<Uuid, CheckpointSeats>>,
+    /// Owner 2026-11-12 — squid charges posted past a wallet's free beans
+    /// (「金豆不够 金豆就是负数」), by user. The reconcile tolerates this much
+    /// over-reservation until the wallet backs its seats again.
+    squid_unbacked: HashMap<Uuid, i64>,
+}
+
+/// A dealer room: `(game, code)`. Codes are drawn per game.
+pub(super) type DealerKey = (String, String);
+
+fn dealer_key(game: &str, code: &str) -> DealerKey {
+    (game.to_owned(), code.to_owned())
 }
 
 /// Bound on cached rooms; past it the cache restarts empty.
@@ -48,10 +60,10 @@ impl CheckpointSeats {
 }
 
 impl Reservations {
-    /// Accounts holding a hold'em or 押大小 reservation.
+    /// Accounts holding a hold'em or dealer-room reservation.
     pub(super) fn holders(&self) -> impl Iterator<Item = Uuid> + '_ {
         self.poker.keys().map(|(_, user, _)| *user).chain(
-            self.sicbo
+            self.dealer
                 .values()
                 .flat_map(|(_, bets)| bets.keys().copied()),
         )
@@ -82,6 +94,30 @@ impl Reservations {
     }
     pub(super) fn remove_user(&mut self, user: Uuid) {
         self.poker.retain(|(_, owner, _), _| *owner != user);
+        self.squid_unbacked.remove(&user);
+    }
+    /// The over-reservation a squid charge past free beans explains.
+    pub(super) fn squid_unbacked(&self, user: Uuid) -> i64 {
+        self.squid_unbacked.get(&user).copied().unwrap_or(0)
+    }
+    pub(super) fn squid_unbacked_users(&self) -> Vec<Uuid> {
+        self.squid_unbacked.keys().copied().collect()
+    }
+    /// Shrinks the tolerance to the wallet's real deficit, dropping it at 0,
+    /// so an old squid charge never masks a later over-reservation.
+    pub(super) fn ratchet_squid_unbacked(&mut self, user: Uuid, deficit: i64) {
+        if let Some(entry) = self.squid_unbacked.get_mut(&user) {
+            *entry = (*entry).min(deficit.max(0));
+            if *entry == 0 {
+                self.squid_unbacked.remove(&user);
+            }
+        }
+    }
+    pub(super) fn note_squid_unbacked(&mut self, user: Uuid, amount: i64) {
+        if amount > 0 {
+            let entry = self.squid_unbacked.entry(user).or_default();
+            *entry = entry.saturating_add(amount);
+        }
     }
     pub(super) fn checkpoint(&mut self, session: Uuid, checkpoint: &RuntimeCheckpoint) {
         self.poker.retain(|(room, user, joined), (revision, _)| {
@@ -112,66 +148,81 @@ impl Reservations {
         }
     }
 
-    pub(super) fn sicbo_commit(&mut self, code: &str, snapshot: &Value) {
+    pub(super) fn dealer_commit(&mut self, game: &str, code: &str, snapshot: &Value) {
+        let key = dealer_key(game, code);
         let revision = snapshot["revision"].as_u64().unwrap_or(0);
         if self
-            .sicbo
-            .get(code)
+            .dealer
+            .get(&key)
             .is_some_and(|(latest, _)| *latest > revision)
         {
             return;
         }
-        let bets = sicbo_bets(snapshot);
-        self.sicbo_locks
-            .retain(|(room, user), _| room != code || bets.contains_key(user));
+        let bets = dealer_bets(game, snapshot);
+        self.dealer_locks
+            .retain(|(room, user), _| *room != key || bets.contains_key(user));
         if bets.is_empty() {
-            self.sicbo.remove(code);
+            self.dealer.remove(&key);
         } else {
-            self.sicbo.insert(code.into(), (revision, bets));
+            self.dealer.insert(key, (revision, bets));
         }
     }
 }
 
-fn sicbo_bets(snapshot: &Value) -> HashMap<Uuid, i64> {
+/// Each bettor's open stake in a gold-bean dealer room's snapshot: 押大小's
+/// one `stake`, 百家乐's three betting areas together. A points room or a
+/// settled round holds nothing.
+fn dealer_bets(game: &str, snapshot: &Value) -> HashMap<Uuid, i64> {
     if snapshot["wallet_unit"] != "beans" || !snapshot["result"].is_null() {
         return HashMap::new();
     }
+    let stake = |bet: &Value| -> Option<i64> {
+        match game {
+            "sicbo" => bet["stake"].as_i64(),
+            "baccarat" => ["player", "banker", "tie"]
+                .iter()
+                .try_fold(0i64, |sum, side| sum.checked_add(bet[*side].as_i64()?)),
+            _ => None,
+        }
+    };
     snapshot["bets"]
         .as_object()
         .into_iter()
         .flatten()
-        .filter_map(|(id, bet)| Some((id.parse().ok()?, bet["stake"].as_i64()?.max(0))))
+        .filter_map(|(id, bet)| Some((id.parse().ok()?, stake(bet)?.max(0))))
         .collect()
 }
 
 /// Until the corresponding snapshot commits, retain the larger old/new wager.
 /// A cancellation acknowledged in memory cannot release crash-recoverable debt.
-pub fn sicbo_accepted<T>(
+pub fn dealer_accepted<T>(
     pool: &PgPool,
+    game: &str,
     code: &str,
     snapshot: &Value,
     enqueue: impl FnOnce() -> Result<T, crate::casino_room::Error>,
 ) -> Result<T, crate::casino_room::Error> {
     let state = state(pool);
     let mut inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
-    let bets = sicbo_bets(snapshot);
+    let key = dealer_key(game, code);
+    let bets = dealer_bets(game, snapshot);
     let mut locks = Vec::new();
     for user in bets.keys() {
         if !inner
             .reservations
-            .sicbo_locks
-            .contains_key(&(code.into(), *user))
+            .dealer_locks
+            .contains_key(&(key.clone(), *user))
         {
-            if let Some(lock) = crate::local_runtime::hold_sicbo(*user)
+            if let Some(lock) = crate::local_runtime::hold_dealer(*user)
                 .map_err(|_| crate::casino_room::Error::Unavailable)?
             {
-                locks.push(((code.into(), *user), lock));
+                locks.push(((key.clone(), *user), lock));
             }
         }
     }
     let result = enqueue()?;
-    inner.reservations.sicbo_locks.extend(locks);
-    let entry = inner.reservations.sicbo.entry(code.into()).or_default();
+    inner.reservations.dealer_locks.extend(locks);
+    let entry = inner.reservations.dealer.entry(key).or_default();
     entry.0 = snapshot["revision"].as_u64().unwrap_or(entry.0);
     for (user, stake) in bets {
         let amount = entry.1.entry(user).or_default();
@@ -180,13 +231,13 @@ pub fn sicbo_accepted<T>(
     Ok(result)
 }
 
-pub fn sicbo_committed(pool: &PgPool, code: &str, snapshot: &Value) {
+pub fn dealer_committed(pool: &PgPool, game: &str, code: &str, snapshot: &Value) {
     state(pool)
         .inner
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .reservations
-        .sicbo_commit(code, snapshot);
+        .dealer_commit(game, code, snapshot);
 }
 
 pub fn sync_poker_checkpoint(pool: &PgPool, session: Uuid, checkpoint: &RuntimeCheckpoint) {
@@ -229,25 +280,25 @@ pub(super) fn reserved(
     user: Uuid,
     sql_balance: bool,
     excluding_poker: Option<Uuid>,
-    excluding_sicbo: Option<&str>,
+    excluding_dealer: Option<(&str, &str)>,
 ) -> sqlx::Result<i64> {
-    if crate::local_runtime::sicbo_held(user).map_err(sqlx::Error::Io)?
+    if crate::local_runtime::dealer_held(user).map_err(sqlx::Error::Io)?
         && !inner
             .users
             .get(&user)
             .is_some_and(|u| !u.effects.is_empty())
         && !inner
             .reservations
-            .sicbo
+            .dealer
             .values()
             .any(|(_, bets)| bets.contains_key(&user))
     {
         return Err(unavailable());
     }
-    if inner.reservations.sicbo.iter().any(|(code, (_, bets))| {
+    if inner.reservations.dealer.iter().any(|((game, code), (_, bets))| {
         bets.contains_key(&user)
             && crate::local_runtime::owned_by_another_backend(crate::release_handoff::rooms::id(
-                "sicbo", code,
+                game, code,
             ))
     }) {
         return Err(unavailable());
@@ -300,8 +351,8 @@ pub(super) fn reserved(
             total = total.checked_add(amount).ok_or_else(unavailable)?;
         }
     }
-    for (code, (_, bets)) in &inner.reservations.sicbo {
-        if Some(code.as_str()) != excluding_sicbo {
+    for ((game, code), (_, bets)) in &inner.reservations.dealer {
+        if Some((game.as_str(), code.as_str())) != excluding_dealer {
             total = total
                 .checked_add(bets.get(&user).copied().unwrap_or(0))
                 .ok_or_else(unavailable)?;
@@ -383,7 +434,7 @@ pub fn available(
     user: Uuid,
     balance: i64,
     sql_balance: bool,
-    excluding_sicbo: Option<&str>,
+    excluding_dealer: Option<(&str, &str)>,
 ) -> sqlx::Result<i64> {
     let state = {
         let _phase = http_phase(HttpPhase::Processing).operation("beans_state_lookup");
@@ -393,7 +444,7 @@ pub fn available(
         let _phase = http_phase(HttpPhase::Processing).operation("beans_available_mutex");
         state.inner.lock().unwrap_or_else(|e| e.into_inner())
     };
-    available_locked(pool, &inner, user, balance, sql_balance, excluding_sicbo)
+    available_locked(pool, &inner, user, balance, sql_balance, excluding_dealer)
 }
 
 pub(super) fn available_locked(
@@ -402,7 +453,7 @@ pub(super) fn available_locked(
     user: Uuid,
     balance: i64,
     sql_balance: bool,
-    excluding_sicbo: Option<&str>,
+    excluding_dealer: Option<(&str, &str)>,
 ) -> sqlx::Result<i64> {
     if !inner.ready {
         return Err(unavailable());
@@ -433,7 +484,7 @@ pub(super) fn available_locked(
             user,
             sql_balance,
             None,
-            excluding_sicbo,
+            excluding_dealer,
         )?)
         .max(0))
 }
@@ -482,4 +533,88 @@ pub fn reserve_poker_stack(
         .poker
         .insert((session, user, member.joined_at), (revision, target));
     Ok(true)
+}
+
+/// Owner 2026-11-12 — a squid loser short of the penalty tops up the whole
+/// shortfall from the wallet, which may go negative (「金豆不够 金豆就是负数」).
+/// Grows this seat's whole-stack reservation by the part of `wanted` the
+/// wallet holds beside every reservation (this seat's current one included),
+/// so nothing else spends it before the hand commits, and returns that part.
+pub fn reserve_poker_top_up(
+    pool: &PgPool,
+    session: Uuid,
+    user: Uuid,
+    wanted: u64,
+) -> sqlx::Result<u64> {
+    ensure(pool, user)?;
+    let state = state(pool);
+    let mut inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
+    if !inner.ready || inner.active_users.contains_key(&user) {
+        return Err(unavailable());
+    }
+    let balance = inner
+        .users
+        .get(&user)
+        .filter(|u| u.available)
+        .and_then(|u| u.wallet.as_ref())
+        .ok_or_else(unavailable)?
+        .balance;
+    let directory = crate::live_directory::memory_snapshot_for_user(pool, user)?;
+    let room = directory.sessions.get(&session).ok_or_else(unavailable)?;
+    let member = room
+        .members
+        .iter()
+        .find(|m| m.user_id == user && m.left_at.is_none())
+        .ok_or_else(unavailable)?;
+    let other = reserved(&inner, &directory, user, false, Some(session), None)?;
+    let all = reserved(&inner, &directory, user, false, None, None)?;
+    let current = all.saturating_sub(other).max(0);
+    let free = balance.saturating_sub(all).max(0);
+    let wanted = i64::try_from(wanted).unwrap_or(i64::MAX);
+    let grant = wanted.min(free);
+    inner.reservations.note_squid_unbacked(user, wanted - grant);
+    if grant == 0 {
+        return Ok(0);
+    }
+    let revision = room
+        .runtime_checkpoint
+        .as_ref()
+        .and_then(|c| c["revision"].as_u64())
+        .unwrap_or(0)
+        .saturating_add(1);
+    inner.reservations.poker.insert(
+        (session, user, member.joined_at),
+        (revision, current.saturating_add(grant)),
+    );
+    Ok(grant as u64)
+}
+
+/// Owner 2026-11-12 — a gold-bean squid leaver's extra buy-in is charged in
+/// full from the wallet: the part past its free beans now (the wallet may go
+/// negative). Record it with [`note_squid_unbacked`] once the leave commits.
+pub fn squid_departure_unbacked(pool: &PgPool, user: Uuid, wanted: u64) -> sqlx::Result<i64> {
+    let state = state(pool);
+    let inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
+    if !inner.ready {
+        return Err(unavailable());
+    }
+    let balance = inner
+        .users
+        .get(&user)
+        .and_then(|u| u.wallet.as_ref())
+        .ok_or_else(unavailable)?
+        .balance;
+    let directory = crate::live_directory::memory_snapshot_for_user(pool, user)?;
+    let all = reserved(&inner, &directory, user, false, None, None)?;
+    let free = balance.saturating_sub(all).max(0);
+    let wanted = i64::try_from(wanted).unwrap_or(i64::MAX);
+    Ok(wanted.saturating_sub(free).max(0))
+}
+
+/// Tolerates `amount` of over-reservation for a committed squid charge
+/// posted past the wallet's free beans (see [`squid_departure_unbacked`]).
+pub fn note_squid_unbacked(pool: &PgPool, user: Uuid, amount: i64) {
+    let state = state(pool);
+    let mut inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
+    inner.reservations.note_squid_unbacked(user, amount);
 }

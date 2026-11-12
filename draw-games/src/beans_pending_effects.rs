@@ -89,7 +89,7 @@ pub(crate) fn accept_effect(
     }
     effect.apply(&mut wallet)?;
     let hold = if user.effect_hold.is_none() {
-        crate::local_runtime::hold_sicbo(owner).map_err(sqlx::Error::Io)?
+        crate::local_runtime::hold_dealer(owner).map_err(sqlx::Error::Io)?
     } else {
         None
     };

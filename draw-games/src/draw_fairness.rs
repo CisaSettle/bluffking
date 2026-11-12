@@ -30,7 +30,7 @@ fn commitment(game: &str, id: Uuid, seed: &str) -> Result<Commitment, sqlx::Erro
 
 /// At most one outstanding offer per user/game. Ordinary polling only reads it.
 pub async fn offer(pool: &PgPool, user: Uuid, game: &str) -> Result<Commitment, sqlx::Error> {
-    if !matches!(game, "scratch" | "sicbo") {
+    if game != "scratch" {
         return Err(sqlx::Error::Protocol(
             "unsupported immediate draw game".into(),
         ));

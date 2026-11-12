@@ -46,11 +46,13 @@ pub enum Game {
     Tenhalf,
     Baccarat,
     Colorcards,
+    Paigow,
 }
 impl Game {
     pub fn size(self) -> usize {
         match self {
             Self::Shortdeck => 36,
+            Self::Paigow => 32,
             Self::Ddz => 54,
             Self::Guandan | Self::Colorcards => 108,
             Self::Baccarat => 416,
@@ -69,6 +71,7 @@ impl Game {
             Self::Tenhalf => "tenhalf",
             Self::Baccarat => "baccarat",
             Self::Colorcards => "colorcards",
+            Self::Paigow => "paigow",
         }
     }
     pub fn parse(id: &str) -> Option<Self> {
@@ -83,6 +86,7 @@ impl Game {
             Self::Tenhalf,
             Self::Baccarat,
             Self::Colorcards,
+            Self::Paigow,
         ]
         .into_iter()
         .find(|g| g.id() == id)

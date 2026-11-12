@@ -34,13 +34,6 @@ use crate::game_catalog::BEANS as GAME;
 pub const GRANT: i64 = 200;
 /// Keeps payouts and JSON integers bounded even for the largest solo multiplier.
 pub const MAX_ALL_IN: i64 = 1_000_000_000_000;
-pub fn solo_stake(base: i64, expected: Option<i64>) -> Option<i64> {
-    match expected {
-        None => Some(base),
-        Some(n) if (1..=MAX_ALL_IN).contains(&n) => Some(n),
-        _ => None,
-    }
-}
 /// Namespace of the server-derived receipt ids of client-requested solo plays.
 const SOLO_RECORD_NS: Uuid = Uuid::from_u128(0x8d2f_6c41_0b7e_4a93_9e15_c3a8_57d0_50e1);
 /// The shared wallet ledger keys play receipts by `(game, record_id, user)`
@@ -115,6 +108,60 @@ pub(crate) fn reentry_chips(
     }
     Ok(Some(saved))
 }
+
+/// The fewest beans `saved` needs to sit back down when a fresh seat costs
+/// `fresh` and the whole wallet, beans reserved by other games included, is
+/// `wallet_total`. A settled departure whose whole wallet can no longer cover
+/// its stack may return with the whole wallet once that covers a fresh
+/// buy-in: it keeps nothing back, so this is no rathole (owner 2026-11-12:
+/// leaving a table with 2,484 and then holding 1,358 blocked that table for
+/// its 24 hours). Beans held by another game must be released first, so
+/// `available` then equals `wallet_total`.
+pub(crate) fn reentry_required(
+    saved: &crate::runtime_checkpoint::StandingChips,
+    fresh: u64,
+    wallet_total: i64,
+) -> u64 {
+    let total = saved.stack + saved.pending_chips;
+    if reentry_reducible(saved) && wallet_total < total as i64 {
+        total.min(fresh).max(wallet_total.max(0) as u64)
+    } else {
+        total
+    }
+}
+
+/// `saved` re-entering with `available` beans: unchanged when they cover it.
+/// Otherwise the old stack was cashed out and the seat is funded afresh with
+/// every available bean: a new `occupancy` (the re-entry's `joined_at`) and
+/// `buyin_total`, which is how standings book a cash-out and new buy-in.
+/// `None` when even [`reentry_required`] is not covered.
+pub(crate) fn reentry_stack(
+    saved: crate::runtime_checkpoint::StandingChips,
+    available: i64,
+    wallet_total: i64,
+    fresh: u64,
+    joined_at: chrono::DateTime<chrono::Utc>,
+) -> Option<crate::runtime_checkpoint::StandingChips> {
+    let available = u64::try_from(available).ok()?;
+    if available < reentry_required(&saved, fresh, wallet_total) {
+        return None;
+    }
+    if available >= saved.stack + saved.pending_chips {
+        return Some(saved);
+    }
+    Some(crate::runtime_checkpoint::StandingChips {
+        stack: available,
+        buyin_total: available,
+        pending_chips: 0,
+        occupancy: Some(joined_at),
+        pending_beans_hand: None,
+    })
+}
+
+/// Only a settled departure without pending chips may come back shorter.
+fn reentry_reducible(saved: &crate::runtime_checkpoint::StandingChips) -> bool {
+    saved.pending_beans_hand.is_none() && saved.pending_chips == 0
+}
 pub const SEATS: i16 = 9;
 /// New public tables run for 24 hours from the first deal.
 pub const PUBLIC_TABLE_DURATION_SECS: i64 = 86_400;
@@ -152,9 +199,15 @@ pub async fn ensure(pool: &PgPool, user: Uuid) -> sqlx::Result<Wallet> {
 
 /// Call with the shared wallet locked, before a new debit. Poker admission
 /// takes the same lock, so a stack cannot be spent in two games at once.
-pub async fn sicbo_seated(conn: &mut PgConnection, user: Uuid) -> sqlx::Result<bool> {
-    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM game_room_checkpoint_members m JOIN game_room_checkpoints c ON c.game=m.game AND c.code=m.code WHERE m.game='sicbo' AND m.user_id=$1)")
-        .bind(user).fetch_one(conn).await
+/// Whether `user` holds a seat in a gold-bean dealer room (百家乐, 押大小).
+pub async fn dealer_seated(conn: &mut PgConnection, user: Uuid) -> sqlx::Result<bool> {
+    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM game_room_checkpoint_members m JOIN game_room_checkpoints c ON c.game=m.game AND c.code=m.code WHERE m.game=ANY($2) AND m.beans AND m.user_id=$1)")
+        .bind(user).bind(dealer_games()).fetch_one(conn).await
+}
+
+/// The registered dealer-room games.
+fn dealer_games() -> Vec<&'static str> {
+    crate::games::ids(|entry| entry.family == crate::games::Family::Dealer)
 }
 
 pub async fn spendable(pool: &PgPool, conn: &mut PgConnection, user: Uuid) -> sqlx::Result<bool> {
@@ -171,7 +224,7 @@ pub async fn spendable(pool: &PgPool, conn: &mut PgConnection, user: Uuid) -> sq
                 .is_some_and(|c| c["beans"] == true)
     });
     Ok(!seated
-        && !sicbo_seated(conn, user).await?
+        && !dealer_seated(conn, user).await?
         && !holds::outstanding(user)
         && !crate::local_runtime::beans_held(user).map_err(sqlx::Error::Io)?)
 }
@@ -183,18 +236,19 @@ pub async fn available_on(
     conn: &mut PgConnection,
     user: Uuid,
     balance: i64,
-    excluding_sicbo: Option<&str>,
+    excluding_dealer: Option<(&str, &str)>,
 ) -> sqlx::Result<i64> {
     if crate::local_runtime::enabled() {
-        let code: Option<String> = sqlx::query_scalar(
-            "SELECT code FROM game_room_checkpoint_members WHERE game='sicbo' AND user_id=$1",
+        let rooms: Vec<(String, String)> = sqlx::query_as(
+            "SELECT game,code FROM game_room_checkpoint_members WHERE game=ANY($2) AND beans AND user_id=$1",
         )
         .bind(user)
-        .fetch_optional(&mut *conn)
+        .bind(dealer_games())
+        .fetch_all(&mut *conn)
         .await?;
-        if code.is_some_and(|code| {
+        if rooms.iter().any(|(game, code)| {
             crate::local_runtime::owned_by_another_backend(crate::release_handoff::rooms::id(
-                "sicbo", &code,
+                game, code,
             ))
         }) {
             return Err(sqlx::Error::Protocol(
@@ -202,7 +256,7 @@ pub async fn available_on(
             ));
         }
     }
-    crate::beans_read_memory::available(pool, user, balance, true, excluding_sicbo)
+    crate::beans_read_memory::available(pool, user, balance, true, excluding_dealer)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -663,6 +717,10 @@ pub mod holds {
         session: Uuid,
         users: HashSet<Uuid>,
         amounts: HashMap<Uuid, i64>,
+        /// Dealt users who left and were folded out of this hand: their
+        /// result is the chips they had committed, already their `amounts`
+        /// entry, so it is no longer unknown (`outstanding_unless`).
+        fixed: HashSet<Uuid>,
         /// Completed; its wallet settlement is queued.
         settling: bool,
         /// The table's unsettled counter: the session actor and every queued
@@ -705,6 +763,7 @@ pub mod holds {
                 session,
                 users,
                 amounts,
+                fixed: HashSet::new(),
                 settling: false,
                 alive: Arc::downgrade(alive),
                 _local_holds: local_holds,
@@ -739,17 +798,35 @@ pub mod holds {
 
     /// Whether `user` was dealt into a beans hand that has not settled yet.
     pub fn outstanding(user: Uuid) -> bool {
-        outstanding_unless(user, |_| false)
+        let mut open = open_hands();
+        open.retain(|_, h| h.alive.strong_count() > 0);
+        open.values().any(|h| h.users.contains(&user))
+    }
+
+    /// Owner 2026-11-12 (「强制退房 就可以立马让他退」): `user` left `hand` and
+    /// was folded out of it, so its result is exactly `loss` (the chips they
+    /// had committed). The hold keeps reserving that loss until the hand's
+    /// settlement commits, but memory admission no longer waits for it.
+    pub(crate) fn fix_departed_loss(hand: Uuid, user: Uuid, loss: i64) {
+        if let Some(open) = open_hands().get_mut(&hand) {
+            if let Some(amount) = open.amounts.get_mut(&user) {
+                *amount = (*amount).min(loss.max(0));
+                open.fixed.insert(user);
+            }
+        }
     }
 
     /// Memory poker admission may ignore results already included in its
-    /// locked wallet snapshot. Durable-wallet spenders must use `outstanding`.
-    /// The predicate must not acquire the wallet lock (wallet -> holds order).
+    /// locked wallet snapshot, and a folded leaver's result whose loss the
+    /// hold already reserves (`fix_departed_loss`). Durable-wallet spenders
+    /// must use `outstanding`. The predicate must not acquire the wallet lock
+    /// (wallet -> holds order).
     pub(crate) fn outstanding_unless(user: Uuid, mut accounted: impl FnMut(Uuid) -> bool) -> bool {
         let mut open = open_hands();
         open.retain(|_, h| h.alive.strong_count() > 0);
-        open.iter()
-            .any(|(hand, h)| h.users.contains(&user) && !accounted(*hand))
+        open.iter().any(|(hand, h)| {
+            h.users.contains(&user) && !h.fixed.contains(&user) && !accounted(*hand)
+        })
     }
 
     pub fn amounts(user: Uuid) -> HashMap<Uuid, i64> {

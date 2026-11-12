@@ -424,12 +424,35 @@ pub async fn settle(conn: &mut PgConnection, posting: &Posting<'_>) -> sqlx::Res
             return Err(protocol(INVALID));
         };
         if after < 0 && entry.delta < 0 {
-            // Posted in full; never clamped, never refused.
-            tracing::warn!(
-                game = posting.game, user = %entry.user, record = %posting.record_id,
-                balance, delta = entry.delta, after, "bean_settlement_unbacked"
-            );
-            crate::beans::alert_negative_settlement(posting.record_id, Some(entry.user), 1);
+            // Posted in full; never clamped, never refused. Owner 2026-11-12
+            // 「金豆不够 金豆就是负数」: a squid penalty is charged in full even
+            // past the wallet, so a negative from the squid part is expected
+            // and only logged; a loss that overdraws without it still alerts.
+            let squid_debit = if posting.game == "squid" {
+                -entry.delta
+            } else {
+                entry
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta["squid_delta"].as_i64())
+                    .map_or(0, |delta| (-delta).max(0))
+            };
+            // The non-squid part (a hand's own loss) alone must not overdraw.
+            let non_squid = entry.delta.saturating_add(squid_debit);
+            let overdrawn_without_squid = non_squid < 0 && balance.saturating_add(non_squid) < 0;
+            if squid_debit > 0 && !overdrawn_without_squid {
+                tracing::info!(
+                    game = posting.game, user = %entry.user, record = %posting.record_id,
+                    balance, delta = entry.delta, after, squid_debit,
+                    "bean_settlement_squid_negative"
+                );
+            } else {
+                tracing::warn!(
+                    game = posting.game, user = %entry.user, record = %posting.record_id,
+                    balance, delta = entry.delta, after, "bean_settlement_unbacked"
+                );
+                crate::beans::alert_negative_settlement(posting.record_id, Some(entry.user), 1);
+            }
         }
     }
     let deltas: Vec<i64> = entries.iter().map(|entry| entry.delta).collect();
@@ -575,6 +598,8 @@ reasons! {
     LotteryJackpot => ("lottery_jackpot", Bonus),
     ScratchReward => ("scratch_reward", Bonus),
     CasualReward => ("casual_reward", Bonus),
+    /// Training drills: first-correct and daily-goal beans ([`crate::drill_rewards`]).
+    DrillReward => ("drill_reward", Bonus),
     /// The single row a wallet starts from after the ledger was rebuilt
     /// (written by a schema file, never by the server). `meta.initial_grant`
     /// is the first-use allowance already contained in it.
@@ -1079,9 +1104,9 @@ pub async fn available_on(
     conn: &mut PgConnection,
     user: Uuid,
     balance: i64,
-    excluding_sicbo: Option<&str>,
+    excluding_dealer: Option<(&str, &str)>,
 ) -> sqlx::Result<i64> {
-    crate::beans::available_on(pool, conn, user, balance, excluding_sicbo).await
+    crate::beans::available_on(pool, conn, user, balance, excluding_dealer).await
 }
 
 /// One wallet whose balance disagrees with its ledger.

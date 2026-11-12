@@ -58,13 +58,14 @@ pub async fn recover<R: DealerRoom>(pool: &PgPool) -> sqlx::Result<()> {
                 // the registry. Activate owned bean rooms' wallets before
                 // admitting any request through the shared recovery guard; a
                 // points room's stacks came back with its snapshot.
-                if beans::<R>() {
-                    for (uid, code) in users {
-                        // Only seats of rooms this process installed.
-                        if registry.room(&code).is_some() && super::holds::<R>(uid, &code) {
-                            let w = bean_ledger::ensure(pool, uid).await?;
-                            bean_ledger::activate(crate::game_catalog::BEANS, uid, &code, w);
-                        }
+                for (uid, code) in users {
+                    // Only seats of bean rooms this process installed.
+                    let Some(room) = registry.room(&code) else {
+                        continue;
+                    };
+                    if room.lock().await.beans && super::holds::<R>(uid, &code) {
+                        let w = bean_ledger::ensure(pool, uid).await?;
+                        bean_ledger::activate(crate::game_catalog::BEANS, uid, &code, w);
                     }
                 }
                 if room_count < crate::pagination::DEFAULT_LIMIT as usize {
@@ -100,11 +101,13 @@ pub(super) fn install<R: DealerRoom>(
             continue;
         }
         let id = crate::release_handoff::rooms::id(R::DEALER, &code);
+        let mut state: R::State = crate::game_checkpoint::decode(row.get("state"))?;
+        let beans = R::beans(&state);
         // Local development: a room another local backend drives stays there;
         // it is not a recovery failure for this process.
         if crate::local_runtime::owned_by_another_backend(id) {
             tracing::info!(%code, "{} room owned by another local backend", R::DEALER);
-            if memory_lifecycle::<R>() {
+            if !beans {
                 R::registry().nonresident.lock().unwrap().extend(
                     by_room
                         .get(&code)
@@ -114,7 +117,6 @@ pub(super) fn install<R: DealerRoom>(
             }
             continue;
         }
-        let mut state: R::State = crate::game_checkpoint::decode(row.get("state"))?;
         // Rooms opened before the session clock start it now (default hour).
         R::clock_mut(&mut state).start(now_ms());
         let handoff_guard = crate::release_handoff::register(id, true)
@@ -122,18 +124,12 @@ pub(super) fn install<R: DealerRoom>(
         let mut members = by_room.remove(&code).unwrap_or_default();
         let mut memberships = Vec::new();
         for (uid, member) in &mut members {
-            if memory_lifecycle::<R>() {
+            if !beans {
                 let owner = memory_membership::current(R::DEALER, &code, *uid)
                     .map(Ok)
                     .unwrap_or_else(|| {
                         // Recovery restores what was admitted before.
-                        memory_membership::claim(
-                            R::DEALER,
-                            &code,
-                            *uid,
-                            super::bean_room::<R>(),
-                            false,
-                        )
+                        memory_membership::claim(R::DEALER, &code, *uid, false, false)
                     })
                     .map_err(|_| {
                         sqlx::Error::Protocol("conflicting recovered room membership".into())
@@ -148,16 +144,16 @@ pub(super) fn install<R: DealerRoom>(
                 }
             }
         }
-        if !memory_lifecycle::<R>() {
+        if beans {
             // Recovery restores what was admitted before.
             let users: Vec<Uuid> = members.keys().copied().collect();
-            memory_membership::hold(R::DEALER, &code, super::bean_room::<R>(), &users, None)
+            memory_membership::hold(R::DEALER, &code, true, &users, None)
                 .map_err(|_| {
                     sqlx::Error::Protocol("conflicting recovered room membership".into())
                 })?;
         }
         let state = Arc::new(state);
-        let initial = memory_lifecycle::<R>().then(|| Snapshot {
+        let initial = (!beans).then(|| Snapshot {
             users: members.keys().copied().collect(),
             names: members
                 .iter()
@@ -170,6 +166,7 @@ pub(super) fn install<R: DealerRoom>(
         });
         let room = Room {
             pool: pool.clone(),
+            beans,
             registry_generation: Some(crate::room_registry::publish_committed(
                 pool,
                 R::DEALER,
@@ -177,7 +174,7 @@ pub(super) fn install<R: DealerRoom>(
             )?),
             state,
             members,
-            writer: writer::<R>(pool, &code, initial),
+            writer: writer::<R>(pool, &code, beans, initial),
             touched: Instant::now(),
             idle: IdleWatch::new(),
             closed: false,
@@ -238,7 +235,7 @@ pub(super) fn handoff_room<R: DealerRoom>(
                     crate::release_handoff::fail(&error);
                 }
                 let frozen = crate::release_handoff::rooms::Frozen {
-                    checkpoint: if memory_lifecycle::<R>() {
+                    checkpoint: if !room.beans {
                         checkpoint_value::<R>(
                             &room.state,
                             &room
@@ -358,6 +355,7 @@ pub(super) async fn drop_room<R: DealerRoom>(
 ) -> Result<()> {
     let room = shared.lock().await;
     let closing = Closing {
+        beans: room.beans,
         registry_generation: room.registry_generation,
         require_empty: true,
         members: Vec::new(),
@@ -380,14 +378,15 @@ pub(super) async fn drop_room<R: DealerRoom>(
 /// underneath (account deletion cascades) leave idle rooms. An emptied room
 /// closes.
 pub(super) async fn sweep<R: DealerRoom>(pool: &PgPool) -> Result<()> {
-    // Accepted membership epochs are authoritative. Reading a lagging SQL
-    // projection here could evict a seat whose admission is queued correctly.
-    if memory_lifecycle::<R>() {
-        return Ok(());
-    }
     let registry = R::registry();
     for (code, shared) in registry.all() {
         let mut room = shared.lock().await;
+        // A points room's accepted membership epochs are authoritative.
+        // Reading a lagging SQL projection here could evict a seat whose
+        // admission is queued correctly.
+        if !room.beans {
+            continue;
+        }
         let idle = room.touched.elapsed() > Duration::from_secs(3600);
         // Hold each unsettled player's membership lock for the whole pass.
         let mut held = Vec::new();
@@ -425,10 +424,8 @@ pub(super) async fn sweep<R: DealerRoom>(pool: &PgPool) -> Result<()> {
             }
         }
         for uid in finish_join {
-            if beans::<R>() {
-                let w = bean_ledger::ensure(pool, uid).await?;
-                bean_ledger::activate(crate::game_catalog::BEANS, uid, &code, w);
-            }
+            let w = bean_ledger::ensure(pool, uid).await?;
+            bean_ledger::activate(crate::game_catalog::BEANS, uid, &code, w);
             if let Some(m) = room.members.get_mut(&uid) {
                 m.joining = false;
             }
@@ -436,9 +433,7 @@ pub(super) async fn sweep<R: DealerRoom>(pool: &PgPool) -> Result<()> {
         }
         for uid in &gone {
             room.members.remove(uid);
-            if beans::<R>() {
-                bean_ledger::retire(crate::game_catalog::BEANS, *uid, &code);
-            }
+            bean_ledger::retire(crate::game_catalog::BEANS, *uid, &code);
             super::release_seat::<R>(*uid, &code);
         }
         // A previously unknown create becomes authoritative only once its
@@ -540,7 +535,7 @@ pub(super) async fn begin_close<R: DealerRoom>(
     room.idle.observe(in_play);
     // A points room whose writer is fenced can never save again: it closes
     // now instead of holding its players until the reclaim tick.
-    let dead = memory_lifecycle::<R>() && room.writer.is_closed();
+    let dead = !room.beans && room.writer.is_closed();
     if !dead
         && !room.idle.expiry_due(in_play, expired)
         && !(reclaim && room.idle.reclaim_due(in_play))
@@ -565,6 +560,7 @@ pub(super) async fn begin_close<R: DealerRoom>(
     room.spectators.close();
     tracing::info!(%code, fenced_writer = dead, "{} room closing after inactivity or expiry", R::DEALER);
     Close::Due(Closing {
+        beans: room.beans,
         registry_generation: room.registry_generation,
         require_empty: false,
         members: room.members.keys().copied().collect(),
@@ -669,7 +665,7 @@ pub(super) async fn finish_close<R: DealerRoom>(
         }
     }
     for uid in &closing.members {
-        if beans::<R>() {
+        if closing.beans {
             bean_ledger::retire(crate::game_catalog::BEANS, *uid, &code);
         }
         super::release_seat::<R>(*uid, &code);

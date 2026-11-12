@@ -8,10 +8,11 @@
 //! transaction, in order, retrying until it lands. A points room (百家乐)
 //! keeps every player's stack inside its snapshot: nothing outside the room
 //! holds points. A bean room's seated wallets are the in-memory projection
-//! ([`crate::bean_ledger::activate`]). Baccarat's memory lifecycle uses
-//! the shared checkpoint membership epochs and ordered departure receipts.
-//! Other dealer games keep durable membership admission, including solo 押大小
-//! whose bean wallet is shared with non-table financial operations. The host table-owner lock (`crate::runtime_owner`)
+//! ([`crate::bean_ledger::activate`]). The host picks 金豆 or 积分 per room
+//! ([`DealerRoom::beans`]). A points room's memory lifecycle uses the shared
+//! checkpoint membership epochs and ordered departure receipts; a bean room
+//! keeps durable membership admission, since its wallet is shared with
+//! non-table financial operations. The host table-owner lock (`crate::runtime_owner`)
 //! routes every room request to one process, which recovers all rooms from
 //! their rows before serving and drains its writers before exiting.
 //! Games with precommitted draws additionally require durable commitment and
@@ -67,6 +68,41 @@ impl From<sqlx::Error> for Error {
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// A dealer room's denomination as its snapshot names it (`"wallet_unit"`):
+/// `crate::beans_reservations`, `crate::room_limits` and schema 0126 read
+/// that key. Chosen by the host at creation (金豆/积分) and fixed after.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WalletUnit {
+    /// The shared gold-bean wallet.
+    Beans,
+    /// Practice points that exist only inside the room.
+    Practice,
+}
+impl WalletUnit {
+    pub fn new(beans: bool) -> Self {
+        if beans {
+            Self::Beans
+        } else {
+            Self::Practice
+        }
+    }
+    pub fn beans(self) -> bool {
+        self == Self::Beans
+    }
+    /// The refusal for a wager above what the player can stake.
+    pub fn insufficient(self) -> &'static str {
+        if self.beans() {
+            "insufficient_beans"
+        } else {
+            "insufficient_chips"
+        }
+    }
+}
+
+/// The stack every player starts with in a points room.
+pub const POINTS_STACK: i64 = 1_000;
+
 /// One dealer-room game: pure rules over its in-memory state, plus the SQL
 /// that makes a settled round durable.
 pub trait DealerRoom: Send + Sync + Sized + 'static {
@@ -76,10 +112,9 @@ pub trait DealerRoom: Send + Sync + Sized + 'static {
     const DEALER: &'static str;
     /// Seats per room, humans and AI co-bettors together.
     const MAX_MEMBERS: usize;
-    /// The stack every player starts with in a points room, whose points live
-    /// only in the room snapshot ([`DealerRoom::stack`]). `None`: a gold-bean
-    /// room, which stakes from the bean wallet ([`crate::beans`]).
-    const POINTS_STACK: Option<i64> = None;
+    /// The smallest wager: a gold-bean room admits only a player whose
+    /// available beans cover it.
+    const MIN_STAKE: i64;
     /// A committed draw must be durable before accepting a wager, and the
     /// accepted wager must be durable before its HTTP acknowledgement.
     const REQUIRE_DURABLE_BETS: bool = false;
@@ -89,7 +124,14 @@ pub trait DealerRoom: Send + Sync + Sized + 'static {
     /// Everything the writer needs to make one settled round durable.
     type Round: Clone + Send + Sync + 'static;
 
-    fn new_state(now: i64, bots: usize) -> Self::State;
+    /// `beans`: the host's 金豆/积分 choice, fixed for the room's life.
+    fn new_state(now: i64, bots: usize, beans: bool) -> Self::State;
+    /// A gold-bean room stakes from the shared bean wallet and keeps durable
+    /// membership rows; a points room keeps every stack in its snapshot
+    /// ([`DealerRoom::stack`]) and uses the memory membership lifecycle. The
+    /// snapshot names it as `"wallet_unit"` (`beans_reservations`,
+    /// `room_limits` and schema 0126 read that key).
+    fn beans(state: &Self::State) -> bool;
     /// The id of the round currently open (its settlement receipt key).
     fn round_id(state: &Self::State) -> Uuid;
     fn bots(state: &Self::State) -> usize;
@@ -270,6 +312,8 @@ impl<R: DealerRoom> Clone for Snapshot<R> {
 
 struct Room<R: DealerRoom> {
     pool: PgPool,
+    /// [`DealerRoom::beans`] of this room's state, fixed at opening.
+    beans: bool,
     registry_generation: Option<Uuid>,
     state: Arc<R::State>,
     members: BTreeMap<Uuid, Member>,
@@ -359,13 +403,14 @@ fn release_seat<R: DealerRoom>(uid: Uuid, code: &str) {
 }
 
 /// Takes `uid`'s hold on `code` for a room whose membership rows this module
-/// writes itself (`memory_lifecycle` rooms claim through their writer
+/// writes itself (points rooms claim through their writer
 /// instead). `crate::room_limits` decides, under the membership lock.
 fn hold_seat<R: DealerRoom>(uid: Uuid, code: &str) -> Result<()> {
+    // Only gold-bean rooms write their own membership rows.
     memory_membership::hold(
         R::DEALER,
         code,
-        bean_room::<R>(),
+        true,
         &[uid],
         Some(&|_| Vec::new()),
     )
@@ -422,6 +467,7 @@ pub(crate) async fn admin_activity<R: DealerRoom>() -> Vec<crate::game_hub::acti
             started: true,
             humans,
             bots: R::bots(&room.state),
+            beans: R::beans(&room.state),
         });
     }
     views
@@ -431,14 +477,6 @@ fn now_ms() -> i64 {
     Utc::now().timestamp_millis()
 }
 
-/// A gold-bean room; otherwise the room keeps its own points.
-fn beans<R: DealerRoom>() -> bool {
-    R::POINTS_STACK.is_none()
-}
-
-fn memory_lifecycle<R: DealerRoom>() -> bool {
-    !beans::<R>()
-}
 
 fn checkpoint_value<R: DealerRoom>(state: &R::State, names: &BTreeMap<Uuid, String>) -> Value {
     let mut value = json!(state);
@@ -463,6 +501,7 @@ fn shared_snapshot<R: DealerRoom>(snapshot: &Snapshot<R>) -> crate::game_checkpo
 fn writer<R: DealerRoom>(
     pool: &PgPool,
     code: &str,
+    beans: bool,
     initial: Option<Snapshot<R>>,
 ) -> Ordered<Option<Snapshot<R>>> {
     let (pool, code) = (pool.clone(), code.to_owned());
@@ -473,7 +512,7 @@ fn writer<R: DealerRoom>(
             let (pool, code, unknown) = (pool.clone(), code.clone(), unknown.clone());
             async move {
                 if let Some(snapshot) = &next {
-                    if memory_lifecycle::<R>() {
+                    if !beans {
                         let next_shared = shared_snapshot(snapshot);
                         let result = if let Some(old) = &old {
                             crate::game_checkpoint::persist_snapshot(
@@ -521,9 +560,10 @@ fn writer<R: DealerRoom>(
                             fenced
                         })?;
                     }
-                    if beans::<R>() {
-                        crate::beans_read_memory::sicbo_committed(
+                    if beans {
+                        crate::beans_read_memory::dealer_committed(
                             &pool,
+                            R::DEALER,
                             &code,
                             &json!(snapshot.state.as_ref()),
                         );
@@ -555,8 +595,8 @@ async fn persist<R: DealerRoom>(pool: &PgPool, code: &str, snap: &Snapshot<R>) -
     );
     users.sort_unstable();
     users.dedup();
-    let _beans_mutation =
-        beans::<R>().then(|| crate::beans_read_memory::mutation(pool, users.iter().copied()));
+    // Only gold-bean rooms persist here (points rooms use `game_checkpoint`).
+    let _beans_mutation = crate::beans_read_memory::mutation(pool, users.iter().copied());
     let mut tx = pool.begin().await?;
     let mut active = Vec::new();
     for user in users {
@@ -579,10 +619,8 @@ async fn persist<R: DealerRoom>(pool: &PgPool, code: &str, snap: &Snapshot<R>) -
     };
     if stored >= snap.revision {
         tx.rollback().await?;
-        if beans::<R>() {
-            for user in &active {
-                crate::beans_read_memory::invalidate_user(pool, *user);
-            }
+        for user in &active {
+            crate::beans_read_memory::invalidate_user(pool, *user);
         }
         return Ok(());
     }
@@ -598,10 +636,8 @@ async fn persist<R: DealerRoom>(pool: &PgPool, code: &str, snap: &Snapshot<R>) -
     .execute(&mut *tx)
     .await?;
     let committed = tx.commit().await;
-    if beans::<R>() {
-        for user in &active {
-            crate::beans_read_memory::invalidate_user(pool, *user);
-        }
+    for user in &active {
+        crate::beans_read_memory::invalidate_user(pool, *user);
     }
     committed?;
     Ok(())
@@ -642,7 +678,7 @@ fn accept<R: DealerRoom>(
         revision,
         state: next.clone(),
         round: round.clone(),
-        memberships: if memory_lifecycle::<R>() {
+        memberships: if !room.beans {
             memory_membership::capture(
                 R::DEALER,
                 code,
@@ -658,8 +694,14 @@ fn accept<R: DealerRoom>(
             .enqueue(Some(snapshot))
             .map_err(|_| Error::Unavailable)
     };
-    if beans::<R>() {
-        crate::beans_read_memory::sicbo_accepted(&room.pool, code, &json!(next.as_ref()), enqueue)?;
+    if room.beans {
+        crate::beans_read_memory::dealer_accepted(
+            &room.pool,
+            R::DEALER,
+            code,
+            &json!(next.as_ref()),
+            enqueue,
+        )?;
         // A points room's settled stacks are already in `next`.
         if let Some(round) = round {
             for (uid, delta) in R::deltas(&round) {
@@ -687,7 +729,7 @@ fn accept<R: DealerRoom>(
 fn push<R: DealerRoom>(code: &str, room: &mut Room<R>) {
     room.pushed_at_ms = now_ms();
     room.push_retry = false;
-    if memory_lifecycle::<R>() && room.writer.is_closed() {
+    if !room.beans && room.writer.is_closed() {
         for (_, _, out) in &room.subscribers {
             let _ = out.try_send(json!({"t":"error","code":"storage_unavailable"}).to_string());
         }
@@ -788,7 +830,7 @@ fn settle_unwatched<R: DealerRoom>(code: &str, room: &mut Room<R>, now: i64) -> 
 /// What the player can stake from: the room's own stack in a points room,
 /// the projected bean wallet in a bean room.
 fn balance<R: DealerRoom>(room: &Room<R>, uid: Uuid) -> i64 {
-    if beans::<R>() {
+    if room.beans {
         bean_ledger::projected(crate::game_catalog::BEANS, uid).map_or(0, |w| w.balance)
     } else {
         R::stack(&room.state, uid)
@@ -869,7 +911,7 @@ fn watch_refusal<R: DealerRoom>(
     uid: Uuid,
     now: i64,
 ) -> std::result::Result<(), RoomError> {
-    if room.release_paused || (memory_lifecycle::<R>() && room.writer.health().is_err()) {
+    if room.release_paused || (!room.beans && room.writer.health().is_err()) {
         return Err(RoomError::StorageUnavailable);
     }
     if room.closed || R::clock(&room.state).expired(now) {
@@ -893,7 +935,7 @@ fn took_seat<R: DealerRoom>(room: &mut Room<R>, uid: Uuid) {
 }
 
 fn seated<R: DealerRoom>(room: &Room<R>, uid: Uuid) -> Result<()> {
-    if memory_lifecycle::<R>() {
+    if !room.beans {
         room.writer.health().map_err(|_| Error::Unavailable)?;
     }
     if room.closed {
@@ -957,15 +999,13 @@ async fn lock_wallet(
 }
 
 /// Locks a bean room's wallet for admission and refuses a player who cannot
-/// cover the smallest stake. A points room admits without any wallet: `None`.
+/// cover the smallest stake. (Points rooms admit through their memory
+/// lifecycle without any wallet.)
 async fn admission_wallet<R: DealerRoom>(
     pool: &PgPool,
     tx: &mut PgConnection,
     uid: Uuid,
 ) -> std::result::Result<Option<bean_ledger::Wallet>, Commit<Option<bean_ledger::Wallet>>> {
-    if !beans::<R>() {
-        return Ok(None);
-    }
     // Admission lock: serializes refills and solo play against taking a seat.
     let wallet = lock_wallet(tx, crate::game_catalog::BEANS, uid)
         .await
@@ -974,25 +1014,18 @@ async fn admission_wallet<R: DealerRoom>(
     if crate::beans::available_on(pool, tx, uid, wallet.balance, None)
         .await
         .map_err(|e| Commit::Refused(e.into()))?
-        < crate::sicbo::MIN_STAKE
+        < R::MIN_STAKE
     {
         return Err(Commit::Refused(Error::Code("insufficient_beans")));
     }
     Ok(Some(wallet))
 }
 
-/// The seat of an admission whose commit is known to have landed: a bean
-/// room's wallet from committed storage (`None` if unreadable, so the sweep
-/// finishes it), nothing to load for a points room.
-async fn committed_seat<R: DealerRoom>(
-    pool: &PgPool,
-    uid: Uuid,
-) -> Option<Option<bean_ledger::Wallet>> {
-    if beans::<R>() {
-        bean_ledger::ensure(pool, uid).await.ok().map(Some)
-    } else {
-        Some(None)
-    }
+/// The seat of a bean-room admission whose commit is known to have landed:
+/// its wallet from committed storage (`None` if unreadable, so the sweep
+/// finishes it).
+async fn committed_seat(pool: &PgPool, uid: Uuid) -> Option<Option<bean_ledger::Wallet>> {
+    bean_ledger::ensure(pool, uid).await.ok().map(Some)
 }
 
 /// A commit whose acknowledgement failed may still have landed: ask the DB.
@@ -1053,16 +1086,10 @@ impl Drop for MemoryAdmission {
     }
 }
 
-/// A dealer room stakes gold beans (骰宝) unless its game keeps points inside
-/// the room (百家乐). Fixed per game.
-pub(crate) fn bean_room<R: DealerRoom>() -> bool {
-    beans::<R>()
-}
-
 /// `crate::room_limits` over the rooms the player holds, before a code is
 /// drawn for a new room; taking the hold decides for good.
-fn admit_other_room<R: DealerRoom>(uid: Uuid) -> Result<()> {
-    crate::room_limits::admit(&held_rooms::<R>(uid), bean_room::<R>())
+fn admit_other_room<R: DealerRoom>(uid: Uuid, beans: bool) -> Result<()> {
+    crate::room_limits::admit(&held_rooms::<R>(uid), beans)
         .map_err(|refusal| Error::Code(refusal.code()))
 }
 
@@ -1086,7 +1113,8 @@ fn claim_memory<R: DealerRoom>(
     if R::registry().nonresident.lock().unwrap().contains(&uid) {
         return Err(Error::Unavailable);
     }
-    let owner = memory_membership::claim(R::DEALER, code, uid, bean_room::<R>(), true)
+    // Memory-lifecycle rooms are points rooms.
+    let owner = memory_membership::claim(R::DEALER, code, uid, false, true)
         .map_err(claim_error)?;
     Ok(MemoryAdmission {
         pool: pool.clone(),
@@ -1107,7 +1135,7 @@ async fn open_room_memory<R: DealerRoom>(
     allow_spectators: bool,
 ) -> Result<String> {
     let registry = R::registry();
-    admit_other_room::<R>(uid)?;
+    admit_other_room::<R>(uid, false)?;
     if registry.nonresident.lock().unwrap().contains(&uid) {
         return Err(Error::Unavailable);
     }
@@ -1128,6 +1156,7 @@ async fn open_room_memory<R: DealerRoom>(
         now_ms(),
         bots.min(crate::casino_bots::MAX_BOTS)
             .min(R::MAX_MEMBERS - 1),
+        false,
     );
     R::set_allow_spectators(&mut state, allow_spectators);
     *R::clock_mut(&mut state) = RoomClock::new(duration_secs);
@@ -1136,7 +1165,7 @@ async fn open_room_memory<R: DealerRoom>(
     crate::room_registry::publish_pending(pool, R::DEALER, &code)?;
     admission.published = crate::room_registry::pending_generation(pool, R::DEALER, &code);
     let state = Arc::new(state);
-    let mut writer = writer::<R>(pool, &code, None);
+    let mut writer = writer::<R>(pool, &code, false, None);
     writer
         .enqueue(Some(Snapshot {
             users: vec![uid],
@@ -1153,6 +1182,7 @@ async fn open_room_memory<R: DealerRoom>(
     members.insert(uid, Member::new(name, false));
     let room = Room {
         pool: pool.clone(),
+        beans: false,
         registry_generation: admission.published,
         state,
         members,
@@ -1250,39 +1280,51 @@ async fn leave_room_memory<R: DealerRoom>(pool: &PgPool, uid: Uuid, code: &str) 
     Ok(())
 }
 
-/// Opens a room; `allow_spectators` is the host's 允许朋友观战.
+/// Opens a room; `allow_spectators` is the host's 允许朋友观战 and `beans`
+/// the host's 金豆/积分 choice.
 pub async fn open_room_with<R: DealerRoom>(
     pool: &PgPool,
     uid: Uuid,
     name: String,
-    bots: usize,
-    duration_secs: u32,
-    allow_spectators: bool,
+    options: RoomOptions,
 ) -> Result<String> {
     let pool = pool.clone();
     membership::<R, _, _>(uid, async move {
-        open_room_now::<R>(&pool, uid, name, bots, duration_secs, allow_spectators).await
+        open_room_now::<R>(&pool, uid, name, options).await
     })
     .await
+}
+
+/// What the host chose when opening a room.
+#[derive(Clone, Copy)]
+pub struct RoomOptions {
+    pub bots: usize,
+    pub duration_secs: u32,
+    pub allow_spectators: bool,
+    pub beans: bool,
 }
 
 async fn open_room_now<R: DealerRoom>(
     pool: &PgPool,
     uid: Uuid,
     name: String,
-    bots: usize,
-    duration_secs: u32,
-    allow_spectators: bool,
+    options: RoomOptions,
 ) -> Result<String> {
+    let RoomOptions {
+        bots,
+        duration_secs,
+        allow_spectators,
+        beans,
+    } = options;
     recover::<R>(pool).await?;
-    if memory_lifecycle::<R>() {
+    if !beans {
         return open_room_memory::<R>(pool, uid, name, bots, duration_secs, allow_spectators).await;
     }
     let registry = R::registry();
     let bots = bots
         .min(crate::casino_bots::MAX_BOTS)
         .min(R::MAX_MEMBERS - 1);
-    admit_other_room::<R>(uid)?;
+    admit_other_room::<R>(uid, true)?;
     let code = crate::room_code::allocate(pool, R::DEALER)
         .await
         .map_err(|e| Error::Code(e.code()))?;
@@ -1292,11 +1334,9 @@ async fn open_room_now<R: DealerRoom>(
         crate::release_handoff::register(crate::release_handoff::rooms::id(R::DEALER, &code), true)
             .ok_or(Error::Unavailable)?;
     let now = now_ms();
-    let mut state = R::new_state(now, bots);
-    let _beans_mutation = beans::<R>().then(|| crate::beans_read_memory::mutation(pool, [uid]));
-    if beans::<R>() {
-        bean_ledger::ensure(pool, uid).await?;
-    }
+    let mut state = R::new_state(now, bots, true);
+    let _beans_mutation = crate::beans_read_memory::mutation(pool, [uid]);
+    bean_ledger::ensure(pool, uid).await?;
     R::set_allow_spectators(&mut state, allow_spectators);
     // Rounds deal from the start, so the session clock does too.
     let clock = R::clock_mut(&mut state);
@@ -1324,7 +1364,7 @@ async fn open_room_now<R: DealerRoom>(
         .bind(json!(state))
         .bind(uid)
         .bind(&name)
-        .bind(bean_room::<R>())
+        .bind(true)
         .execute(&mut *tx)
         .await
         .map_err(|e| Commit::Refused(member_insert_refusal(e)))?;
@@ -1349,7 +1389,7 @@ async fn open_room_now<R: DealerRoom>(
             Some(true) => {
                 // Exact membership proves this creation transaction committed.
                 registration.set_unknown(false);
-                committed_seat::<R>(pool, uid).await
+                committed_seat(pool, uid).await
             }
             None => None,
         },
@@ -1363,10 +1403,11 @@ async fn open_room_now<R: DealerRoom>(
     members.insert(uid, Member::new(name, joining));
     let room = Room {
         pool: pool.clone(),
+        beans: true,
         registry_generation: None,
         state: Arc::new(state),
         members,
-        writer: writer::<R>(pool, &code, None),
+        writer: writer::<R>(pool, &code, true, None),
         touched: Instant::now(),
         idle: IdleWatch::new(),
         closed: false,
@@ -1426,15 +1467,14 @@ async fn join_room_now<R: DealerRoom>(
     name: String,
 ) -> Result<()> {
     recover::<R>(pool).await?;
-    if memory_lifecycle::<R>() {
-        return join_room_memory::<R>(pool, code, uid, name).await;
-    }
     let registry = R::registry();
     let shared = registry.room(code).ok_or(Error::Code("room_not_found"))?;
-    let _beans_mutation = beans::<R>().then(|| crate::beans_read_memory::mutation(pool, [uid]));
-    if beans::<R>() {
-        bean_ledger::ensure(pool, uid).await?;
+    // Fixed at opening, so it cannot change after this read.
+    if !shared.lock().await.beans {
+        return join_room_memory::<R>(pool, code, uid, name).await;
     }
+    let _beans_mutation = crate::beans_read_memory::mutation(pool, [uid]);
+    bean_ledger::ensure(pool, uid).await?;
     if holds::<R>(uid, code) {
         // Seated already, or a join whose outcome is still unknown.
         let room = shared.lock().await;
@@ -1479,7 +1519,7 @@ async fn join_room_now<R: DealerRoom>(
         .bind(uid)
         .bind(code)
         .bind(&name)
-        .bind(bean_room::<R>())
+        .bind(true)
         .execute(&mut *tx)
         .await
         .map_err(|e| Commit::Refused(member_insert_refusal(e)))?;
@@ -1492,7 +1532,7 @@ async fn join_room_now<R: DealerRoom>(
         Commit::Refused(e) => Err(e),
         Commit::Unknown(e) => match member_row::<R>(pool, uid, code).await {
             Some(false) => Err(e),
-            Some(true) => Ok(committed_seat::<R>(pool, uid).await),
+            Some(true) => Ok(committed_seat(pool, uid).await),
             None => Ok(None),
         },
     };
@@ -1543,7 +1583,12 @@ pub async fn place_bet<R: DealerRoom>(
     let shared = R::registry()
         .room(code)
         .ok_or(Error::Code("room_not_found"))?;
-    let durable_round = if R::REQUIRE_DURABLE_BETS {
+    // A bean room also waits: its wager is checked against the locked SQL
+    // wallet minus every other reservation, which is only exact once the
+    // room's previous settlement is durable, and an acknowledged bean wager
+    // must survive a crash.
+    let durable_bets = R::REQUIRE_DURABLE_BETS || shared.lock().await.beans;
+    let durable_round = if durable_bets {
         let (round, durable) = {
             let room = shared.lock().await;
             seated(&room, uid)?;
@@ -1567,22 +1612,30 @@ pub async fn place_bet<R: DealerRoom>(
     if room.members.get(&uid).is_some_and(|m| m.leaving) {
         return Err(Error::Code("bet_closed"));
     }
+    // Check the round again after the persistence wait (`R::bet` rechecks
+    // the deadline).
     if durable_round.is_some_and(|round| round != R::round_id(&room.state)) {
         return Err(Error::Code("bet_closed"));
     }
     room.touched = Instant::now();
     let mut next = room.state.as_ref().clone();
-    // Check the round and deadline again after the persistence wait.
-    if beans::<R>() {
-        // The prior round is durable, and the room lock prevents a new round
-        // transition. Read the locked shared wallet rather than an old display
+    if room.beans {
+        // The prior round is durable (`durable_bets`), and the room lock
+        // prevents a new round transition. Read the locked shared wallet rather than an old display
         // projection: daily grants may arrive while a player stays seated.
         let _beans_mutation = crate::beans_read_memory::mutation(pool, [uid]);
         let mut tx = pool.begin().await?;
         let current = bean_ledger::lock(&mut tx, crate::game_catalog::BEANS, uid)
             .await?
             .ok_or(Error::Code("storage_unavailable"))?;
-        let available = crate::beans::available_on(pool, &mut tx, uid, current, Some(code)).await?;
+        let available = crate::beans::available_on(
+            pool,
+            &mut tx,
+            uid,
+            current,
+            Some((R::DEALER, code)),
+        )
+        .await?;
         if !R::settled(&room.state) {
             let collision: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM wallet_ledger WHERE user_id=$1 AND game=$2 AND record_id=$3)",
@@ -1610,7 +1663,13 @@ pub async fn place_bet<R: DealerRoom>(
             }
             room.writer.health().map_err(|_| Error::Unavailable)?;
             R::set_revision(&mut next, R::revision(&room.state) + 1);
-            crate::beans_read_memory::sicbo_accepted(pool, code, &json!(&next), || Ok(()))?;
+            crate::beans_read_memory::dealer_accepted(
+                pool,
+                R::DEALER,
+                code,
+                &json!(&next),
+                || Ok(()),
+            )?;
         }
         // Finish the read transaction before enqueueing an accepted wager, so
         // a failed commit never leaves an accepted bet behind an error reply.
@@ -1625,7 +1684,7 @@ pub async fn place_bet<R: DealerRoom>(
         room.idle.activity();
     }
     // The acknowledgement covers this wager only, not an early settlement.
-    let durable = R::REQUIRE_DURABLE_BETS.then(|| room.writer.durable());
+    let durable = durable_bets.then(|| room.writer.durable());
     deal_when_all_bet(code, &mut room, now_ms());
     let response = view(code, &room, uid);
     drop(room);
@@ -1666,13 +1725,17 @@ fn held_code<R: DealerRoom>(uid: Uuid, code: &str) -> Option<String> {
 
 async fn leave_room_now<R: DealerRoom>(pool: &PgPool, uid: Uuid, code: &str) -> Result<()> {
     recover::<R>(pool).await?;
-    if memory_lifecycle::<R>() {
-        return leave_room_memory::<R>(pool, uid, code).await;
-    }
-    let registry = R::registry();
-    let Some(code) = held_code::<R>(uid, code) else {
+    let Some(held) = held_rooms::<R>(uid)
+        .into_iter()
+        .find(|held| held.code.eq_ignore_ascii_case(code))
+    else {
         return Ok(());
     };
+    if !held.beans {
+        return leave_room_memory::<R>(pool, uid, &held.code).await;
+    }
+    let registry = R::registry();
+    let code = held.code;
     let Some(shared) = registry.room(&code) else {
         release_seat::<R>(uid, &code);
         return Ok(());
@@ -1738,9 +1801,7 @@ async fn leave_room_now<R: DealerRoom>(pool: &PgPool, uid: Uuid, code: &str) -> 
         deal_when_all_bet(&code, &mut room, now_ms());
         empty_and_closed(pool, &code, &mut room)
     };
-    if beans::<R>() {
-        bean_ledger::retire(crate::game_catalog::BEANS, uid, &code);
-    }
+    bean_ledger::retire(crate::game_catalog::BEANS, uid, &code);
     release_seat::<R>(uid, &code);
     if empty {
         drop_room::<R>(pool, &code, &shared).await?;
@@ -1751,6 +1812,8 @@ async fn leave_room_now<R: DealerRoom>(pool: &PgPool, uid: Uuid, code: &str) -> 
 /// A room fenced for closing: its members, and their membership locks so no
 /// join or leave interleaves until the seats are released.
 struct Closing {
+    /// The room's [`DealerRoom::beans`]: its seated wallets retire on close.
+    beans: bool,
     registry_generation: Option<Uuid>,
     require_empty: bool,
     members: Vec<Uuid>,
@@ -2062,6 +2125,9 @@ pub struct CreateRequest {
     /// 允许朋友观战; omitted means allowed.
     #[serde(default = "spectators::default_allow")]
     pub allow_spectators: bool,
+    /// 金豆 room; omitted means a 积分 (points) room, as for card tables.
+    #[serde(default)]
+    pub beans: bool,
 }
 impl Default for CreateRequest {
     fn default() -> Self {
@@ -2069,6 +2135,7 @@ impl Default for CreateRequest {
             bots: 0,
             duration_secs: None,
             allow_spectators: spectators::default_allow(),
+            beans: false,
         }
     }
 }
@@ -2100,9 +2167,12 @@ pub async fn create<R: DealerRoom>(
             &s.pool,
             auth.user_id,
             name,
-            usize::from(req.bots),
-            duration_secs,
-            req.allow_spectators,
+            RoomOptions {
+                bots: usize::from(req.bots),
+                duration_secs,
+                allow_spectators: req.allow_spectators,
+                beans: req.beans,
+            },
         )
         .await
         .map(|code| json!({"code":code})),
@@ -2319,6 +2389,7 @@ async fn dissolve_room<R: DealerRoom>(
     room.spectators.close();
     tracing::info!(%code, "{} room dissolved by its last player", R::DEALER);
     let closing = Closing {
+        beans: room.beans,
         registry_generation: room.registry_generation,
         require_empty: false,
         members: vec![uid],
@@ -2386,7 +2457,7 @@ async fn settle_due<R: DealerRoom>(now: i64) {
         // or a fenced writer must tell its sockets (`push`).
         if watched(&room)
             && (room.push_retry
-                || (memory_lifecycle::<R>() && room.writer.is_closed())
+                || (!room.beans && room.writer.is_closed())
                 || view_change::<R>(&room).is_some_and(|at| at <= now_ms()))
         {
             push::<R>(&code, &mut room);
@@ -2457,8 +2528,9 @@ async fn next_wake<R: DealerRoom>(
                 due.push(expires.max(shown));
             }
         }
-        // `sweep` only reconciles unsettled seats and rooms idle for an hour.
-        if !memory_lifecycle::<R>() {
+        // `sweep` only reconciles a bean room's unsettled seats and its rooms
+        // idle for an hour.
+        if room.beans {
             let from = if room.members.values().any(|m| m.joining || m.leaving) {
                 Instant::now()
             } else {
@@ -2511,7 +2583,7 @@ pub async fn run_dealer<R: DealerRoom>(pool: PgPool) {
         }
         let busy = close_idle::<R>(&pool, now_ms(), reclaim, &mut deferred).await;
         reclaim = false;
-        if !memory_lifecycle::<R>() && last_sweep.elapsed() >= Duration::from_secs(60) {
+        if last_sweep.elapsed() >= Duration::from_secs(60) {
             last_sweep = Instant::now();
             if let Err(error) = sweep::<R>(&pool).await {
                 tracing::warn!(?error, "{} idle room sweep failed", R::DEALER);
@@ -2579,7 +2651,7 @@ fn add_chips<R: DealerRoom>(
     req: &BuyInRequest,
 ) -> Result<()> {
     seated(room, user)?;
-    if beans::<R>() {
+    if room.beans {
         return Err(Error::Code("beans_buy_in_disabled"));
     }
     if R::clock(&room.state).expired(now_ms()) || room.members.get(&user).is_some_and(|m| m.leaving)

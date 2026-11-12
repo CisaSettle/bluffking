@@ -294,11 +294,11 @@ pub async fn load_history_page_filtered(
          page.session_id, page.played_at, page.delta, ",
     );
     if sessions {
-        // A baccarat session is all practice-chip room rounds or all solo
-        // gold-bean hands; its first record tells which.
-        // The room games whose session is a points or a gold-bean room, and
-        // 百家乐 (see above); the bean receipt tells which.
-        let unit_codes = crate::games::code_list(|entry| entry.table() || entry.id == "baccarat");
+        // The room games whose session is a points or a gold-bean room (card,
+        // board and dealer rooms); the bean receipt tells which.
+        let unit_codes = crate::games::code_list(|entry| {
+            entry.table() || entry.family == crate::games::Family::Dealer
+        });
         // A 掼蛋 match is one record holding all of its deals.
         let guandan = game::GUANDAN;
         let beans = game::BEANS;

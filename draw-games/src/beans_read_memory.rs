@@ -31,7 +31,8 @@ pub(crate) use pending_effects::{
 };
 pub(crate) use reservations::release_poker_session;
 pub use reservations::{
-    available, reserve_poker_stack, sicbo_accepted, sicbo_committed, sync_poker_checkpoint,
+    available, dealer_accepted, dealer_committed, note_squid_unbacked, reserve_poker_stack,
+    reserve_poker_top_up, squid_departure_unbacked, sync_poker_checkpoint,
 };
 
 const PAGE: i64 = 500;
@@ -662,13 +663,15 @@ pub(crate) fn poker_abandoned(pool: &PgPool, hand: Uuid) {
 pub(crate) fn over_reserved(pool: &PgPool) -> Vec<Uuid> {
     const MAX_CHECKED: usize = 5_000;
     let state = state(pool);
-    let inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
+    let mut inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
     if !inner.ready {
         return Vec::new();
     }
     let mut candidates: BTreeSet<Uuid> = inner.reservations.holders().collect();
     candidates.extend(inner.cards.holders());
-    candidates
+    let mut deficits: Vec<(Uuid, i64)> = Vec::new();
+    let checked: BTreeSet<Uuid> = candidates.iter().take(MAX_CHECKED).copied().collect();
+    let over = candidates
         .into_iter()
         .take(MAX_CHECKED)
         .filter(|user| {
@@ -680,15 +683,38 @@ pub(crate) fn over_reserved(pool: &PgPool) -> Vec<Uuid> {
             else {
                 return false;
             };
-            crate::live_directory::memory_snapshot_for_user(pool, *user)
+            let Ok(reserved) = crate::live_directory::memory_snapshot_for_user(pool, *user)
                 .and_then(|directory| {
                     reservations::reserved(&inner, &directory, *user, false, None, None)
                 })
-                // A wallet a settlement left negative is reported as such; it
-                // is over-reserved only by what its seats still hold.
-                .is_ok_and(|reserved| reserved > 0 && reserved > balance.max(0))
+            else {
+                return false;
+            };
+            // A wallet a settlement left negative is reported as such; it
+            // is over-reserved only by what its seats still hold, beyond what
+            // a squid charge posted past its free beans explains.
+            let over = reserved.saturating_sub(balance.max(0));
+            deficits.push((*user, reserved.saturating_sub(balance)));
+            reserved > 0
+                && over > 0
+                && reserved.saturating_sub(balance) > inner.reservations.squid_unbacked(*user)
         })
-        .collect()
+        .collect();
+    // Users holding no reservation now owe at most their negative balance.
+    for user in inner.reservations.squid_unbacked_users() {
+        if !checked.contains(&user) {
+            let balance = inner
+                .users
+                .get(&user)
+                .and_then(|entry| entry.wallet.as_ref())
+                .map_or(0, |wallet| wallet.balance);
+            deficits.push((user, balance.saturating_neg()));
+        }
+    }
+    for (user, deficit) in deficits {
+        inner.reservations.ratchet_squid_unbacked(user, deficit);
+    }
+    over
 }
 /// The id a ledger row is kept under; `None` rows are not kept at all.
 /// A 2048 reward (a bonus row without a record id) is kept beside its
@@ -834,9 +860,10 @@ pub async fn hydrate(pool: &PgPool) -> sqlx::Result<()> {
                 if loaded.count > MAX_ROWS || loaded.bytes > MAX_BYTES { return Err(unavailable()); }
             }
         }
-        let rooms: Vec<(String, Value)> = sqlx::query_as("SELECT code,state FROM game_room_checkpoints WHERE game='sicbo'")
+        let rooms: Vec<(String, String, Value)> = sqlx::query_as("SELECT game,code,state FROM game_room_checkpoints WHERE game=ANY($1) AND state->>'wallet_unit'='beans'")
+            .bind(crate::games::ids(|entry| entry.family == crate::games::Family::Dealer))
             .fetch_all(&mut *tx).await?;
-        for (code, snapshot) in rooms { loaded.reservations.sicbo_commit(&code, &snapshot); }
+        for (game, code, snapshot) in rooms { loaded.reservations.dealer_commit(&game, &code, &snapshot); }
         let cards: Vec<(String, String, i64, Value)> = sqlx::query_as("SELECT game,code,revision,state FROM game_room_checkpoints WHERE game=ANY($1) AND (state->'opts'->>'beans'='true' OR state->'bean_match'->>'enabled'='true')").bind(crate::games::table_ids()).fetch_all(&mut *tx).await?;
         for (game, code, revision, snapshot) in cards { loaded.cards.hydrate(&game, &code, revision as u64, &snapshot)?; }
         tx.commit().await?;
@@ -1336,6 +1363,18 @@ pub(crate) fn with_admission_balance<R>(
     id: Uuid,
     accept: impl FnOnce(i64, bool) -> sqlx::Result<R>,
 ) -> sqlx::Result<R> {
+    with_admission_wallet(pool, id, |available, _, unaccounted| {
+        accept(available, unaccounted)
+    })
+}
+
+/// [`with_admission_balance`] that also passes the whole wallet balance,
+/// including beans other rooms and games reserve, as the second argument.
+pub(crate) fn with_admission_wallet<R>(
+    pool: &PgPool,
+    id: Uuid,
+    accept: impl FnOnce(i64, i64, bool) -> sqlx::Result<R>,
+) -> sqlx::Result<R> {
     ensure(pool, id)?;
     let state = state(pool);
     let inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -1352,7 +1391,11 @@ pub(crate) fn with_admission_balance<R>(
     let reserved = reservations::reserved(&inner, &directory, id, false, None, None)?;
     let unaccounted =
         crate::beans::holds::outstanding_unless(id, |hand| inner.poker.contains_key(&hand));
-    accept(balance.saturating_sub(reserved).max(0), unaccounted)
+    accept(
+        balance.saturating_sub(reserved).max(0),
+        balance,
+        unaccounted,
+    )
 }
 
 pub fn profile(pool: &PgPool, id: Uuid) -> sqlx::Result<(Wallet, bool)> {
