@@ -55,7 +55,9 @@ pub fn solo_record_id(game: &str, user: Uuid, request: Uuid) -> Uuid {
 }
 /// Extra beans ADDED by the once-per-Singapore-day claim (not a refill-to
 /// target).
-pub const DAILY_REFILL_TO: i64 = 100;
+/// 200 = one public-table buy-in, so a day's claim is enough to play
+/// (owner 2026-11-12: 「每天送200…最少代入是200，每天领完就可以玩」).
+pub const DAILY_REFILL_TO: i64 = 200;
 /// Public beans table shape. One stake keeps the thin player pool together.
 pub const STAKE_KEY: &str = "1/2";
 pub const SB: u32 = 1;
