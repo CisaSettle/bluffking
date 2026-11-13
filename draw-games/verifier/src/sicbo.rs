@@ -8,8 +8,10 @@ use crate::proof::Reveal;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+/// A wager is any whole stake from 1 up to the bettor's balance (梭哈 stakes
+/// all of it); the server refuses a stake above what the bettor can cover.
 pub const MIN_STAKE: i64 = 1;
-pub const MAX_STAKE: i64 = 1;
+pub const MAX_STAKE: i64 = 1_000_000_000_000;
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -101,14 +103,7 @@ pub fn verify(value: &Value) -> Result<Value, String> {
     }
     match (proof.side, proof.stake, proof.won, proof.delta) {
         (Some(side), Some(stake), Some(won), Some(claimed_delta)) => {
-            // Rooms admit MIN_STAKE..=MAX_STAKE; solo also permits an all-in
-            // wager of the whole balance.
-            let allowed = if proof.kind == "sicbo" {
-                1..=1_000_000_000_000
-            } else {
-                MIN_STAKE..=MAX_STAKE
-            };
-            if !allowed.contains(&stake) {
+            if !(MIN_STAKE..=MAX_STAKE).contains(&stake) {
                 return Err("sicbo stake is outside the allowed range".into());
             }
             if won != wins(dice, side) || claimed_delta != delta(dice, side, stake) {

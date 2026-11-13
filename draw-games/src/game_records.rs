@@ -217,13 +217,20 @@ pub async fn load_history_page_filtered(
          WHERE r.user_id=$1 AND {opponent_filter}), page AS MATERIALIZED ("
     ));
     if sessions {
-        query.push(
-            "SELECT game, group_id AS record_id, group_id AS session_id, played_at, delta, \
-             records AS hands, started_at FROM (SELECT user_id, game, COALESCE(session_id,record_id) AS group_id, \
+        // A record without a session is its own group; its session_id stays
+        // NULL so callers never treat a record id as a session. 鱿鱼 rounds
+        // belong to their poker room's 局: they join its net, not its hands.
+        let (poker, squid) = (game::POKER, game::SQUID);
+        query.push(format!(
+            "SELECT game, group_id AS record_id, CASE WHEN grouped_records > 0 THEN group_id END AS session_id, \
+             played_at, delta, CASE WHEN hands > 0 THEN hands ELSE records END AS hands, started_at FROM (SELECT user_id, \
+             CASE WHEN game={squid} AND session_id IS NOT NULL THEN {poker}::smallint ELSE game END AS game, \
+             COALESCE(session_id,record_id) AS group_id, \
              max(played_at) AS played_at, min(played_at) AS started_at, \
-             sum(delta)::bigint AS delta, count(*) AS records FROM filtered_records \
-             WHERE user_id=$1 GROUP BY user_id,game,COALESCE(session_id,record_id)) grouped WHERE user_id = ",
-        );
+             sum(delta)::bigint AS delta, count(*) AS records, count(*) FILTER (WHERE game<>{squid}) AS hands, \
+             count(session_id) AS grouped_records FROM filtered_records \
+             WHERE user_id=$1 GROUP BY user_id,2,COALESCE(session_id,record_id)) grouped WHERE user_id = ",
+        ));
         query.push_bind(user_id);
         if let Some(game_code) = game_code {
             query.push(" AND game = ").push_bind(game_code);
@@ -306,7 +313,7 @@ pub async fn load_history_page_filtered(
              'unit', CASE WHEN page.game IN (")).push(unit_codes).push(format!(") THEN (SELECT CASE WHEN EXISTS (SELECT 1 FROM wallet_ledger l WHERE l.game={beans} AND l.record_id=f.record_id AND l.user_id=$1 \
              AND l.kind='play') \
              THEN 'beans' ELSE 'practice' END FROM (SELECT r.record_id FROM game_records r WHERE r.user_id=$1 AND r.game=page.game \
-             AND COALESCE(r.session_id,r.record_id)=page.session_id LIMIT 1) f) END)"));
+             AND COALESCE(r.session_id,r.record_id)=page.record_id LIMIT 1) f) END)"));
     } else {
         // Hydrated below by a statement planned only for this page's games.
         query.push("NULL::jsonb");

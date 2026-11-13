@@ -28,13 +28,16 @@ pub(crate) fn wins_jackpot(reveal: &draw_games::proof::Reveal, user: Uuid) -> bo
     draw_games::proof::Entropy::new(seed).below(10_000) == 0
 }
 
-/// A jackpot pays 5 × the highest bean payout a normal stake can win: a
+/// The stake a jackpot multiplies: one bean, whatever the wager.
+const JACKPOT_STAKE: i64 = 1;
+
+/// A jackpot pays 5 × the highest bean payout a 1-bean stake can win: a
 /// winning small/big returns the stake plus an equal win (2 × stake), so the
-/// bonus is 10 × stake. The stake it multiplies is capped at [`MAX_STAKE`], so
-/// a solo all-in wager draws the same 10-bean jackpot as a 1-bean one.
+/// bonus is 10 × [`JACKPOT_STAKE`]. Larger stakes (up to 梭哈) draw the same
+/// 10-bean jackpot as a 1-bean one.
 pub(crate) fn jackpot_bonus(stake: i64) -> Option<i64> {
     stake
-        .min(MAX_STAKE)
+        .min(JACKPOT_STAKE)
         .checked_mul(2)?
         .checked_mul(5)
         .filter(|bonus| *bonus > 0)

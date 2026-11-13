@@ -19,6 +19,8 @@ const PAYOUT_MS: i64 = 620;
 /// Seats per room, humans and AI co-bettors together.
 const MAX_MEMBERS: usize = 8;
 const HISTORY: usize = 60;
+/// AI co-bettors stake a plausible 1–50, not the open player limit.
+const BOT_MAX_STAKE: i64 = 50;
 
 pub use crate::casino_room::{Error, Result};
 
@@ -172,7 +174,7 @@ impl State {
             } else {
                 Side::Big
             };
-            let stake = casino_bots::stake(MIN_STAKE, MAX_STAKE, bot.chips);
+            let stake = casino_bots::stake(MIN_STAKE, BOT_MAX_STAKE, bot.chips);
             let wager = Wager { side, stake };
             if wager.valid() {
                 let at_ms = casino_bots::reveal_at(open, close);

@@ -123,6 +123,9 @@ pub(crate) fn reentry_required(
     wallet_total: i64,
 ) -> u64 {
     let total = saved.stack + saved.pending_chips;
+    if reentry_busted(saved) {
+        return fresh;
+    }
     if reentry_reducible(saved) && wallet_total < total as i64 {
         total.min(fresh).max(wallet_total.max(0) as u64)
     } else {
@@ -142,9 +145,25 @@ pub(crate) fn reentry_stack(
     fresh: u64,
     joined_at: chrono::DateTime<chrono::Utc>,
 ) -> Option<crate::runtime_checkpoint::StandingChips> {
+    // Owner 2026-11-13: a wallet at or below 0 beans sits at no bean table.
+    if wallet_total <= 0 {
+        return None;
+    }
     let available = u64::try_from(available).ok()?;
     if available < reentry_required(&saved, fresh, wallet_total) {
         return None;
+    }
+    if reentry_busted(&saved) {
+        // Owner 2026-11-13: nobody sits back down with 0 chips. A busted
+        // departure returns only with a fresh buy-in, like a new seat.
+        return Some(crate::runtime_checkpoint::StandingChips {
+            stack: fresh,
+            buyin_total: fresh,
+            pending_chips: 0,
+            occupancy: Some(joined_at),
+            pending_beans_hand: None,
+            season_day: None,
+        });
     }
     if available >= saved.stack + saved.pending_chips {
         return Some(saved);
@@ -157,6 +176,11 @@ pub(crate) fn reentry_stack(
         pending_beans_hand: None,
         season_day: None,
     })
+}
+
+/// A settled departure that left with no chips at all.
+fn reentry_busted(saved: &crate::runtime_checkpoint::StandingChips) -> bool {
+    reentry_reducible(saved) && saved.stack == 0
 }
 
 /// Only a settled departure without pending chips may come back shorter.

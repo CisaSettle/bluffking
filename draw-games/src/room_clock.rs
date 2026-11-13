@@ -1,6 +1,6 @@
 //! Session length for the non-poker game rooms.
 //!
-//! The host picks a duration at creation (same 1h–8h grid as poker rooms,
+//! The host picks a duration at creation (same 30min–8h grid as poker rooms,
 //! validated by [`crate::handlers::validate_room_duration_secs`]). The
 //! countdown starts with the first deal. Once it has elapsed the hand in
 //! progress still finishes normally; the room simply deals no new hand.
