@@ -37,6 +37,8 @@ pub const MAX_BUNDLE_BYTES: usize = 8 * 1024 * 1024;
 #[serde(rename_all = "kebab-case")]
 pub enum Game {
     Zjh,
+    /// 炸金花 with the two jokers: ids 0..52 as `Zjh`, 52 small and 53 big joker.
+    ZjhJokers,
     Niuniu,
     Sangong,
     Shortdeck,
@@ -53,7 +55,7 @@ impl Game {
         match self {
             Self::Shortdeck => 36,
             Self::Paigow => 32,
-            Self::Ddz => 54,
+            Self::Ddz | Self::ZjhJokers => 54,
             Self::Guandan | Self::Colorcards => 108,
             Self::Baccarat => 416,
             _ => 52,
@@ -62,6 +64,7 @@ impl Game {
     pub fn id(self) -> &'static str {
         match self {
             Self::Zjh => "zjh",
+            Self::ZjhJokers => "zjh-jokers",
             Self::Niuniu => "niuniu",
             Self::Sangong => "sangong",
             Self::Shortdeck => "shortdeck",
@@ -77,6 +80,7 @@ impl Game {
     pub fn parse(id: &str) -> Option<Self> {
         [
             Self::Zjh,
+            Self::ZjhJokers,
             Self::Niuniu,
             Self::Sangong,
             Self::Shortdeck,
@@ -114,7 +118,7 @@ impl Context {
     pub fn validate(&self) -> Result<(), Error> {
         hex32(&self.roster)?;
         let max = match self.game {
-            Game::Zjh | Game::Colorcards => 10,
+            Game::Zjh | Game::ZjhJokers | Game::Colorcards => 10,
             Game::Ddz => 3,
             Game::Guandan => 4,
             Game::Baccarat => 1,
