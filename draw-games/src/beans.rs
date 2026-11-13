@@ -155,6 +155,7 @@ pub(crate) fn reentry_stack(
         pending_chips: 0,
         occupancy: Some(joined_at),
         pending_beans_hand: None,
+        season_day: None,
     })
 }
 
