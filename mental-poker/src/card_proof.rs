@@ -401,7 +401,6 @@ impl LockedDeck {
             party_id: self.context.party(),
             x_i: self.key,
             q_i: self.public_key,
-            blind: Scalar::ZERO,
         };
         let ids = self.context.identities();
         let openings = positions

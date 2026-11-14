@@ -1309,75 +1309,33 @@ fn uniform_below<R: RngCore + CryptoRng>(rng: &mut R, bound: usize) -> usize {
 /// (ADR-076/077/078); open-source + verifiable**.
 ///
 /// Implements [`ShuffleProofProvider`] with the sound sigma-based interim
-/// argument (scheme [`SCHEME`]). The prover holds the input/output decks + the
-/// witness in a [`Shuffle`]; the verifier reconstructs the decks from the
-/// attestation and checks they hash to the bound `input_hash`/`output_hash`.
+/// argument (schemes [`SCHEME`] / [`CARD_SCHEME`]). Proofs are produced by
+/// [`Shuffle::prove`] and its siblings; the verifier reconstructs the decks from
+/// the attestation and checks they hash to the bound `input_hash`/`output_hash`.
 ///
-/// The provider is constructed with the [`Shuffle`] witness for `prove_shuffle`
-/// (the trait does not pass decks); `verify_shuffle` is fully self-contained
-/// (everything it needs is in the proof + the bound hashes).
+/// `verify_shuffle` is fully self-contained (everything it needs is in the
+/// proof + the bound hashes).
 pub struct RealShuffleProofProvider {
-    shuffle: Option<Shuffle>,
     /// F2: the DKG-derived joint key (64-hex) every shuffle proof MUST be bound
     /// to. When set, `verify_shuffle` rejects a proof whose attestation declares
     /// a different `Q` (a shuffler proving under a key it controls). When `None`,
     /// the bound key falls back to whatever the trait caller passes in
-    /// `expected_joint_key`; if BOTH are absent the proof is only self-consistent
-    /// (used by the lowest-level positive round-trip tests that already control
-    /// the key by construction).
+    /// `expected_joint_key`; if BOTH are absent the proof is only self-consistent.
+    /// The only constructor, `verifier_with_expected_key`, always sets it.
     expected_joint_key: Option<String>,
 }
 
 impl RealShuffleProofProvider {
-    /// A verify-only provider (no witness, no pinned key). `prove_shuffle` panics
-    /// if called. Callers that know the DKG joint key should prefer
-    /// [`verifier_with_expected_key`](Self::verifier_with_expected_key) so the
-    /// proof is bound to it (F2).
-    pub fn verifier() -> Self {
-        RealShuffleProofProvider {
-            shuffle: None,
-            expected_joint_key: None,
-        }
-    }
-
     /// A verify-only provider that PINS the DKG joint key (F2). Every proof it
     /// accepts must declare exactly this `Q` in its attestation.
     pub fn verifier_with_expected_key(joint_key_hex: impl Into<String>) -> Self {
         RealShuffleProofProvider {
-            shuffle: None,
             expected_joint_key: Some(joint_key_hex.into()),
-        }
-    }
-
-    /// A prove-and-verify provider holding the shuffle witness.
-    pub fn with_witness(shuffle: Shuffle) -> Self {
-        RealShuffleProofProvider {
-            shuffle: Some(shuffle),
-            expected_joint_key: None,
         }
     }
 }
 
 impl ShuffleProofProvider for RealShuffleProofProvider {
-    fn scheme(&self) -> &'static str {
-        SCHEME
-    }
-
-    fn prove_shuffle(
-        &self,
-        party: &str,
-        round: u32,
-        _input_hash: &Hash,
-        _output_hash: &Hash,
-    ) -> ShuffleProof {
-        let shuffle = self.shuffle.as_ref().expect(
-            "RealShuffleProofProvider::prove_shuffle requires a witness (use with_witness)",
-        );
-        // Prove uses real OS randomness for the sigma blinders.
-        let mut rng = rand::rngs::OsRng;
-        shuffle.prove(party, round, &mut rng)
-    }
-
     fn verify_shuffle(
         &self,
         party: &str,

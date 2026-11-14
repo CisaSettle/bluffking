@@ -407,15 +407,9 @@ fn release_seat<R: DealerRoom>(uid: Uuid, code: &str) {
 /// instead). `crate::room_limits` decides, under the membership lock.
 fn hold_seat<R: DealerRoom>(uid: Uuid, code: &str) -> Result<()> {
     // Only gold-bean rooms write their own membership rows.
-    memory_membership::hold(
-        R::DEALER,
-        code,
-        true,
-        &[uid],
-        Some(&|_| Vec::new()),
-    )
-    .map(|_| ())
-    .map_err(claim_error)
+    memory_membership::hold(R::DEALER, code, true, &[uid], Some(&|_| Vec::new()))
+        .map(|_| ())
+        .map_err(claim_error)
 }
 
 fn claim_error(error: memory_membership::ClaimError) -> Error {
@@ -477,7 +471,6 @@ fn now_ms() -> i64 {
     Utc::now().timestamp_millis()
 }
 
-
 fn checkpoint_value<R: DealerRoom>(state: &R::State, names: &BTreeMap<Uuid, String>) -> Value {
     let mut value = json!(state);
     // Generic membership rows do not carry dealer display names. Both the
@@ -494,7 +487,6 @@ fn shared_snapshot<R: DealerRoom>(snapshot: &Snapshot<R>) -> crate::game_checkpo
         memberships: snapshot.memberships.clone(),
         settlement: snapshot.round.clone().and_then(R::checkpoint_settlement),
         advance: 1,
-        settlement_write: None,
     }
 }
 
@@ -1098,6 +1090,14 @@ pub(crate) fn held_rooms<R: DealerRoom>(uid: Uuid) -> Vec<crate::room_limits::He
     memory_membership::held(R::DEALER, uid)
 }
 
+/// [`held_rooms`] once this owner has recovered its rooms; `None` before.
+pub(crate) fn held_rooms_now<R: DealerRoom>(uid: Uuid) -> Option<Vec<crate::room_limits::Held>> {
+    R::registry()
+        .recovered
+        .get()
+        .map(|_| held_rooms::<R>(uid))
+}
+
 /// `{"rooms", "max_rooms"}`: what every profile and leave of a dealer game
 /// answers about the caller's rooms (`crate::room_limits`).
 pub(crate) fn rooms_fields<R: DealerRoom>(uid: Uuid, body: &mut Value) {
@@ -1114,8 +1114,7 @@ fn claim_memory<R: DealerRoom>(
         return Err(Error::Unavailable);
     }
     // Memory-lifecycle rooms are points rooms.
-    let owner = memory_membership::claim(R::DEALER, code, uid, false, true)
-        .map_err(claim_error)?;
+    let owner = memory_membership::claim(R::DEALER, code, uid, false, true).map_err(claim_error)?;
     Ok(MemoryAdmission {
         pool: pool.clone(),
         owner,
@@ -1628,14 +1627,9 @@ pub async fn place_bet<R: DealerRoom>(
         let current = bean_ledger::lock(&mut tx, crate::game_catalog::BEANS, uid)
             .await?
             .ok_or(Error::Code("storage_unavailable"))?;
-        let available = crate::beans::available_on(
-            pool,
-            &mut tx,
-            uid,
-            current,
-            Some((R::DEALER, code)),
-        )
-        .await?;
+        let available =
+            crate::beans::available_on(pool, &mut tx, uid, current, Some((R::DEALER, code)))
+                .await?;
         if !R::settled(&room.state) {
             let collision: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM wallet_ledger WHERE user_id=$1 AND game=$2 AND record_id=$3)",
@@ -1917,37 +1911,40 @@ pub struct SocketQuery {
 /// `GET …/rooms/{code}`. Wagers, joins and leaves stay HTTP.
 pub async fn socket<R: DealerRoom>(
     State(s): State<AppState>,
-    auth: AuthUser,
+    user: crate::game_socket::SocketUser,
     axum::extract::Query(q): axum::extract::Query<SocketQuery>,
     headers: axum::http::HeaderMap,
     connect_info: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
-    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     ws: axum::extract::ws::WebSocketUpgrade,
 ) -> Response {
     if !crate::game_socket::origin_allowed(&headers) {
         return (StatusCode::FORBIDDEN, "forbidden origin").into_response();
     }
-    if let Err(e) = recover::<R>(&s.pool).await {
-        return response::<R>(Err(Error::Db(e)));
-    }
+    let crate::game_socket::SocketUser::Live(auth) = user else {
+        return crate::game_socket::unauthenticated(ws);
+    };
     // Watch intent always takes the spectator path; its refusals (including
     // `already_seated`) arrive as error frames on the upgraded socket.
     let watching = q.watch.as_deref() == Some("1");
-    if !watching {
+    // A browser cannot read a refused upgrade's status, so these refusals are
+    // sent as the error frame on the upgraded socket (`game_socket::refuse`).
+    let refusal = if let Err(e) = recover::<R>(&s.pool).await {
+        tracing::warn!(error=%e, "{} storage error", R::LABEL);
+        Some("storage_unavailable")
+    } else if watching {
+        None
+    } else {
         let seated_here = match R::registry().room(&q.room) {
             Some(shared) => seated(&*shared.lock().await, auth.user_id).is_ok(),
             None => false,
         };
-        if !seated_here {
-            return response::<R>(Err(Error::Code("room_not_found")));
-        }
-    }
+        (!seated_here).then_some("room_not_found")
+    };
     let Some(socket_auth) = crate::game_socket::SocketAuth::capture(
         &s,
         &headers,
         connect_info.map(|ci| ci.0.ip()),
         auth.user_id,
-        raw_query.as_deref(),
     )
     .await
     else {
@@ -1962,7 +1959,7 @@ pub async fn socket<R: DealerRoom>(
     // ADR-105 global socket ceiling, as on /ws. A player already holds a
     // seat, so that socket is a returning one; a spectator holds nothing and
     // arrives new. The guard lives until the socket ends.
-    let arrival = if watching {
+    let arrival = if watching || refusal.is_some() {
         crate::admission::Arrival::New
     } else {
         crate::admission::Arrival::Returning
@@ -1982,6 +1979,16 @@ pub async fn socket<R: DealerRoom>(
             );
         }
     };
+    if let Some(code) = refusal {
+        // Counted against the socket ceiling like any other socket until it ends.
+        let refused = crate::game_socket::refuse_with(
+            ws,
+            socket_auth,
+            crate::game_hub::snapshot::error_frame(code),
+            admission,
+        );
+        return refused;
+    }
     static IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let id = IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let (code, uid) = (q.room, auth.user_id);
@@ -2031,16 +2038,6 @@ pub async fn socket<R: DealerRoom>(
 
 // Uses the room owner lock and ordered checkpoint writer, just like a wager.
 async fn handle_social<R: DealerRoom>(code: &str, uid: Uuid, connection: u64, msg: Value) -> bool {
-    let operation = if msg["t"] == "throw_item" {
-        crate::server_performance::WsOperation::Social
-    } else {
-        crate::server_performance::WsOperation::Rejected
-    };
-    let _timing = crate::request_timing::WsTimer::with_operation(
-        crate::request_timing::ws_received(),
-        R::LABEL,
-        operation,
-    );
     if msg["t"] != "throw_item" {
         return true;
     }

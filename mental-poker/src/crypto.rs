@@ -1,7 +1,7 @@
 //! Verifiable-shuffle proof interface.
 //!
 //! [`ShuffleProof`] is the wire/proof object and [`ShuffleProofProvider`] the
-//! prove/verify seam. The implementation is the real re-encryption shuffle in
+//! verify seam (proofs are produced by `Shuffle::prove*` directly). The implementation is the real re-encryption shuffle in
 //! [`crate::crypto_real::shuffle`], used by engine-blind dealing and by the
 //! `pf2` / card-proof verifiable-dealing bundles.
 
@@ -25,24 +25,11 @@ pub struct ShuffleProof {
     pub attestation: String,
 }
 
-/// Produces and verifies shuffle proofs.
+/// Verifies shuffle proofs.
 ///
 /// `verify_shuffle` MUST be callable offline by the verifier with no secret
 /// state beyond the proof object and the public deck hashes.
 pub trait ShuffleProofProvider {
-    /// Identifier of the proof scheme this provider implements.
-    fn scheme(&self) -> &'static str;
-
-    /// Prove that `output_hash` is a valid re-encryption shuffle of `input_hash`
-    /// performed by `party` in `round`.
-    fn prove_shuffle(
-        &self,
-        party: &str,
-        round: u32,
-        input_hash: &Hash,
-        output_hash: &Hash,
-    ) -> ShuffleProof;
-
     /// Verify a shuffle proof against the public deck hashes.
     ///
     /// `expected_joint_key` is the DKG-derived joint public key the shuffle MUST

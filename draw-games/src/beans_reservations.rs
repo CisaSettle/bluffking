@@ -7,6 +7,19 @@ use chrono::{DateTime, Utc};
 #[derive(Default)]
 pub(super) struct Reservations {
     poker: HashMap<(Uuid, Uuid, DateTime<Utc>), (u64, i64)>,
+    /// Hold'em beans a table has let go of in memory whose checkpoint write is
+    /// still queued, by `(session, user)`: `(checkpoint revision, amount)`. A
+    /// crash before that write commits restores them to the table, so
+    /// [`reserved`] keeps counting them until [`poker_checkpoint_durable`].
+    /// This is the one rule that makes a table operation depend on the
+    /// database: the actor never waits, the released beans do. Amounts add
+    /// up (cancel, re-stage, cancel counts both), which can over-reserve for
+    /// the few milliseconds until the writer commits; it never under-reserves,
+    /// also when a settlement moved the stack in between.
+    releasing: HashMap<(Uuid, Uuid), Vec<(u64, i64)>>,
+    /// Newest checkpoint revision accepted per hold'em session, so accepting
+    /// the same checkpoint again counts no release twice.
+    accepted: HashMap<Uuid, u64>,
     /// Open wagers of gold-bean dealer rooms (百家乐, 押大小), by room.
     dealer: HashMap<DealerKey, (u64, HashMap<Uuid, i64>)>,
     dealer_locks: HashMap<(DealerKey, Uuid), std::fs::File>,
@@ -94,6 +107,7 @@ impl Reservations {
     }
     pub(super) fn remove_user(&mut self, user: Uuid) {
         self.poker.retain(|(_, owner, _), _| *owner != user);
+        self.releasing.retain(|(_, owner), _| *owner != user);
         self.squid_unbacked.remove(&user);
     }
     /// The over-reservation a squid charge past free beans explains.
@@ -119,25 +133,78 @@ impl Reservations {
             *entry = entry.saturating_add(amount);
         }
     }
-    pub(super) fn checkpoint(&mut self, session: Uuid, checkpoint: &RuntimeCheckpoint) {
+    /// Accept `checkpoint` as the table's seats. `published` is the room's
+    /// previously accepted checkpoint and `deltas` the wallet deltas accepted
+    /// with this one (a settlement moves a stack and its wallet together).
+    /// Whatever a seat that stays lets go of beyond its wallet delta (a
+    /// cancelled top-up) is a release: it stays reserved under this
+    /// checkpoint's revision until that revision is durable. A seat that
+    /// leaves is released at once, as before (`bean_ledger` "narrow residue").
+    pub(super) fn checkpoint(
+        &mut self,
+        session: Uuid,
+        checkpoint: &RuntimeCheckpoint,
+        published: Option<&Value>,
+        deltas: &[(Uuid, i64)],
+    ) {
+        let mut next: HashMap<(Uuid, DateTime<Utc>), i64> = HashMap::new();
+        for seat in checkpoint.seats.values() {
+            if let Some(owner) = &seat.occupant {
+                next.entry((owner.user_id, owner.joined_at)).or_insert(
+                    seat.stack
+                        .saturating_add(seat.pending_chips)
+                        .min(i64::MAX as u64) as i64,
+                );
+            }
+        }
+        // Every seat generation reserved until now: held entries, else the
+        // amount [`reserved`] reads from the published checkpoint.
+        let mut held: HashMap<(Uuid, DateTime<Utc>), (u64, i64)> = HashMap::new();
+        let newest = self.accepted.entry(session).or_default();
+        let first = *newest < checkpoint.revision;
+        *newest = (*newest).max(checkpoint.revision);
+        if let Some(Ok(seats)) = published.filter(|_| first).map(CheckpointSeats::parse) {
+            for (key, amount) in seats.seats {
+                held.insert(key, (seats.revision, amount));
+            }
+        }
+        for ((room, user, joined), (revision, amount)) in &self.poker {
+            if first
+                && *room == session
+                && held
+                    .get(&(*user, *joined))
+                    .is_none_or(|(shown, _)| revision >= shown)
+            {
+                held.insert((*user, *joined), (*revision, *amount));
+            }
+        }
+        for ((user, joined), (revision, amount)) in held {
+            // A reservation made for a later revision is not lowered here.
+            if revision > checkpoint.revision {
+                continue;
+            }
+            let delta = deltas
+                .iter()
+                .find(|(owner, _)| *owner == user)
+                .map_or(0, |(_, delta)| *delta);
+            let Some(kept) = next.get(&(user, joined)).copied() else {
+                continue;
+            };
+            let released = amount.saturating_add(delta).saturating_sub(kept);
+            if released > 0 {
+                self.releasing
+                    .entry((session, user))
+                    .or_default()
+                    .push((checkpoint.revision, released));
+            }
+        }
         self.poker.retain(|(room, user, joined), (revision, _)| {
             *room != session
                 || *revision > checkpoint.revision
-                || checkpoint.seats.values().any(|seat| {
-                    seat.occupant
-                        .as_ref()
-                        .is_some_and(|owner| owner.user_id == *user && owner.joined_at == *joined)
-                })
+                || next.contains_key(&(*user, *joined))
         });
-        for seat in checkpoint.seats.values() {
-            let Some(owner) = &seat.occupant else {
-                continue;
-            };
-            let key = (session, owner.user_id, owner.joined_at);
-            let amount = seat
-                .stack
-                .saturating_add(seat.pending_chips)
-                .min(i64::MAX as u64) as i64;
+        for ((user, joined), amount) in next {
+            let key = (session, user, joined);
             if self
                 .poker
                 .get(&key)
@@ -253,7 +320,40 @@ pub fn sync_poker_checkpoint(pool: &PgPool, session: Uuid, checkpoint: &RuntimeC
     {
         return;
     }
-    inner.reservations.checkpoint(session, checkpoint);
+    let published = directory
+        .sessions
+        .get(&session)
+        .and_then(|room| room.runtime_checkpoint.as_ref());
+    inner
+        .reservations
+        .checkpoint(session, checkpoint, published, &[]);
+}
+
+/// The table's ordered writer committed checkpoint `revision`: beans released
+/// by it and by every earlier checkpoint of the same FIFO are free again.
+/// A flush accepts its checkpoint before queuing the write, and a hand or
+/// squid settlement records under the bean mutex before queuing, so no
+/// release is recorded after its own commit was reported here. A departure
+/// records after queuing; its checkpoint releases nothing for seats that stay.
+pub fn poker_checkpoint_durable(pool: &PgPool, session: Uuid, revision: u64) {
+    let state = state(pool);
+    let mut inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
+    inner.reservations.releasing.retain(|(room, _), released| {
+        if *room == session {
+            released.retain(|(accepted, _)| *accepted > revision);
+        }
+        !released.is_empty()
+    });
+}
+
+/// The accepted checkpoint of an open gold-bean hold'em room.
+pub(super) fn published_poker_checkpoint(pool: &PgPool, session: Uuid) -> Option<Option<Value>> {
+    let directory = crate::live_directory::memory_snapshot(pool).ok()?;
+    directory
+        .sessions
+        .get(&session)
+        .filter(|room| is_beans(room) && room.ended_at.is_none())
+        .map(|room| room.runtime_checkpoint.clone())
 }
 
 /// Called after directory closure and after dropping its publication lock.
@@ -264,6 +364,11 @@ pub(crate) fn release_poker_session(pool: &PgPool, session: Uuid) {
         .reservations
         .poker
         .retain(|(room, _, _), _| *room != session);
+    inner
+        .reservations
+        .releasing
+        .retain(|(room, _), _| *room != session);
+    inner.reservations.accepted.remove(&session);
     inner.reservations.seats.get_mut().remove(&session);
 }
 
@@ -295,15 +400,21 @@ pub(super) fn reserved(
     {
         return Err(unavailable());
     }
-    if inner.reservations.dealer.iter().any(|((game, code), (_, bets))| {
-        bets.contains_key(&user)
-            && crate::local_runtime::owned_by_another_backend(crate::release_handoff::rooms::id(
-                game, code,
-            ))
-    }) {
+    if inner
+        .reservations
+        .dealer
+        .iter()
+        .any(|((game, code), (_, bets))| {
+            bets.contains_key(&user)
+                && crate::local_runtime::owned_by_another_backend(
+                    crate::release_handoff::rooms::id(game, code),
+                )
+        })
+    {
         return Err(unavailable());
     }
-    let mut poker = crate::beans::holds::amounts(user);
+    let (mut poker, fixed_departure_losses) = crate::beans::holds::amounts(user);
+    let mut seats: HashMap<Uuid, i64> = HashMap::new();
     for (room, member) in directory.memberships_for(user) {
         if !is_beans(room) || room.ended_at.is_some() {
             continue;
@@ -342,10 +453,31 @@ pub(super) fn reserved(
             // beans again. Unsettled hand holds are included in `poker` above.
             0
         };
-        let entry = poker.entry(room.id).or_default();
+        let entry = seats.entry(room.id).or_default();
+        *entry = (*entry).max(amount);
+    }
+    // Beans a table released whose write has not committed: a crash returns
+    // them to that table, so they stay reserved there until it does.
+    for ((session, owner), released) in &inner.reservations.releasing {
+        if *owner != user {
+            continue;
+        }
+        let releasing = released
+            .iter()
+            .try_fold(0i64, |sum, (_, amount)| sum.checked_add(*amount))
+            .ok_or_else(unavailable)?;
+        let entry = seats.entry(*session).or_default();
+        *entry = entry.checked_add(releasing).ok_or_else(unavailable)?;
+    }
+    for (session, amount) in seats {
+        let entry = poker.entry(session).or_default();
         *entry = (*entry).max(amount);
     }
     let mut total = inner.cards.reserved(user, None)?;
+    // Owed by departed occupancies, never part of the excluded seat's stack.
+    total = total
+        .checked_add(fixed_departure_losses)
+        .ok_or_else(unavailable)?;
     for (session, amount) in poker {
         if Some(session) != excluding_poker {
             total = total.checked_add(amount).ok_or_else(unavailable)?;
@@ -436,14 +568,8 @@ pub fn available(
     sql_balance: bool,
     excluding_dealer: Option<(&str, &str)>,
 ) -> sqlx::Result<i64> {
-    let state = {
-        let _phase = http_phase(HttpPhase::Processing).operation("beans_state_lookup");
-        state(pool)
-    };
-    let inner = {
-        let _phase = http_phase(HttpPhase::Processing).operation("beans_available_mutex");
-        state.inner.lock().unwrap_or_else(|e| e.into_inner())
-    };
+    let state = { state(pool) };
+    let inner = { state.inner.lock().unwrap_or_else(|e| e.into_inner()) };
     available_locked(pool, &inner, user, balance, sql_balance, excluding_dealer)
 }
 
@@ -458,11 +584,7 @@ pub(super) fn available_locked(
     if !inner.ready {
         return Err(unavailable());
     }
-    let directory = {
-        let _phase = http_phase(HttpPhase::Processing).operation("beans_directory_snapshot");
-        crate::live_directory::memory_snapshot_for_user(pool, user)?
-    };
-    let _phase = http_phase(HttpPhase::Processing).operation("beans_available_compute");
+    let directory = { crate::live_directory::memory_snapshot_for_user(pool, user)? };
     for (room, member) in directory.memberships_for(user) {
         if is_beans(room)
             && room.ended_at.is_none()
@@ -568,7 +690,15 @@ pub fn reserve_poker_top_up(
         .ok_or_else(unavailable)?;
     let other = reserved(&inner, &directory, user, false, Some(session), None)?;
     let all = reserved(&inner, &directory, user, false, None, None)?;
-    let current = all.saturating_sub(other).max(0);
+    // The seat's own stack: `releasing` amounts are counted on their own.
+    let releasing = inner
+        .reservations
+        .releasing
+        .get(&(session, user))
+        .map_or(0, |released| {
+            released.iter().map(|(_, amount)| *amount).sum::<i64>()
+        });
+    let current = all.saturating_sub(other).saturating_sub(releasing).max(0);
     let free = balance.saturating_sub(all).max(0);
     let wanted = i64::try_from(wanted).unwrap_or(i64::MAX);
     let grant = wanted.min(free);

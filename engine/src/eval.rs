@@ -52,6 +52,8 @@ impl serde::Serialize for HandRank {
             HandRank::Flush(v) => ("flush", *v),
             HandRank::FullHouse(v) => ("full_house", *v),
             HandRank::FourOfAKind(v) => ("four_of_a_kind", *v),
+            // Wire category stays "straight_flush" (royal included) so Deserialize
+            // round-trips; the royal label comes from `name()`.
             HandRank::StraightFlush(v) => ("straight_flush", *v),
         };
         let mut st = s.serialize_struct("HandRank", 2)?;
@@ -123,8 +125,12 @@ impl<'de> serde::Deserialize<'de> for HandRank {
 
 impl HandRank {
     /// A short lowercase string describing the category (for logging / WS frames).
+    ///
+    /// The ace-high straight flush is named `royal_flush` so every surface can
+    /// label it 皇家同花顺; rs_poker encodes it as `StraightFlush(9)` (A high).
     pub fn name(&self) -> &'static str {
         match self {
+            HandRank::StraightFlush(9) => "royal_flush",
             HandRank::HighCard(_) => "high_card",
             HandRank::OnePair(_) => "one_pair",
             HandRank::TwoPair(_) => "two_pair",
@@ -189,8 +195,8 @@ pub fn rank_players(
 /// one Monte Carlo trial. The wrapped `rs_poker` type is a PRIVATE field, so no
 /// `rs_poker` type appears in any public signature (ADR-012): callers can only
 /// obtain a `BoardEval` from [`board_eval`] and consume it via [`rank_with_board`].
-/// Exposed `pub` so `server::equity` (the live-snapshot MC, which must not
-/// depend on `rs_poker`) can share this allocation-free evaluator.
+/// Exposed `pub` so the server's bot strategies (which must not depend on
+/// `rs_poker`) can share this allocation-free evaluator.
 #[derive(Clone, Copy)]
 pub struct BoardEval {
     hand: Hand,
@@ -261,7 +267,8 @@ pub fn rank_with_board(be: &BoardEval, hole: &HoleCards) -> HandRank {
 /// | flush             | flush high    | —          | —          | 5 flush ranks desc    |
 /// | full_house        | trip rank     | pair rank  | —          | —                     |
 /// | four_of_a_kind    | quad rank     | —          | top kicker | —                     |
-/// | straight_flush    | high (A => royal) | —      | —          | 5 ranks desc          |
+/// | straight_flush    | straight high | —          | —          | 5 ranks desc          |
+/// | royal_flush       | A             | —          | —          | A K Q J T             |
 ///
 /// Rank characters use the single-char abbreviations from
 /// [`Rank::char`] (`'2'..'9'`, `'T'`, `'J'`, `'Q'`, `'K'`, `'A'`) wrapped in a

@@ -92,10 +92,10 @@ pub struct EquityResult {
     /// Hero's combined equity (expected pot share), 0..=100. Each trial/runout
     /// contributes `1.0` on an outright win and `1/N` on an N-way chop, summed
     /// in exact integer units ([`SHARE_SCALE`]) and rounded ONCE at the end —
-    /// mirroring `server::equity::compute_equity`'s `1/(1+tied_opponents)`
-    /// weighting. This avoids both the up-to-~1pp low bias from re-rounding
-    /// per-runout shares and the multi-way-chop overstatement from weighting
-    /// every tie as 0.5. This is the authoritative equity number.
+    /// i.e. a `1/(1+tied_opponents)` weighting. This avoids both the up-to-~1pp
+    /// low bias from re-rounding per-runout shares and the multi-way-chop
+    /// overstatement from weighting every tie as 0.5. This is the authoritative
+    /// equity number.
     pub combined_pct: u8,
 }
 
@@ -146,16 +146,6 @@ impl EquityResult {
 ///   `EquityResult { 0, 0 }` (caller treats as invalid / `ContextNotFound`).
 /// - `opponents` clamped to ≤ 5 (max 6-max minus hero).
 pub fn equity(input: EquityInput) -> EquityResult {
-    equity_inner(input).0
-}
-
-/// Core of [`equity`], additionally returning the number of MC trials actually
-/// run (`t` at the early-stop break, or `trials` when the loop ran to
-/// completion / took a non-MC path). The trial count is an internal detail used
-/// only by the ADR-082 early-stop tests — it deliberately does NOT leak through
-/// the public [`equity`] signature (ADR-012 keeps the public API on engine types
-/// only, and no caller needs the count).
-fn equity_inner(input: EquityInput) -> (EquityResult, u32) {
     // Specialize before the MC loop: earlier streets must not pay for a
     // per-trial cache branch when their board changes on every draw.
     if input.board.count() == 5 {
@@ -165,18 +155,18 @@ fn equity_inner(input: EquityInput) -> (EquityResult, u32) {
     }
 }
 
-fn equity_impl<const CACHE_RIVER: bool>(input: EquityInput) -> (EquityResult, u32) {
+fn equity_impl<const CACHE_RIVER: bool>(input: EquityInput) -> EquityResult {
     // Defensive: validate cards are unique.
     let board_cards = input.board.all_cards();
     if board_cards.len() > 5 {
-        return (EquityResult::INVALID, 0);
+        return EquityResult::INVALID;
     }
     let mut all_known: Vec<Card> = Vec::with_capacity(7);
     all_known.push(input.hero.card1);
     all_known.push(input.hero.card2);
     all_known.extend_from_slice(&board_cards);
     if has_duplicates(&all_known) {
-        return (EquityResult::INVALID, 0);
+        return EquityResult::INVALID;
     }
 
     let trials = input.trials.clamp(1, MAX_MC_TRIALS);
@@ -199,7 +189,7 @@ fn equity_impl<const CACHE_RIVER: bool>(input: EquityInput) -> (EquityResult, u3
                 combined.push(h.card2);
             }
             if has_duplicates(&combined) {
-                return (EquityResult::INVALID, 0);
+                return EquityResult::INVALID;
             }
             // Audit fix N-2 (2026-05-23): known opponent cards must be
             // excluded from the run-out deck so MC trials never deal a
@@ -236,14 +226,11 @@ fn equity_impl<const CACHE_RIVER: bool>(input: EquityInput) -> (EquityResult, u3
     };
     if n_opp == 0 {
         // Heads-up vs ghost: hero always wins by default.
-        return (
-            EquityResult {
-                win_pct: 100,
-                tie_pct: 0,
-                combined_pct: 100,
-            },
-            0,
-        );
+        return EquityResult {
+            win_pct: 100,
+            tie_pct: 0,
+            combined_pct: 100,
+        };
     }
 
     let remaining_deck = deck_minus(&all_known);
@@ -253,10 +240,8 @@ fn equity_impl<const CACHE_RIVER: bool>(input: EquityInput) -> (EquityResult, u3
     // sampling, so retries/cache keys never depend on trial count or seed.
     if let Some(opps) = opp_holdings.as_ref() {
         if board_cards.len() >= 3 {
-            // Exact enumeration is not MC — report `trials` unchanged for the
-            // trial-count sibling (no early-stop hook here, ADR-082 §4).
-            let res = exact_known_runouts(&input.hero, &input.board, opps, &remaining_deck);
-            return (res, trials);
+            // Exact enumeration is not MC (no early-stop hook here, ADR-082 §4).
+            return exact_known_runouts(&input.hero, &input.board, opps, &remaining_deck);
         }
     }
 
@@ -378,8 +363,8 @@ fn equity_impl<const CACHE_RIVER: bool>(input: EquityInput) -> (EquityResult, u3
         let early_stop = input.early_stop;
         let es_min_trials = early_stop.map(|e| e.min_trials.min(trials));
 
-        // `t` = trials completed so far (1-based after the body). `trials_run`
-        // captures the actual count at break / completion for the test sibling.
+        // Trials completed so far (1-based after the body). `trials_run`
+        // captures the actual count at break / completion for `from_counts`.
         let mut completed: u32 = 0;
         for _ in 0..trials {
             draw_prefix(&mut scratch, draw_len, &mut rng);
@@ -470,10 +455,7 @@ fn equity_impl<const CACHE_RIVER: bool>(input: EquityInput) -> (EquityResult, u3
         trials_run = completed;
     }
 
-    (
-        EquityResult::from_counts(wins as u64, ties as u64, share_sum, trials_run as u64),
-        trials_run,
-    )
+    EquityResult::from_counts(wins as u64, ties as u64, share_sum, trials_run as u64)
 }
 
 /// Wilson-STYLE conservative half-width at 95% (`z = 1.959964`) on the running
@@ -592,7 +574,7 @@ fn exact_known_runouts(
     let mut tie_sum: u64 = 0;
     // Accumulate the EXACT per-runout pot share in SHARE_SCALE units (no
     // intermediate per-runout rounding), rounded ONCE over `SHARE_SCALE*total`
-    // at the end (mirrors `from_counts` / `server::equity::compute_equity`).
+    // at the end (mirrors `from_counts`).
     // Re-rounding a per-runout `combined_pct` would re-introduce the up-to-~1pp
     // low bias on chop-heavy boards.
     let mut share_sum: u64 = 0;

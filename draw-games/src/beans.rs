@@ -68,6 +68,10 @@ pub const SQUID_PENALTY_BB: u8 = 5;
 pub const SQUID_EXTRA_TOKENS: u8 = 3;
 pub const BOMB_POT_BB: u64 = 5;
 pub const BOMB_POT_INTERVAL_MINUTES: [u16; 2] = [5, 8];
+/// Owner 2026-11-13: public Hold'em tables pay the 7-2 bounty — a 7-2 offsuit
+/// winner of the main pot after the flop collects this many BB from every
+/// other dealt player.
+pub const SEVEN_DEUCE_BB: u8 = 5;
 
 /// Rule keys every new public beans session adds to its `session_config`.
 /// Bomb Pot needs durable runtime checkpoints (as friend-room create does).
@@ -78,6 +82,7 @@ pub fn public_rule_config() -> serde_json::Map<String, serde_json::Value> {
     rules.insert("squid_extra_tokens".into(), SQUID_EXTRA_TOKENS.into());
     rules.insert("squid_funding".into(), "stack".into());
     rules.insert("bomb_pot_bb".into(), BOMB_POT_BB.into());
+    rules.insert("seven_deuce_bb".into(), SEVEN_DEUCE_BB.into());
     rules.insert(
         "bomb_pot_interval_minutes".into(),
         serde_json::json!(BOMB_POT_INTERVAL_MINUTES),
@@ -107,6 +112,24 @@ pub(crate) fn reentry_chips(
         return Err("room_unavailable");
     }
     Ok(Some(saved))
+}
+
+/// A departure saved during a hand keeps the stack from before that hand until
+/// the hand settles. Once the leaver's result is fixed (it had folded:
+/// `holds::fix_departed_loss`), it re-enters with that loss taken now instead
+/// of waiting for the settlement, which then finds no pending departure.
+pub(crate) fn take_fixed_departure_loss(
+    user: Uuid,
+    mut saved: crate::runtime_checkpoint::StandingChips,
+) -> crate::runtime_checkpoint::StandingChips {
+    if let Some(loss) = saved
+        .pending_beans_hand
+        .and_then(|hand| holds::fixed_loss(hand, user))
+    {
+        saved.stack = saved.stack.saturating_sub(u64::try_from(loss).unwrap_or(0));
+        saved.pending_beans_hand = None;
+    }
+    saved
 }
 
 /// The fewest beans `saved` needs to sit back down when a fresh seat costs
@@ -163,6 +186,7 @@ pub(crate) fn reentry_stack(
             occupancy: Some(joined_at),
             pending_beans_hand: None,
             season_day: None,
+            season_carry: 0,
         });
     }
     if available >= saved.stack + saved.pending_chips {
@@ -175,6 +199,7 @@ pub(crate) fn reentry_stack(
         occupancy: Some(joined_at),
         pending_beans_hand: None,
         season_day: None,
+        season_carry: 0,
     })
 }
 
@@ -300,6 +325,8 @@ pub struct Profile {
     pub ante: u32,
     /// 血战鱿鱼 penalty per share in beans (0 = no squid).
     pub squid_penalty: u32,
+    /// 7-2 bounty per other dealt player, in beans.
+    pub seven_deuce: u32,
     /// Per-seat Bomb Pot contribution in beans (0 = no Bomb Pot).
     pub bomb_pot: u32,
     pub daily_refill_to: i64,
@@ -313,16 +340,12 @@ pub struct Profile {
 }
 
 pub async fn profile(pool: &PgPool, user: Uuid) -> sqlx::Result<Profile> {
-    let _publication_observation =
-        crate::beans_read_memory::observe_profile_publication(pool, user);
     let (w, daily_available) = crate::beans_read_memory::read_after_publication(pool, || {
         crate::beans_read_memory::profile(pool, user)
     })
     .await?;
     let available_balance =
         crate::beans_read_memory::available(pool, user, w.balance, false, None)?;
-    let _phase = crate::request_timing::http_phase(crate::request_timing::HttpPhase::Processing)
-        .operation("beans_profile_assemble");
     Ok(Profile {
         balance: w.balance,
         available_balance,
@@ -336,6 +359,7 @@ pub async fn profile(pool: &PgPool, user: Uuid) -> sqlx::Result<Profile> {
         straddle: BB * u32::from(STRADDLE_BB),
         ante: ANTE,
         squid_penalty: BB * u32::from(SQUID_PENALTY_BB),
+        seven_deuce: BB * u32::from(SEVEN_DEUCE_BB),
         bomb_pot: BB * BOMB_POT_BB as u32,
         daily_refill_to: DAILY_REFILL_TO,
         initial_grant: crate::auth::registration_reward::BEANS,
@@ -829,7 +853,7 @@ pub mod holds {
     }
 
     /// Owner 2026-11-12 (「强制退房 就可以立马让他退」): `user` left `hand` and
-    /// was folded out of it, so its result is exactly `loss` (the chips they
+    /// was folded out of it, so its result is at most `loss` (the chips they
     /// had committed). The hold keeps reserving that loss until the hand's
     /// settlement commits, but memory admission no longer waits for it.
     pub(crate) fn fix_departed_loss(hand: Uuid, user: Uuid, loss: i64) {
@@ -839,6 +863,17 @@ pub mod holds {
                 open.fixed.insert(user);
             }
         }
+    }
+
+    /// `user`'s fixed loss in `hand` (`fix_departed_loss`) while the hand has
+    /// not settled.
+    pub(crate) fn fixed_loss(hand: Uuid, user: Uuid) -> Option<i64> {
+        let open = open_hands();
+        let hand = open.get(&hand).filter(|h| h.alive.strong_count() > 0)?;
+        hand.fixed
+            .contains(&user)
+            .then(|| hand.amounts.get(&user).copied())
+            .flatten()
     }
 
     /// Memory poker admission may ignore results already included in its
@@ -854,16 +889,26 @@ pub mod holds {
         })
     }
 
-    pub fn amounts(user: Uuid) -> HashMap<Uuid, i64> {
+    /// `user`'s unsettled hand liabilities: per session the live seat's
+    /// largest open hold, which the seat's own stack reservation overlaps,
+    /// and separately the sum of fixed departure losses (`fix_departed_loss`).
+    /// A fixed loss belongs to an occupancy that already left, so it adds to
+    /// whatever the user holds now, at that table too.
+    pub fn amounts(user: Uuid) -> (HashMap<Uuid, i64>, i64) {
         let mut open = open_hands();
         open.retain(|_, h| h.alive.strong_count() > 0);
         let mut amounts = HashMap::<Uuid, i64>::new();
+        let mut fixed = 0i64;
         for hand in open.values() {
             if let Some(amount) = hand.amounts.get(&user) {
-                let entry = amounts.entry(hand.session).or_default();
-                *entry = (*entry).max(*amount);
+                if hand.fixed.contains(&user) {
+                    fixed = fixed.saturating_add((*amount).max(0));
+                } else {
+                    let entry = amounts.entry(hand.session).or_default();
+                    *entry = (*entry).max(*amount);
+                }
             }
         }
-        amounts
+        (amounts, fixed)
     }
 }

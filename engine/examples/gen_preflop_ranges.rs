@@ -53,8 +53,9 @@
 //! ```
 //! (`--release` is ~10× faster; the OUTPUT is identical to a debug run.)
 
+use engine::solver::all_hand_keys;
 use engine::solver::preflop_cfr::{
-    canonical_keys, solve, Bucket, Position, CFR_ITERS, EQUITY_SEED, EQUITY_TRIALS,
+    solve, Bucket, Position, CFR_ITERS, EQUITY_SEED, EQUITY_TRIALS,
 };
 
 /// Premiums force-included in EVERY continuing bucket at full frequency (never
@@ -66,7 +67,7 @@ const ALWAYS_IN: [&str; 4] = ["AA", "KK", "QQ", "AKs"];
 const INCLUDE_FLOOR: f32 = 0.05;
 
 fn main() {
-    let keys = canonical_keys();
+    let keys = all_hand_keys();
     let res = solve(&keys);
 
     // Collect rounded continue frequency per (position, bucket, key). Index by

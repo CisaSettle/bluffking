@@ -1,7 +1,6 @@
 //! Authenticated lottery HTTP endpoints; rule failures have stable wire codes.
 use super::{runtime, store, Game};
 use crate::api_resources::OperationPath as Path;
-use crate::request_timing::{lottery_span, mark_lottery, LotteryStage};
 use crate::{app_state::AppState, auth::middleware::AuthUser, handlers::respond::error_code};
 use axum::{
     extract::{rejection::JsonRejection, Query, State},
@@ -106,19 +105,14 @@ pub async fn buy(
     body: Result<Json<Value>, JsonRejection>,
 ) -> Result<Response, Error> {
     let game = game(&name)?;
-    mark_lottery(game.as_str());
-    let decoding = lottery_span(LotteryStage::Decode);
     let Json(body) = body.map_err(|_| Error::InvalidEntry)?;
     let purchase = if game == Game::Scratch {
         let body = serde_json::from_value(body).map_err(|_| Error::InvalidEntry)?;
-        drop(decoding);
         runtime::buy_scratch(&state.pool, auth.user_id, &body).await?
     } else {
         let body = serde_json::from_value(body).map_err(|_| Error::InvalidEntry)?;
-        drop(decoding);
         runtime::buy_numbers(&state.pool, auth.user_id, game, &body).await?
     };
-    let _reply = lottery_span(LotteryStage::Reply);
     if query.receipt_only && game != Game::Scratch {
         // The transaction has committed. Hall crowd/feed/history reads must not
         // delay its receipt or turn their failure into a failed purchase.

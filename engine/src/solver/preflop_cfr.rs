@@ -1087,13 +1087,3 @@ fn solve_bucket_full(
     }
     hero_freq
 }
-
-// --------------------------------------------------------------------------
-// Convenience: the canonical key order (re-exported for the generator).
-// --------------------------------------------------------------------------
-
-/// Canonical 169 hand-key order (pairs, suited, offsuit), from
-/// `preflop_charts::all_hand_keys`.
-pub fn canonical_keys() -> Vec<String> {
-    all_hand_keys()
-}

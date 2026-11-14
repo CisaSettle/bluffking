@@ -39,28 +39,6 @@ pub enum HandStrength {
     FullHousePlus,
 }
 
-impl HandStrength {
-    /// All 13 variants, in canonical ascending order. Used by tests + by
-    /// the `templates_zh` exhaustive check.
-    pub fn all() -> [HandStrength; 13] {
-        [
-            HandStrength::PureBluffNoEquity,
-            HandStrength::DrawWeak,
-            HandStrength::DrawStrong,
-            HandStrength::PairWeak,
-            HandStrength::PairMiddle,
-            HandStrength::PairTopWeakKicker,
-            HandStrength::PairTopStrongKicker,
-            HandStrength::Overpair,
-            HandStrength::TwoPair,
-            HandStrength::Set,
-            HandStrength::Straight,
-            HandStrength::Flush,
-            HandStrength::FullHousePlus,
-        ]
-    }
-}
-
 /// Classify the hero hand on the given board.
 ///
 /// Preflop (`board` is empty): returns a coarse pocket-pair classification —

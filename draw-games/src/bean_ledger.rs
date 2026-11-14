@@ -65,6 +65,10 @@
 //!   `beans_card_rooms::accept_card_snapshot`), and an accepted lottery
 //!   prize is not spendable at all until its row commits, so no durable
 //!   admission can have been funded by winnings a crash then voids;
+//! * beans a seated hold'em player lets go of (a cancelled top-up) are
+//!   answered from memory but stay reserved until the checkpoint carrying the
+//!   release commits (`beans_reservations::Reservations::releasing`), so a
+//!   crash cannot return them to the table after they were spent elsewhere;
 //! * a disconnect changes nothing: the seat, its checkpoint and its
 //!   reservation stay until the room itself releases them.
 //!
@@ -1426,9 +1430,7 @@ pub async fn ensure(pool: &PgPool, user_id: Uuid) -> sqlx::Result<Wallet> {
 async fn ensure_durable(pool: &PgPool, user_id: Uuid) -> sqlx::Result<Wallet> {
     // Profile reads must not start a write transaction for an existing wallet.
     // Read fresh committed balances; keep first-use grant + ledger atomic below.
-    let started = std::time::Instant::now();
     let mut conn = pool.acquire().await?;
-    let acquired = std::time::Instant::now();
     let row = sqlx::query(
         "SELECT balance, hands_played, hands_won, net_won, refills \
          FROM wallets WHERE user_id = $1 AND game = $2",
@@ -1437,9 +1439,6 @@ async fn ensure_durable(pool: &PgPool, user_id: Uuid) -> sqlx::Result<Wallet> {
     .bind(GAME)
     .fetch_optional(&mut *conn)
     .await?;
-    tracing::debug!(target: "game_latency", game=GAME, stage="wallet_read",
-        acquire_ms=(acquired-started).as_secs_f64()*1000.0,
-        query_ms=acquired.elapsed().as_secs_f64()*1000.0);
     drop(conn);
     if let Some(row) = row {
         return Ok(wallet_from(&row));

@@ -201,8 +201,6 @@ pub async fn load_history_page_filtered(
     session_id: Option<Uuid>,
     opponent: Opponent,
 ) -> sqlx::Result<RecordsResponse> {
-    use crate::request_timing::{http_phase, HttpPhase};
-    let prepare = http_phase(HttpPhase::Processing).operation("records_query_prepare");
     // Group only this player's indexed records; hydrate details after paging.
     // `game_records.has_bots` holds the per-game opponent evidence (schema
     // 0006, maintained with the record and its sources); NULL is unknown and
@@ -285,21 +283,29 @@ pub async fn load_history_page_filtered(
         .push_bind(limit + 1);
     // Return totals and the bounded page in one snapshot and one round trip.
     // Tagged rows avoid JSON encoding of ordinary SQL fields and keep totals
-    // available even when the requested page is empty.
+    // available even when the requested page is empty. The totals come from
+    // the write-time projection (schema 0168): at most three rows per game
+    // instead of the player's whole history.
+    let totals_filter = match opponent.has_bots() {
+        None => "TRUE",
+        Some(true) => "has_bots = true",
+        Some(false) => "has_bots = false",
+    };
     query.push(
         ") SELECT 0::smallint AS row_kind, t.game AS summary_order, t.game, \
          NULL::uuid AS record_id, NULL::uuid AS session_id, \
          t.last_played_at AS played_at, NULL::bigint AS delta, NULL::jsonb AS detail, \
-         t.played, t.net FROM (SELECT game, max(played_at) AS last_played_at, count(*) AS played, \
-         CASE WHEN game IN (",
+         t.played, t.net FROM (SELECT game, max(last_played_at) AS last_played_at, \
+         sum(played)::bigint AS played, CASE WHEN game IN (",
     );
     // Card-game points stay in their room, so those games have no account net.
     query.push(card_codes());
-    query.push(
-        ") THEN NULL::bigint ELSE sum(delta)::bigint END AS net FROM filtered_records WHERE user_id=$1 GROUP BY game) t \
+    query.push(format!(
+        ") THEN NULL::bigint ELSE sum(net)::bigint END AS net FROM game_record_totals \
+         WHERE user_id=$1 AND {totals_filter} GROUP BY game) t \
          UNION ALL SELECT 1::smallint, NULL::smallint, page.game, page.record_id, \
          page.session_id, page.played_at, page.delta, ",
-    );
+    ));
     if sessions {
         // The room games whose session is a points or a gold-bean room (card,
         // board and dealer rooms); the bean receipt tells which.
@@ -324,14 +330,8 @@ pub async fn load_history_page_filtered(
     );
     // The page and its detail statement are sequential: one pooled connection
     // serves both instead of an acquire (and idle-connection ping) each.
-    drop(prepare);
-    let acquire = http_phase(HttpPhase::DbPool).operation("records_pool_acquire");
     let mut conn = pool.acquire().await?;
-    drop(acquire);
-    let page = http_phase(HttpPhase::DbQuery).operation("records_page_query");
     let rows = query.build().fetch_all(&mut *conn).await?;
-    drop(page);
-    let decode = http_phase(HttpPhase::Processing).operation("records_page_decode");
     let summary = rows
         .iter()
         .filter(|r| r.get::<i16, _>("row_kind") == 0)
@@ -350,17 +350,14 @@ pub async fn load_history_page_filtered(
     let has_more = page_rows.len() as i64 > limit;
     let page_rows: Vec<_> = page_rows.into_iter().take(limit as usize).collect();
     let mut details = if sessions {
-        drop(decode);
         std::collections::HashMap::new()
     } else {
         let keys: Vec<(i16, Uuid)> = page_rows
             .iter()
             .map(|r| (r.get("game"), r.get("record_id")))
             .collect();
-        drop(decode);
         load_page_details(&mut conn, user_id, &keys).await?
     };
-    let _assemble = http_phase(HttpPhase::Processing).operation("records_response_assemble");
     let entries: Vec<RecordEntry> = page_rows
         .into_iter()
         .map(|r| {
@@ -429,8 +426,6 @@ async fn load_page_details(
     user_id: Uuid,
     keys: &[(i16, Uuid)],
 ) -> sqlx::Result<std::collections::HashMap<(i16, Uuid), Option<Value>>> {
-    use crate::request_timing::{http_phase, HttpPhase};
-    let prepare = http_phase(HttpPhase::Processing).operation("records_details_prepare");
     // One CASE arm per distinct expression on this page (all card games share one).
     let mut arms: Vec<(Vec<i16>, &str)> = Vec::new();
     for &(code, _) in keys {
@@ -458,8 +453,6 @@ async fn load_page_details(
         " ELSE NULL END, '{}'::jsonb) || CASE WHEN EXISTS(SELECT 1 FROM wallet_ledger l WHERE l.game=$4 AND l.record_id=page.record_id AND l.user_id=$1 AND l.kind='play') OR EXISTS(SELECT 1 FROM game_records kept WHERE kept.user_id=$1 AND kept.game=page.game AND kept.record_id=page.record_id AND kept.detail->>'unit'='beans') THEN jsonb_build_object('unit','beans') ELSE '{}'::jsonb END AS detail FROM unnest($2::smallint[], $3::uuid[]) AS page(game, record_id)",
     );
     let (games, ids): (Vec<i16>, Vec<Uuid>) = keys.iter().copied().unzip();
-    drop(prepare);
-    let query = http_phase(HttpPhase::DbQuery).operation("records_details_query");
     let rows = sqlx::query(&sql)
         .bind(user_id)
         .bind(games)
@@ -467,8 +460,6 @@ async fn load_page_details(
         .bind(game::BEANS)
         .fetch_all(conn)
         .await?;
-    drop(query);
-    let _decode = http_phase(HttpPhase::Processing).operation("records_details_decode");
     Ok(rows
         .into_iter()
         .map(|row| {

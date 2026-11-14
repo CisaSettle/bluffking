@@ -78,7 +78,7 @@ fn decode_verifying_key_strict(bytes: &[u8; 32]) -> Option<VerifyingKey> {
 /// - `signing` — the secret `SigningKey`s this provider can sign *as* (a party
 ///   holds only its own; a verifier-only instance holds none);
 /// - `verifying` — the public `VerifyingKey` of every signer, used for
-///   verification and exported (safely) in the [`KeyDirectory`].
+///   verification; a [`KeyDirectory`] carries the same public keys.
 ///
 /// The split is what makes the scheme asymmetric: a verifier-only instance
 /// (built via [`Ed25519SignatureProvider::verifier_from_directory`]) can check
@@ -131,18 +131,6 @@ impl Ed25519SignatureProvider {
         self.verifying
             .get(signer)
             .map(|vk| hex::encode(vk.to_bytes()))
-    }
-
-    /// Export the **public** verifying keys. The directory carries only public
-    /// keys and is safe to publish to every verifier / auditor.
-    pub fn directory(&self) -> KeyDirectory {
-        KeyDirectory {
-            keys: self
-                .verifying
-                .iter()
-                .map(|(signer, vk)| (signer.clone(), hex::encode(vk.to_bytes())))
-                .collect(),
-        }
     }
 
     /// Reconstruct a **verifier-only** provider from an exported asymmetric

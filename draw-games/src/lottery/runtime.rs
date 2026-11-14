@@ -7,7 +7,6 @@ use super::{
     Game,
 };
 use crate::db_writer::PgPool;
-use crate::request_timing::{lottery_span, LotteryStage};
 use crate::{
     beans_read_memory::{self, PendingEffect},
     write_behind::Ordered,
@@ -1017,6 +1016,13 @@ fn offer(
         .map_err(|_| Error::InvalidEntry)
 }
 
+/// Changes whenever this process restarts, so a client can tell that the
+/// in-memory revisions it holds belong to an earlier runtime.
+fn runtime_epoch() -> &'static str {
+    static EPOCH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(|| Uuid::new_v4().to_string())
+}
+
 fn current_view(pool: &PgPool, user: Uuid, game: Game) -> Result<Value, Error> {
     player(pool, user)?;
     beans_read_memory::ensure(pool, user)?;
@@ -1089,7 +1095,7 @@ fn current_view(pool: &PgPool, user: Uuid, game: Game) -> Result<Value, Error> {
     let present = members.len();
     members.truncate(12);
     Ok(
-        json!({"game":game.as_str(),"runtime_epoch":crate::server_performance::process_instance_id(),"revision":data.revision,"durable_revision":data.durable,"now_ms":super::now_ms(),"balance":balance,"available_balance":available,"unit":game.unit(),"daily_refill":super::REFILL,"period":period,"my_tickets":my,"last_draw":null,"recent":[],"crowd":{"present":present,"members":members.iter().map(|((_,u),at)|json!({"user_id":u,"name":name(pool,*u),"seen_at_ms":at.timestamp_millis()})).collect::<Vec<_>>()},"feed":[],"fairness_offer":fairness}),
+        json!({"game":game.as_str(),"runtime_epoch":runtime_epoch(),"revision":data.revision,"durable_revision":data.durable,"now_ms":super::now_ms(),"balance":balance,"available_balance":available,"unit":game.unit(),"daily_refill":super::REFILL,"period":period,"my_tickets":my,"last_draw":null,"recent":[],"crowd":{"present":present,"members":members.iter().map(|((_,u),at)|json!({"user_id":u,"name":name(pool,*u),"seen_at_ms":at.timestamp_millis()})).collect::<Vec<_>>()},"feed":[],"fairness_offer":fairness}),
     )
 }
 
@@ -1281,7 +1287,6 @@ pub async fn buy_numbers(
     game: Game,
     body: &NumberBuy,
 ) -> Result<Purchase, Error> {
-    let validation = lottery_span(LotteryStage::Validate);
     player(pool, user)?;
     let entries = body
         .tickets
@@ -1295,17 +1300,9 @@ pub async fn buy_numbers(
     }
     let hash = store::body_sha256(&identity);
     let state = state(pool);
-    drop(validation);
-    let command = {
-        let _span = lottery_span(LotteryStage::CommandWait);
-        state.commands.lock().await
-    };
+    let command = { state.commands.lock().await };
     let (replay, wallet) = {
-        let mut conn = {
-            let _span = lottery_span(LotteryStage::ReplayPool);
-            pool.acquire().await?
-        };
-        let _span = lottery_span(LotteryStage::ReplayQuery);
+        let mut conn = { pool.acquire().await? };
         store::replay_request_and_wallet(&mut conn, game, user, body.request_id, &hash).await?
     };
     let (purchase, receipt) = if let Some(p) = replay {
@@ -1315,15 +1312,12 @@ pub async fn buy_numbers(
         )
     } else {
         {
-            let _span = lottery_span(LotteryStage::WalletReady);
             wallet_ready_after(pool, user, wallet).await?;
         }
-        let _span = lottery_span(LotteryStage::Accept);
         accept_numbers(pool, user, game, body)?
     };
     drop(command);
     {
-        let _span = lottery_span(LotteryStage::CommitWait);
         receipt.wait().await?;
     }
     Ok(purchase)
@@ -1353,27 +1347,17 @@ pub async fn buy_scratch(
     user: Uuid,
     body: &super::scratch::ScratchBuy,
 ) -> Result<Purchase, Error> {
-    let validation = lottery_span(LotteryStage::Validate);
     player(pool, user)?;
     // The same normalised identity the purchase stored, so a retried
     // request replays instead of conflicting.
     let hash = store::body_sha256(&body.identity());
     let state = state(pool);
-    drop(validation);
-    let command = {
-        let _span = lottery_span(LotteryStage::CommandWait);
-        state.commands.lock().await
-    };
+    let command = { state.commands.lock().await };
     {
-        let _span = lottery_span(LotteryStage::ScratchPrepare);
         prepare_scratch(pool, user, None).await?;
     }
     let (replay, wallet) = {
-        let mut conn = {
-            let _span = lottery_span(LotteryStage::ReplayPool);
-            pool.acquire().await?
-        };
-        let _span = lottery_span(LotteryStage::ReplayQuery);
+        let mut conn = { pool.acquire().await? };
         store::replay_request_and_wallet(&mut conn, Game::Scratch, user, body.request_id, &hash)
             .await?
     };
@@ -1386,18 +1370,12 @@ pub async fn buy_scratch(
         (p, pending_receipt(&state, id))
     } else {
         {
-            let _span = lottery_span(LotteryStage::WalletReady);
             wallet_ready_after(pool, user, wallet).await?;
         }
-        let _span = lottery_span(LotteryStage::Accept);
         accept_scratch(pool, user, body)?
     };
     drop(command);
-    let cards = {
-        let _span = lottery_span(LotteryStage::CommitWait);
-        receipt.wait().await?
-    };
-    let _span = lottery_span(LotteryStage::Reply);
+    let cards = { receipt.wait().await? };
     Ok(committed_purchase(purchase, &cards))
 }
 
