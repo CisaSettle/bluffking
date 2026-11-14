@@ -261,7 +261,7 @@ impl GameHand {
         // Capture entitlement before force-folding withholders. Their matched
         // stake is forfeited to honest survivors, not reclassified as a normal
         // folded-player refund.
-        let settlement_pots = self.settlement_side_pots();
+        let settlement_pots = self.hand_side_pots();
 
         // Force-fold each attributable withholder (only a currently non-folded
         // seat — a folded/unknown/duplicate id is ignored, never an error: the
@@ -396,7 +396,7 @@ impl GameHand {
         // (action) order (audit 2026-06-03).
         let button_order = self.button_relative_order();
 
-        let settlement_pots = self.settlement_side_pots();
+        let settlement_pots = self.hand_side_pots();
         let (pot_results, run_twice) = match (self.run_twice_from, self.second_board.as_ref()) {
             // All-in runout dealt twice: each contested pot is halved (the odd
             // chip stays with the first run) and each half is awarded on its
@@ -463,7 +463,7 @@ impl GameHand {
     /// zero-leak. `rank_hand` is not called.
     pub(super) fn assemble_blind_uncontested_result(&self, lone: Option<PlayerId>) -> HandResult {
         let button_order = self.button_relative_order();
-        let settlement_pots = self.settlement_side_pots();
+        let settlement_pots = self.hand_side_pots();
         let pot_results = distribute_pots_uncontested(&settlement_pots, lone, &button_order);
         self.finalize_pots(pot_results, Vec::new())
     }
@@ -613,6 +613,109 @@ impl GameHand {
             show_order,
             folded_hole_cards,
             run_twice: None,
+            seven_deuce: Vec::new(),
+        }
+    }
+
+    /// Apply the room's seven-deuce bounty to a finished hand's `result`, once
+    /// every dealt seat's hole cards are known (`showdown` plus
+    /// `folded_hole_cards`, which the sealed dealer fills after settlement).
+    ///
+    /// Requires the flop to have been dealt and a 7-2 offsuit holder among the
+    /// main pot's winners. Each such winner collects up to the configured
+    /// amount from every other dealt player's settled stack. Chips only move
+    /// between `final_stacks`, so the hand stays chip-conserving; `pots` and
+    /// `chips_awarded` stay pot-only. The queued `HandFinished` event is
+    /// updated to the same result. Idempotent: a result that already carries
+    /// bounties is left unchanged. `exempt` players pay nothing (the server
+    /// passes players who left the table during the hand, whose result was
+    /// already fixed at what they committed).
+    pub fn apply_seven_deuce_bounty(
+        &mut self,
+        result: &mut HandResult,
+        exempt: &std::collections::HashSet<PlayerId>,
+    ) {
+        let amount = self.seven_deuce_bounty.0;
+        if amount == 0 || result.board.flop.is_none() || !result.seven_deuce.is_empty() {
+            return;
+        }
+        let Some(main_pot) = result
+            .pots
+            .iter()
+            .filter(|pot| !pot.is_refund)
+            .min_by_key(|pot| pot.index)
+        else {
+            return;
+        };
+        let hole_cards = |pid: PlayerId| {
+            result
+                .showdown
+                .iter()
+                .find(|entry| entry.player_id == pid)
+                .map(|entry| entry.hole_cards)
+                .or_else(|| result.folded_hole_cards.get(&pid.inner()).copied())
+        };
+        let winners: Vec<(PlayerId, HoleCards)> = self
+            .seats
+            .iter()
+            .filter(|seat| !seat.folded)
+            .filter(|seat| {
+                main_pot
+                    .winners
+                    .iter()
+                    .any(|w| w.player_id == seat.player_id && w.amount_won.0 > 0)
+            })
+            .filter_map(|seat| hole_cards(seat.player_id).map(|cards| (seat.player_id, cards)))
+            .filter(|(_, cards)| is_seven_deuce_offsuit(cards))
+            .collect();
+        if winners.is_empty() {
+            return;
+        }
+        for (winner, hole_cards) in winners {
+            let mut payments = Vec::new();
+            for seat in &self.seats {
+                let payer = seat.player_id;
+                if payer == winner || exempt.contains(&payer) {
+                    continue;
+                }
+                let payer_stack = result
+                    .final_stacks
+                    .get(&payer.inner())
+                    .copied()
+                    .unwrap_or(0);
+                let winner_stack = result
+                    .final_stacks
+                    .get(&winner.inner())
+                    .copied()
+                    .unwrap_or(0);
+                let paid = amount.min(payer_stack).min(u32::MAX - winner_stack);
+                if paid == 0 {
+                    continue;
+                }
+                result
+                    .final_stacks
+                    .insert(payer.inner(), payer_stack - paid);
+                result
+                    .final_stacks
+                    .insert(winner.inner(), winner_stack + paid);
+                payments.push(PotWinner {
+                    player_id: payer,
+                    amount_won: Chips(paid),
+                });
+            }
+            result.seven_deuce.push(SevenDeuceBounty {
+                winner,
+                hole_cards,
+                amount: Chips(amount),
+                payments,
+            });
+        }
+        for event in self.events.iter_mut().rev() {
+            if let EngineEvent::HandFinished { result: queued } = event {
+                queued.final_stacks = result.final_stacks.clone();
+                queued.seven_deuce = result.seven_deuce.clone();
+                break;
+            }
         }
     }
 
@@ -699,11 +802,6 @@ impl GameHand {
             order.insert(self.seats[idx].player_id.inner(), offset);
         }
         order
-    }
-
-    /// The hand-global pot decomposition visible right now.
-    pub(super) fn merged_side_pots(&self) -> Vec<SidePot> {
-        self.hand_side_pots()
     }
 
     /// Rebuild canonical pots from each player's total contribution for the
@@ -804,11 +902,6 @@ impl GameHand {
             }
         }
         canonical
-    }
-
-    /// Canonical, hand-global pots used for every terminal settlement path.
-    pub(super) fn settlement_side_pots(&self) -> Vec<SidePot> {
-        self.hand_side_pots()
     }
 
     /// Accumulate new side pots into the running cumulative list.
@@ -1294,4 +1387,12 @@ pub(super) fn distribute_pots_among_survivors(
             split(idx, pot, &eligible_survivors, false)
         })
         .collect()
+}
+
+/// 7-2 offsuit (either card order).
+fn is_seven_deuce_offsuit(cards: &HoleCards) -> bool {
+    use crate::card::Rank;
+    let ranks = (cards.card1.rank, cards.card2.rank);
+    let seven_deuce = matches!(ranks, (Rank::Seven, Rank::Two) | (Rank::Two, Rank::Seven));
+    seven_deuce && cards.card1.suit != cards.card2.suit
 }

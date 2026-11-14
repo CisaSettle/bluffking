@@ -25,14 +25,10 @@
 //! public `Q`. That bias reveals no honest share and does not allow decryption;
 //! it is a disclosed residual of the trusted-operator scope (spec §2).
 //!
-//! ## Commit-reveal primitive (not on the live wire)
-//!
-//! [`DkgParty::commitment`] / [`verify_dkg`] implement a Pedersen
-//! commit-before-reveal variant (`Cmt_i = Q_i + blind_i·H`, opened with the
-//! revealed `(Q_i, blind_i)` plus the PoK). Run in that order it locks every
-//! contribution before any is revealed; no live message carries a commitment.
-//! The joint secret `x = Σ x_i` is never assembled in one place in the real
-//! protocol — each party keeps only `x_i`.
+//! A Pedersen commit-before-reveal round was considered and not adopted: no
+//! message carries a commitment and this crate has no code for one. The joint
+//! secret `x = Σ x_i` is never assembled in one place — each party keeps only
+//! `x_i`.
 //!
 //! ## Status
 //!
@@ -40,9 +36,7 @@
 //! the engine-blind table class by ADR-070; in
 //! production these run ONLY for engine-blind sessions (`resolve_mp_crypto_mode`).
 
-use crate::crypto_real::ec::{
-    is_identity_pubkey, point_from_hex, point_to_hex, scalar_from_hex, scalar_to_hex,
-};
+use crate::crypto_real::ec::{point_from_hex, point_to_hex, scalar_from_hex, scalar_to_hex};
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT as G;
 // PERF: fixed-base precomputed table for G (constant-time; safe on prover paths).
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_TABLE as GT;
@@ -51,8 +45,6 @@ use curve25519_dalek::scalar::Scalar;
 use merlin::Transcript;
 use rand_core::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
-
-use super::ec::pedersen_h;
 
 /// Squeeze a Fiat–Shamir challenge scalar from a merlin transcript (64 wide
 /// bytes → `from_bytes_mod_order_wide`). Shared helper for all sigma proofs.
@@ -214,58 +206,42 @@ pub fn schnorr_verify_bound(
 }
 
 // ---------------------------------------------------------------------------
-// Pedersen commitment to the public-key share (commit-reveal primitive; not on
-// the live engine-blind wire, see the module docs)
+// Per-party DKG state
 // ---------------------------------------------------------------------------
 
-/// `Commit(Q_i, blind) = Q_i + blind·H`. Hiding (blind is secret until reveal)
-/// and binding (`log_G(H)` unknown, so a committer cannot open to a different
-/// `Q_i`). Returns the commitment point.
-fn pedersen_commit(q_i: &RistrettoPoint, blind: &Scalar) -> RistrettoPoint {
-    q_i + blind * pedersen_h()
-}
-
-// ---------------------------------------------------------------------------
-// Per-party DKG state + transcript payloads
-// ---------------------------------------------------------------------------
-
-/// A party's secret DKG state: its secret share `x_i`, the blind, and its public
-/// share `Q_i`. The secret `x_i` NEVER leaves the party (and is never sent to
-/// the coordinator).
+/// A party's secret DKG state: its secret share `x_i` and its public share
+/// `Q_i`. The secret `x_i` NEVER leaves the party (and is never sent to the
+/// coordinator).
 ///
 /// U31 (dual-AI OSS review): the `Debug` impl is manual and **redacts** `x_i`
-/// and `blind` (a stray `{:?}` in a log line / panic message must never leak
-/// key material), and `Drop` best-effort scrubs both scalars (see the impls
-/// below for the honest caveat on the scrub).
+/// (a stray `{:?}` in a log line / panic message must never leak key
+/// material), and `Drop` best-effort scrubs the scalar (see the impls below
+/// for the honest caveat on the scrub).
 #[derive(Clone)]
 pub struct DkgParty {
     /// Stable party identifier (e.g. `"party:0"`).
     pub party_id: String,
     /// Secret key share `x_i` (NEVER published).
     pub x_i: Scalar,
-    /// Blind used in the commitment (revealed in DKG-2).
-    pub blind: Scalar,
     /// Public key share `Q_i = x_i·G`.
     pub q_i: RistrettoPoint,
 }
 
-// U31 (dual-AI OSS review): manual Debug — the secret share `x_i` and the
-// commitment blind are REDACTED so `{:?}` (logs, panics, `dbg!`, the derived
-// Debug of any containing struct such as `DkgRun`) can never print them; only
-// the public fields are shown.
+// U31 (dual-AI OSS review): manual Debug — the secret share `x_i` is REDACTED
+// so `{:?}` (logs, panics, `dbg!`, the derived Debug of any containing struct)
+// can never print it; only the public fields are shown.
 impl std::fmt::Debug for DkgParty {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DkgParty")
             .field("party_id", &self.party_id)
             .field("x_i", &"<redacted>")
-            .field("blind", &"<redacted>")
             .field("q_i", &point_to_hex(&self.q_i))
             .finish()
     }
 }
 
-// U31 (dual-AI OSS review): best-effort scrub of the secret share + blind when
-// the party state is dropped, so the plaintext scalars do not linger in freed
+// U31 (dual-AI OSS review): best-effort scrub of the secret share when the
+// party state is dropped, so the plaintext scalar does not linger in freed
 // memory. HONEST CAVEAT: `zeroize` is deliberately NOT a dependency of this
 // crate, so this is a plain overwrite — it removes the obvious freed-memory
 // copy but is not hardened against compiler dead-store elimination or copies
@@ -274,176 +250,19 @@ impl std::fmt::Debug for DkgParty {
 impl Drop for DkgParty {
     fn drop(&mut self) {
         self.x_i = Scalar::ZERO;
-        self.blind = Scalar::ZERO;
     }
 }
 
 impl DkgParty {
-    /// DKG-1: pick `x_i ← OsRng`, compute `Q_i`, a blind, and the commitment.
+    /// Pick the secret share `x_i` from `rng` (production: `OsRng`) and compute
+    /// the public share `Q_i = x_i·G`.
     pub fn generate<R: RngCore + CryptoRng>(party_id: impl Into<String>, rng: &mut R) -> Self {
         let x_i = Scalar::random(rng);
-        let blind = Scalar::random(rng);
         let q_i = &x_i * GT;
         DkgParty {
             party_id: party_id.into(),
             x_i,
-            blind,
             q_i,
-        }
-    }
-
-    /// The published commitment (DKG-1 output).
-    pub fn commitment(&self) -> DkgCommitment {
-        DkgCommitment {
-            party_id: self.party_id.clone(),
-            commitment: point_to_hex(&pedersen_commit(&self.q_i, &self.blind)),
-        }
-    }
-
-    /// The reveal (DKG-2 output): `Q_i`, the blind, and a Schnorr PoK of `x_i`.
-    pub fn reveal<R: RngCore + CryptoRng>(&self, rng: &mut R) -> DkgShare {
-        DkgShare {
-            party_id: self.party_id.clone(),
-            pubkey_share: point_to_hex(&self.q_i),
-            blind: scalar_to_hex(&self.blind),
-            pok: schnorr_prove(&self.party_id, &self.x_i, &self.q_i, rng),
-        }
-    }
-}
-
-/// DKG-1 transcript payload: a hiding/binding commitment to `Q_i`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DkgCommitment {
-    /// Party identifier.
-    pub party_id: String,
-    /// `Commit(Q_i, blind)` as 64-hex point.
-    pub commitment: String,
-}
-
-/// DKG-2 transcript payload: the revealed `Q_i`, blind, and Schnorr PoK.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DkgShare {
-    /// Party identifier.
-    pub party_id: String,
-    /// `Q_i = x_i·G` as 64-hex point.
-    pub pubkey_share: String,
-    /// The Pedersen blind, revealed so the commitment can be opened.
-    pub blind: String,
-    /// Schnorr PoK of `x_i` (rogue-key defense).
-    pub pok: SchnorrPok,
-}
-
-/// Errors from DKG verification (all are clean rejects, never panics).
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum DkgError {
-    /// A commitment / share / pok field was not a valid point/scalar.
-    #[error("malformed DKG field for {0}")]
-    Malformed(String),
-    /// A commitment did not open to the revealed `Q_i` (T10).
-    #[error("commitment for {0} does not open to revealed Q_i")]
-    CommitmentMismatch(String),
-    /// A Schnorr PoK failed (rogue key / wrong x_i).
-    #[error("Schnorr PoK failed for {0}")]
-    BadPok(String),
-    /// Commitment and reveal sets did not match up.
-    #[error("commitment/share party set mismatch")]
-    PartySetMismatch,
-}
-
-/// Verify the full DKG: every commitment opens to its revealed `Q_i` and every
-/// Schnorr PoK holds; returns the joint key `Q = Σ Q_i`.
-///
-/// `commitments` and `shares` must cover the same party set (commit-before-
-/// reveal: the commitments were fixed first, the reveals open them).
-pub fn verify_dkg(
-    commitments: &[DkgCommitment],
-    shares: &[DkgShare],
-) -> Result<RistrettoPoint, DkgError> {
-    if commitments.len() != shares.len() {
-        return Err(DkgError::PartySetMismatch);
-    }
-    let mut joint = RistrettoPoint::default(); // identity
-                                               // F1 (n-of-n property): the share set must be a BIJECTION onto the commitment
-                                               // party set — exactly one share per party, no duplicate, no unknown, no
-                                               // missing. Without the duplicate guard, a share set like [P0, P1, P0]
-                                               // (len-matched to [P0, P1, P2]) would be accepted: P0's contribution counted
-                                               // twice and P2's never required, so a coalition of {P0, P1} could control the
-                                               // joint secret and decrypt — defeating n-of-n (audit F1).
-    let mut seen: Vec<&str> = Vec::with_capacity(shares.len());
-    for share in shares {
-        // No party may appear twice (duplicate-party guard).
-        if seen.contains(&share.party_id.as_str()) {
-            return Err(DkgError::PartySetMismatch);
-        }
-        seen.push(&share.party_id);
-
-        // Find the matching commitment (commit-before-reveal binding). A missing
-        // or unknown party fails here. Combined with the equal-length and
-        // distinct-party guards, every commitment party is covered exactly once.
-        let cmt = commitments
-            .iter()
-            .find(|c| c.party_id == share.party_id)
-            .ok_or(DkgError::PartySetMismatch)?;
-
-        let q_i = point_from_hex(&share.pubkey_share)
-            .ok_or_else(|| DkgError::Malformed(share.party_id.clone()))?;
-        // F-CRYPTO-15: reject an identity (x_i = 0) public-key share BEFORE it is
-        // summed (see `ec::is_identity_pubkey` for the rationale).
-        if is_identity_pubkey(&q_i) {
-            return Err(DkgError::BadPok(share.party_id.clone()));
-        }
-        let blind = scalar_from_hex(&share.blind)
-            .ok_or_else(|| DkgError::Malformed(share.party_id.clone()))?;
-        let cmt_point = point_from_hex(&cmt.commitment)
-            .ok_or_else(|| DkgError::Malformed(share.party_id.clone()))?;
-
-        // The commitment must open to the revealed Q_i (T10: a late-changed
-        // share fails its commitment open).
-        if cmt_point != pedersen_commit(&q_i, &blind) {
-            return Err(DkgError::CommitmentMismatch(share.party_id.clone()));
-        }
-        // The Schnorr PoK proves knowledge of x_i (rogue-key defense) AND is
-        // bound to this party_id (F4): a PoK lifted from another party squeezes a
-        // different challenge and fails here.
-        if !schnorr_verify(&share.party_id, &q_i, &share.pok) {
-            return Err(DkgError::BadPok(share.party_id.clone()));
-        }
-        joint += q_i;
-    }
-    Ok(joint)
-}
-
-/// A completed DKG run (test/bench harness): all `n` parties + the joint key.
-/// In the real protocol each `DkgParty` lives on a different client; here they
-/// are simulated locally with real `OsRng`.
-#[derive(Debug, Clone)]
-pub struct DkgRun {
-    /// The `n` parties (each holds its own secret `x_i`).
-    pub parties: Vec<DkgParty>,
-    /// The joint public key `Q = Σ Q_i`.
-    pub joint_key: RistrettoPoint,
-    /// The published commitments (DKG-1).
-    pub commitments: Vec<DkgCommitment>,
-    /// The published shares (DKG-2).
-    pub shares: Vec<DkgShare>,
-}
-
-impl DkgRun {
-    /// Run a full DKG for `n` parties (`"party:0".."party:{n-1}"`).
-    pub fn simulate<R: RngCore + CryptoRng>(n: usize, rng: &mut R) -> Self {
-        let parties: Vec<DkgParty> = (0..n)
-            .map(|i| DkgParty::generate(format!("party:{i}"), rng))
-            .collect();
-        let commitments: Vec<DkgCommitment> = parties.iter().map(|p| p.commitment()).collect();
-        let shares: Vec<DkgShare> = parties.iter().map(|p| p.reveal(rng)).collect();
-        let joint_key = parties
-            .iter()
-            .fold(RistrettoPoint::default(), |acc, p| acc + p.q_i);
-        DkgRun {
-            parties,
-            joint_key,
-            commitments,
-            shares,
         }
     }
 }

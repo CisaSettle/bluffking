@@ -9,7 +9,7 @@ use thiserror::Error;
 use crate::hand::{BoardCards, HoleCards, Street};
 use crate::player::Position;
 
-use super::equity::{equity_vs_random, EquityResult};
+use super::equity::equity_vs_random;
 use super::hand_strength::{classify, HandStrength};
 use super::preflop_charts::{hand_key, lookup, position_to_bucket, ActionBucket};
 use super::templates_zh::{render, render_chat_reply, RenderContext};
@@ -174,17 +174,12 @@ enum RenderMode<'a> {
     Chat { hand_id: &'a str },
 }
 
-/// Equity estimator used by the rule pipeline: `(hero, board, opp_count, seed)`
-/// → `EquityResult`. The shipped path is [`equity_vs_random`] (which opts into
-/// the ADR-082 coach early-stop).
-type EquityFn = fn(HoleCards, BoardCards, u8, u64) -> EquityResult;
-
 /// Top-level entry — runs the locked rule pipeline.
 ///
 /// Pure + deterministic given `input.seed` (ADR-043 §6). Uses the live-coach
 /// equity path ([`equity_vs_random`], ADR-082 early-stop on).
 pub fn analyze(input: &SolverInput) -> Result<CoachHintOut, SolverError> {
-    analyze_inner(input, RenderMode::Hint, equity_vs_random)
+    analyze_inner(input, RenderMode::Hint)
 }
 
 /// Chat-mode analyze — identical rule pipeline as [`analyze`], but the
@@ -194,14 +189,10 @@ pub fn analyze(input: &SolverInput) -> Result<CoachHintOut, SolverError> {
 /// Server's chat handler MUST use this entry point and MUST NOT inline the
 /// preamble itself — that path was an audit finding (C-3, 2026-05-23).
 pub fn analyze_chat(input: &SolverInput, hand_id: &str) -> Result<CoachHintOut, SolverError> {
-    analyze_inner(input, RenderMode::Chat { hand_id }, equity_vs_random)
+    analyze_inner(input, RenderMode::Chat { hand_id })
 }
 
-fn analyze_inner(
-    input: &SolverInput,
-    mode: RenderMode<'_>,
-    equity_fn: EquityFn,
-) -> Result<CoachHintOut, SolverError> {
+fn analyze_inner(input: &SolverInput, mode: RenderMode<'_>) -> Result<CoachHintOut, SolverError> {
     // ---- §7 T3: DoS guard ----
     if input.actions_so_far_count > MAX_ACTIONS_SO_FAR {
         return Err(SolverError::ContextTooLarge);
@@ -213,9 +204,9 @@ fn analyze_inner(
     }
 
     if matches!(input.street, Street::Preflop) {
-        analyze_preflop(input, mode, equity_fn)
+        analyze_preflop(input, mode)
     } else {
-        Ok(analyze_postflop(input, mode, equity_fn))
+        Ok(analyze_postflop(input, mode))
     }
 }
 
@@ -233,7 +224,6 @@ fn render_with_mode(ctx: &RenderContext<'_>, seed: u64, mode: RenderMode<'_>) ->
 fn analyze_preflop(
     input: &SolverInput,
     mode: RenderMode<'_>,
-    equity_fn: EquityFn,
 ) -> Result<CoachHintOut, SolverError> {
     // ADR-043 §3.4.1.
     let pos = position_to_bucket(input.position);
@@ -244,7 +234,7 @@ fn analyze_preflop(
     let key = hand_key(input.hero);
 
     let opp_count = input.num_players_in_hand.saturating_sub(1).max(1);
-    let eq = equity_fn(input.hero, input.board.clone(), opp_count, input.seed);
+    let eq = equity_vs_random(input.hero, input.board.clone(), opp_count, input.seed);
     let equity_pct = eq.equity_pct();
     let pot_odds_pct = pot_odds(input.pot_before, input.to_call);
 
@@ -460,13 +450,9 @@ pub(crate) fn recommend_postflop(ctx: &PostflopRuleCtx) -> SolverAction {
     }
 }
 
-fn analyze_postflop(
-    input: &SolverInput,
-    mode: RenderMode<'_>,
-    equity_fn: EquityFn,
-) -> CoachHintOut {
+fn analyze_postflop(input: &SolverInput, mode: RenderMode<'_>) -> CoachHintOut {
     let opp_count = input.num_players_in_hand.saturating_sub(1).max(1);
-    let eq = equity_fn(input.hero, input.board.clone(), opp_count, input.seed);
+    let eq = equity_vs_random(input.hero, input.board.clone(), opp_count, input.seed);
     let equity_pct = eq.equity_pct();
 
     let pot_odds_pct = pot_odds(input.pot_before, input.to_call);

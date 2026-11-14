@@ -166,7 +166,6 @@ impl LockedDeck {
         let party = DkgParty {
             party_id: DEALER_PARTY.to_string(),
             x_i: self.key,
-            blind: Scalar::ZERO,
             q_i: self.public_key,
         };
         let mut positions = positions.to_vec();

@@ -375,6 +375,25 @@ impl GameHand {
         Ok(())
     }
 
+    /// Run a finished plaintext all-in runout a second time from `from`.
+    ///
+    /// The first board is already complete; the second run's own cards are the
+    /// next cards of the same seeded deck, so seed + actions + `from` rebuild
+    /// the hand exactly. Call before [`Self::finish`].
+    pub fn deal_second_run(&mut self, from: Street) -> Result<(), BlindInjectError> {
+        if self.mode != HandMode::Plaintext {
+            return Err(BlindInjectError::NoSecondRunPending);
+        }
+        let count = second_run_cards_from(from);
+        let remaining = self.deck.remaining();
+        if count == 0 || remaining < count {
+            return Err(BlindInjectError::NoSecondRunPending);
+        }
+        let start = self.deck.cards().len() - remaining;
+        let cards: Vec<Card> = self.deck.cards()[start..start + count].to_vec();
+        self.restore_run_twice(from, &cards)
+    }
+
     /// Compute the new-street betting-state triple
     /// `(current_bet, min_raise_to, next_actor_seat)` from the active round.
     /// Shared by the plaintext StreetRevealed patch and the blind

@@ -242,6 +242,26 @@ pub struct HandResult {
     /// settlement of both runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_twice: Option<RunTwiceResult>,
+    /// Seven-deuce bounties paid this hand (room option, plaintext only).
+    /// `final_stacks` already include them; `chips_awarded` and `pots` stay
+    /// pot-only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seven_deuce: Vec<SevenDeuceBounty>,
+}
+
+/// One 7-2 offsuit winner's bounty: after the flop was dealt, the winner of
+/// (a share of) the main pot collects the configured amount from every other
+/// dealt player, capped by what each payer has left after the pots.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SevenDeuceBounty {
+    /// The 7-2 offsuit winner who collects.
+    pub winner: PlayerId,
+    /// The winner's hole cards (published with the bounty).
+    pub hole_cards: HoleCards,
+    /// Configured bounty per payer, in chips.
+    pub amount: Chips,
+    /// Chips actually paid by each other dealt player (zero payers omitted).
+    pub payments: Vec<PotWinner>,
 }
 
 /// Per-run detail of a hand whose all-in runout was dealt twice.
@@ -427,6 +447,8 @@ pub struct GameHand {
     bomb_pot: Option<Chips>,
     /// Per-seat ante posted as dead money before the blinds (zero = none).
     ante: Chips,
+    /// Seven-deuce bounty per payer (zero = off). Plaintext hands only.
+    seven_deuce_bounty: Chips,
     /// Tournament dead money paid by the big blind, after reserving its live blind.
     big_blind_ante: Chips,
     posted_big_blind_ante: Option<(PlayerId, Chips)>,
@@ -691,7 +713,7 @@ impl GameHand {
             .unwrap_or(Chips::ZERO);
         let pot = Chips(self.completed_pot.0 + round_pot.0);
 
-        let side_pots = self.merged_side_pots();
+        let side_pots = self.hand_side_pots();
 
         let players = self
             .seats

@@ -48,6 +48,7 @@ impl GameHand {
             forced_straddle: self.forced_straddle,
             bomb_pot: self.bomb_pot,
             ante: self.ante,
+            seven_deuce_bounty: self.seven_deuce_bounty,
             big_blind_ante: self.big_blind_ante,
             posted_big_blind_ante: self.posted_big_blind_ante,
             preflop_bring_in: self.preflop_bring_in,
@@ -334,7 +335,7 @@ impl GameHand {
                 .map(|r| r.pot_total())
                 .unwrap_or(Chips::ZERO);
             let total_pot = self.completed_pot.0 as u64 + current_round_pot.0 as u64;
-            let side_pots = self.merged_side_pots();
+            let side_pots = self.hand_side_pots();
             // Snapshot all-in state at emit time so the translate layer can apply
             // the has_all_in guard without needing access to full engine state.
             let has_all_in = self.seats.iter().any(|s| s.all_in);
