@@ -14,7 +14,7 @@
 //!      require an explicit outs value.
 //!   3. [`pot_odds`] — pot-odds / required-equity / call-or-fold arithmetic.
 
-use crate::card::{Card, Rank, Suit};
+use crate::card::{Card, Rank};
 use crate::hand::{BoardCards, HoleCards};
 
 // ===========================================================================
@@ -212,208 +212,20 @@ pub struct DetectedDraws {
 /// uses distinct ranks). Returned outs combine flush + straight conservatively
 /// (see [`DetectedDraws::outs`]).
 pub fn detect_draws(hero: &HoleCards, board: &BoardCards) -> DetectedDraws {
-    // Only flop (5 cards total) or turn (6 cards total) are meaningful.
-    let board_count = board.count();
-    if board_count != 3 && board_count != 4 {
-        return DetectedDraws {
-            draws: Vec::new(),
-            outs: 0,
-        };
-    }
-
-    let board_cards = board.all_cards();
-    let mut cards = Vec::with_capacity(2 + board_cards.len());
-    cards.push(hero.card1);
-    cards.push(hero.card2);
-    cards.extend_from_slice(&board_cards);
-
+    let features = super::draws::draws(hero, board);
     let mut draws = Vec::new();
-
-    let hero_suits = [hero.card1.suit, hero.card2.suit];
-    if has_flush_draw(&hero_suits, &cards) {
+    if features.flush {
         draws.push(DrawKind::FlushDraw);
     }
-
-    // Hero rank-presence bitmask (bit i = Rank::ALL[i]), restricted to ranks the
-    // BOARD does not already hold: a hero card duplicating a board rank adds no
-    // rank to any straight, so it cannot be hero's participation.
-    let hero_bits: u16 = [hero.card1, hero.card2]
-        .iter()
-        .filter(|hc| board_cards.iter().all(|bc| bc.rank != hc.rank))
-        .fold(0u16, |bits, hc| bits | (1u16 << rank_index(hc.rank)));
-    if let Some(kind) = detect_straight_draw(&cards, hero_bits) {
-        draws.push(kind);
+    if features.open_ended {
+        draws.push(DrawKind::OpenEndedStraightDraw);
+    } else if features.gutshot {
+        draws.push(DrawKind::Gutshot);
     }
-
-    // Conservative outs: never sum flush + straight (shared completing cards can
-    // double-count). Take the single largest detected draw's outs.
     let outs = draws.iter().map(|d| d.outs()).max().unwrap_or(0);
-
     DetectedDraws { draws, outs }
 }
 
-/// True iff exactly four cards share one suit (a flush DRAW) AND hero holds at
-/// least one of them. Five+ of a suit is a made flush, not a draw, so it does not
-/// count; four on the board with none in hero's hand is the board's draw, not
-/// hero's.
-fn has_flush_draw(hero_suits: &[Suit; 2], cards: &[Card]) -> bool {
-    for &suit in Suit::ALL.iter() {
-        let n = cards.iter().filter(|c| c.suit == suit).count();
-        let hero_n = hero_suits.iter().filter(|&&s| s == suit).count();
-        if n == 4 && hero_n >= 1 {
-            return true;
-        }
-    }
-    false
-}
-
-/// Detect the strongest straight draw (OESD > gutshot) among the distinct ranks,
-/// or `None` if the hand already makes a straight or has no four-to-a-straight.
-///
-/// `hero_bits` is the rank-presence bitmask (bit i = `Rank::ALL[i]`) of hero's
-/// hole ranks that the board does not already hold; a four-card window only
-/// counts as hero's draw when it contains at least one such rank.
-fn detect_straight_draw(cards: &[Card], hero_bits: u16) -> Option<DrawKind> {
-    // Rank-presence bitmask, low→high. Bit i (0..=12) = Rank::ALL[i] present.
-    // Ace also occupies a virtual "bit -1" via a separate wheel check.
-    let mut present = [false; 13];
-    for c in cards {
-        present[rank_index(c.rank)] = true;
-    }
-    let ace = present[12];
-
-    // If a made 5-straight already exists, it's not a draw.
-    if makes_straight(&present, ace) {
-        return None;
-    }
-
-    // Scan every 5-rank straight window (including the wheel A-2-3-4-5) and find
-    // the best draw: a window we already have 4 of distinct ranks in.
-    // Windows are the 10 high-card values 5..=A (top rank = window high).
-    let mut best: Option<DrawKind> = None;
-
-    // Standard windows: high card from Six(index 4) up to Ace(index 12). The
-    // five-low window (2-3-4-5-6) is the lowest standard run; the A-low wheel is
-    // handled separately below. Starting at index 4 keeps `high - 4` ≥ 0.
-    for high in 4..=12usize {
-        let in_window = |idx: usize| -> bool {
-            // window ranks are high-4 ..= high
-            present[idx]
-        };
-        let window_idxs = [high - 4, high - 3, high - 2, high - 1, high];
-        let count = window_idxs.iter().filter(|&&i| in_window(i)).count();
-        // Hero must hold at least one rank of the window (a board-only run is not
-        // hero's draw).
-        let window_bits: u16 = window_idxs.iter().fold(0u16, |b, &i| b | (1u16 << i));
-        if count == 4 && (window_bits & hero_bits) != 0 {
-            let kind = classify_window(&present, &window_idxs);
-            best = Some(stronger(best, kind));
-        }
-    }
-
-    // Wheel window A-2-3-4-5 (ranks: Ace + Two..Five). Index the Ace specially.
-    {
-        let wheel = [ace, present[0], present[1], present[2], present[3]];
-        let count = wheel.iter().filter(|&&p| p).count();
-        let wheel_bits: u16 = (1u16 << 12) | 0b1111;
-        if count == 4 && (wheel_bits & hero_bits) != 0 {
-            // The wheel can only ever be a gutshot for draw purposes here: a true
-            // OESD requires open ends, and the wheel's low end (A) and high end
-            // (6, which would extend 2-3-4-5-6) are asymmetric. We classify it by
-            // which single card is missing — but since one end is the Ace
-            // (non-extendable downward), treat a four-to-the-wheel as a GUTSHOT
-            // (4 outs), the conservative call.
-            best = Some(stronger(best, DrawKind::Gutshot));
-        }
-    }
-
-    best
-}
-
-/// Classify a four-card straight window (exactly one of the five ranks missing)
-/// as an OESD or a gutshot.
-///
-/// A window is an OESD only when the missing rank is at an END of the run AND the
-/// run can extend on the OPEN side (i.e. the four held ranks are consecutive and
-/// both extension cards exist on the board — represented by the missing card
-/// being a true end with a further rank beyond). For the conservative tool we
-/// classify by the SHAPE of the four held ranks:
-///   * four CONSECUTIVE ranks (e.g. 6-7-8-9) that are NOT bounded by the deck
-///     edge on both sides → OESD (8 outs)
-///   * otherwise (one internal gap, or an edge-bounded run like A-K-Q-J) →
-///     gutshot (4 outs)
-fn classify_window(present: &[bool; 13], window: &[usize; 5]) -> DrawKind {
-    // Find the single missing index in the window.
-    let missing: Vec<usize> = window.iter().copied().filter(|&i| !present[i]).collect();
-    if missing.len() != 1 {
-        // Shouldn't happen (caller passed a count==4 window), be conservative.
-        return DrawKind::Gutshot;
-    }
-    let miss = missing[0];
-    let lo = window[0];
-    let hi = window[4];
-
-    // If the missing card is INTERNAL to the window (not at either end), the four
-    // held ranks straddle a one-card hole → gutshot.
-    if miss != lo && miss != hi {
-        return DrawKind::Gutshot;
-    }
-
-    // Missing card is at an end ⇒ the four held ranks are consecutive
-    // (e.g. window 5-6-7-8-9 missing 9 → held 5-6-7-8). This is an OESD ONLY
-    // when BOTH outside ranks exist in the deck so it can complete two ways.
-    // The four consecutive held ranks span [held_lo, held_hi]; the two
-    // completing ranks are held_lo-1 and held_hi+1.
-    let held_hi = if miss == lo {
-        window[4] // dropped the low end ⇒ held run is window[1..=4]
-    } else {
-        window[3] // dropped the high end ⇒ held run is window[0..=3]
-    };
-    // The LOW end of a four-consecutive run is ALWAYS completable: by a lower rank
-    // when one exists, or by the Ace via the wheel A-2-3-4-5 when the low card is a
-    // Two. So held 2-3-4-5 is a true OESD (completes with A *or* 6 = 8 outs), not a
-    // gutshot. Only the HIGH end can be deck-blocked — nothing extends above the
-    // Ace — so a four-run topping out at the Ace (e.g. held J-Q-K-A, completes only
-    // with T) is one-way, which we treat as a gutshot.
-    if held_hi < 12 {
-        DrawKind::OpenEndedStraightDraw
-    } else {
-        DrawKind::Gutshot
-    }
-}
-
-/// Pick the stronger of an optional current best and a new draw kind
-/// (OESD > Gutshot).
-fn stronger(current: Option<DrawKind>, new: DrawKind) -> DrawKind {
-    match current {
-        Some(DrawKind::OpenEndedStraightDraw) => DrawKind::OpenEndedStraightDraw,
-        Some(_) => {
-            if new == DrawKind::OpenEndedStraightDraw {
-                DrawKind::OpenEndedStraightDraw
-            } else {
-                DrawKind::Gutshot
-            }
-        }
-        None => new,
-    }
-}
-
-/// True iff the distinct ranks already make a five-card straight (incl. wheel).
-fn makes_straight(present: &[bool; 13], ace: bool) -> bool {
-    // Wheel A-2-3-4-5.
-    if ace && present[0] && present[1] && present[2] && present[3] {
-        return true;
-    }
-    // Standard 5-in-a-row windows.
-    for high in 4..=12usize {
-        if (high - 4..=high).all(|i| present[i]) {
-            return true;
-        }
-    }
-    false
-}
-
-/// Index of a rank in `Rank::ALL` (Two=0 .. Ace=12).
 fn rank_index(rank: Rank) -> usize {
     match rank {
         Rank::Two => 0,
@@ -682,7 +494,7 @@ pub fn scare_card(
     if known.len() > 52 {
         return Err(ScareCardError::TooManyCards);
     }
-    if has_duplicate_cards(known) {
+    if !crate::card::cards_unique(known.iter().copied()) {
         return Err(ScareCardError::DuplicateCard);
     }
 
@@ -769,18 +581,6 @@ pub fn overcards_to_board_top(board: &BoardCards) -> Vec<Rank> {
         None => return Vec::new(),
     };
     Rank::ALL.iter().copied().filter(|&r| r > top).collect()
-}
-
-/// True if `cards` contains a duplicate (same rank+suit twice).
-fn has_duplicate_cards(cards: &[Card]) -> bool {
-    for (i, a) in cards.iter().enumerate() {
-        for b in &cards[i + 1..] {
-            if a == b {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 /// Exact binomial coefficient C(n, k) as a `u128`. Returns 0 when `k > n`.

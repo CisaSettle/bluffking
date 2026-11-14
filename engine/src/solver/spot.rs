@@ -222,7 +222,7 @@ pub fn analyze_spot(req: &SpotRequest) -> Result<SpotAnalysis, SolverError> {
         let ctx = PostflopRuleCtx {
             equity_pct,
             pot_odds_pct,
-            spr: spr(req.stack_bb, req.pot_bb),
+            spr: advisor::stack_to_pot_ratio(req.stack_bb, req.pot_bb),
             hand_strength: hand_class,
             to_call: bb_to_units(req.to_call_bb),
             stack_before: bb_to_units(req.stack_bb as f32),
@@ -805,11 +805,6 @@ fn ev_margin(equity_pct: u8, pot_bb: f32, to_call_bb: f32) -> f32 {
     } else {
         0.0
     }
-}
-
-fn spr(stack_bb: u32, pot_bb: f32) -> f32 {
-    let denom = pot_bb.max(1.0);
-    stack_bb as f32 / denom
 }
 
 /// Convert a bb amount to integer chip "units" for the advisor's u32-based

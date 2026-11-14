@@ -4,7 +4,7 @@
 //! layer proves deck composition and openings; game adapters must additionally
 //! check deal positions, visibility and the commitment witnessed before play.
 //! A server-only shuffle does not prove the operator did not select its seed.
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use curve25519_dalek::{
     constants::RISTRETTO_BASEPOINT_POINT as G, ristretto::RistrettoPoint, scalar::Scalar,
@@ -16,14 +16,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    crypto::{ShuffleProof, ShuffleProofProvider},
     crypto_real::{
-        decrypt::{
-            partial_decrypt, verify_and_open_point, ThresholdDecryptionProof, SCHEME as OPEN_SCHEME,
-        },
-        dkg::DkgParty,
+        decrypt::{verify_and_open_point, ThresholdDecryptionProof, SCHEME as OPEN_SCHEME},
         ec::{deck_hash, point_from_hex, point_to_hex, Ct},
-        shuffle::{output_deck_from_proof, RealShuffleProofProvider, Shuffle, CARD_SCHEME},
+        shuffle::{output_deck_from_proof, verify_shuffle, Shuffle, ShuffleProof, CARD_SCHEME},
     },
     hash::ds_hash,
 };
@@ -199,9 +195,7 @@ pub struct Secret {
 
 pub struct LockedDeck {
     context: Context,
-    key: Scalar,
-    public_key: RistrettoPoint,
-    shuffle: Shuffle,
+    locked: crate::locked_shuffle::LockedShuffle,
     commit: [u8; 32],
     // Baccarat never restricts its eight-deck shoe during rebind. Retain the
     // ciphertext digest prepared off-thread instead of compressing 832 points
@@ -332,27 +326,24 @@ impl LockedDeck {
         while key == Scalar::ZERO {
             key = Scalar::random(&mut rng);
         }
-        let public_key = key * G;
         let full_input = (0..context.game.size())
             .map(|id| Ct::trivial(&message(id as u16)))
             .collect();
-        let mut shuffle = Shuffle::perform(
+        let mut locked = crate::locked_shuffle::LockedShuffle::new(
+            key,
             full_input,
-            &public_key,
             &mut random("cards:shuffle:v1", master, &context),
         );
-        restrict(&mut shuffle, &context);
+        restrict(&mut locked.shuffle, &context);
         let baccarat_deck_hash =
-            (context.game == Game::Baccarat).then(|| deck_hash(&shuffle.output));
+            (context.game == Game::Baccarat).then(|| deck_hash(&locked.shuffle.output));
         let commit = match &baccarat_deck_hash {
-            Some(hash) => commit_of_deck_hash(&context, &public_key, hash),
-            None => commit_of(&context, &public_key, &shuffle.output),
+            Some(hash) => commit_of_deck_hash(&context, &locked.public_key, hash),
+            None => commit_of(&context, &locked.public_key, &locked.shuffle.output),
         };
         Ok(Self {
             context,
-            key,
-            public_key,
-            shuffle,
+            locked,
             commit,
             baccarat_deck_hash,
         })
@@ -361,13 +352,19 @@ impl LockedDeck {
     /// and secret shuffle depend on the fresh master and manifest, not routing.
     pub fn rebind(&mut self, context: Context) -> Result<(), Error> {
         context.validate()?;
-        if context.game != self.context.game || self.shuffle.input.len() != context.game.size() {
+        if context.game != self.context.game
+            || self.locked.shuffle.input.len() != context.game.size()
+        {
             return Err(Error::Context);
         }
-        restrict(&mut self.shuffle, &context);
+        restrict(&mut self.locked.shuffle, &context);
         self.commit = match &self.baccarat_deck_hash {
-            Some(hash) => commit_of_deck_hash(&context, &self.public_key, hash),
-            None => commit_of(&context, &self.public_key, &self.shuffle.output),
+            Some(hash) => commit_of_deck_hash(&context, &self.locked.public_key, hash),
+            None => commit_of(
+                &context,
+                &self.locked.public_key,
+                &self.locked.shuffle.output,
+            ),
         };
         self.context = context;
         Ok(())
@@ -383,7 +380,7 @@ impl LockedDeck {
         let ids = self.context.identities();
         Ok(order(&self.context, &self.commit, seeds)?
             .iter()
-            .map(|&i| ids[self.shuffle.pi[i]])
+            .map(|&i| ids[self.locked.shuffle.pi[i]])
             .collect())
     }
     pub fn bundle<R: RngCore + CryptoRng>(
@@ -393,41 +390,25 @@ impl LockedDeck {
         rng: &mut R,
     ) -> Result<Bundle, Error> {
         let order = order(&self.context, &self.commit, seeds)?;
-        let positions: BTreeSet<_> = positions.iter().copied().collect();
-        if positions.iter().any(|p| *p >= order.len()) {
-            return Err(Error::Position);
-        }
-        let party = DkgParty {
-            party_id: self.context.party(),
-            x_i: self.key,
-            q_i: self.public_key,
-        };
         let ids = self.context.identities();
-        let openings = positions
+        let openings = self
+            .locked
+            .openings(&order, positions, self.context.party(), OPEN_SCHEME, rng)
+            .ok_or(Error::Position)?
             .into_iter()
-            .map(|position| {
-                let index = order[position];
-                Opening {
-                    position,
-                    card: ids[self.shuffle.pi[index]],
-                    proof: ThresholdDecryptionProof {
-                        scheme: OPEN_SCHEME.into(),
-                        shares: vec![partial_decrypt(
-                            &party,
-                            position as u32,
-                            &self.shuffle.output[index],
-                            rng,
-                        )],
-                    },
-                }
+            .map(|(position, card, proof)| Opening {
+                position,
+                card: ids[card],
+                proof,
             })
             .collect();
         Ok(Bundle {
             commitment: self.commitment(),
             commitments: None,
-            public_key: point_to_hex(&self.public_key),
+            public_key: point_to_hex(&self.locked.public_key),
             client_seeds: seeds.iter().map(|(s, v)| (*s, hex::encode(v))).collect(),
             shuffle_proof: self
+                .locked
                 .shuffle
                 .prove_cards(&self.context.party(), 0, rng)
                 .ok_or(Error::Shuffle)?,
@@ -491,12 +472,12 @@ pub fn verify(bundle: &Bundle) -> Result<Verified, Error> {
     if deck.len() != context.size() || commit_of(context, &key, &deck) != commit {
         return Err(Error::Commitment);
     }
-    if !RealShuffleProofProvider::verifier_with_expected_key(&bundle.public_key).verify_shuffle(
+    if !verify_shuffle(
         &context.party(),
         0,
         &deck_hash(&input(context)),
         &deck_hash(&deck),
-        Some(&bundle.public_key),
+        &bundle.public_key,
         &bundle.shuffle_proof,
     ) {
         return Err(Error::Shuffle);

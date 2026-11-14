@@ -12,7 +12,7 @@ use crate::player::Position;
 use super::equity::equity_vs_random;
 use super::hand_strength::{classify, HandStrength};
 use super::preflop_charts::{hand_key, lookup, position_to_bucket, ActionBucket};
-use super::templates_zh::{render, render_chat_reply, RenderContext};
+use super::templates_zh::{render, RenderContext};
 use super::MAX_ACTIONS_SO_FAR;
 
 /// 6-max vs HU table sizes. v1 only supports 6-max preflop charts; HU
@@ -134,7 +134,7 @@ pub struct SolverInput {
     /// Hero's own seat (for `is_aggressor` comparison).
     pub hero_seat: u8,
     /// What the user did at this seq. `None` means "evaluate the spot
-    /// pre-action" (chat-mode pre-eval).
+    /// pre-action" (pre-evaluation).
     pub hero_action_taken: Option<SolverAction>,
     /// Preflop action context bucket (only used when `street == Preflop`).
     pub preflop_action: Option<PreflopAction>,
@@ -164,56 +164,31 @@ pub enum SolverError {
     MissingPreflopAction,
 }
 
-/// How the reasoning sentence should be rendered.
-#[derive(Debug, Clone, Copy)]
-enum RenderMode<'a> {
-    /// Hint-mode rendering — straight `templates_zh::render`.
-    Hint,
-    /// Chat-mode rendering — prepend `关于手牌 [hand:UUID]：` via
-    /// `templates_zh::render_chat_reply`. ADR-043 §4.3.
-    Chat { hand_id: &'a str },
-}
-
 /// Top-level entry — runs the locked rule pipeline.
 ///
 /// Pure + deterministic given `input.seed` (ADR-043 §6). Uses the live-coach
 /// equity path ([`equity_vs_random`], ADR-082 early-stop on).
 pub fn analyze(input: &SolverInput) -> Result<CoachHintOut, SolverError> {
-    analyze_inner(input, RenderMode::Hint)
-}
-
-/// Chat-mode analyze — identical rule pipeline as [`analyze`], but the
-/// returned `reasoning_zh` is wrapped via `templates_zh::render_chat_reply`
-/// to include the canonical `关于手牌 [hand:UUID]：` preamble (ADR-043 §4.3).
-///
-/// Server's chat handler MUST use this entry point and MUST NOT inline the
-/// preamble itself — that path was an audit finding (C-3, 2026-05-23).
-pub fn analyze_chat(input: &SolverInput, hand_id: &str) -> Result<CoachHintOut, SolverError> {
-    analyze_inner(input, RenderMode::Chat { hand_id })
-}
-
-fn analyze_inner(input: &SolverInput, mode: RenderMode<'_>) -> Result<CoachHintOut, SolverError> {
     // ---- §7 T3: DoS guard ----
     if input.actions_so_far_count > MAX_ACTIONS_SO_FAR {
         return Err(SolverError::ContextTooLarge);
     }
 
     // ---- §7 T4: card-validity guard ----
-    if !cards_unique(&input.hero, &input.board) {
+    if !crate::card::cards_unique(
+        input
+            .hero
+            .as_array()
+            .into_iter()
+            .chain(input.board.all_cards()),
+    ) {
         return Err(SolverError::InvalidCards);
     }
 
     if matches!(input.street, Street::Preflop) {
-        analyze_preflop(input, mode)
+        analyze_preflop(input)
     } else {
-        Ok(analyze_postflop(input, mode))
-    }
-}
-
-fn render_with_mode(ctx: &RenderContext<'_>, seed: u64, mode: RenderMode<'_>) -> String {
-    match mode {
-        RenderMode::Hint => render(ctx, seed),
-        RenderMode::Chat { hand_id } => render_chat_reply(ctx, hand_id, seed),
+        Ok(analyze_postflop(input))
     }
 }
 
@@ -221,10 +196,7 @@ fn render_with_mode(ctx: &RenderContext<'_>, seed: u64, mode: RenderMode<'_>) ->
 // Preflop
 // ---------------------------------------------------------------------------
 
-fn analyze_preflop(
-    input: &SolverInput,
-    mode: RenderMode<'_>,
-) -> Result<CoachHintOut, SolverError> {
+fn analyze_preflop(input: &SolverInput) -> Result<CoachHintOut, SolverError> {
     // ADR-043 §3.4.1.
     let pos = position_to_bucket(input.position);
     let bucket = input
@@ -246,7 +218,7 @@ fn analyze_preflop(
         &PostflopRuleCtx {
             equity_pct,
             pot_odds_pct,
-            spr: stack_to_pot_ratio(input.stack_before, input.pot_before),
+            spr: stack_to_pot_ratio(input.stack_before, input.pot_before as f32),
             hand_strength: hs,
             to_call: input.to_call,
             stack_before: input.stack_before,
@@ -273,7 +245,7 @@ fn analyze_preflop(
         pot_odds_pct,
     );
 
-    let reasoning = render_with_mode(
+    let reasoning = render(
         &RenderContext {
             verdict,
             hs,
@@ -286,7 +258,6 @@ fn analyze_preflop(
             preflop: true,
         },
         input.seed,
-        mode,
     );
 
     Ok(CoachHintOut {
@@ -450,13 +421,13 @@ pub(crate) fn recommend_postflop(ctx: &PostflopRuleCtx) -> SolverAction {
     }
 }
 
-fn analyze_postflop(input: &SolverInput, mode: RenderMode<'_>) -> CoachHintOut {
+fn analyze_postflop(input: &SolverInput) -> CoachHintOut {
     let opp_count = input.num_players_in_hand.saturating_sub(1).max(1);
     let eq = equity_vs_random(input.hero, input.board.clone(), opp_count, input.seed);
     let equity_pct = eq.equity_pct();
 
     let pot_odds_pct = pot_odds(input.pot_before, input.to_call);
-    let spr = stack_to_pot_ratio(input.stack_before, input.pot_before);
+    let spr = stack_to_pot_ratio(input.stack_before, input.pot_before as f32);
     let hs = classify(input.hero, &input.board);
     let can_check = input.to_call == 0;
     let is_aggressor = input.last_aggressor_seat == Some(input.hero_seat);
@@ -485,7 +456,7 @@ fn analyze_postflop(input: &SolverInput, mode: RenderMode<'_>) -> CoachHintOut {
         pot_odds_pct,
     );
 
-    let reasoning = render_with_mode(
+    let reasoning = render(
         &RenderContext {
             verdict,
             hs,
@@ -498,7 +469,6 @@ fn analyze_postflop(input: &SolverInput, mode: RenderMode<'_>) -> CoachHintOut {
             preflop: false,
         },
         input.seed,
-        mode,
     );
 
     CoachHintOut {
@@ -521,7 +491,7 @@ pub(crate) fn verdict_from_actions(
 ) -> SolverVerdict {
     let hero = match hero {
         Some(a) => a,
-        // No hero action (pre-eval / chat mode) — verdict is "Good" by default.
+        // No hero action (pre-evaluation) — verdict is "Good" by default.
         None => return SolverVerdict::Good,
     };
     if hero == gto {
@@ -628,21 +598,6 @@ pub(crate) fn pot_odds(pot_before: u32, to_call: u32) -> u8 {
     (((to_call as u64) * 100 + denom / 2) / denom).min(100) as u8
 }
 
-pub(crate) fn stack_to_pot_ratio(stack: u32, pot: u32) -> f32 {
-    // T6 §7: never divide by 0.
-    let denom = pot.max(1) as f32;
-    stack as f32 / denom
-}
-
-fn cards_unique(hero: &HoleCards, board: &BoardCards) -> bool {
-    let mut all = vec![hero.card1, hero.card2];
-    all.extend(board.all_cards());
-    for (i, a) in all.iter().enumerate() {
-        for b in &all[i + 1..] {
-            if a == b {
-                return false;
-            }
-        }
-    }
-    true
+pub(crate) fn stack_to_pot_ratio(stack: u32, pot: f32) -> f32 {
+    stack as f32 / pot.max(1.0)
 }

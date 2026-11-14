@@ -211,30 +211,6 @@ impl Bucket {
 // All-in equity matrix
 // --------------------------------------------------------------------------
 
-/// Parse a 169-grid key into (high, low, is_pair, is_suited).
-fn parse_key(key: &str) -> Option<(Rank, Rank, bool, bool)> {
-    let b = key.as_bytes();
-    let r1 = rank_from_char(b[0] as char)?;
-    if b.len() == 2 && b[0] == b[1] {
-        return Some((r1, r1, true, false));
-    }
-    if b.len() == 3 {
-        let r2 = rank_from_char(b[1] as char)?;
-        let suited = match b[2] {
-            b's' => true,
-            b'o' => false,
-            _ => return None,
-        };
-        let (hi, lo) = if r1 >= r2 { (r1, r2) } else { (r2, r1) };
-        return Some((hi, lo, false, suited));
-    }
-    None
-}
-
-fn rank_from_char(ch: char) -> Option<Rank> {
-    Rank::ALL.iter().copied().find(|r| r.char() == ch)
-}
-
 /// A representative concrete combo for a 169 key. Hero uses Spades/Hearts;
 /// villain uses Diamonds/Clubs so the two reps never share a concrete card and the
 /// per-cell showdown is always legal, deterministically.
@@ -252,13 +228,13 @@ fn rank_from_char(ch: char) -> Option<Rank> {
 /// class-averaged matrix. (Class-averaging would loop legal combo pairs per
 /// class-pair; deferred as not worth the build cost for a sub-quantum effect.)
 fn rep_combo(key: &str, hero: bool) -> Option<HoleCards> {
-    let (hi, lo, is_pair, suited) = parse_key(key)?;
+    let (hi, lo, suited) = crate::card::parse_hand_class(key)?;
     let (s_main, s_alt) = if hero {
         (Suit::Spades, Suit::Hearts)
     } else {
         (Suit::Diamonds, Suit::Clubs)
     };
-    if is_pair {
+    if hi == lo {
         return Some(HoleCards::new(Card::new(hi, s_main), Card::new(lo, s_alt)));
     }
     if suited {
@@ -465,8 +441,8 @@ fn realization(
     let tilt = ((e - 0.62) * 0.55).clamp(-0.18, 0.06);
     r += tilt;
 
-    if let Some((hi, lo, is_pair, suited)) = parse_key(key) {
-        if is_pair {
+    if let Some((hi, lo, suited)) = crate::card::parse_hand_class(key) {
+        if hi == lo {
             // Set-mining implied odds: pairs realize well.
             r += 0.05;
         } else if suited {

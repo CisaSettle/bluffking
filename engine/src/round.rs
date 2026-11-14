@@ -4,6 +4,7 @@
 //! (preflop → flop → turn → river) combine to form a full hand.
 
 use crate::action::{ActionError, PlayerAction};
+use crate::betting::{action_reopened, pot_layers, Contribution, PotLayer, PotPolicy};
 use crate::player::{Chips, PlayerId};
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +22,17 @@ pub struct SidePot {
     /// contribution and a deepest all-in stack's unmatched top layer.
     #[serde(default)]
     pub refund_to: Vec<PlayerId>,
+}
+
+impl From<PotLayer<PlayerId, u32>> for SidePot {
+    fn from(layer: PotLayer<PlayerId, u32>) -> Self {
+        Self {
+            cap: Chips(layer.cap),
+            amount: Chips(layer.amount),
+            eligible: layer.eligible,
+            refund_to: layer.refund_to,
+        }
+    }
 }
 
 /// State of a single player within a betting round.
@@ -320,8 +332,11 @@ impl BettingRound {
     /// that meets or exceeds the last full-raise increment, they regain the right
     /// to re-raise even though no single wager cleared their `has_acted` flag.
     fn action_reopened_for(&self, ps: &PlayerState) -> bool {
-        self.last_raise_amount.0 > 0
-            && self.current_bet.0.saturating_sub(ps.acted_at_bet.0) >= self.last_raise_amount.0
+        action_reopened(
+            self.current_bet.0,
+            ps.acted_at_bet.0,
+            self.last_raise_amount.0,
+        )
     }
 
     /// Apply an action for `player_id` (must be the current actor).
@@ -587,108 +602,19 @@ impl BettingRound {
 
     /// Compute side pots from contributions this round.
     pub fn side_pots(&self) -> Vec<SidePot> {
-        let eligible: Vec<(PlayerId, u32)> = self
+        let contributions: Vec<_> = self
             .players
             .iter()
-            .filter(|p| !p.folded)
-            .map(|p| (p.player_id, p.contributed.0))
+            .map(|p| Contribution {
+                id: p.player_id,
+                amount: p.contributed.0,
+                live: !p.folded,
+            })
             .collect();
-
-        // (player_id, contribution) for EVERY player, folded included — needed
-        // both to size each layer's `amount` and to identify the contributors of
-        // a folder's uncalled-overage slice (the top layer that sits above every
-        // eligible player's contribution).
-        let all_with_contrib: Vec<(PlayerId, u32)> = self
-            .players
-            .iter()
-            .map(|p| (p.player_id, p.contributed.0))
-            .collect();
-
-        if eligible.is_empty() {
-            return vec![];
-        }
-
-        // Derive levels from ALL contributions (folded included), not just the
-        // eligible (non-folded) ones. A folder who put in strictly more than the
-        // top eligible contribution must still form its own top layer, otherwise
-        // the slice between the top eligible level and the folder's contribution
-        // is allocated to no pot and those chips are silently destroyed.
-        let mut levels: Vec<u32> = all_with_contrib.iter().map(|(_, c)| *c).collect();
-        levels.sort_unstable();
-        levels.dedup();
-
-        if levels.is_empty() || levels == [0] {
-            return vec![];
-        }
-
-        let mut pots = Vec::new();
-        let mut prev = 0u32;
-
-        for &level in &levels {
-            if level == 0 {
-                prev = level;
-                continue;
-            }
-            let slice = level - prev;
-
-            let amount: u32 = all_with_contrib
-                .iter()
-                .map(|(_, c)| if *c <= prev { 0 } else { slice.min(c - prev) })
-                .sum();
-
-            let pot_eligible: Vec<PlayerId> = eligible
-                .iter()
-                .filter(|(_, c)| *c >= level)
-                .map(|(pid, _)| *pid)
-                .collect();
-
-            if amount == 0 {
-                prev = level;
-                continue;
-            }
-
-            if !pot_eligible.is_empty() {
-                let contributors: Vec<PlayerId> = all_with_contrib
-                    .iter()
-                    .filter(|(_, c)| *c > prev)
-                    .map(|(pid, _)| *pid)
-                    .collect();
-                let refund_to = if pot_eligible.len() == 1 && contributors == pot_eligible {
-                    pot_eligible.clone()
-                } else {
-                    Vec::new()
-                };
-                pots.push(SidePot {
-                    cap: Chips(level),
-                    amount: Chips(amount),
-                    eligible: pot_eligible,
-                    refund_to,
-                });
-            } else {
-                // No live (non-folded) player reached this level — this slice is
-                // a folder's uncalled overage. Refund it to its actual
-                // contributor(s): everyone (folded) who put chips into this slice
-                // (contribution > prev). distribute_pots returns it to them
-                // rather than dropping the chips.
-                let refund_to: Vec<PlayerId> = all_with_contrib
-                    .iter()
-                    .filter(|(_, c)| *c > prev)
-                    .map(|(pid, _)| *pid)
-                    .collect();
-                if !refund_to.is_empty() {
-                    pots.push(SidePot {
-                        cap: Chips(level),
-                        amount: Chips(amount),
-                        eligible: Vec::new(),
-                        refund_to,
-                    });
-                }
-            }
-
-            prev = level;
-        }
-
-        pots
+        pot_layers(&contributions, PotPolicy::RefundUnmatched)
+            .into_iter()
+            .map(SidePot::from)
+            .collect()
     }
 
     // ---- Public accessors ----

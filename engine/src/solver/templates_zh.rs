@@ -44,14 +44,6 @@ pub fn render(ctx: &RenderContext<'_>, seed: u64) -> String {
     truncate_chars(&raw, MAX_REASONING_CHARS)
 }
 
-/// Render a chat-mode reply that references a specific hand via `[hand:UUID]`
-/// fence. ADR-043 §4.3 chat path.
-pub fn render_chat_reply(ctx: &RenderContext<'_>, hand_id: &str, seed: u64) -> String {
-    let body = pick_template(ctx, seed);
-    let combined = format!("关于手牌 [hand:{hand_id}]：{body}");
-    truncate_chars(&combined, MAX_REASONING_CHARS)
-}
-
 // ---------------------------------------------------------------------------
 // Template selection
 // ---------------------------------------------------------------------------

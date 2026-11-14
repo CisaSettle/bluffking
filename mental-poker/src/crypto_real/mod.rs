@@ -2,11 +2,9 @@
 //!
 //! The real cryptography specified in `docs/architecture/mp-phase4-crypto-spec.md`:
 //!
-//! - [`SignatureProvider`](crate::signing::SignatureProvider) →
-//!   [`ed25519_signer::Ed25519SignatureProvider`] (component 1);
+//! - [`ed25519_signer::Ed25519SignatureProvider`] (component 1);
 //! - threshold ElGamal + Chaum–Pedersen decryption in [`decrypt`] (component 2);
-//! - [`ShuffleProofProvider`](crate::crypto::ShuffleProofProvider) →
-//!   [`shuffle::RealShuffleProofProvider`], a sound sigma-based verifiable
+//! - [`shuffle::verify_shuffle`], a sound sigma-based verifiable
 //!   re-encryption shuffle (component 3);
 //! - the n-of-n DKG in [`dkg`] and the ristretto255 ElGamal layer in [`ec`].
 //!
@@ -30,4 +28,3 @@ pub mod recovery;
 pub mod shuffle;
 
 pub use ed25519_signer::Ed25519SignatureProvider;
-pub use shuffle::RealShuffleProofProvider;

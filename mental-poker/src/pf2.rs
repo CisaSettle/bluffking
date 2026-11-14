@@ -29,7 +29,6 @@
 
 use std::collections::BTreeMap;
 
-use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
 use curve25519_dalek::ristretto::RistrettoPoint;
 use curve25519_dalek::scalar::Scalar;
 use engine::{Deck, PokerRng};
@@ -40,15 +39,13 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::card_id::card_to_id;
-use crate::crypto::{ShuffleProof, ShuffleProofProvider};
 use crate::crypto_real::decrypt::{
-    partial_decrypt, verify_and_open, ThresholdDecryptionProof, SCHEME as DECRYPT_SCHEME,
+    verify_and_open, ThresholdDecryptionProof, SCHEME as DECRYPT_SCHEME,
 };
-use crate::crypto_real::dkg::DkgParty;
 use crate::crypto_real::ec::{
     canonical_starting_deck, deck_hash, point_from_hex, point_to_bytes, point_to_hex, Ct, DECK_SIZE,
 };
-use crate::crypto_real::shuffle::{output_deck_from_proof, RealShuffleProofProvider, Shuffle};
+use crate::crypto_real::shuffle::{output_deck_from_proof, verify_shuffle, ShuffleProof};
 use crate::hash::ds_hash;
 
 /// Bundle scheme identifier (wire `scheme`).
@@ -88,9 +85,7 @@ pub fn decode_stored_seed(stored: &[u8]) -> Option<[u8; 32]> {
 /// witness; never serialize it.
 pub struct LockedDeck {
     hand_id: Uuid,
-    key: Scalar,
-    public_key: RistrettoPoint,
-    shuffle: Shuffle,
+    locked: crate::locked_shuffle::LockedShuffle,
     commit: [u8; 32],
 }
 
@@ -123,18 +118,15 @@ impl LockedDeck {
     /// `(master_seed, hand_id)` always yields the same key, deck and commit.
     pub fn new(master_seed: &[u8; 32], hand_id: Uuid) -> Self {
         let key = Scalar::random(&mut seeded_rng(DS_KEY, master_seed, hand_id));
-        let public_key = key * RISTRETTO_BASEPOINT_POINT;
-        let shuffle = Shuffle::perform(
+        let locked = crate::locked_shuffle::LockedShuffle::new(
+            key,
             canonical_starting_deck(),
-            &public_key,
             &mut seeded_rng(DS_SHUFFLE, master_seed, hand_id),
         );
-        let commit = commit_of(hand_id, &public_key, &shuffle.output);
+        let commit = commit_of(hand_id, &locked.public_key, &locked.shuffle.output);
         Self {
             hand_id,
-            key,
-            public_key,
-            shuffle,
+            locked,
             commit,
         }
     }
@@ -148,7 +140,7 @@ impl LockedDeck {
     pub fn final_card_ids(&self, client_seeds: &BTreeMap<u8, [u8; 32]>) -> Vec<u8> {
         public_order(&self.commit, client_seeds, self.hand_id)
             .into_iter()
-            .map(|j| self.shuffle.pi[j] as u8)
+            .map(|j| self.locked.shuffle.pi[j] as u8)
             .collect()
     }
 
@@ -163,34 +155,23 @@ impl LockedDeck {
         rng: &mut R,
     ) -> Result<Bundle, Pf2Error> {
         let order = public_order(&self.commit, client_seeds, self.hand_id);
-        let party = DkgParty {
-            party_id: DEALER_PARTY.to_string(),
-            x_i: self.key,
-            q_i: self.public_key,
-        };
-        let mut positions = positions.to_vec();
-        positions.sort_unstable();
-        positions.dedup();
-        let mut openings = Vec::with_capacity(positions.len());
-        for position in positions {
-            let index = *order.get(position).ok_or(Pf2Error::Position)?;
-            let ct = &self.shuffle.output[index];
-            let share = partial_decrypt(&party, position as u32, ct, rng);
-            openings.push(Opening {
+        let openings = self
+            .locked
+            .openings(&order, positions, DEALER_PARTY.into(), DECRYPT_SCHEME, rng)
+            .ok_or(Pf2Error::Position)?
+            .into_iter()
+            .map(|(position, card, proof)| Opening {
                 position,
-                card: self.shuffle.pi[index] as u8,
-                proof: ThresholdDecryptionProof {
-                    scheme: DECRYPT_SCHEME.to_string(),
-                    shares: vec![share],
-                },
-            });
-        }
+                card: card as u8,
+                proof,
+            })
+            .collect();
         Ok(Bundle {
             scheme: SCHEME.to_string(),
             hand_id: self.hand_id.to_string(),
             commit: hex::encode(self.commit),
-            public_key: point_to_hex(&self.public_key),
-            shuffle_proof: self.shuffle.prove(DEALER_PARTY, SHUFFLE_ROUND, rng),
+            public_key: point_to_hex(&self.locked.public_key),
+            shuffle_proof: self.locked.shuffle.prove(DEALER_PARTY, SHUFFLE_ROUND, rng),
             client_seeds: client_seeds
                 .iter()
                 .map(|(seat, seed)| (seat.to_string(), hex::encode(seed)))
@@ -375,12 +356,12 @@ pub(crate) fn verify_deck(bundle: &Bundle, max_seats: usize) -> Result<Verified,
     let input_hash = deck_hash(&canonical_starting_deck());
     let output_hash = deck_hash(&deck);
     let q_hex = point_to_hex(&public_key);
-    if !RealShuffleProofProvider::verifier_with_expected_key(q_hex.clone()).verify_shuffle(
+    if !verify_shuffle(
         DEALER_PARTY,
         SHUFFLE_ROUND,
         &input_hash,
         &output_hash,
-        Some(&q_hex),
+        &q_hex,
         &bundle.shuffle_proof,
     ) {
         return Err(Pf2Error::Shuffle);

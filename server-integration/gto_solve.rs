@@ -137,9 +137,7 @@ const DEFAULT_MAX_CONCURRENT_SOLVES: usize = 2;
 fn max_concurrent_solves() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(|| {
-        std::env::var("SOLVER_MAX_CONCURRENT")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
+        crate::config::env_parse::<usize>("SOLVER_MAX_CONCURRENT")
             .map(|n| n.max(1))
             .unwrap_or(DEFAULT_MAX_CONCURRENT_SOLVES)
     })
@@ -172,30 +170,6 @@ const MAX_INFLIGHT_PER_IP: usize = 1;
 /// rejected. Conservative for a shared box.
 const PUBLIC_MAX_MEMORY_BYTES: u64 = 1_000_000_000;
 
-/// Iteration cap (safety net — flop converges to <1% pot in <100 iters).
-/// This is the PUBLIC / anonymous / Free-tier cap and is UNCHANGED (ADR-085 adds
-/// the Pro/Max caps below ABOVE this baseline; it never lowers the public one).
-const PUBLIC_MAX_ITERATIONS: u32 = 800;
-
-/// ADR-085 §Entitlement Matrix — Pro-tier iteration cap (deeper convergence than
-/// the public/Free baseline). Applied to a signed-in Pro caller.
-const PRO_MAX_ITERATIONS: u32 = 3200;
-
-/// ADR-085 §Entitlement Matrix — Max-tier iteration cap (deepest convergence).
-/// Applied to a signed-in Max caller. The memory gate ([`PUBLIC_MAX_MEMORY_BYTES`])
-/// stays UNIFORM across tiers, so a wider Pro/Max tree that would exceed 1 GB is
-/// still rejected by the memory guard — tiers only relax the iteration cap and
-/// the pre-check bet/raise-size WIDTH below.
-const MAX_TIER_MAX_ITERATIONS: u32 = 8000;
-
-/// Max distinct FLOP bet/raise sizes allowed per tier. Free = 1 (the existing
-/// public cap — the flop tree is the memory-expensive one), Pro = 3, Max = "all"
-/// (bounded generously; the token-length cap + the memory gate remain the hard
-/// safety limits). Turn/river trees are tiny, so all tiers keep the existing 2.
-const PRO_MAX_FLOP_SIZES: usize = 3;
-const MAX_TIER_FLOP_SIZES: usize = 8;
-const MAX_TIER_TURN_RIVER_SIZES: usize = 8;
-
 /// Stop once exploitability reaches this fraction of the pot (0.5%).
 const PUBLIC_TARGET_EXPLOIT_PCT: f32 = 0.005;
 
@@ -215,9 +189,7 @@ const DEFAULT_SOLVER_THREADS: usize = 1;
 fn solver_threads() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(|| {
-        std::env::var("SOLVER_THREADS")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
+        crate::config::env_parse::<usize>("SOLVER_THREADS")
             .map(|n| n.max(1))
             .unwrap_or(DEFAULT_SOLVER_THREADS)
     })
@@ -1198,11 +1170,7 @@ pub async fn solve_handler(
         Some(user) => entitlement::effective_tier(&state.pool, user.user_id).await,
         None => Tier::Free,
     };
-    let max_iterations = match tier {
-        Tier::Free => PUBLIC_MAX_ITERATIONS,
-        Tier::Pro => PRO_MAX_ITERATIONS,
-        Tier::Max => MAX_TIER_MAX_ITERATIONS,
-    };
+    let max_iterations = entitlement::solver_iterations(tier);
 
     // --- street ---
     let street = match dto.street.to_ascii_lowercase().as_str() {
@@ -1310,12 +1278,9 @@ pub async fn solve_handler(
     // /river cap stays 2 for Free/Pro (tiny trees), widened only for Max. The
     // uniform memory gate ([`PUBLIC_MAX_MEMORY_BYTES`]) still rejects any tree
     // that would exceed 1 GB regardless of tier.
-    let max_sizes = match (street, tier) {
-        (SolveStreet::Flop, Tier::Free) => 1,
-        (SolveStreet::Flop, Tier::Pro) => PRO_MAX_FLOP_SIZES,
-        (SolveStreet::Flop, Tier::Max) => MAX_TIER_FLOP_SIZES,
-        (SolveStreet::Turn | SolveStreet::River, Tier::Max) => MAX_TIER_TURN_RIVER_SIZES,
-        (SolveStreet::Turn | SolveStreet::River, _) => 2,
+    let max_sizes = match street {
+        SolveStreet::Flop => entitlement::solver_flop_sizes(tier),
+        SolveStreet::Turn | SolveStreet::River => entitlement::solver_turn_river_sizes(tier),
     };
     if count_bet_sizes(&bet_sizes) > max_sizes {
         return bad_request(
