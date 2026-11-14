@@ -16,6 +16,7 @@
 //! functions are pure and deterministic given the input seed (§6).
 
 pub mod advisor;
+pub mod draws;
 pub mod equity;
 pub mod hand_strength;
 pub mod preflop_cfr;
@@ -26,8 +27,8 @@ pub mod templates_zh;
 pub mod tool_math;
 
 pub use advisor::{
-    analyze, analyze_chat, CoachHintOut, HandKey, PreflopAction, SolverAction, SolverError,
-    SolverInput, SolverVerdict, TableSize,
+    analyze, CoachHintOut, HandKey, PreflopAction, SolverAction, SolverError, SolverInput,
+    SolverVerdict, TableSize,
 };
 pub use equity::{
     equity, range_legal_combos, EarlyStop, EquityInput, EquityResult, OpponentSpec, RangeBucket,

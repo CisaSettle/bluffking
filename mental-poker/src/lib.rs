@@ -3,13 +3,10 @@
 //! Pure, verifiable dealing primitives shared by the server, the browser
 //! (`mp-wasm`) and the offline verifiers:
 //!
-//! - [`pf`] — retired ADR-064 v1 commit-reveal records, still checked offline
-//!   by the `pf_verify` binary;
 //! - [`pf2`] / [`pf2_zjh`] / [`card_proof`] — verifiable-dealing bundles (locked
 //!   encrypted deck, shuffle proof, decryption proofs for opened cards);
 //! - [`crypto_real`] — the real cryptography (DKG, verifiable re-encryption
-//!   shuffle, threshold decryption, Ed25519) behind the [`crypto`] and
-//!   [`signing`] seams, used by engine-blind (server-blind) dealing.
+//!   shuffle, threshold decryption, Ed25519) used by engine-blind dealing.
 //!
 //! ## Safety
 //!
@@ -29,13 +26,12 @@
 
 pub mod card_id;
 pub mod card_proof;
-pub mod crypto;
 /// Real cryptography (`docs/architecture/mp-phase4-crypto-spec.md`) — **GA'd
 /// for the engine-blind table class by ADR-070 (2026-06-23); cross-vendor AI-audited (ADR-076/077/078),
 /// open-source + independently verifiable** (the GA gate was a clean
 /// cross-vendor AI audit).
 ///
-/// Houses the real `ed25519-dalek`-backed [`signing::SignatureProvider`] plus
+/// Houses the real `ed25519-dalek`-backed [`crypto_real::Ed25519SignatureProvider`] plus
 /// the verifiable-shuffle and threshold-decryption primitives. In production
 /// these are selected ONLY for the engine-blind table class (n-of-n server-blind
 /// dealing, opt-in all-human rooms), via `resolve_mp_crypto_mode`;
@@ -43,7 +39,6 @@ pub mod crypto;
 pub mod crypto_real;
 pub mod events;
 pub mod hash;
-pub mod pf;
+mod locked_shuffle;
 pub mod pf2;
 pub mod pf2_zjh;
-pub mod signing;

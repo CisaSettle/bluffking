@@ -628,8 +628,7 @@ async fn create_hand(
     // one the game server announced to the players, not missing (worker
     // restarted after the commit) and not another hand's.
     let committed = state.commits.write().await.remove(&request.hand_id);
-    let Some(pending) =
-        committed.filter(|pending| pending.locked.commit() == request.seed_commit)
+    let Some(pending) = committed.filter(|pending| pending.locked.commit() == request.seed_commit)
     else {
         return (
             StatusCode::CONFLICT,
@@ -1224,22 +1223,14 @@ impl SealedDealerClient {
 }
 
 static CLIENT: OnceLock<SealedDealerClient> = OnceLock::new();
-static PUBLIC_WS_ENDPOINT: OnceLock<Arc<str>> = OnceLock::new();
 
 pub fn client() -> Result<&'static SealedDealerClient, &'static str> {
     CLIENT.get().ok_or("sealed dealer is not configured")
 }
 
 pub fn public_ws_endpoint() -> Result<&'static str, &'static str> {
-    PUBLIC_WS_ENDPOINT
-        .get()
-        .map(AsRef::as_ref)
-        .ok_or("sealed dealer public websocket is not configured")
-}
-
-fn external_internal_token() -> Result<String, String> {
-    std::env::var("SEALED_DEALER_INTERNAL_TOKEN")
-        .map_err(|_| "SEALED_DEALER_INTERNAL_TOKEN is required with SEALED_DEALER_URL".to_string())
+    client()?;
+    Ok("/sealed-dealer/ws")
 }
 
 fn local_worker_addr() -> Result<SocketAddr, String> {
@@ -1249,38 +1240,17 @@ fn local_worker_addr() -> Result<SocketAddr, String> {
         .map_err(|e| format!("invalid SEALED_DEALER_ADDR: {e}"))
 }
 
-/// The environment-only part of [`configure_or_launch`]: the same parsers,
+/// The environment-only part of [`launch`]: the same parsers,
 /// without installing an authority, spawning the worker or opening sockets.
 /// The release preflight runs it before the predecessor is drained.
 pub fn validate_config() -> Result<(), String> {
-    if std::env::var("SEALED_DEALER_URL").is_ok() {
-        authorization::external_authority_from_env()?;
-        external_internal_token()?;
-    } else {
-        local_worker_addr()?;
-    }
+    local_worker_addr()?;
     Ok(())
 }
 
-/// Configure an externally managed dealer, or launch the default sibling
-/// process on loopback. The returned child guard must live as long as the main
+/// Launch the sibling dealer on loopback. The returned child guard lives as long as the main
 /// server; dropping it kills only the worker launched by this process.
-pub async fn configure_or_launch() -> Result<Option<tokio::process::Child>, String> {
-    let public_endpoint = std::env::var("SEALED_DEALER_PUBLIC_WS_ENDPOINT")
-        .unwrap_or_else(|_| "/sealed-dealer/ws".to_string());
-
-    if let Ok(base_url) = std::env::var("SEALED_DEALER_URL") {
-        authorization::configure_external_authority()?;
-        let internal_auth = external_internal_token()?;
-        CLIENT
-            .set(SealedDealerClient::new(base_url, internal_auth))
-            .map_err(|_| "sealed dealer configured twice")?;
-        PUBLIC_WS_ENDPOINT
-            .set(Arc::from(public_endpoint))
-            .map_err(|_| "sealed dealer public endpoint configured twice")?;
-        return Ok(None);
-    }
-
+pub async fn launch() -> Result<tokio::process::Child, String> {
     let addr = local_worker_addr()?;
     let mut raw_token = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut raw_token);
@@ -1346,10 +1316,7 @@ pub async fn configure_or_launch() -> Result<Option<tokio::process::Child>, Stri
     CLIENT
         .set(SealedDealerClient::new(base_url, worker_credential))
         .map_err(|_| "sealed dealer configured twice")?;
-    PUBLIC_WS_ENDPOINT
-        .set(Arc::from(public_endpoint))
-        .map_err(|_| "sealed dealer public endpoint configured twice")?;
-    Ok(Some(child))
+    Ok(child)
 }
 
 /// The outcome of the pre-deal seed exchange for a committed hand.
@@ -1380,7 +1347,7 @@ pub struct ActiveHand {
 impl ActiveHand {
     pub async fn create(
         hand_id: Uuid,
-        hand: &engine::GameHand,
+        dealt_seats: &[u8],
         bots: &std::collections::HashSet<u8>,
         users: &HashMap<Uuid, u8>,
         commit: SeedCommitInput,
@@ -1388,7 +1355,7 @@ impl ActiveHand {
         let client = client()?.clone();
         let endpoint = public_ws_endpoint()?.to_string();
         let client_seeds = commit.client_seeds.clone();
-        let mut seats: Vec<u8> = hand.seats().iter().map(|s| s.seat).collect();
+        let mut seats = dealt_seats.to_vec();
         seats.sort_unstable();
         let dealt_users = users
             .iter()
@@ -1433,6 +1400,17 @@ impl ActiveHand {
         client()?.commit_hand(hand_id).await
     }
 
+    pub fn ticket(&self, seat: u8) -> Option<crate::protocol::ServerMsg> {
+        let ticket = self.deal.tickets.iter().find(|t| t.seat == seat)?;
+        Some(crate::protocol::ServerMsg::SealedDealTicket {
+            hand_id: self.hand_id,
+            seat,
+            ticket: ticket.ticket.clone(),
+            endpoint: self.endpoint.clone(),
+            commitment: self.deal.commitment.clone(),
+        })
+    }
+
     pub async fn sync_tickets(
         &self,
         users: &HashMap<Uuid, u8>,
@@ -1460,15 +1438,8 @@ impl ActiveHand {
             {
                 continue;
             }
-            let Some(ticket) = self.deal.tickets.iter().find(|t| t.seat == seat) else {
+            let Some(msg) = self.ticket(seat) else {
                 continue;
-            };
-            let msg = crate::protocol::ServerMsg::SealedDealTicket {
-                hand_id: self.hand_id,
-                seat,
-                ticket: ticket.ticket.clone(),
-                endpoint: self.endpoint.clone(),
-                commitment: self.deal.commitment.clone(),
             };
             if let Ok(json) = serde_json::to_string(&msg) {
                 if crate::runtime_checkpoint::try_send(&tx, crate::outbound::Outbound::Text(json))
@@ -1486,16 +1457,21 @@ impl ActiveHand {
             && self.client.delivery_received(self.hand_id, seat).await.ok() == Some(false)
     }
 
+    /// Reveal one street; coordinators choose when to publish its snapshot.
+    pub async fn advance_street(&self, hand: &mut engine::GameHand) -> Result<(), String> {
+        let Some(street) = hand.pending_board_street() else {
+            return Ok(());
+        };
+        let ids = self.client.reveal_board(self.hand_id, street).await?;
+        let cards = deck_cards(&ids).ok_or("invalid sealed board")?;
+        hand.inject_board_for_street(&cards)
+            .map(|_| ())
+            .map_err(|e| format!("{e:?}"))
+    }
+
     pub async fn advance(&self, hand: &mut engine::GameHand) -> Result<(), String> {
-        while let Some(street) = hand.pending_board_street() {
-            let ids = self.client.reveal_board(self.hand_id, street).await?;
-            let cards: Option<Vec<_>> = ids
-                .into_iter()
-                .map(mental_poker::card_id::id_to_card)
-                .collect();
-            let cards = cards.ok_or("invalid sealed board")?;
-            hand.inject_board_for_street(&cards)
-                .map_err(|e| format!("{e:?}"))?;
+        while hand.pending_board_street().is_some() {
+            self.advance_street(hand).await?;
         }
         Ok(())
     }

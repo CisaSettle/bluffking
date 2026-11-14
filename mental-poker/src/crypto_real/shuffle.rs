@@ -3,7 +3,7 @@
 //!
 //! This is the single highest-risk primitive of the server-blind increment and
 //! the one with **no audited off-the-shelf ristretto crate** (spec §3). It
-//! implements [`ShuffleProofProvider`](crate::crypto::ShuffleProofProvider) with
+//! provides [`verify_shuffle`] with
 //! a **sound** sigma-based re-encryption-shuffle argument over ristretto255,
 //! made non-interactive with a `merlin` Fiat–Shamir transcript. It ships behind
 //! the spec §3.6 interim discriminator [`SCHEME`] = `"reenc-shuffle-ristretto-v2"`
@@ -104,7 +104,6 @@
 //!   production reachable ONLY for engine-blind sessions via
 //!   `resolve_mp_crypto_mode` and the engine-blind coordinator.
 
-use crate::crypto::{ShuffleProof, ShuffleProofProvider};
 use crate::crypto_real::dkg::challenge_scalar;
 use crate::crypto_real::ec::{
     deck_hash, is_identity_pubkey, point_from_hex, point_to_bytes, point_to_hex, scalar_from_hex,
@@ -125,6 +124,19 @@ use rand_core::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
 
 use super::ec::{batch_weight, pedersen_h};
+
+/// A verifiable shuffle proof, carried as JSON.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShuffleProof {
+    /// Proof scheme identifier (e.g. `reenc-shuffle-ristretto-v2`).
+    pub scheme: String,
+    /// Hex hash of the deck this shuffle consumed.
+    pub input_deck_hash: String,
+    /// Hex hash of the deck this shuffle produced.
+    pub output_deck_hash: String,
+    /// Scheme-specific attestation bytes (hex).
+    pub attestation: String,
+}
 
 /// Scheme identifier for the (sound, sigma-based interim) re-encryption shuffle
 /// (spec §3.6). The full Bayer–Groth `"bg-shuffle-ristretto-v1"` is a later
@@ -788,12 +800,12 @@ fn prove_permutation<R: RngCore + CryptoRng>(
 
 /// Verify a re-encryption shuffle argument. Returns `false` (never panics) on any
 /// malformed field, deck-hash mismatch, or failed sigma/permutation check.
-fn verify_argument(
+pub fn verify_shuffle(
     party: &str,
     round: u32,
     input_hash: &Hash,
     output_hash: &Hash,
-    expected_joint_key: Option<&str>,
+    expected_joint_key: &str,
     proof: &ShuffleProof,
 ) -> bool {
     if proof.scheme != SCHEME && proof.scheme != CARD_SCHEME {
@@ -816,36 +828,16 @@ fn verify_argument(
         Some(p) => p,
         None => return false,
     };
-    // F-CRYPTO-15 (code-review #8): reject an IDENTITY joint key unconditionally —
-    // including when no `expected_joint_key` is pinned (with Q = identity the
-    // re-encryption term r'·Q is identity, so C2 = M and the argument still
-    // verifies for the degenerate key). A floor defense even if a caller forgets
-    // to pin the DKG key. See `ec::is_identity_pubkey` for the full rationale.
-    if is_identity_pubkey(&q) {
+    // Bind every proof to the independently reconstructed DKG key. Identity
+    // keys expose the cards, even if the shuffle argument itself verifies.
+    if is_identity_pubkey(&q) || point_from_hex(expected_joint_key) != Some(q) {
         return false;
-    }
-    // F2 (KEY BINDING — soundness): the shuffle re-encrypts under the joint key
-    // `Q`, so its soundness is *relative to whatever Q the proof was built with*.
-    // Trusting `arg.joint_key` blindly lets a malicious shuffler prove a perfectly
-    // valid shuffle under a key IT controls — re-encrypting the deck under its own
-    // key so it can later decrypt every card. The verifier MUST pin the proof to
-    // the externally-known DKG joint key. When an expected key is supplied, the
-    // attestation's Q must equal it (canonical-encoding compare, malformed →
-    // reject).
-    if let Some(expected_hex) = expected_joint_key {
-        let expected = match point_from_hex(expected_hex) {
-            Some(p) => p,
-            None => return false,
-        };
-        if q != expected {
-            return false;
-        }
     }
     let n = d_in.len();
     if n == 0 || d_out.len() != n || n > MAX_CARD_DECK || (proof.scheme == SCHEME && n > 52) {
         return false;
     }
-    // The proof must be ABOUT the decks bound by the trait's hashes (T6 — the
+    // The proof must be ABOUT the decks bound by the supplied hashes (T6 — the
     // verifier never trusts the embedded decks blindly; they must hash to the
     // committed input/output hashes, which the caller binds to the transcript).
     let in_hash = deck_hash_bytes(&d_in_bytes);
@@ -1298,63 +1290,5 @@ fn uniform_below<R: RngCore + CryptoRng>(rng: &mut R, bound: usize) -> usize {
         if v < zone {
             return (v % bound) as usize;
         }
-    }
-}
-
-// ===========================================================================
-// The trait impl (the seam — crypto.rs:71)
-// ===========================================================================
-
-/// Real verifiable re-encryption shuffle provider — **cross-vendor AI-audited
-/// (ADR-076/077/078); open-source + verifiable**.
-///
-/// Implements [`ShuffleProofProvider`] with the sound sigma-based interim
-/// argument (schemes [`SCHEME`] / [`CARD_SCHEME`]). Proofs are produced by
-/// [`Shuffle::prove`] and its siblings; the verifier reconstructs the decks from
-/// the attestation and checks they hash to the bound `input_hash`/`output_hash`.
-///
-/// `verify_shuffle` is fully self-contained (everything it needs is in the
-/// proof + the bound hashes).
-pub struct RealShuffleProofProvider {
-    /// F2: the DKG-derived joint key (64-hex) every shuffle proof MUST be bound
-    /// to. When set, `verify_shuffle` rejects a proof whose attestation declares
-    /// a different `Q` (a shuffler proving under a key it controls). When `None`,
-    /// the bound key falls back to whatever the trait caller passes in
-    /// `expected_joint_key`; if BOTH are absent the proof is only self-consistent.
-    /// The only constructor, `verifier_with_expected_key`, always sets it.
-    expected_joint_key: Option<String>,
-}
-
-impl RealShuffleProofProvider {
-    /// A verify-only provider that PINS the DKG joint key (F2). Every proof it
-    /// accepts must declare exactly this `Q` in its attestation.
-    pub fn verifier_with_expected_key(joint_key_hex: impl Into<String>) -> Self {
-        RealShuffleProofProvider {
-            expected_joint_key: Some(joint_key_hex.into()),
-        }
-    }
-}
-
-impl ShuffleProofProvider for RealShuffleProofProvider {
-    fn verify_shuffle(
-        &self,
-        party: &str,
-        round: u32,
-        input_hash: &Hash,
-        output_hash: &Hash,
-        expected_joint_key: Option<&str>,
-        proof: &ShuffleProof,
-    ) -> bool {
-        // F2: bind to a joint key if either the provider pins one or the caller
-        // supplies one. A provider-pinned key takes precedence; if both are
-        // present they must agree (else the proof is rejected — a caller and the
-        // provider disagreeing on the encryption key is never a valid shuffle).
-        let pinned = self.expected_joint_key.as_deref();
-        let expected = match (pinned, expected_joint_key) {
-            (Some(a), Some(b)) if a != b => return false,
-            (Some(a), _) => Some(a),
-            (None, b) => b,
-        };
-        verify_argument(party, round, input_hash, output_hash, expected, proof)
     }
 }

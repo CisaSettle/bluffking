@@ -165,7 +165,7 @@ fn equity_impl<const CACHE_RIVER: bool>(input: EquityInput) -> EquityResult {
     all_known.push(input.hero.card1);
     all_known.push(input.hero.card2);
     all_known.extend_from_slice(&board_cards);
-    if has_duplicates(&all_known) {
+    if !crate::card::cards_unique(all_known.iter().copied()) {
         return EquityResult::INVALID;
     }
 
@@ -188,7 +188,7 @@ fn equity_impl<const CACHE_RIVER: bool>(input: EquityInput) -> EquityResult {
                 combined.push(h.card1);
                 combined.push(h.card2);
             }
-            if has_duplicates(&combined) {
+            if !crate::card::cards_unique(combined.iter().copied()) {
                 return EquityResult::INVALID;
             }
             // Audit fix N-2 (2026-05-23): known opponent cards must be
@@ -492,7 +492,7 @@ fn wilson_half_width(share_sum: u64, n: u32) -> f64 {
 ///
 /// ADR-082: this is the **live-coach** entry point (the ONLY caller is
 /// `advisor::analyze_preflop`/`analyze_postflop`, reached via
-/// `coach.rs run_solver`/`run_solver_chat`). It is the **single** site that opts
+/// `coach.rs run_solver`). It is the **single** site that opts
 /// into the Monte-Carlo early-stop policy — every other `EquityInput` builder
 /// (`analyze_spot`, `analyze_replay`, `poker_tools`, all tests) keeps
 /// `early_stop: None` so their numbers stay byte-identical to pre-ADR-082.
@@ -618,82 +618,30 @@ fn exact_known_runouts(
     EquityResult::from_counts(win_sum, tie_sum, share_sum, total)
 }
 
-fn has_duplicates(cards: &[Card]) -> bool {
-    for (i, a) in cards.iter().enumerate() {
-        for b in &cards[i + 1..] {
-            if a == b {
-                return true;
-            }
-        }
-    }
-    false
-}
-
 /// Expand a single 169-grid `hand_key` (e.g. "AA" / "AKs" / "AKo") into its
 /// concrete `HoleCards` combos: pair → 6, suited → 4, offsuit → 12. Returns an
 /// empty `Vec` for an unparseable key (never panics — M1 §1a).
 pub(crate) fn expand_range_key(key: &str) -> Vec<HoleCards> {
-    let bytes = key.as_bytes();
-    if bytes.len() < 2 {
+    let Some((high, low, suited)) = crate::card::parse_hand_class(key) else {
         return Vec::new();
-    }
-    let r1 = match rank_from_char(bytes[0] as char) {
-        Some(r) => r,
-        None => return Vec::new(),
-    };
-    let r2 = match rank_from_char(bytes[1] as char) {
-        Some(r) => r,
-        None => return Vec::new(),
     };
     let mut out = Vec::new();
-    if r1 == r2 {
-        // Pair: every unordered pair of suits → C(4,2) = 6 combos.
-        if bytes.len() != 2 {
-            return Vec::new();
-        }
-        for i in 0..Suit::ALL.len() {
-            for j in (i + 1)..Suit::ALL.len() {
+    for (i, &first) in Suit::ALL.iter().enumerate() {
+        for (j, &second) in Suit::ALL.iter().enumerate() {
+            let include = if high == low {
+                i < j
+            } else {
+                (i == j) == suited
+            };
+            if include {
                 out.push(HoleCards::new(
-                    Card::new(r1, Suit::ALL[i]),
-                    Card::new(r2, Suit::ALL[j]),
+                    Card::new(high, first),
+                    Card::new(low, second),
                 ));
-            }
-        }
-    } else {
-        let suffix = match bytes.get(2) {
-            Some(b's') => Suitedness::Suited,
-            Some(b'o') => Suitedness::Offsuit,
-            _ => return Vec::new(),
-        };
-        match suffix {
-            Suitedness::Suited => {
-                // Same suit → 4 combos.
-                for &s in Suit::ALL.iter() {
-                    out.push(HoleCards::new(Card::new(r1, s), Card::new(r2, s)));
-                }
-            }
-            Suitedness::Offsuit => {
-                // Different suits → 4 × 3 = 12 combos.
-                for &s1 in Suit::ALL.iter() {
-                    for &s2 in Suit::ALL.iter() {
-                        if s1 != s2 {
-                            out.push(HoleCards::new(Card::new(r1, s1), Card::new(r2, s2)));
-                        }
-                    }
-                }
             }
         }
     }
     out
-}
-
-enum Suitedness {
-    Suited,
-    Offsuit,
-}
-
-fn rank_from_char(ch: char) -> Option<Rank> {
-    Rank::ALL.iter().copied().find(|r| r.char() == ch)
 }
 
 /// Build the conflict-filtered weighted combo pool for an `OpponentSpec::Range`.

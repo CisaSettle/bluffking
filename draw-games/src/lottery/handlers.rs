@@ -149,9 +149,8 @@ pub async fn reveal(
 /// The daily claim is idempotent per day; like `/api/wallet/beans-daily` it
 /// reads no request body.
 pub async fn refill(State(state): State<AppState>, auth: AuthUser) -> Result<Json<Value>, Error> {
-    Ok(Json(
-        json!({"granted": super::REFILL, "balance": runtime::refill(&state.pool, auth.user_id).await?}),
-    ))
+    let (granted, balance) = runtime::refill(&state.pool, auth.user_id).await?;
+    Ok(Json(json!({"granted": granted, "balance": balance})))
 }
 #[derive(Deserialize)]
 pub struct Listing {

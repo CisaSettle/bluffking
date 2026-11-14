@@ -443,6 +443,8 @@ pub struct GameHand {
     /// action opens to that seat's left, and a fully-funded straddle becomes
     /// the preflop bring-in / minimum raise increment.
     forced_straddle: Option<Chips>,
+    /// Seats posting a live entry BB, topped up after ordinary forced posts.
+    entry_blinds: Vec<PlayerId>,
     /// Per-seat bomb-pot contribution; replaces blinds and skips preflop.
     bomb_pot: Option<Chips>,
     /// Per-seat ante posted as dead money before the blinds (zero = none).

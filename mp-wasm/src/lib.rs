@@ -21,8 +21,8 @@ use mental_poker::crypto_real::ec::{
     deck_hash, is_identity_pubkey, point_from_hex, point_to_hex, Ct, CtWire, EncDeck, DECK_SIZE,
 };
 use mental_poker::crypto_real::ed25519_signer::Ed25519SignatureProvider;
+use mental_poker::crypto_real::ed25519_signer::KeyDirectory;
 use mental_poker::crypto_real::shuffle::Shuffle;
-use mental_poker::signing::{KeyDirectory, SignatureProvider};
 use rand::RngCore;
 use std::collections::BTreeMap;
 

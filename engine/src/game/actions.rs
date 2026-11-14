@@ -46,6 +46,7 @@ impl GameHand {
             big_blind: self.big_blind,
             small_blind: self.small_blind,
             forced_straddle: self.forced_straddle,
+            entry_blinds: Vec::new(),
             bomb_pot: self.bomb_pot,
             ante: self.ante,
             seven_deuce_bounty: self.seven_deuce_bounty,

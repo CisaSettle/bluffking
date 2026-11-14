@@ -1322,6 +1322,18 @@ pub(crate) fn with_admission_wallet<R>(
     )
 }
 
+/// A balance-dependent grant must wait for accepted game effects to become durable.
+/// Call under a mutation fence, which blocks fresh admissions.
+pub(crate) fn has_pending_rewards_settlement(pool: &PgPool, id: Uuid) -> bool {
+    let state = state(pool);
+    let inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
+    !inner.ready
+        || inner
+            .users
+            .get(&id)
+            .is_none_or(|user| !user.poker.is_empty() || !user.effects.is_empty())
+}
+
 pub fn profile(pool: &PgPool, id: Uuid) -> sqlx::Result<(Wallet, bool)> {
     ensure(pool, id)?;
     let day = crate::lottery::sgt_day(chrono::Utc::now());

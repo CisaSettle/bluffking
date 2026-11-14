@@ -167,12 +167,11 @@ pub fn all_hand_keys() -> Vec<HandKey> {
 /// Number of concrete 2-card combos for a 169-grid key: pair=6, suited=4,
 /// offsuit=12. Garbage keys (no `s`/`o` suffix, wrong length) → 0.
 pub fn combos_for_key(key: &str) -> u32 {
-    let bytes = key.as_bytes();
-    match bytes.len() {
-        2 if bytes[0] == bytes[1] => 6, // pair, e.g. "AA"
-        3 if bytes[2] == b's' => 4,     // suited
-        3 if bytes[2] == b'o' => 12,    // offsuit
-        _ => 0,
+    match crate::card::parse_hand_class(key) {
+        Some((high, low, _)) if high == low => 6,
+        Some((_, _, true)) => 4,
+        Some((_, _, false)) => 12,
+        None => 0,
     }
 }
 

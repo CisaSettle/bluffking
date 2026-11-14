@@ -578,6 +578,7 @@ reasons! {
     /// The first-use allowance of a new wallet ([`grant_on`] only).
     FirstUseGrant => ("first_use_grant", Grant),
     DailyRefill => ("daily_refill", Bonus),
+    RecoveryGrant => ("recovery_grant", Bonus),
     RegistrationWelcome => ("registration_welcome", Bonus),
     RegistrationReferral => ("registration_referral", Bonus),
     AdminGrant => ("admin_grant", Bonus),

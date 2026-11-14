@@ -117,7 +117,7 @@ pub async fn handler(
     p.map(|p|json!({"purchased":p.purchased,"charged":p.charged,"balance_before":p.balance_before,"balance_after":p.balance_after}))
    },
    Client::Reveal{ticket_id,index}=>reveal(&pool,owner,ticket_id,index).await.map(|(t,b)|json!({"ticket":t,"balance":b})),
-   Client::Refill=>refill(&pool,owner).await.map(|balance|json!({"balance":balance,"granted":super::super::REFILL}))
+   Client::Refill=>refill(&pool,owner).await.map(|(granted,balance)|json!({"balance":balance,"granted":granted}))
   };
   let frame=match result{Ok(result)=>json!({"t":"result","result":result}),Err(e)=>json!({"t":"error","code":code(&e)})};if let Some(out)=out{out.try_send(frame.to_string()).is_ok()}else{false}
  }}).await;

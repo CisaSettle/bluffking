@@ -9,9 +9,6 @@
 //! valid decryption proof at the position the verifier derives itself. Prints
 //! the proven board and hole cards. Cards that were never opened stay encrypted.
 //!
-//! **v1 (legacy record).** A JSON `HandRecord` with a revealed `server_seed`
-//! (hands dealt before v2) is still recomputed with [`mental_poker::pf`].
-//!
 //! ```text
 //! cargo run -p mental-poker --bin pf_demo_hand \
 //!   | cargo run -p mental-poker --bin pf_verify -- -      # → OK
@@ -30,7 +27,6 @@
 use std::io::Read;
 
 use mental_poker::card_id::id_to_card;
-use mental_poker::pf::{verify_hand, HandRecord};
 use mental_poker::pf2::{self, Bundle};
 
 fn main() {
@@ -69,7 +65,6 @@ fn print_usage() {
     eprintln!(
         "  pf_verify --hand <bundle.json>   verify a saved verification bundle (pf-shuffle-v2)"
     );
-    eprintln!("                                   or a legacy v1 hand record");
     eprintln!("  pf_verify -                      read the JSON from stdin");
 }
 
@@ -117,11 +112,7 @@ fn verify_json(json: &str) -> i32 {
             }
         };
     }
-    if value.get("scheme").is_some() {
-        verify_v2(value)
-    } else {
-        verify_v1(value)
-    }
+    verify_v2(value)
 }
 
 fn card_str(id: Option<u8>) -> String {
@@ -166,46 +157,6 @@ fn verify_v2(value: serde_json::Value) -> i32 {
             println!(
                 "  opened cards   : {} of 52 (?? = not opened, stays encrypted)",
                 v.cards.len()
-            );
-            0
-        }
-        Err(e) => {
-            println!("REJECTED");
-            println!("  {e}");
-            1
-        }
-    }
-}
-
-fn verify_v1(value: serde_json::Value) -> i32 {
-    let rec: HandRecord = match serde_json::from_value(value) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!(
-                "error: not a {} bundle or a valid v1 hand record: {e}",
-                pf2::SCHEME
-            );
-            return 2;
-        }
-    };
-    if rec.server_seed.is_empty() {
-        // Legacy / engine-blind hand: no commit-reveal secrets to verify.
-        println!(
-            "SKIPPED: hand {} has no server_seed (not a commit-reveal hand)",
-            rec.hand_id
-        );
-        return 1;
-    }
-    match verify_hand(&rec) {
-        Ok(report) => {
-            println!("OK (legacy v1 record): deck reproduced, commit verified");
-            println!("  hand_id           : {}", rec.hand_id);
-            println!("  recomputed deck_seed: {}", report.deck_seed_hex);
-            println!("  hole seats checked : {}", report.hole_seats_checked);
-            println!("  board cards checked: {}", report.board_cards_checked);
-            println!(
-                "  client seeds mixed : {} (anti-grind when >0)",
-                rec.client_seeds.len()
             );
             0
         }

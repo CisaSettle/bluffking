@@ -17,6 +17,7 @@
 #![forbid(unsafe_code)]
 
 pub mod action;
+pub mod betting;
 pub mod card;
 pub mod deck;
 pub mod eval;

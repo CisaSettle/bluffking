@@ -1298,29 +1298,50 @@ pub async fn buy_numbers(
         identity["all_in"] = json!(true);
         identity["expected_balance"] = json!(body.expected_balance);
     }
-    let hash = store::body_sha256(&identity);
+    purchase(
+        pool,
+        user,
+        game,
+        body.request_id,
+        super::purchase_id(user, body.request_id),
+        store::body_sha256(&identity),
+        |hash| accept_numbers(pool, user, game, body, &entries, hash),
+    )
+    .await
+}
+
+/// One replay/commit lifecycle; the caller validates and admits its own ticket type.
+async fn purchase(
+    pool: &PgPool,
+    user: Uuid,
+    game: Game,
+    request: Uuid,
+    record: Uuid,
+    hash: String,
+    accept: impl FnOnce(String) -> Result<(Purchase, CommitReceipt), Error>,
+) -> Result<Purchase, Error> {
     let state = state(pool);
-    let command = { state.commands.lock().await };
+    let command = state.commands.lock().await;
+    if game == Game::Scratch {
+        prepare_scratch(pool, user, None).await?;
+    }
     let (replay, wallet) = {
-        let mut conn = { pool.acquire().await? };
-        store::replay_request_and_wallet(&mut conn, game, user, body.request_id, &hash).await?
+        let mut conn = pool.acquire().await?;
+        store::replay_request_and_wallet(&mut conn, game, user, request, &hash).await?
     };
-    let (purchase, receipt) = if let Some(p) = replay {
-        (
-            p,
-            pending_receipt(&state, super::purchase_id(user, body.request_id)),
-        )
+    let (purchase, receipt) = if let Some(purchase) = replay {
+        (purchase, pending_receipt(&state, record))
     } else {
-        {
-            wallet_ready_after(pool, user, wallet).await?;
-        }
-        accept_numbers(pool, user, game, body)?
+        wallet_ready_after(pool, user, wallet).await?;
+        accept(hash)?
     };
     drop(command);
-    {
-        receipt.wait().await?;
-    }
-    Ok(purchase)
+    let cards = receipt.wait().await?;
+    Ok(if game == Game::Scratch {
+        committed_purchase(purchase, &cards)
+    } else {
+        purchase
+    })
 }
 
 fn committed_purchase(mut purchase: Purchase, cards: &[OwnedTicket]) -> Purchase {
@@ -1348,35 +1369,21 @@ pub async fn buy_scratch(
     body: &super::scratch::ScratchBuy,
 ) -> Result<Purchase, Error> {
     player(pool, user)?;
-    // The same normalised identity the purchase stored, so a retried
-    // request replays instead of conflicting.
-    let hash = store::body_sha256(&body.identity());
-    let state = state(pool);
-    let command = { state.commands.lock().await };
-    {
-        prepare_scratch(pool, user, None).await?;
-    }
-    let (replay, wallet) = {
-        let mut conn = { pool.acquire().await? };
-        store::replay_request_and_wallet(&mut conn, Game::Scratch, user, body.request_id, &hash)
-            .await?
-    };
-    let (purchase, receipt) = if let Some(p) = replay {
-        let id = if body.count > 1 || body.all_in {
-            super::scratch_batch_id(user, body.request_id)
-        } else {
-            super::purchase_id(user, body.request_id)
-        };
-        (p, pending_receipt(&state, id))
+    let record = if body.count > 1 || body.all_in {
+        super::scratch_batch_id(user, body.request_id)
     } else {
-        {
-            wallet_ready_after(pool, user, wallet).await?;
-        }
-        accept_scratch(pool, user, body)?
+        super::purchase_id(user, body.request_id)
     };
-    drop(command);
-    let cards = { receipt.wait().await? };
-    Ok(committed_purchase(purchase, &cards))
+    purchase(
+        pool,
+        user,
+        Game::Scratch,
+        body.request_id,
+        record,
+        store::body_sha256(&body.identity()),
+        |hash| accept_scratch(pool, user, body, hash),
+    )
+    .await
 }
 
 pub async fn reveal(
@@ -1401,9 +1408,9 @@ pub async fn reveal(
     Ok((wire, balance))
 }
 
-pub async fn refill(pool: &PgPool, user: Uuid) -> Result<i64, Error> {
+pub async fn refill(pool: &PgPool, user: Uuid) -> Result<(i64, i64), Error> {
     match crate::beans::claim_daily(pool, user).await? {
-        crate::beans::DailyOutcome::Granted { balance, .. } => Ok(balance),
+        crate::beans::DailyOutcome::Granted { granted, balance } => Ok((granted, balance)),
         crate::beans::DailyOutcome::AlreadyClaimed { .. } => Err(Error::DailyAlreadyClaimed),
     }
 }
@@ -1413,6 +1420,8 @@ fn accept_numbers(
     user: Uuid,
     game: Game,
     body: &NumberBuy,
+    entries: &[Entry],
+    hash: String,
 ) -> Result<(Purchase, CommitReceipt), Error> {
     player(pool, user)?;
     if body.request_id.is_nil()
@@ -1424,17 +1433,6 @@ fn accept_numbers(
     {
         return Err(Error::InvalidEntry);
     }
-    let entries = body
-        .tickets
-        .iter()
-        .map(|v| Entry::parse(game, v).map_err(|_| Error::InvalidEntry))
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut normalized = json!({"game":game.as_str(),"period":body.period,"multiplier":body.multiplier,"tickets":entries.iter().map(Entry::to_value).collect::<Vec<_>>(),"proof_commitment":body.proof_commitment});
-    if body.all_in {
-        normalized["all_in"] = json!(true);
-        normalized["expected_balance"] = json!(body.expected_balance)
-    }
-    let hash = store::body_sha256(&normalized);
     let state = state(pool);
     let mut lock = state.data.lock().unwrap_or_else(|e| e.into_inner());
     let data = lock.as_mut().ok_or_else(unavailable)?;
@@ -1562,38 +1560,14 @@ fn accept_numbers(
             card,
         })
     }
-    let receipt = Receipt {
-        game: game.as_str().into(),
-        record: id,
-        hash,
-        tickets: event.cards.iter().map(|t| t.card.id).collect(),
-        charged,
-        before,
-        after: before - charged,
-    };
     event.period = Some(row);
-    event.receipt = Some(receipt.clone());
     event.effect = Some(PendingEffect {
         delta: -charged,
         bonus: 0,
         played: 0,
         won: 0,
     });
-    let purchased = event
-        .cards
-        .iter()
-        .map(|t| store::ticket_json(game, &t.card))
-        .collect();
-    let commit = admit(pool, &state, data, event, charged)?;
-    Ok((
-        Purchase {
-            purchased,
-            charged,
-            balance_before: before,
-            balance_after: receipt.after,
-        },
-        commit,
-    ))
+    admit_purchase(pool, &state, data, event, hash, charged, before - charged)
 }
 
 /// Beans for a settling card's service reward, recorded on the card.
@@ -1608,6 +1582,7 @@ fn accept_scratch(
     pool: &PgPool,
     user: Uuid,
     body: &super::scratch::ScratchBuy,
+    hash: String,
 ) -> Result<(Purchase, CommitReceipt), Error> {
     player(pool, user)?;
     if body.request_id.is_nil()
@@ -1626,7 +1601,6 @@ fn accept_scratch(
         return Err(Error::TooManyTickets);
     }
     let batch = body.count > 1 || body.all_in;
-    let hash = store::body_sha256(&body.identity());
     let state = state(pool);
     let mut lock = state.data.lock().unwrap_or_else(|e| e.into_inner());
     let data = lock.as_mut().ok_or_else(unavailable)?;
@@ -1745,27 +1719,41 @@ fn accept_scratch(
         .checked_add(delta)
         .and_then(|v| v.checked_add(event.bonus))
         .ok_or(Error::InvalidEntry)?;
-    event.receipt = Some(Receipt {
-        game: "scratch".into(),
-        record: id,
-        hash,
-        tickets: event.cards.iter().map(|t| t.card.id).collect(),
-        charged,
-        before,
-        after,
-    });
     event.effect = Some(PendingEffect {
         delta,
         bonus: event.bonus,
         played: i32::from(batch),
         won: i32::from(batch && paid > 0),
     });
+    admit_purchase(pool, &state, data, event, hash, charged, after)
+}
+
+fn admit_purchase(
+    pool: &PgPool,
+    state: &Arc<State>,
+    data: &mut Data,
+    mut event: Event,
+    hash: String,
+    charged: i64,
+    after: i64,
+) -> Result<(Purchase, CommitReceipt), Error> {
+    let before = event.before;
+    let game = Game::parse(&event.game).ok_or(Error::InvalidEntry)?;
+    event.receipt = Some(Receipt {
+        game: event.game.clone(),
+        record: event.id,
+        hash,
+        tickets: event.cards.iter().map(|t| t.card.id).collect(),
+        charged,
+        before,
+        after,
+    });
     let purchased = event
         .cards
         .iter()
-        .map(|t| store::ticket_json(Game::Scratch, &t.card))
+        .map(|t| store::ticket_json(game, &t.card))
         .collect();
-    let receipt = admit(pool, &state, data, event, charged)?;
+    let receipt = admit(pool, state, data, event, charged)?;
     Ok((
         Purchase {
             purchased,

@@ -2,9 +2,7 @@
 //! (ADR-076/077/078); open-source + verifiable
 //! (`docs/architecture/mp-phase4-crypto-spec.md` §5)**.
 //!
-//! [`Ed25519SignatureProvider`] implements the
-//! [`SignatureProvider`](crate::signing::SignatureProvider) trait with
-//! `ed25519-dalek` 2.2.0.
+//! [`Ed25519SignatureProvider`] signs and verifies with `ed25519-dalek` 2.2.0.
 //!
 //! ## Why this is sound
 //!
@@ -13,19 +11,18 @@
 //! - **Signing** needs the 32-byte `SigningKey` (a secret seed). Only the
 //!   owning party holds it; it is NEVER sent to the coordinator.
 //! - **Verifying** needs only the 32-byte `VerifyingKey` (a public point). The
-//!   exported [`KeyDirectory`](crate::signing::KeyDirectory) carries only these
+//!   exported [`KeyDirectory`] carries only these
 //!   — they are safe to publish. A holder of public keys alone **cannot**
 //!   forge a signature (threat T8).
 //! - **Determinism:** Ed25519 (RFC 8032) is deterministic — the same key over
 //!   the same message always yields the same 64-byte signature. This satisfies
-//!   the [`SignatureProvider`](crate::signing::SignatureProvider) replay
-//!   invariant *natively*.
+//!   the protocol replay invariant *natively*.
 //!
 //! ## Byte serialization (spec §5.3 — pinned for future 3-runtime parity)
 //!
 //! - `SigningKey`: 32-byte seed (`to_bytes`), held only by the owning party.
 //! - `VerifyingKey`: 32-byte compressed Edwards point (`to_bytes`), lower-case
-//!   hex in [`KeyDirectory`](crate::signing::KeyDirectory).
+//!   hex in [`KeyDirectory`].
 //! - `Signature`: 64 bytes (`R ‖ s`, `to_bytes`), lower-case hex (128 chars),
 //!   carried in the `mp_*` signature fields. The `Signature = String` (hex)
 //!   type is unchanged.
@@ -39,11 +36,22 @@
 //! backend); the *Phase-4 integration* as a whole is cross-vendor AI-audited and
 //! independently verifiable.
 
-use crate::signing::{KeyDirectory, Signature, SignatureProvider};
+use serde::{Deserialize, Serialize};
 // U30 (dual-AI OSS review): `Verifier` trait no longer imported — verification
 // uses the inherent `VerifyingKey::verify_strict` (see `verify` below).
 use ed25519_dalek::{Signature as DalekSignature, Signer, SigningKey, VerifyingKey};
 use std::collections::BTreeMap;
+
+/// Hex-encoded Ed25519 signature.
+pub type Signature = String;
+
+/// The set of public verification keys needed to check signatures
+/// (signer id → hex-encoded Ed25519 verifying key). Safe to publish.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct KeyDirectory {
+    /// signer id → hex-encoded verification key.
+    pub keys: BTreeMap<String, String>,
+}
 
 /// U30 (dual-AI OSS review): strict public-key import.
 ///
@@ -157,8 +165,8 @@ impl Ed25519SignatureProvider {
     }
 }
 
-impl SignatureProvider for Ed25519SignatureProvider {
-    fn sign(&self, signer: &str, message: &[u8]) -> Signature {
+impl Ed25519SignatureProvider {
+    pub fn sign(&self, signer: &str, message: &[u8]) -> Signature {
         match self.signing.get(signer) {
             // RFC-8032 deterministic signature, 64 bytes, lower-case hex.
             Some(sk) => hex::encode(sk.sign(message).to_bytes()),
@@ -169,7 +177,7 @@ impl SignatureProvider for Ed25519SignatureProvider {
         }
     }
 
-    fn verify(&self, signer: &str, message: &[u8], signature: &Signature) -> bool {
+    pub fn verify(&self, signer: &str, message: &[u8], signature: &Signature) -> bool {
         let vk = match self.verifying.get(signer) {
             Some(vk) => vk,
             None => return false,

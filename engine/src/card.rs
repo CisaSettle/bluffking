@@ -74,6 +74,11 @@ impl Rank {
         Rank::Ace,
     ];
 
+    /// Parse the canonical uppercase rank abbreviation.
+    pub fn from_char(ch: char) -> Option<Self> {
+        Self::ALL.into_iter().find(|rank| rank.char() == ch)
+    }
+
     /// Single-character abbreviation.
     pub fn char(self) -> char {
         match self {
@@ -147,22 +152,7 @@ pub fn parse_card(s: &str) -> Option<Card> {
     if chars.next().is_some() {
         return None; // too many chars
     }
-    let rank = match rank_ch {
-        '2' => Rank::Two,
-        '3' => Rank::Three,
-        '4' => Rank::Four,
-        '5' => Rank::Five,
-        '6' => Rank::Six,
-        '7' => Rank::Seven,
-        '8' => Rank::Eight,
-        '9' => Rank::Nine,
-        'T' | 't' => Rank::Ten,
-        'J' | 'j' => Rank::Jack,
-        'Q' | 'q' => Rank::Queen,
-        'K' | 'k' => Rank::King,
-        'A' | 'a' => Rank::Ace,
-        _ => return None,
-    };
+    let rank = Rank::from_char(rank_ch.to_ascii_uppercase())?;
     let suit = match suit_ch {
         's' | 'S' => Suit::Spades,
         'h' | 'H' => Suit::Hearts,
@@ -171,4 +161,31 @@ pub fn parse_card(s: &str) -> Option<Card> {
         _ => return None,
     };
     Some(Card::new(rank, suit))
+}
+
+/// Parse a canonical 169-grid hand class: AA, AKs, KQo (high rank first).
+/// Pairs carry suited=false. Invalid ranks, ordering or suffixes are rejected.
+pub fn parse_hand_class(token: &str) -> Option<(Rank, Rank, bool)> {
+    let b = token.as_bytes();
+    let high = Rank::from_char(*b.first()? as char)?;
+    let low = Rank::from_char(*b.get(1)? as char)?;
+    match (b.len(), b.get(2)) {
+        (2, None) if high == low => Some((high, low, false)),
+        (3, Some(b's')) if high > low => Some((high, low, true)),
+        (3, Some(b'o')) if high > low => Some((high, low, false)),
+        _ => None,
+    }
+}
+
+/// Check uniqueness in a standard 52-card deck without allocating.
+pub fn cards_unique(cards: impl IntoIterator<Item = Card>) -> bool {
+    let mut seen = 0u64;
+    for card in cards {
+        let bit = 1u64 << (card.rank as u8 * 4 + card.suit as u8);
+        if seen & bit != 0 {
+            return false;
+        }
+        seen |= bit;
+    }
+    true
 }

@@ -71,7 +71,7 @@ pub const BOMB_POT_INTERVAL_MINUTES: [u16; 2] = [5, 8];
 /// Owner 2026-11-13: public Hold'em tables pay the 7-2 bounty — a 7-2 offsuit
 /// winner of the main pot after the flop collects this many BB from every
 /// other dealt player.
-pub const SEVEN_DEUCE_BB: u8 = 5;
+pub const SEVEN_DEUCE_BB: u8 = 10;
 
 /// Rule keys every new public beans session adds to its `session_config`.
 /// Bomb Pot needs durable runtime checkpoints (as friend-room create does).
@@ -215,32 +215,8 @@ fn reentry_reducible(saved: &crate::runtime_checkpoint::StandingChips) -> bool {
 pub const SEATS: i16 = 9;
 /// New public tables run for 24 hours from the first deal.
 pub const PUBLIC_TABLE_DURATION_SECS: i64 = 86_400;
-/// Paid pack, priced at the bean anchor (owner 2026-11-12: 「按照一美金=1金豆改」):
-/// 14 beans for US$13.99. A `BILLING_BEANS_PACK_USD_CENTS` override must keep
-/// the same 1 bean ≈ US$1 ratio, so change both together.
-pub const PACK_BEANS: i64 = 14;
-pub const PACK_USD_CENTS_DEFAULT: i64 = 1_399;
 /// The `daily_usage` feature of the once-per-Singapore-day claim.
 pub(crate) const DAILY_FEATURE: &str = "beans_daily_refill";
-
-pub fn pack_usd_cents() -> i64 {
-    std::env::var("BILLING_BEANS_PACK_USD_CENTS")
-        .ok()
-        .and_then(|v| v.trim().parse::<i64>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(PACK_USD_CENTS_DEFAULT)
-}
-
-/// Whether the paid pack may be sold at all. Fail-closed (owner 2026-10-13):
-/// the purchase entry stays off until counsel clears selling beans; set
-/// `BILLING_BEANS_PACK_ENABLED=1` to reopen it. The daily free refill, the
-/// Stripe webhook (fulfilment and refunds of already-paid packs) and the
-/// public tables themselves are unaffected.
-pub fn pack_enabled() -> bool {
-    std::env::var("BILLING_BEANS_PACK_ENABLED")
-        .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
-        .unwrap_or(false)
-}
 
 /// Creates the wallet with its grant on first use; idempotent afterwards.
 pub async fn ensure(pool: &PgPool, user: Uuid) -> sqlx::Result<Wallet> {
@@ -333,10 +309,6 @@ pub struct Profile {
     pub initial_grant: i64,
     /// True when today's free refill has not been claimed yet regardless of the current balance.
     pub daily_available: bool,
-    pub pack_beans: i64,
-    pub pack_usd_cents: i64,
-    /// False while the pack is not for sale; the H5 hides the buy button.
-    pub pack_available: bool,
 }
 
 pub async fn profile(pool: &PgPool, user: Uuid) -> sqlx::Result<Profile> {
@@ -364,9 +336,6 @@ pub async fn profile(pool: &PgPool, user: Uuid) -> sqlx::Result<Profile> {
         daily_refill_to: DAILY_REFILL_TO,
         initial_grant: crate::auth::registration_reward::BEANS,
         daily_available,
-        pack_beans: PACK_BEANS,
-        pack_usd_cents: pack_usd_cents(),
-        pack_available: pack_enabled(),
     })
 }
 
@@ -415,7 +384,8 @@ pub async fn claim_daily(pool: &PgPool, user: Uuid) -> sqlx::Result<DailyOutcome
         beans_mutation.publish_daily(day, before);
         return Ok(DailyOutcome::AlreadyClaimed { balance: before });
     }
-    let granted = DAILY_REFILL_TO;
+    let bonus = crate::beans_benefits::daily_bonus(&mut tx, user, day).await?;
+    let granted = DAILY_REFILL_TO + bonus;
     // Keyed by the Singapore day the database just claimed.
     let posted = bean_ledger::credit(
         &mut tx,
@@ -424,7 +394,7 @@ pub async fn claim_daily(pool: &PgPool, user: Uuid) -> sqlx::Result<DailyOutcome
             Reason::DailyRefill,
             day,
             Amount::Credit(granted),
-            serde_json::json!({ "day": day }),
+            serde_json::json!({ "day": day, "weekly_bonus": bonus }),
         )),
     )
     .await?;
@@ -521,7 +491,7 @@ pub(crate) fn alert_negative_settlement(record: Uuid, user: Option<Uuid>, wallet
     );
 }
 
-/// Settles one completed public-table hand into every human's beans wallet
+/// Settles one completed gold-bean hand into every human's beans wallet
 /// on the caller's transaction (the hand write), as one
 /// [`crate::bean_ledger`] posting: every participant or nobody, never
 /// clamped. The caller only invokes this when the hand row was newly
@@ -541,7 +511,9 @@ pub async fn settle_hand_on(
         room_code: None,
         session,
         has_bots,
-        meta: serde_json::json!({ "table": "public" }),
+        // This path also serves private and bot-practice bean rooms. Room
+        // visibility comes from the linked session, never the currency flag.
+        meta: serde_json::json!({ "table": "gold_beans" }),
         entries: players
             .iter()
             .map(|(user, effect)| Entry {

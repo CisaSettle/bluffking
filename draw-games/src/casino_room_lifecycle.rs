@@ -101,8 +101,8 @@ pub(super) fn install<R: DealerRoom>(
             continue;
         }
         let id = crate::release_handoff::rooms::id(R::DEALER, &code);
-        let mut state: R::State = crate::game_checkpoint::decode(row.get("state"))?;
-        let beans = R::beans(&state);
+        let mut state: DealerState<R> = crate::game_checkpoint::decode(row.get("state"))?;
+        let beans = state.wallet_unit.beans();
         // Local development: a room another local backend drives stays there;
         // it is not a recovery failure for this process.
         if crate::local_runtime::owned_by_another_backend(id) {
@@ -118,7 +118,7 @@ pub(super) fn install<R: DealerRoom>(
             continue;
         }
         // Rooms opened before the session clock start it now (default hour).
-        R::clock_mut(&mut state).start(now_ms());
+        state.clock.start(now_ms());
         let handoff_guard = crate::release_handoff::register(id, true)
             .ok_or_else(|| sqlx::Error::Protocol("release room registration refused".into()))?;
         let mut members = by_room.remove(&code).unwrap_or_default();
@@ -159,7 +159,7 @@ pub(super) fn install<R: DealerRoom>(
                 .iter()
                 .map(|(user, member)| (*user, member.name.clone()))
                 .collect(),
-            revision: R::revision(&state),
+            revision: state.revision,
             state: state.clone(),
             round: None,
             memberships,
@@ -261,7 +261,7 @@ pub(super) fn handoff_room<R: DealerRoom>(
                     &pool,
                     R::DEALER,
                     &code,
-                    R::revision(&room.state) as u64,
+                    room.state.revision as u64,
                     frozen.clone(),
                 )
                 .await
@@ -277,7 +277,7 @@ pub(super) fn handoff_room<R: DealerRoom>(
                     return;
                 }
             };
-            let revision = R::revision(&shared.lock().await.state) as u64;
+            let revision = shared.lock().await.state.revision as u64;
             if !crate::release_handoff::park(id, Some(revision)).await {
                 return;
             }
@@ -299,7 +299,7 @@ pub(super) fn handoff_room<R: DealerRoom>(
             }
             loop {
                 let mut room = shared.lock().await;
-                let mut next: R::State = match serde_json::from_value(frozen.checkpoint.clone()) {
+                let mut next: DealerState<R> = match serde_json::from_value(frozen.checkpoint.clone()) {
                     Ok(value) => value,
                     Err(error) => {
                         crate::release_handoff::fail(&error.to_string());
@@ -332,7 +332,7 @@ pub(super) fn empty_and_closed<R: DealerRoom>(
     code: &str,
     room: &mut Room<R>,
 ) -> bool {
-    if room.members.is_empty() && !R::open_bets(&room.state) {
+    if room.members.is_empty() && !room.state.open_bets() {
         room.closed = true;
     }
     if room.closed {
@@ -359,7 +359,7 @@ pub(super) async fn drop_room<R: DealerRoom>(
         registry_generation: room.registry_generation,
         require_empty: true,
         members: Vec::new(),
-        round: R::round_id(&room.state),
+        round: room.state.round_id,
         _held: Vec::new(),
     };
     let request = crate::release_handoff::admit_request(true).ok_or(Error::Unavailable)?;
@@ -530,8 +530,8 @@ pub(super) async fn begin_close<R: DealerRoom>(
     if room.closed || room.release_paused || crate::release_handoff::draining() {
         return Close::NotDue;
     }
-    let expired = R::clock(&room.state).expired(now);
-    let in_play = R::open_bets(&room.state);
+    let expired = room.state.clock.expired(now);
+    let in_play = room.state.open_bets();
     room.idle.observe(in_play);
     // A points room whose writer is fenced can never save again: it closes
     // now instead of holding its players until the reclaim tick.
@@ -564,7 +564,7 @@ pub(super) async fn begin_close<R: DealerRoom>(
         registry_generation: room.registry_generation,
         require_empty: false,
         members: room.members.keys().copied().collect(),
-        round: R::round_id(&room.state),
+        round: room.state.round_id,
         _held: held,
     })
 }

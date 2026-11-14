@@ -5,6 +5,7 @@
 //! the very same type — no behaviour change, no public-path change.
 
 use super::*;
+use crate::betting::{pot_layers, Contribution, PotPolicy};
 
 impl GameHand {
     /// Produce the final result and emit a [`EngineEvent::HandFinished`] event.
@@ -821,25 +822,23 @@ impl GameHand {
                 .map_or(0, |(_, amount)| amount.0);
             total.saturating_sub(ante)
         };
-        let all: Vec<(PlayerId, u32)> = self
+        let contributions: Vec<_> = self
             .seats
             .iter()
-            .map(|seat| (seat.player_id, contribution(seat)))
+            .map(|seat| Contribution {
+                id: seat.player_id,
+                amount: contribution(seat),
+                live: !seat.folded,
+            })
             .collect();
-        let eligible: Vec<(PlayerId, u32)> = self
-            .seats
+        let eligible: Vec<PlayerId> = contributions
             .iter()
-            .filter(|seat| !seat.folded)
-            .map(|seat| (seat.player_id, contribution(seat)))
+            .filter(|p| p.live)
+            .map(|p| p.id)
             .collect();
         if eligible.is_empty() {
             return Vec::new();
         }
-
-        let mut levels: Vec<u32> = all.iter().map(|(_, amount)| *amount).collect();
-        levels.sort_unstable();
-        levels.dedup();
-        let mut previous = 0u32;
         let mut pots: Vec<SidePot> = Vec::new();
         if let Some((_, amount)) = self.posted_big_blind_ante {
             // A table ante is shared dead money, even when another contender
@@ -847,48 +846,15 @@ impl GameHand {
             pots.push(SidePot {
                 cap: Chips::ZERO,
                 amount,
-                eligible: eligible.iter().map(|(player, _)| *player).collect(),
+                eligible,
                 refund_to: Vec::new(),
             });
         }
-
-        for level in levels.into_iter().filter(|level| *level > 0) {
-            let slice = level - previous;
-            let amount = all
-                .iter()
-                .map(|(_, contribution)| contribution.saturating_sub(previous).min(slice))
-                .sum::<u32>();
-            let pot_eligible: Vec<PlayerId> = eligible
-                .iter()
-                .filter(|(_, contribution)| *contribution >= level)
-                .map(|(pid, _)| *pid)
-                .collect();
-            let contributors: Vec<PlayerId> = all
-                .iter()
-                .filter(|(_, contribution)| *contribution > previous)
-                .map(|(pid, _)| *pid)
-                .collect();
-
-            let (eligible_ids, refund_to) = if pot_eligible.is_empty() {
-                (Vec::new(), contributors)
-            } else {
-                let refund = if pot_eligible.len() == 1 && contributors == pot_eligible {
-                    pot_eligible.clone()
-                } else {
-                    Vec::new()
-                };
-                (pot_eligible, refund)
-            };
-            if amount > 0 {
-                pots.push(SidePot {
-                    cap: Chips(level),
-                    amount: Chips(amount),
-                    eligible: eligible_ids,
-                    refund_to,
-                });
-            }
-            previous = level;
-        }
+        pots.extend(
+            pot_layers(&contributions, PotPolicy::RefundUnmatched)
+                .into_iter()
+                .map(SidePot::from),
+        );
 
         let mut canonical: Vec<SidePot> = Vec::new();
         for pot in pots {
