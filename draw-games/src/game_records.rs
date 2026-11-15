@@ -358,6 +358,7 @@ pub async fn load_history_page_filtered(
             .collect();
         load_page_details(&mut conn, user_id, &keys).await?
     };
+    drop(conn);
     let entries: Vec<RecordEntry> = page_rows
         .into_iter()
         .map(|r| {
