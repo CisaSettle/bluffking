@@ -239,10 +239,16 @@ pub fn bundle(stored: Stored, players: Value) -> Result<zk::Bundle, String> {
         if p["cards"].is_null() {
             continue;
         }
-        let cards = p["cards"]
-            .as_array()
-            .filter(|c| c.len() == 3)
-            .ok_or("invalid stored cards")?;
+        let cards = p["cards"].as_array().ok_or("invalid stored cards")?;
+        // Gold-bean rows written before bot cards were kept store a visible
+        // bot seat as `[]`; the deck itself is authoritative, so open it.
+        if cards.is_empty() {
+            positions.extend(slots);
+            continue;
+        }
+        if cards.len() != 3 {
+            return Err("invalid stored cards".into());
+        }
         for (card, pos) in cards.iter().zip(slots) {
             let code = mental_poker::card_id::id_to_card(ids[pos])
                 .ok_or("invalid card")?
