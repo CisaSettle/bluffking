@@ -78,13 +78,13 @@ impl Reveal {
             return Err("Commitment does not match the revealed seed and context".into());
         }
         let server = seed_bytes(&self.server_seed)?;
-        let client = if matches!(
-            self.commitment.game.as_str(),
-            "sicbo-room" | "yuxiaxie-room" | "zjh"
-        ) {
+        let client = if matches!(self.commitment.game.as_str(), "yuxiaxie-room" | "zjh") {
             if !self.client_seed.is_empty() {
                 return Err("Room protocol does not accept a client seed".into());
             }
+            Vec::new()
+        } else if self.commitment.game == "sicbo-room" && self.client_seed.is_empty() {
+            // A round no player wagered on folds in no player seed.
             Vec::new()
         } else {
             seed_bytes(&self.client_seed)?.to_vec()
