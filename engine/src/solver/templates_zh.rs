@@ -224,19 +224,15 @@ fn pick_preflop_template(ctx: &RenderContext<'_>, seed: u64) -> String {
 /// a STARTING hand: pocket pairs by tier (JJ+ 大 / 77–TT 中 / ≤66 小 口袋对),
 /// unpaired hands by suitedness from the 169-grid label (`AKs` / `AQo`).
 pub fn preflop_band_zh(hs: HandStrength, hand_label: &str) -> &'static str {
-    let chars: Vec<char> = hand_label.chars().collect();
-    let is_pair = chars.len() == 2 && chars[0] == chars[1];
-    if is_pair {
-        return match hs {
+    match crate::card::parse_hand_class(hand_label) {
+        Some((high, low, _)) if high == low => match hs {
             HandStrength::Overpair => "大口袋对",
             HandStrength::PairMiddle => "中口袋对",
             _ => "小口袋对",
-        };
-    }
-    match chars.last() {
-        Some('s') => "同花起手牌",
-        Some('o') => "杂色起手牌",
-        _ => "起手牌",
+        },
+        Some((_, _, true)) => "同花起手牌",
+        Some((_, _, false)) => "杂色起手牌",
+        None => "起手牌",
     }
 }
 

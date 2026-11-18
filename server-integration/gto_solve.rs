@@ -81,7 +81,7 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use engine::card::{parse_card, Card};
+use engine::card::{cards_unique, parse_card, Card};
 use engine::hand::HoleCards;
 use gto_solver::{
     hero_strategy, solve_spot_with, HandStrategy, Player, SolveControl, SolveError, SolveLimits,
@@ -752,16 +752,11 @@ fn parse_board(street: SolveStreet, board: &[String]) -> Result<ParsedBoard, (St
             }
         }
     }
-    // Uniqueness across the whole board.
-    for (i, a) in cards.iter().enumerate() {
-        for b in &cards[i + 1..] {
-            if a == b {
-                return Err((
-                    "duplicate_card".into(),
-                    "a board card appears more than once".into(),
-                ));
-            }
-        }
+    if !cards_unique(cards.iter().copied()) {
+        return Err((
+            "duplicate_card".into(),
+            "a board card appears more than once".into(),
+        ));
     }
     let flop = [cards[0], cards[1], cards[2]];
     let turn = cards.get(3).copied();

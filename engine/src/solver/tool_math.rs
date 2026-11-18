@@ -300,6 +300,19 @@ pub struct PotOdds {
     pub margin_pct: Option<f64>,
 }
 
+/// Pot odds as the equity a call needs, `to_call / (pot + to_call)`, in percent
+/// and unrounded; 0 when nothing is owed. Each caller rounds for its own use:
+/// whole percent for coach labels, one decimal in the pot-odds tool, and a
+/// floor for the bots' integer thresholds. (The spot analyser keeps its own
+/// `f32` big-blind version: widening `f32` decimals to `f64` moves half-percent ties.)
+pub fn pot_odds_pct(pot: f64, to_call: f64) -> f64 {
+    let total = pot + to_call;
+    if to_call <= 0.0 || total <= 0.0 {
+        return 0.0;
+    }
+    to_call * 100.0 / total
+}
+
 /// Error from [`pot_odds`] — invalid (non-positive / non-finite) inputs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PotOddsError {
@@ -336,7 +349,7 @@ pub fn pot_odds(pot: f64, to_call: f64, equity_pct: Option<f64>) -> Result<PotOd
         return Err(PotOddsError::InvalidPot);
     }
 
-    let needed = to_call / total * 100.0;
+    let needed = pot_odds_pct(pot, to_call);
     let needed_r = round1(needed);
 
     let (echo_equity, verdict, margin) = match equity_pct {

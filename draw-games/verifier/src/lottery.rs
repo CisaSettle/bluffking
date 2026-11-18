@@ -763,7 +763,8 @@ fn legacy_minute_label(draw_ms: i64) -> String {
         .from_local_datetime(&at.date_naive().and_hms_opt(0, 0, 0).expect("midnight"))
         .single()
         .map_or(draw_ms, |d| d.timestamp_millis());
-    let index = (draw_ms.div_euclid(60_000) - (day_start_ms + 59_999).div_euclid(60_000) + 1).max(1);
+    let index =
+        (draw_ms.div_euclid(60_000) - (day_start_ms + 59_999).div_euclid(60_000) + 1).max(1);
     format!("{}-{:03}", at.format("%Y%m%d"), index)
 }
 

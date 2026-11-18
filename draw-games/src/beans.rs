@@ -708,6 +708,9 @@ pub enum LeaderboardSort {
     /// Deepest lifetime losses: the profit index read from its losing end.
     Loss,
     Balance,
+    /// Smallest current total wallet balance first; equal balances rank the
+    /// most-played wallet first.
+    LowBalance,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -723,13 +726,21 @@ pub struct LeaderboardRow {
 pub const LEADERBOARD_LIMIT: usize = 20;
 
 /// Top [`LEADERBOARD_LIMIT`] active players by lifetime profit, deepest
-/// lifetime loss or current total wallet balance, served from the in-memory
-/// wallet read model.
+/// lifetime loss, or highest or lowest current total wallet balance, served
+/// from the in-memory wallet read model. A human or bot `opponent` narrows
+/// the profit and loss boards to that share of play (schema 0184); balance
+/// boards have no opponent split and ignore it.
 pub async fn leaderboard(
     pool: &PgPool,
     sort: LeaderboardSort,
+    opponent: crate::game_records::Opponent,
 ) -> sqlx::Result<Vec<LeaderboardRow>> {
-    crate::beans_read_memory::leaderboard(pool, sort).await
+    match (sort, opponent.has_bots()) {
+        (LeaderboardSort::Profit | LeaderboardSort::Loss, Some(bots)) => {
+            crate::beans_read_memory::opponent_leaderboard(pool, sort, bots).await
+        }
+        _ => crate::beans_read_memory::leaderboard(pool, sort).await,
+    }
 }
 
 /// Unsettled public-hand liabilities, held per process: the runtime owner

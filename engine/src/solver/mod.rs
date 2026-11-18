@@ -45,7 +45,7 @@ pub use spot::{
     SpotRequest,
 };
 pub use tool_math::{
-    detect_draws, outs_to_odds, overcards_to_board_top, pot_odds, scare_card,
+    detect_draws, outs_to_odds, overcards_to_board_top, pot_odds, pot_odds_pct, scare_card,
     scare_card_from_board, DetectedDraws, DrawKind, OutsOdds, OutsStreet, PotOdds, PotOddsError,
     PotOddsVerdict, ScareCardError, ScareCardOdds, POT_ODDS_MARGIN_PCT,
 };

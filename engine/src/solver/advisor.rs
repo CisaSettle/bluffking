@@ -588,14 +588,7 @@ pub(crate) fn preflop_verdict(
 // ---------------------------------------------------------------------------
 
 pub(crate) fn pot_odds(pot_before: u32, to_call: u32) -> u8 {
-    if to_call == 0 {
-        return 0;
-    }
-    let denom = (pot_before as u64) + (to_call as u64);
-    if denom == 0 {
-        return 0;
-    }
-    (((to_call as u64) * 100 + denom / 2) / denom).min(100) as u8
+    super::pot_odds_pct(f64::from(pot_before), f64::from(to_call)).round() as u8
 }
 
 pub(crate) fn stack_to_pot_ratio(stack: u32, pot: f32) -> f32 {

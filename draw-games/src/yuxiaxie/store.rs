@@ -105,7 +105,11 @@ impl State {
             if casino_bots::skips() {
                 continue;
             }
-            let picks = if OsRng.next_u32() % 3 == 0 { 2 } else { 1 };
+            let picks = if OsRng.next_u32().is_multiple_of(3) {
+                2
+            } else {
+                1
+            };
             let budget = (bot.chips / picks as i64).max(MIN_STAKE);
             let bets: Bets = Symbol::ALL
                 .choose_multiple(&mut OsRng, picks)

@@ -50,29 +50,38 @@ static READ_WAITERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(
 /// Leaderboard reads wait on their own small pool so a burst of rankings
 /// can never take publication-wait slots from wallet and game reads.
 static LEADERBOARD_WAITERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(16);
+/// Opponent-filtered boards read the shared database pool; a few at a time,
+/// apart from the 全部 boards' publication waits.
+static OPPONENT_BOARD_READS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(3);
 type RankKey = (std::cmp::Reverse<i64>, std::cmp::Reverse<i32>, Uuid);
+/// Lowest balance first; among equal balances the most-played wallet first.
+type LowRankKey = (i64, std::cmp::Reverse<i32>, Uuid);
 struct Rank {
     profit: RankKey,
     balance: RankKey,
+    low_balance: LowRankKey,
 }
 
-/// Update both indexes through every existing wallet publication/invalidation path.
-/// Both rankings include only wallets with completed gold-bean games.
+/// Update every index through every existing wallet publication/invalidation path.
+/// All rankings include only wallets with completed gold-bean games.
 #[derive(Default)]
 struct Rankings {
     profit: BTreeSet<RankKey>,
     balance: BTreeSet<RankKey>,
+    low_balance: BTreeSet<LowRankKey>,
 }
 impl Rankings {
     fn insert(&mut self, rank: Rank) {
         if rank.profit.1 .0 > 0 {
             self.profit.insert(rank.profit);
             self.balance.insert(rank.balance);
+            self.low_balance.insert(rank.low_balance);
         }
     }
     fn remove(&mut self, rank: &Rank) {
         self.profit.remove(&rank.profit);
         self.balance.remove(&rank.balance);
+        self.low_balance.remove(&rank.low_balance);
     }
 }
 #[derive(Default)]
@@ -387,6 +396,7 @@ fn rank(id: Uuid, user: &User) -> Option<Rank> {
                 std::cmp::Reverse(w.hands_played),
                 id,
             ),
+            low_balance: (w.balance, std::cmp::Reverse(w.hands_played), id),
         })
 }
 fn wallet(row: &sqlx::postgres::PgRow) -> Wallet {
@@ -710,6 +720,7 @@ fn add_ledger(
         Some("claw") => Some("claw"),
         Some("roulette") => Some("roulette"),
         Some("slots") => Some("slots"),
+        Some("fruit") => Some("fruit"),
         _ => return Ok(()),
     };
     if let Some(game) = game {
@@ -806,10 +817,10 @@ pub async fn hydrate(pool: &PgPool) -> sqlx::Result<()> {
         }
         {
             // Literal game and predicate: they match the partial index
-            // wallet_ledger_beans_read_hydration (schema 0129) exactly, so even
+            // wallet_ledger_beans_read_hydration (schema 0185) exactly, so even
             // a generic plan reads only these rows.
             const _: () = assert!(crate::game_catalog::BEANS == 10);
-            let mut rows = sqlx::query_as::<_, (i64, Uuid, Option<Uuid>, i64, Value)>("SELECT id,user_id,record_id,balance_after,details FROM wallet_ledger WHERE game=10 AND details->>'v'='2' AND details->>'game' IN ('slots','roulette','claw','2048','call-fold','lucky-draw') AND (kind='play' OR details->>'reason'='casual_reward') AND id>0 ORDER BY id")
+            let mut rows = sqlx::query_as::<_, (i64, Uuid, Option<Uuid>, i64, Value)>("SELECT id,user_id,record_id,balance_after,details FROM wallet_ledger WHERE game=10 AND details->>'v'='2' AND details->>'game' IN ('slots','roulette','claw','fruit','2048','call-fold','lucky-draw') AND (kind='play' OR details->>'reason'='casual_reward') AND id>0 ORDER BY id")
                 .fetch(&mut *tx);
             while let Some((_, owner, record, balance, details)) = rows.try_next().await? {
                 if let Some(user) = loaded.users.get_mut(&owner) {
@@ -1018,13 +1029,13 @@ async fn read_user(
             if count(&user) > MAX_ROWS || user.bytes > MAX_BYTES { return Err(unavailable()); }
         }
         // Literal game and predicate: every statement below repeats the partial
-        // index wallet_ledger_beans_read_user (schema 0135) predicate verbatim,
+        // index wallet_ledger_beans_read_user (schema 0185) predicate verbatim,
         // so even a generic plan reads only this account's casual rows.
         const _: () = assert!(crate::game_catalog::BEANS == 10);
         // Casual receipts are looked up by any past request id, so all are kept.
         let mut after = 0i64;
         loop {
-            let rows: Vec<(i64, Option<Uuid>, i64, Value)> = sqlx::query_as("SELECT id,record_id,balance_after,details FROM wallet_ledger WHERE user_id=$1 AND game=10 AND details->>'v'='2' AND details->>'game' IN ('slots','roulette','claw','2048','call-fold','lucky-draw') AND (kind='play' OR details->>'reason'='casual_reward') AND details->>'game' IN ('2048','call-fold','lucky-draw') AND id>$2 ORDER BY id LIMIT $3")
+            let rows: Vec<(i64, Option<Uuid>, i64, Value)> = sqlx::query_as("SELECT id,record_id,balance_after,details FROM wallet_ledger WHERE user_id=$1 AND game=10 AND details->>'v'='2' AND details->>'game' IN ('slots','roulette','claw','fruit','2048','call-fold','lucky-draw') AND (kind='play' OR details->>'reason'='casual_reward') AND details->>'game' IN ('2048','call-fold','lucky-draw') AND id>$2 ORDER BY id LIMIT $3")
                 .bind(id).bind(after).bind(PAGE).fetch_all(&mut *tx).await?;
             if rows.is_empty() { break; }
             for (cursor, record, balance, details) in rows { after = cursor; add_ledger(&mut user, record, balance, details)?; }
@@ -1032,7 +1043,7 @@ async fn read_user(
         }
         // A cabinet keeps only its newest kept row (`add_ledger`), the one a
         // full replay in id order would leave: fetch just that row per game.
-        let newest: Vec<(i64, Option<Uuid>, i64, Value)> = sqlx::query_as("SELECT DISTINCT ON (details->>'game') id,record_id,balance_after,details FROM wallet_ledger WHERE user_id=$1 AND game=10 AND details->>'v'='2' AND details->>'game' IN ('slots','roulette','claw','2048','call-fold','lucky-draw') AND (kind='play' OR details->>'reason'='casual_reward') AND details->>'game' IN ('slots','roulette','claw') ORDER BY details->>'game',id DESC")
+        let newest: Vec<(i64, Option<Uuid>, i64, Value)> = sqlx::query_as("SELECT DISTINCT ON (details->>'game') id,record_id,balance_after,details FROM wallet_ledger WHERE user_id=$1 AND game=10 AND details->>'v'='2' AND details->>'game' IN ('slots','roulette','claw','fruit','2048','call-fold','lucky-draw') AND (kind='play' OR details->>'reason'='casual_reward') AND details->>'game' IN ('slots','roulette','claw','fruit') ORDER BY details->>'game',id DESC")
             .bind(id).fetch_all(&mut *tx).await?;
         for (mut before, record, balance, details) in newest {
             if ledger_record(record, &details).is_some() {
@@ -1043,7 +1054,7 @@ async fn read_user(
             // back to that game's newest kept row, exactly as a replay would.
             let game = details["game"].as_str().ok_or_else(unavailable)?.to_owned();
             'older: loop {
-                let rows: Vec<(i64, Option<Uuid>, i64, Value)> = sqlx::query_as("SELECT id,record_id,balance_after,details FROM wallet_ledger WHERE user_id=$1 AND game=10 AND details->>'v'='2' AND details->>'game' IN ('slots','roulette','claw','2048','call-fold','lucky-draw') AND (kind='play' OR details->>'reason'='casual_reward') AND details->>'game'=$2 AND id<$3 ORDER BY id DESC LIMIT $4")
+                let rows: Vec<(i64, Option<Uuid>, i64, Value)> = sqlx::query_as("SELECT id,record_id,balance_after,details FROM wallet_ledger WHERE user_id=$1 AND game=10 AND details->>'v'='2' AND details->>'game' IN ('slots','roulette','claw','fruit','2048','call-fold','lucky-draw') AND (kind='play' OR details->>'reason'='casual_reward') AND details->>'game'=$2 AND id<$3 ORDER BY id DESC LIMIT $4")
                     .bind(id).bind(&game).bind(before).bind(PAGE).fetch_all(&mut *tx).await?;
                 if rows.is_empty() { break; }
                 for (cursor, record, balance, details) in rows {
@@ -1403,29 +1414,28 @@ fn leaderboard_snapshot(
     let mut rows = Vec::with_capacity(beans::LEADERBOARD_LIMIT);
     // The loss board walks the profit index from its losing end and stops at
     // the first wallet that is not down: only net losers are ranked there.
-    let ranks: Box<dyn Iterator<Item = &RankKey>> = match sort {
-        beans::LeaderboardSort::Profit => Box::new(inner.ranks.profit.iter()),
+    let ranks: Box<dyn Iterator<Item = &Uuid>> = match sort {
+        beans::LeaderboardSort::Profit => Box::new(inner.ranks.profit.iter().map(|(_, _, id)| id)),
         beans::LeaderboardSort::Loss => Box::new(
             inner
                 .ranks
                 .profit
                 .iter()
                 .rev()
-                .take_while(|(net_won, _, _)| net_won.0 < 0),
+                .take_while(|(net_won, _, _)| net_won.0 < 0)
+                .map(|(_, _, id)| id),
         ),
-        beans::LeaderboardSort::Balance => Box::new(inner.ranks.balance.iter()),
-    };
-    for (_, _, id) in ranks {
-        // An identity mid-mutation (rename, deletion) sits out this one read
-        // instead of failing the whole board; an unrecovered directory is a 503.
-        let player = match crate::player_directory::lookup_or_unresolved(pool, *id) {
-            Ok((Some(player), _)) => player,
-            Ok((None, _)) => continue,
-            Err(_) => return Err(unavailable()),
-        };
-        if !player.active() {
-            continue;
+        beans::LeaderboardSort::Balance => {
+            Box::new(inner.ranks.balance.iter().map(|(_, _, id)| id))
         }
+        beans::LeaderboardSort::LowBalance => {
+            Box::new(inner.ranks.low_balance.iter().map(|(_, _, id)| id))
+        }
+    };
+    for id in ranks {
+        let Some(display_name) = public_name(pool, *id)? else {
+            continue;
+        };
         let wallet = inner
             .users
             .get(id)
@@ -1433,17 +1443,87 @@ fn leaderboard_snapshot(
             .ok_or_else(unavailable)?;
         rows.push(beans::LeaderboardRow {
             user_id: *id,
-            display_name: crate::content_moderation::public_name_or_fallback(
-                player
-                    .display_name
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty()),
-                *id,
-            ),
+            display_name,
             balance: wallet.balance,
             net_won: wallet.net_won,
             hands_played: wallet.hands_played,
+        });
+        if rows.len() == beans::LEADERBOARD_LIMIT {
+            break;
+        }
+    }
+    Ok(rows)
+}
+
+/// The board name of an active player. An identity mid-mutation (rename,
+/// deletion) sits out this one read instead of failing the whole board; an
+/// unrecovered directory is a 503.
+fn public_name(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<String>> {
+    let player = match crate::player_directory::lookup_or_unresolved(pool, id) {
+        Ok((Some(player), _)) => player,
+        Ok((None, _)) => return Ok(None),
+        Err(_) => return Err(unavailable()),
+    };
+    if !player.active() {
+        return Ok(None);
+    }
+    Ok(Some(crate::content_moderation::public_name_or_fallback(
+        player
+            .display_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty()),
+        id,
+    )))
+}
+
+/// The profit or loss board over only human-only (`bots = false`) or only
+/// bot (`bots = true`) play, from the committed wallet split of schema 0184
+/// through its partial rank index. Committed rows only: a hand accepted in
+/// memory joins this board once its writer commits. The row's
+/// `net_won`/`hands_played` are that share of play.
+pub async fn opponent_leaderboard(
+    pool: &PgPool,
+    sort: beans::LeaderboardSort,
+    bots: bool,
+) -> sqlx::Result<Vec<beans::LeaderboardRow>> {
+    // Literal columns and order, so each statement matches its partial index
+    // (wallets_human_rank / wallets_bot_rank); the loss board reads it backward.
+    const _: () = assert!(crate::game_catalog::BEANS == 10);
+    let sql = match (bots, sort) {
+        (false, beans::LeaderboardSort::Loss) => "SELECT w.user_id,w.balance,w.human_net_won,w.human_hands FROM wallets w JOIN users u ON u.id=w.user_id AND u.deleted_at IS NULL WHERE w.game=10 AND w.human_hands>0 AND w.human_net_won<0 ORDER BY w.human_net_won ASC,w.human_hands ASC,w.user_id DESC LIMIT $1",
+        (false, _) => "SELECT w.user_id,w.balance,w.human_net_won,w.human_hands FROM wallets w JOIN users u ON u.id=w.user_id AND u.deleted_at IS NULL WHERE w.game=10 AND w.human_hands>0 ORDER BY w.human_net_won DESC,w.human_hands DESC,w.user_id ASC LIMIT $1",
+        (true, beans::LeaderboardSort::Loss) => "SELECT w.user_id,w.balance,w.bot_net_won,w.bot_hands FROM wallets w JOIN users u ON u.id=w.user_id AND u.deleted_at IS NULL WHERE w.game=10 AND w.bot_hands>0 AND w.bot_net_won<0 ORDER BY w.bot_net_won ASC,w.bot_hands ASC,w.user_id DESC LIMIT $1",
+        (true, _) => "SELECT w.user_id,w.balance,w.bot_net_won,w.bot_hands FROM wallets w JOIN users u ON u.id=w.user_id AND u.deleted_at IS NULL WHERE w.game=10 AND w.bot_hands>0 ORDER BY w.bot_net_won DESC,w.bot_hands DESC,w.user_id ASC LIMIT $1",
+    };
+    // Its own small semaphore over the shared pool and one bounded wait: a
+    // burst of filtered rankings never holds more than a few connections.
+    let candidates: Vec<(Uuid, i64, i64, i32)> =
+        tokio::time::timeout(READ_PUBLICATION_WAIT, async {
+            let _permit = OPPONENT_BOARD_READS
+                .acquire()
+                .await
+                .map_err(|_| unavailable())?;
+            let mut conn = pool.acquire().await?;
+            // Headroom for directory-hidden players without a second round trip.
+            sqlx::query_as(sql)
+                .bind(4 * beans::LEADERBOARD_LIMIT as i64)
+                .fetch_all(&mut *conn)
+                .await
+        })
+        .await
+        .map_err(|_| unavailable())??;
+    let mut rows = Vec::with_capacity(beans::LEADERBOARD_LIMIT);
+    for (id, balance, net_won, hands_played) in candidates {
+        let Some(display_name) = public_name(pool, id)? else {
+            continue;
+        };
+        rows.push(beans::LeaderboardRow {
+            user_id: id,
+            display_name,
+            balance,
+            net_won,
+            hands_played,
         });
         if rows.len() == beans::LEADERBOARD_LIMIT {
             break;

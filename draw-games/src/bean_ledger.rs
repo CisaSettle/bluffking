@@ -472,13 +472,23 @@ pub async fn settle(conn: &mut PgConnection, posting: &Posting<'_>) -> sqlx::Res
         .iter()
         .map(|entry| details(posting, entry).to_string())
         .collect();
+    // Opponent split for the leaderboard filter (schema 0184): no bot and at
+    // least two humans is human-only; any bot is bot; anything else (a lone
+    // human against the house) counts only in the totals.
+    // Counted after erased accounts' shares are dropped, as the ledger rows
+    // the 0184 backfill reads.
+    let human_only = !posting.has_bots && entries.len() >= 2;
     // The rows are locked above, so the ledger reads each exact new balance.
     let written: Vec<(Uuid, i64, i64)> = sqlx::query_as(
         "/* bk:bean_ledger_post */ \
          WITH e AS (SELECT * FROM unnest($1::uuid[],$2::bigint[],$3::int[],$4::int[],$5::text[]) \
                     AS e(user_id,delta,played,won,details)), \
          updated AS (UPDATE wallets w SET balance=w.balance+e.delta,net_won=w.net_won+e.delta, \
-                hands_played=w.hands_played+e.played,hands_won=w.hands_won+e.won,updated_at=now() \
+                hands_played=w.hands_played+e.played,hands_won=w.hands_won+e.won,updated_at=now(), \
+                human_net_won=w.human_net_won+CASE WHEN $10 THEN e.delta ELSE 0 END, \
+                human_hands=w.human_hands+CASE WHEN $10 THEN e.played ELSE 0 END, \
+                bot_net_won=w.bot_net_won+CASE WHEN $9 THEN e.delta ELSE 0 END, \
+                bot_hands=w.bot_hands+CASE WHEN $9 THEN e.played ELSE 0 END \
               FROM e WHERE w.user_id=e.user_id AND w.game=$6 \
               RETURNING w.user_id,w.balance,e.delta,e.played,e.details) \
          INSERT INTO wallet_ledger(user_id,game,kind,record_id,room_code,delta,balance_after,details,hand_completed,has_bots) \
@@ -494,6 +504,7 @@ pub async fn settle(conn: &mut PgConnection, posting: &Posting<'_>) -> sqlx::Res
     .bind(posting.record_id)
     .bind(posting.room_code)
     .bind(posting.has_bots)
+    .bind(human_only)
     .fetch_all(conn.writer())
     .await?;
     if written.len() != entries.len() {
