@@ -5,6 +5,7 @@ pub mod lottery;
 pub mod proof;
 pub mod scratch;
 pub mod sicbo;
+pub mod yuxiaxie;
 pub mod zjh;
 
 pub fn verify(proof: &serde_json::Value) -> Result<serde_json::Value, String> {
@@ -12,6 +13,7 @@ pub fn verify(proof: &serde_json::Value) -> Result<serde_json::Value, String> {
         Some("lottery") => lottery::verify(proof),
         Some("scratch") => scratch::verify(proof),
         Some("sicbo" | "sicbo-room") => sicbo::verify(proof),
+        Some("yuxiaxie-room") => yuxiaxie::verify(proof),
         Some("zjh") => zjh::verify(proof),
         _ => Err("Unknown proof kind or unsupported legacy record".into()),
     }

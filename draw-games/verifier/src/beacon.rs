@@ -15,8 +15,8 @@ pub struct Beacon {
     pub signature: String,
 }
 
-/// The first beacon scheduled at or after the draw. Sales close five seconds
-/// earlier; this selection never depends on a relay response or on its value.
+/// The first beacon scheduled at or after the draw. Sales close before the
+/// draw; this selection never depends on a relay response or on its value.
 pub fn round_at_or_after(draw_ms: i64) -> Result<u64, String> {
     let delta = draw_ms
         .checked_sub(GENESIS_SECONDS * 1_000)
@@ -27,6 +27,13 @@ pub fn round_at_or_after(draw_ms: i64) -> Result<u64, String> {
         .map(|n| n / PERIOD_MS + 1)
         .ok_or("draw time overflow")?;
     Ok(round as u64)
+}
+
+/// When `round` is scheduled (Unix ms); round 1 is the chain's genesis.
+pub fn round_time_ms(round: u64) -> i64 {
+    (round.saturating_sub(1) as i64)
+        .saturating_mul(PERIOD_MS)
+        .saturating_add(GENESIS_SECONDS * 1_000)
 }
 
 /// Validate the BLS signature for this exact round and return SHA-256(signature).
