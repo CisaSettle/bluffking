@@ -120,6 +120,21 @@ fn match_receipt(proof: &Value, receipt: &Value) -> Result<(), String> {
         {
             return Err("Client seed differs from saved challenge".into());
         }
+        // A room wager's receipt keeps the seed the bettor's browser sent with
+        // it; a proof asserting a settled wager must list that seed among those
+        // it folded in. A room-wide proof (wager cancelled or refused) need not.
+        if kind == "sicbo-room" && proof.get("stake").is_some() {
+            if let Some(seed) = receipt.get("client_seed").filter(|seed| !seed.is_null()) {
+                let listed = proof["player_seeds"]
+                    .as_array()
+                    .is_some_and(|seeds| seeds.contains(seed));
+                if !listed {
+                    return Err(
+                        "Round does not include the player seed saved with the wager".into(),
+                    );
+                }
+            }
+        }
         if kind == "scratch" {
             if terms["reward_version"] != proof["reward_version"] {
                 return Err("Service reward version differs from saved purchase terms".into());

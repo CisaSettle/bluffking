@@ -32,8 +32,9 @@
 //!    posted in full (owner 2026-11-11: 「不够余额是负数就行了 让结算继续
 //!    游戏继续，报警给我即可」): the balance goes negative, the settlement and
 //!    the game continue, and `[bean_settlement_negative_balance]` alerts the
-//!    owner.
-//!    `balance >= reserved stack >= possible loss` makes that rare. A
+//!    owner. A squid penalty or a 7-2 / premium-hand bounty shortage
+//!    (`bounty_topup`) charged past the wallet is expected and only logged.
+//!    `balance >= reserved stack >= possible loss` makes the rest rare. A
 //!    negative balance is zero spendable beans: every admission, top-up,
 //!    stake, gift, exchange and entry fee still refuses on available beans.
 //! 3. A posting is idempotent on `(record_id, user)`: replaying identical
@@ -430,26 +431,39 @@ pub async fn settle(conn: &mut PgConnection, posting: &Posting<'_>) -> sqlx::Res
         if after < 0 && entry.delta < 0 {
             // Posted in full; never clamped, never refused. Owner 2026-11-12
             // 「金豆不够 金豆就是负数」: a squid penalty is charged in full even
-            // past the wallet, so a negative from the squid part is expected
-            // and only logged; a loss that overdraws without it still alerts.
+            // past the wallet, and so is a 7-2 / premium-hand bounty's shortage
+            // beyond the table stack (its automatic `bounty_topup`). A negative
+            // those side debits explain is expected and only logged; a loss
+            // that overdraws without them still alerts.
+            let meta = entry.meta.as_ref();
             let squid_debit = if posting.game == "squid" {
                 -entry.delta
             } else {
-                entry
-                    .meta
-                    .as_ref()
-                    .and_then(|meta| meta["squid_delta"].as_i64())
+                meta.and_then(|meta| meta["squid_delta"].as_i64())
                     .map_or(0, |delta| (-delta).max(0))
             };
-            // The non-squid part (a hand's own loss) alone must not overdraw.
-            let non_squid = entry.delta.saturating_add(squid_debit);
-            let overdrawn_without_squid = non_squid < 0 && balance.saturating_add(non_squid) < 0;
-            if squid_debit > 0 && !overdrawn_without_squid {
-                tracing::info!(
-                    game = posting.game, user = %entry.user, record = %posting.record_id,
-                    balance, delta = entry.delta, after, squid_debit,
-                    "bean_settlement_squid_negative"
-                );
+            let bounty_topup = meta
+                .and_then(|meta| meta["bounty_topup"].as_i64())
+                .unwrap_or(0)
+                .max(0);
+            let side_debit = squid_debit.saturating_add(bounty_topup);
+            // The rest (a hand's own loss) alone must not overdraw.
+            let own = entry.delta.saturating_add(side_debit);
+            let overdrawn_without_side = own < 0 && balance.saturating_add(own) < 0;
+            if side_debit > 0 && !overdrawn_without_side {
+                if bounty_topup > 0 {
+                    tracing::warn!(
+                        game = posting.game, user = %entry.user, record = %posting.record_id,
+                        balance, delta = entry.delta, after, squid_debit, bounty_topup,
+                        "bean_settlement_bounty_negative"
+                    );
+                } else {
+                    tracing::info!(
+                        game = posting.game, user = %entry.user, record = %posting.record_id,
+                        balance, delta = entry.delta, after, squid_debit,
+                        "bean_settlement_squid_negative"
+                    );
+                }
             } else {
                 tracing::warn!(
                     game = posting.game, user = %entry.user, record = %posting.record_id,

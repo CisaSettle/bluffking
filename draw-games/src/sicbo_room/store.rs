@@ -86,6 +86,14 @@ pub struct SicboState {
     #[serde(default)]
     jackpots: BTreeSet<Uuid>,
     bot_bets: BTreeMap<Uuid, BotBet>,
+    /// The seed each bettor's browser sent with their accepted wager. Never
+    /// shown before settlement: until the last one arrives nobody, the server
+    /// included, can compute the dice.
+    #[serde(default)]
+    player_seeds: BTreeMap<Uuid, String>,
+    /// The settled round's folded-in seeds, sorted, for its proofs.
+    #[serde(default)]
+    round_seeds: Vec<String>,
 }
 impl State {
     fn new(now: i64, bots: Vec<Bot>, beans: bool) -> Self {
@@ -100,6 +108,8 @@ impl State {
                 fairness: new_fairness(round_id),
                 jackpots: BTreeSet::new(),
                 bot_bets: BTreeMap::new(),
+                player_seeds: BTreeMap::new(),
+                round_seeds: Vec::new(),
             },
         );
         state.deal_bot_bets(now);
@@ -109,6 +119,8 @@ impl State {
         self.next_round(now, BET_MS);
         self.extra.fairness = new_fairness(self.round_id);
         self.extra.jackpots.clear();
+        self.extra.player_seeds.clear();
+        self.extra.round_seeds.clear();
         self.deal_bot_bets(now);
     }
     fn deal_bot_bets(&mut self, open: i64) {
@@ -141,6 +153,7 @@ pub struct Round {
     round_no: i64,
     result: Roll,
     fairness: Reveal,
+    player_seeds: Vec<String>,
     has_bots: bool,
     bettors: Vec<(Uuid, Wager, i64)>,
     jackpots: BTreeSet<Uuid>,
@@ -173,25 +186,46 @@ pub struct BetRequest {
     /// Commitment the bettor received before submitting this wager.
     #[serde(default)]
     commitment: Option<String>,
+    /// 32 random bytes (lowercase hex) from the bettor's browser, required
+    /// with a wager and folded into this round's dice.
+    #[serde(default)]
+    client_seed: Option<String>,
     /// `null` cancels the wager.
     bet: Option<Wager>,
 }
 
 static REGISTRY: Registry<SicboRoom> = Registry::new();
 
-/// Replays the committed round seed.
+/// Folds the settled wagers' player seeds into the committed round seed.
 fn settle_round(state: &mut State, now: i64) -> Option<Round> {
     if state.result.is_some() || now < state.deadline_ms {
         return None;
     }
-    let reveal = &state.extra.fairness;
-    if reveal.commitment.game != "sicbo-room"
-        || reveal.commitment.draw_id != state.round_id.to_string()
+    if state.extra.fairness.commitment.game != "sicbo-room"
+        || state.extra.fairness.commitment.draw_id != state.round_id.to_string()
     {
         tracing::error!(round_id=%state.round_id, "sicbo room proof identity mismatch");
         return None;
     }
-    let dice = match draw_games::sicbo::draw(reveal) {
+    // Only the seeds of wagers this round settles; a set sorts and dedups.
+    let seeds: Vec<String> = state
+        .bets
+        .keys()
+        .filter_map(|uid| state.extra.player_seeds.get(uid).cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let client_seed = match draw_games::sicbo::room_client_seed(&seeds) {
+        Ok(seed) => seed,
+        Err(error) => {
+            tracing::error!(round_id=%state.round_id, %error, "sicbo room player seeds invalid");
+            return None;
+        }
+    };
+    state.extra.fairness.client_seed = client_seed;
+    state.extra.round_seeds = seeds;
+    let reveal = &state.extra.fairness;
+    let dice = match draw_games::sicbo::draw(reveal, &state.extra.round_seeds) {
         Ok(dice) => dice,
         Err(error) => {
             tracing::error!(round_id=%state.round_id, %error, "sicbo room proof invalid");
@@ -229,7 +263,8 @@ fn settle_round(state: &mut State, now: i64) -> Option<Round> {
             );
         }
     }
-    let fairness = draw_games::sicbo::draw_proof(&state.extra.fairness, dice);
+    let fairness =
+        draw_games::sicbo::draw_proof(&state.extra.fairness, dice, &state.extra.round_seeds);
     state
         .history
         .push(json!({"round_id":state.round_id,"round_no":state.round_no,
@@ -253,6 +288,7 @@ fn settle_round(state: &mut State, now: i64) -> Option<Round> {
         round_no: state.round_no,
         result,
         fairness: state.extra.fairness.clone(),
+        player_seeds: state.extra.round_seeds.clone(),
         has_bots: !state.bots.is_empty(),
         bettors,
         jackpots: state.extra.jackpots.clone(),
@@ -359,8 +395,13 @@ impl DealerRoom for SicboRoom {
         {
             return Err(Error::Code("fairness_conflict"));
         }
-        // Exact retries are read-only, including after closing/settlement.
-        if state.bets.get(&uid).copied() == wager {
+        // Exact retries (same wager and seed) are read-only, including after
+        // closing/settlement. A different seed is a new attempt.
+        if state.bets.get(&uid).copied() == wager
+            && (wager.is_none()
+                || state.extra.player_seeds.get(&uid).map(String::as_str)
+                    == req.client_seed.as_deref())
+        {
             return Ok(false);
         }
         if !state.betting_open(now, BET_LOCK_MS) {
@@ -369,12 +410,20 @@ impl DealerRoom for SicboRoom {
         if wager.is_some_and(|w| !w.valid()) {
             return Err(Error::Code("invalid_bet"));
         }
-        if wager.is_some() {
-            let reveal = &state.extra.fairness;
-            if req.commitment.as_deref() != Some(reveal.commitment.commitment.as_str()) {
-                return Err(Error::Code("fairness_required"));
+        let seed = match wager {
+            Some(_) => {
+                let reveal = &state.extra.fairness;
+                if req.commitment.as_deref() != Some(reveal.commitment.commitment.as_str()) {
+                    return Err(Error::Code("fairness_required"));
+                }
+                Some(
+                    req.client_seed
+                        .filter(|seed| draw_games::proof::seed_bytes(seed).is_ok())
+                        .ok_or(Error::Code("fairness_required"))?,
+                )
             }
-        }
+            None => None,
+        };
         let current_revision = state.bet_revisions.get(&uid).copied().unwrap_or(0);
         if req.bet_revision != current_revision {
             return Err(Error::Code("bet_changed"));
@@ -382,10 +431,17 @@ impl DealerRoom for SicboRoom {
         if wager.map_or(0, |w| w.stake) > balance {
             return Err(Error::Code(state.wallet_unit.insufficient()));
         }
-        match wager {
-            Some(w) => state.bets.insert(uid, w),
-            None => state.bets.remove(&uid),
-        };
+        match (wager, seed) {
+            (Some(w), Some(seed)) => {
+                state.bets.insert(uid, w);
+                state.extra.player_seeds.insert(uid, seed);
+            }
+            (None, _) => {
+                state.bets.remove(&uid);
+                state.extra.player_seeds.remove(&uid);
+            }
+            (Some(_), None) => return Err(Error::Code("fairness_required")),
+        }
         state.bet_revisions.insert(uid, current_revision + 1);
         Ok(true)
     }
@@ -408,15 +464,20 @@ impl DealerRoom for SicboRoom {
             result["fairness"] = {
                 let reveal = &state.extra.fairness;
                 if let Some((wager, delta)) = bet.zip(state.deltas.get(&uid)) {
-                    let mut proof =
-                        draw_games::sicbo::payout_proof(reveal, roll.dice, wager.side, wager.stake);
+                    let mut proof = draw_games::sicbo::payout_proof(
+                        reveal,
+                        roll.dice,
+                        &state.extra.round_seeds,
+                        wager.side,
+                        wager.stake,
+                    );
                     // Assert the actual shown settlement, so verification also
                     // detects a mismatch between that settlement and the rules.
                     proof["delta"] = json!(delta);
                     proof["won"] = json!(*delta > 0);
                     proof
                 } else {
-                    draw_games::sicbo::draw_proof(reveal, roll.dice)
+                    draw_games::sicbo::draw_proof(reveal, roll.dice, &state.extra.round_seeds)
                 }
             };
             result
@@ -468,7 +529,7 @@ impl DealerRoom for SicboRoom {
                     won: delta > 0,
                     meta: Some(json!({"side":wager.side,"stake":wager.stake,"won":delta>0,
                         "jackpot_bonus":round.jackpot(uid, wager).unwrap_or(0),
-                        "fairness":draw_games::sicbo::payout_proof(&round.fairness, round.result.dice, wager.side, wager.stake)})),
+                        "fairness":draw_games::sicbo::payout_proof(&round.fairness, round.result.dice, &round.player_seeds, wager.side, wager.stake)})),
                 })
                 .collect(),
         };
@@ -521,7 +582,7 @@ async fn persist_points_round(
     let rows: Vec<_> = round.bettors.iter().map(|&(uid, wager, delta)| (uid, delta, json!({"unit":"practice","room_code":code,"round_no":round.round_no,
             "side":wager.side,"stake":wager.stake,"won":delta>0,
             "dice":round.result.dice,"total":round.result.total,"triple":round.result.triple,
-            "fairness":draw_games::sicbo::payout_proof(&round.fairness, round.result.dice, wager.side, wager.stake)}))).collect();
+            "fairness":draw_games::sicbo::payout_proof(&round.fairness, round.result.dice, &round.player_seeds, wager.side, wager.stake)}))).collect();
     crate::casino_room::record_practice(
         tx,
         crate::game_catalog::SICBO,

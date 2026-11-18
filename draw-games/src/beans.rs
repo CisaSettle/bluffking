@@ -499,6 +499,27 @@ pub(crate) fn alert_negative_settlement(record: Uuid, user: Option<Uuid>, wallet
     );
 }
 
+/// Beans a 7-2 or premium-hand bounty took from `user` beyond its table
+/// stack (`SeatRecord::bounty_topup`): automatic extra buy-in that is charged
+/// in full even past the wallet, like a squid penalty.
+fn bounty_topup(seats: &[crate::persist::SeatRecord], user: Uuid) -> u64 {
+    seats
+        .iter()
+        .filter(|seat| seat.user_id == Some(user))
+        .map(|seat| seat.bounty_topup)
+        .fold(0, u64::saturating_add)
+}
+
+/// Per-player ledger meta of a hand. `bounty_topup` is written only when
+/// present, so ordinary hand rows keep their exact shape.
+fn hand_entry_meta(squid_delta: i64, bounty_topup: u64) -> serde_json::Value {
+    let mut meta = serde_json::json!({ "squid_delta": squid_delta });
+    if bounty_topup > 0 {
+        meta["bounty_topup"] = bounty_topup.into();
+    }
+    meta
+}
+
 /// Settles one completed gold-bean hand into every human's beans wallet
 /// on the caller's transaction (the hand write), as one
 /// [`crate::bean_ledger`] posting: every participant or nobody, never
@@ -509,6 +530,7 @@ pub async fn settle_hand_on(
     hand_id: Uuid,
     session: Option<Uuid>,
     players: &[(Uuid, PokerEffect)],
+    seats: &[crate::persist::SeatRecord],
     has_bots: bool,
 ) -> sqlx::Result<()> {
     use crate::bean_ledger::{Entry, Kind, Posted, Posting};
@@ -529,7 +551,10 @@ pub async fn settle_hand_on(
                 delta: effect.delta,
                 completes_hand: effect.played > 0,
                 won: effect.won > 0,
-                meta: Some(serde_json::json!({ "squid_delta": effect.squid_delta })),
+                meta: Some(hand_entry_meta(
+                    effect.squid_delta,
+                    bounty_topup(seats, *user),
+                )),
             })
             .collect(),
     };
@@ -868,6 +893,26 @@ pub mod holds {
             .contains(&user)
             .then(|| hand.amounts.get(&user).copied())
             .flatten()
+    }
+
+    /// The session of a live beans hand `user` was dealt into whose result is
+    /// still open: not a folded leaver's fixed loss (`fix_departed_loss`). A
+    /// hand still being played comes before one already queued to settle.
+    pub(crate) fn open_result_session(user: Uuid) -> Option<Uuid> {
+        let mut open = open_hands();
+        open.retain(|_, h| h.alive.strong_count() > 0);
+        open.values()
+            .filter(|h| h.users.contains(&user) && !h.fixed.contains(&user))
+            .min_by_key(|h| h.settling)
+            .map(|h| h.session)
+    }
+
+    /// Whether `user`'s result in a beans hand of `session` is still open.
+    pub(crate) fn open_result_in(user: Uuid, session: Uuid) -> bool {
+        let mut open = open_hands();
+        open.retain(|_, h| h.alive.strong_count() > 0);
+        open.values()
+            .any(|h| h.session == session && h.users.contains(&user) && !h.fixed.contains(&user))
     }
 
     /// Memory poker admission may ignore results already included in its
