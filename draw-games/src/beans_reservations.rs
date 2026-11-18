@@ -237,7 +237,7 @@ impl Reservations {
 }
 
 /// Each bettor's open stake in a gold-bean dealer room's snapshot: 押大小's
-/// one `stake`, 百家乐's three betting areas together. A points room or a
+/// one `stake`, 百家乐's betting areas and 鱼虾蟹's symbols together. A points room or a
 /// settled round holds nothing.
 fn dealer_bets(game: &str, snapshot: &Value) -> HashMap<Uuid, i64> {
     if snapshot["wallet_unit"] != "beans" || !snapshot["result"].is_null() {
@@ -246,9 +246,15 @@ fn dealer_bets(game: &str, snapshot: &Value) -> HashMap<Uuid, i64> {
     let stake = |bet: &Value| -> Option<i64> {
         match game {
             "sicbo" => bet["stake"].as_i64(),
-            "baccarat" => ["player", "banker", "tie"]
-                .iter()
-                .try_fold(0i64, |sum, side| sum.checked_add(bet[*side].as_i64()?)),
+            // 鱼虾蟹: a stake per chosen symbol.
+            "yuxiaxie" => bet
+                .as_object()?
+                .values()
+                .try_fold(0i64, |sum, stake| sum.checked_add(stake.as_i64()?)),
+            // Typed like the room state, so areas a snapshot lacks count 0.
+            "baccarat" => serde_json::from_value::<crate::baccarat::rules::Bets>(bet.clone())
+                .ok()?
+                .total(),
             _ => None,
         }
     };

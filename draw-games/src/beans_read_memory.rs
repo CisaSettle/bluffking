@@ -1401,9 +1401,19 @@ fn leaderboard_snapshot(
         return Err(unavailable());
     }
     let mut rows = Vec::with_capacity(beans::LEADERBOARD_LIMIT);
-    let ranks = match sort {
-        beans::LeaderboardSort::Profit => &inner.ranks.profit,
-        beans::LeaderboardSort::Balance => &inner.ranks.balance,
+    // The loss board walks the profit index from its losing end and stops at
+    // the first wallet that is not down: only net losers are ranked there.
+    let ranks: Box<dyn Iterator<Item = &RankKey>> = match sort {
+        beans::LeaderboardSort::Profit => Box::new(inner.ranks.profit.iter()),
+        beans::LeaderboardSort::Loss => Box::new(
+            inner
+                .ranks
+                .profit
+                .iter()
+                .rev()
+                .take_while(|(net_won, _, _)| net_won.0 < 0),
+        ),
+        beans::LeaderboardSort::Balance => Box::new(inner.ranks.balance.iter()),
     };
     for (_, _, id) in ranks {
         // An identity mid-mutation (rename, deletion) sits out this one read

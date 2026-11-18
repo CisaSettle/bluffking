@@ -36,7 +36,10 @@ const MAX_ROWS: usize = 2_000_000;
 const MAX_BYTES: usize = 256 * 1024 * 1024;
 const MAX_QUEUED_BYTES: usize = 64 * 1024 * 1024;
 const PAGE: i64 = 500;
-const PERIOD_SLOTS: usize = 3;
+/// Periods of one game held at once (open, awaiting the beacon, settling).
+/// A purchase that would need another one is refused (fail-closed while the
+/// beacon is unavailable).
+const PERIOD_SLOTS: usize = 8;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct OwnedTicket {
@@ -930,30 +933,38 @@ async fn discard_fenced(pool: &PgPool) -> bool {
     true
 }
 
-fn ensure_period(
+/// A stored period's accepted plan.
+fn plan_of(row: &PeriodRow) -> Option<draw_games::lottery::Plan> {
+    serde_json::from_value(row.proof_plan.clone()?).ok()
+}
+
+/// The period of `game` now on sale: the newest undrawn one whose sales are
+/// still open. Purchases join it; with none, a purchase opens the next one.
+fn on_sale(data: &Data, game: Game) -> Option<i64> {
+    let now = super::now_ms();
+    data.periods
+        .range((game.as_str().into(), i64::MIN)..=(game.as_str().into(), i64::MAX))
+        .rev()
+        .find(|(_, r)| r.status == "open")
+        .filter(|(_, r)| plan_of(r).is_some_and(|plan| now < plan.closes_at_ms))
+        .map(|((_, id), _)| *id)
+}
+
+/// Opens the period a purchase starts now (its draw is `COUNTDOWN_MS` away).
+fn open_period(
     pool: &PgPool,
     state: &Arc<State>,
     data: &mut Data,
     game: Game,
-) -> Result<(), Error> {
-    let selling = game
-        .schedule()
-        .ok_or(Error::InvalidEntry)?
-        .period_at(super::now_ms());
-    if data
-        .periods
-        .contains_key(&(game.as_str().into(), selling.id))
-    {
-        return Ok(());
-    }
-    if super::now_ms() >= selling.closes_ms {
-        return Err(Error::SalesClosed);
+) -> Result<i64, Error> {
+    let selling =
+        draw_games::lottery::Period::opened_at(super::now_ms()).ok_or(Error::InvalidEntry)?;
+    let key = (game.as_str().to_owned(), selling.id);
+    if data.periods.contains_key(&key) {
+        return Ok(selling.id);
     }
     // Its creation was refused: nothing can be sold in it.
-    if parked()
-        .periods
-        .contains(&(game.as_str().into(), selling.id))
-    {
+    if parked().periods.contains(&key) {
         return Err(Error::SalesClosed);
     }
     if data
@@ -989,7 +1000,8 @@ fn ensure_period(
         super::record_id(&format!("period:{}:{}", game.as_str(), selling.id)),
     );
     event.period = Some(row);
-    admit(pool, state, data, event, 0).map(|_| ())
+    admit(pool, state, data, event, 0)?;
+    Ok(selling.id)
 }
 fn offer(
     pool: &PgPool,
@@ -1054,18 +1066,35 @@ fn current_view(pool: &PgPool, user: Uuid, game: Game) -> Result<Value, Error> {
     } else {
         None
     };
-    let (period, my) = if let Some(schedule) = game.schedule() {
-        let selling = schedule.period_at(super::now_ms());
-        let row = data.periods.get(&(game.as_str().into(), selling.id));
-        let open = row.is_some_and(|r| r.status == "open" && r.proof_plan.is_some())
-            && super::now_ms() < selling.closes_ms;
-        (
-            store::period_json(&selling, row, open),
-            data.own(user, game, selling.id)
-                .iter()
-                .map(|t| store::ticket_json(game, t))
-                .collect::<Vec<_>>(),
-        )
+    let (period, my) = if game.drawn() {
+        // The newest period still waiting for its draw (on sale until it
+        // closes); none while the hall is idle.
+        let current = data
+            .periods
+            .range((game.as_str().into(), i64::MIN)..=(game.as_str().into(), i64::MAX))
+            .rev()
+            .find(|(_, r)| r.status == "open")
+            .and_then(|(_, row)| {
+                let plan = plan_of(row)?;
+                let selling = draw_games::lottery::Period {
+                    id: row.period,
+                    opens_ms: plan.sales_opens_at_ms().ok()?,
+                    closes_ms: plan.closes_at_ms,
+                    draw_ms: plan.draw_at_ms,
+                    label: plan.label().ok()?,
+                };
+                Some((selling, row))
+            });
+        match current {
+            Some((selling, row)) => (
+                store::period_json(&selling, Some(row), super::now_ms() < selling.closes_ms),
+                data.own(user, game, selling.id)
+                    .iter()
+                    .map(|t| store::ticket_json(game, t))
+                    .collect::<Vec<_>>(),
+            ),
+            None => (Value::Null, vec![]),
+        }
     } else {
         let ids = data
             .by_user
@@ -1263,18 +1292,8 @@ pub async fn prepare(pool: &PgPool, user: Uuid, game: Game) -> Result<Value, Err
             Uuid::parse_str(&offer.draw_id).map_err(|_| Error::InvalidEntry)?,
         )
     } else {
-        let mut lock = state.data.lock().unwrap_or_else(|e| e.into_inner());
-        let data = lock.as_mut().ok_or_else(unavailable)?;
-        ensure_period(pool, &state, data, game)?;
-        // Period creation is driven by the background owner as well.
-        let selling = game
-            .schedule()
-            .ok_or(Error::InvalidEntry)?
-            .period_at(super::now_ms());
-        pending_receipt(
-            &state,
-            super::record_id(&format!("period:{}:{}", game.as_str(), selling.id)),
-        )
+        // Number games open a period only with a purchase.
+        CommitReceipt::complete()
     };
     drop(command);
     receipt.wait().await?;
@@ -1293,7 +1312,7 @@ pub async fn buy_numbers(
         .iter()
         .map(|v| Entry::parse(game, v).map_err(|_| Error::InvalidEntry))
         .collect::<Result<Vec<_>, _>>()?;
-    let mut identity = json!({"game":game.as_str(),"period":body.period,"multiplier":body.multiplier,"tickets":entries.iter().map(Entry::to_value).collect::<Vec<_>>(),"proof_commitment":body.proof_commitment});
+    let mut identity = json!({"game":game.as_str(),"multiplier":body.multiplier,"tickets":entries.iter().map(Entry::to_value).collect::<Vec<_>>()});
     if body.all_in {
         identity["all_in"] = json!(true);
         identity["expected_balance"] = json!(body.expected_balance);
@@ -1440,37 +1459,20 @@ fn accept_numbers(
         let id = super::purchase_id(user, body.request_id);
         return Ok((p, pending_receipt(&state, id)));
     }
-    ensure_period(pool, &state, data, game)?;
-    let selling = game
-        .schedule()
-        .ok_or(Error::InvalidEntry)?
-        .period_at(super::now_ms());
-    if selling.id != body.period || super::now_ms() >= selling.closes_ms {
-        return Err(Error::SalesClosed);
-    }
-    let mut row = data
-        .periods
-        .get(&(game.as_str().into(), selling.id))
-        .cloned()
-        .ok_or(Error::SalesClosed)?;
-    if row.status != "open" {
-        return Err(Error::SalesClosed);
-    }
-    let plan: draw_games::lottery::Plan =
-        serde_json::from_value(row.proof_plan.clone().ok_or(Error::FairnessRequired)?)
-            .map_err(|_| Error::InvalidEntry)?;
-    plan.validate().map_err(|_| Error::InvalidEntry)?;
-    if plan.commitment != body.proof_commitment {
-        return Err(Error::RequestConflict);
-    }
+    // Join the period on sale, or open one once the entry, cap and balance
+    // checks have passed (a writer-side refusal can still leave it empty).
+    let joining = on_sale(data, game);
     let before = beans_read_memory::ensure(pool, user)?.balance;
     let available = beans_read_memory::available(pool, user, before, false, None)?;
-    let old = data.own(user, game, selling.id);
-    let used = old
-        .iter()
-        .map(|t| i64::from(t.stakes) * i64::from(t.multiplier))
-        .sum::<i64>();
-    if old.len() + entries.len() > rules::MAX_TICKETS_PER_PERIOD as usize {
+    let (held, used) = joining.map_or((0, 0), |id| {
+        let old = data.own(user, game, id);
+        let used = old
+            .iter()
+            .map(|t| i64::from(t.stakes) * i64::from(t.multiplier))
+            .sum::<i64>();
+        (old.len(), used)
+    });
+    if held + entries.len() > rules::MAX_TICKETS_PER_PERIOD as usize {
         return Err(Error::TooManyTickets);
     }
     let stakes = entries.iter().map(Entry::stakes).collect::<Vec<_>>();
@@ -1522,6 +1524,25 @@ fn accept_numbers(
         return Err(Error::InsufficientBalance);
     }
     let total_i32 = i32::try_from(total).map_err(|_| Error::TooManyTickets)?;
+    let period = match joining {
+        Some(id) => id,
+        None => open_period(pool, &state, data, game)?,
+    };
+    let mut row = data
+        .periods
+        .get(&(game.as_str().into(), period))
+        .cloned()
+        .ok_or(Error::SalesClosed)?;
+    if row.status != "open" {
+        return Err(Error::SalesClosed);
+    }
+    let plan = plan_of(&row).ok_or(Error::FairnessRequired)?;
+    plan.validate().map_err(|_| Error::InvalidEntry)?;
+    // One clock read decides the sale and stamps the tickets' purchase time.
+    let at = Utc::now();
+    if at.timestamp_millis() >= plan.closes_at_ms {
+        return Err(Error::SalesClosed);
+    }
     row.stakes = row
         .stakes
         .checked_add(total_i32)
@@ -1534,15 +1555,16 @@ fn accept_numbers(
         .tickets
         .checked_add(entries.len() as i32)
         .ok_or(Error::TooManyTickets)?;
-    row.players += i32::from(old.is_empty());
+    row.players += i32::from(held == 0);
     let id = super::purchase_id(user, body.request_id);
     let mut event = Event::new(game, Some(user), "purchase", id);
+    event.at = at;
     event.before = before;
     for ((entry, stakes), multiplier) in entries.iter().zip(stakes).zip(multipliers) {
         let card = TicketRow {
             id: Uuid::new_v4(),
             purchase_id: id,
-            period: selling.id,
+            period,
             bought_at: event.at,
             entry: entry.to_value(),
             stakes: stakes as i32,
@@ -1906,7 +1928,7 @@ const SCRATCH_RETRY: Duration = Duration::from_secs(60);
 const DAY: Duration = Duration::from_secs(24 * 3600);
 
 /// Retry delay after `failures` consecutive passes left due work unfinished:
-/// 0.5 s doubling to 5 s (a pending beacon is fetched at most every 5 s anyway).
+/// 0.5 s doubling to 5 s.
 fn backoff(failures: u32) -> Duration {
     Duration::from_millis(500u64 << failures.saturating_sub(1).min(4)).min(Duration::from_secs(5))
 }
@@ -2134,7 +2156,10 @@ async fn pass(pool: &PgPool, s: &mut Schedule) -> std::time::Instant {
     // Draw work from memory: the next period boundary, the next draw, and a
     // draw that is due but still waits (its beacon is not out yet).
     let (next_ms, due) = drawn_deadline(pool);
-    retry |= due;
+    // Players watch a countdown: a beacon that is due but not served yet is
+    // asked for again every BEACON_RETRY for a while, then with the backoff.
+    let waiting_beacon = due.is_some_and(|at| super::now_ms() - at < BEACON_FAST_WINDOW_MS);
+    retry |= due.is_some() && !waiting_beacon;
     let now = std::time::Instant::now();
     let mut next = (now
         + Duration::from_millis(next_ms.saturating_sub(super::now_ms()).max(0) as u64 + 1))
@@ -2148,6 +2173,9 @@ async fn pass(pool: &PgPool, s: &mut Schedule) -> std::time::Instant {
         next = next.min(now + backoff(s.failures));
     } else {
         s.failures = 0;
+    }
+    if waiting_beacon {
+        next = next.min(now + BEACON_RETRY);
     }
     if again {
         next = now;
@@ -2189,17 +2217,26 @@ async fn settle_all(pool: &PgPool) -> bool {
     }
 }
 
-/// The next draw-game deadline (wall-clock ms: the next period boundary or
-/// an earlier open period's draw) and whether a draw is already due.
-fn drawn_deadline(pool: &PgPool) -> (i64, bool) {
+/// Wait after a beacon round's scheduled time before its relay is asked.
+const BEACON_GRACE_MS: i64 = 150;
+/// Retry cadence for a due beacon during the first `BEACON_FAST_WINDOW_MS`
+/// (the relay's own negative cache is shorter, see `beacon::fetch`).
+const BEACON_RETRY: Duration = Duration::from_millis(400);
+const BEACON_FAST_WINDOW_MS: i64 = 10_000;
+
+/// When an open period's draw is due: its preselected beacon round is
+/// scheduled (at or after the draw) and the relay has had a moment to serve it.
+fn beacon_due_ms(plan: &draw_games::lottery::Plan) -> i64 {
+    plan.beacon_at_ms().saturating_add(BEACON_GRACE_MS)
+}
+
+/// The next draw deadline (wall-clock ms: the earliest open period's beacon)
+/// and, when a draw is already due, since when. Idle halls have none: a
+/// purchase commit wakes the loop.
+fn drawn_deadline(pool: &PgPool) -> (i64, Option<i64>) {
     let now = super::now_ms();
-    let mut next = Game::DRAWN
-        .iter()
-        .filter_map(|game| game.schedule())
-        .map(|schedule| schedule.period_at(now).draw_ms)
-        .min()
-        .unwrap_or(now + 60_000);
-    let mut due = false;
+    let mut next = now + 60_000;
+    let mut due: Option<i64> = None;
     let state = state(pool);
     let lock = state.data.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(data) = lock.as_ref() {
@@ -2211,10 +2248,11 @@ fn drawn_deadline(pool: &PgPool) -> (i64, bool) {
             else {
                 continue;
             };
-            if plan.draw_at_ms > now {
-                next = next.min(plan.draw_at_ms);
+            if beacon_due_ms(&plan) > now {
+                next = next.min(beacon_due_ms(&plan));
             } else if !parked().periods.contains(key) {
-                due = true;
+                let at = beacon_due_ms(&plan);
+                due = Some(due.map_or(at, |d| d.min(at)));
             }
         }
     }
@@ -2426,33 +2464,18 @@ async fn recover_slots(pool: &PgPool, backlog: &mut Vec<Game>) -> Result<(), Err
     Ok(())
 }
 
+/// Draws the first open period of `game` whose beacon is due.
 async fn advance(pool: &PgPool, game: Game) -> Result<(), Error> {
     let state = state(pool);
     let plan = {
-        let _command = state.commands.lock().await;
-        let mut lock = state.data.lock().unwrap_or_else(|e| e.into_inner());
-        let data = lock.as_mut().ok_or_else(unavailable)?;
-        if data
-            .periods
-            .range((game.as_str().into(), i64::MIN)..=(game.as_str().into(), i64::MAX))
-            .count()
-            < PERIOD_SLOTS
-        {
-            match ensure_period(pool, &state, data, game) {
-                Ok(()) | Err(Error::SalesClosed) => {}
-                Err(e) => return Err(e),
-            }
-        }
+        let lock = state.data.lock().unwrap_or_else(|e| e.into_inner());
+        let data = lock.as_ref().ok_or_else(unavailable)?;
         data.periods
-            .iter()
-            .filter(|((g, _), r)| g == game.as_str() && r.status == "open")
-            .filter_map(|(_, r)| {
-                r.proof_plan
-                    .clone()
-                    .and_then(|p| serde_json::from_value::<draw_games::lottery::Plan>(p).ok())
-            })
+            .range((game.as_str().into(), i64::MIN)..=(game.as_str().into(), i64::MAX))
+            .filter(|(_, r)| r.status == "open")
+            .filter_map(|(_, r)| plan_of(r))
             .find(|p| {
-                p.draw_at_ms <= super::now_ms()
+                beacon_due_ms(p) <= super::now_ms()
                     && !parked().periods.contains(&(game.as_str().into(), p.period))
             })
     };

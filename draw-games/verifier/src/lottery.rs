@@ -527,8 +527,13 @@ pub fn choose(n: usize, k: usize) -> i64 {
     result
 }
 
-/// 封盘: sales close this long before the draw.
-pub const CLOSE_MS: i64 = 5_000;
+/// A purchase when nothing is on sale opens a period that draws this long
+/// after it (the countdown every buyer sees).
+pub const COUNTDOWN_MS: i64 = 3_000;
+/// 封盘: sales close this long before the draw; a later purchase opens the
+/// next period. Every beacon round is scheduled at or after the draw, so it
+/// is published at least this long after the last ticket can be accepted.
+pub const CLOSE_MS: i64 = 1_000;
 /// Period labels and report days use Singapore time.
 pub const SGT_OFFSET_SECS: i32 = 8 * 60 * 60;
 
@@ -551,7 +556,7 @@ impl Game {
         Game::Fucai3d,
         Game::Scratch,
     ];
-    /// The scheduled number games, in draw-loop order.
+    /// The drawn number games, in draw-loop order.
     pub const DRAWN: [Game; 5] = [
         Game::Happy8,
         Game::Fucai3d,
@@ -590,22 +595,14 @@ impl Game {
             Game::Scratch => crate::scratch::COST,
         }
     }
-    /// All current number lotteries share the minute boundary.
-    pub fn schedule(self) -> Option<Schedule> {
-        (self != Game::Scratch).then_some(Schedule {
-            interval_ms: 60_000,
-            offset_ms: 0,
-        })
+    /// The number games (every game but scratch) are drawn from the beacon.
+    pub fn drawn(self) -> bool {
+        self != Game::Scratch
     }
 }
 
-/// Wall-clock aligned periods: `period = floor((now − offset) / interval)`.
-#[derive(Debug, Clone, Copy)]
-pub struct Schedule {
-    pub interval_ms: i64,
-    pub offset_ms: i64,
-}
-
+/// One drawn period. Its id is its draw time (Unix ms): a purchase when no
+/// period of the game is on sale opens `id = bought_at + COUNTDOWN_MS`.
 #[derive(Debug, Clone)]
 pub struct Period {
     pub id: i64,
@@ -615,57 +612,55 @@ pub struct Period {
     pub label: String,
 }
 
-impl Schedule {
-    /// The period selling at `now_ms` (its draw is the next boundary).
-    pub fn period_at(&self, now_ms: i64) -> Period {
-        self.period((now_ms - self.offset_ms).div_euclid(self.interval_ms))
+impl Period {
+    /// The period a purchase at `now_ms` opens when nothing is on sale.
+    pub fn opened_at(now_ms: i64) -> Option<Period> {
+        Self::of(now_ms.checked_add(COUNTDOWN_MS)?)
     }
-    pub fn period(&self, id: i64) -> Period {
-        let opens_ms = id * self.interval_ms + self.offset_ms;
-        let draw_ms = opens_ms + self.interval_ms;
-        Period {
+    pub fn of(id: i64) -> Option<Period> {
+        Some(Period {
             id,
-            opens_ms,
-            closes_ms: draw_ms - CLOSE_MS,
-            draw_ms,
-            label: self.label(draw_ms),
-        }
+            opens_ms: id.checked_sub(COUNTDOWN_MS)?,
+            closes_ms: id.checked_sub(CLOSE_MS)?,
+            draw_ms: id,
+            label: label(id),
+        })
     }
-    /// `YYYYMMDD-NNN`: the SGT day of the draw and the draw's 1-based index
-    /// within that day.
-    pub fn label(&self, draw_ms: i64) -> String {
-        let sgt = sgt();
-        let at = sgt
-            .timestamp_millis_opt(draw_ms)
-            .single()
-            .unwrap_or_else(|| {
-                sgt.timestamp_millis_opt(0)
-                    .single()
-                    .expect("epoch is representable")
-            });
-        let day_start_ms = sgt
-            .from_local_datetime(&at.date_naive().and_hms_opt(0, 0, 0).expect("midnight"))
-            .single()
-            .map_or(draw_ms, |d| d.timestamp_millis());
-        // Draws happen at j·interval + offset (j ≥ 1); count the day's draws
-        // up to this one.
-        let j = (draw_ms - self.offset_ms).div_euclid(self.interval_ms);
-        let first_j =
-            (day_start_ms - self.offset_ms + self.interval_ms - 1).div_euclid(self.interval_ms);
-        let index = (j - first_j + 1).max(1);
-        format!("{}-{:03}", at.format("%Y%m%d"), index)
-    }
+}
+
+/// `YYYYMMDD-HHMMSS`: the SGT time of the draw. A game's periods draw at
+/// least `COUNTDOWN_MS - CLOSE_MS` apart, so the label is unique per game.
+pub fn label(draw_ms: i64) -> String {
+    let sgt = sgt();
+    sgt.timestamp_millis_opt(draw_ms)
+        .single()
+        .unwrap_or_else(|| {
+            sgt.timestamp_millis_opt(0)
+                .single()
+                .expect("epoch is representable")
+        })
+        .format("%Y%m%d-%H%M%S")
+        .to_string()
 }
 
 pub fn sgt() -> FixedOffset {
     FixedOffset::east_opt(SGT_OFFSET_SECS).expect("Singapore UTC offset is valid")
 }
 
-/// v4 = the minute schedule with the 1-bean-scale prize tables above.
-pub const PROTOCOL: &str = "bluffking-lottery-drand-v4-minute";
+/// v5 = purchase-opened periods (id = draw time) with the v4 prize tables.
+pub const PROTOCOL: &str = "bluffking-lottery-drand-v5-instant";
+/// The retired minute schedule (period = minute index, draw at its end, sales
+/// closed 5 s before). Kept only so periods accepted under it still validate,
+/// settle and verify until retention deletes them; remove after 2026-12-31.
+pub const PROTOCOL_V4_MINUTE: &str = "bluffking-lottery-drand-v4-minute";
 
-/// All choice points are derived from the game and wall-clock period. The
-/// commitment binds the protocol version, sales deadline and exact future pulse.
+/// A protocol whose accepted plans this verifier can replay.
+pub fn known_protocol(protocol: &str) -> bool {
+    protocol == PROTOCOL || protocol == PROTOCOL_V4_MINUTE
+}
+
+/// All choice points are derived from the game and period id. The commitment
+/// binds the protocol version, sales deadline and exact future pulse.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Plan {
@@ -681,16 +676,28 @@ pub struct Plan {
 
 impl Plan {
     pub fn new(game: Game, period: i64) -> Result<Self, String> {
-        let schedule = game.schedule().ok_or("not a scheduled lottery")?;
-        let draw_at_ms = period
-            .checked_add(1)
-            .and_then(|n| n.checked_mul(schedule.interval_ms))
-            .and_then(|n| n.checked_add(schedule.offset_ms))
-            .ok_or("period overflow")?;
-        let closes_at_ms = draw_at_ms.checked_sub(CLOSE_MS).ok_or("period overflow")?;
+        Self::derive(PROTOCOL, game, period)
+    }
+
+    fn derive(protocol: &str, game: Game, period: i64) -> Result<Self, String> {
+        if !game.drawn() {
+            return Err("not a drawn lottery".into());
+        }
+        let (draw_at_ms, close_ms) = match protocol {
+            PROTOCOL => (period, CLOSE_MS),
+            PROTOCOL_V4_MINUTE => (
+                period
+                    .checked_add(1)
+                    .and_then(|n| n.checked_mul(60_000))
+                    .ok_or("period overflow")?,
+                5_000,
+            ),
+            _ => return Err("unsupported lottery protocol".into()),
+        };
+        let closes_at_ms = draw_at_ms.checked_sub(close_ms).ok_or("period overflow")?;
         let beacon_round = crate::beacon::round_at_or_after(draw_at_ms)?;
         let commitment = hex::encode(sha256_fields(&[
-            PROTOCOL.as_bytes(),
+            protocol.as_bytes(),
             game.as_str().as_bytes(),
             &period.to_be_bytes(),
             &draw_at_ms.to_be_bytes(),
@@ -699,7 +706,7 @@ impl Plan {
             &beacon_round.to_be_bytes(),
         ]));
         Ok(Self {
-            protocol: PROTOCOL.into(),
+            protocol: protocol.into(),
             game: game.as_str().into(),
             period,
             draw_at_ms,
@@ -712,34 +719,52 @@ impl Plan {
 
     pub fn validate(&self) -> Result<Game, String> {
         let game = Game::parse(&self.game).ok_or("unknown lottery game")?;
-        if self.protocol != PROTOCOL {
-            return Err("unsupported lottery protocol".into());
-        }
-        if *self != Self::new(game, self.period)? {
+        if *self != Self::derive(&self.protocol, game, self.period)? {
             return Err("plan does not match the fixed public schedule and protocol".into());
         }
         Ok(game)
     }
 
-    /// Use the accepted plan's own schedule for saved ticket windows and labels.
+    /// Use the accepted plan's own protocol for saved ticket windows and labels.
     pub fn sales_opens_at_ms(&self) -> Result<i64, String> {
-        let game = self.validate()?;
+        self.validate()?;
+        let window = if self.protocol == PROTOCOL {
+            COUNTDOWN_MS
+        } else {
+            60_000
+        };
         self.draw_at_ms
-            .checked_sub(
-                game.schedule()
-                    .ok_or("not a scheduled lottery")?
-                    .interval_ms,
-            )
+            .checked_sub(window)
             .ok_or_else(|| "sales window overflow".into())
     }
 
-    pub fn label(&self) -> Result<String, String> {
-        let game = self.validate()?;
-        Ok(game
-            .schedule()
-            .ok_or("not a scheduled lottery")?
-            .label(self.draw_at_ms))
+    /// When the preselected beacon round is published (at or after the draw).
+    pub fn beacon_at_ms(&self) -> i64 {
+        crate::beacon::round_time_ms(self.beacon_round)
     }
+
+    pub fn label(&self) -> Result<String, String> {
+        self.validate()?;
+        Ok(if self.protocol == PROTOCOL {
+            label(self.draw_at_ms)
+        } else {
+            legacy_minute_label(self.draw_at_ms)
+        })
+    }
+}
+
+/// v4 labels: `YYYYMMDD-NNN`, the draw's 1-based minute index within its SGT day.
+fn legacy_minute_label(draw_ms: i64) -> String {
+    let sgt = sgt();
+    let Some(at) = sgt.timestamp_millis_opt(draw_ms).single() else {
+        return label(draw_ms);
+    };
+    let day_start_ms = sgt
+        .from_local_datetime(&at.date_naive().and_hms_opt(0, 0, 0).expect("midnight"))
+        .single()
+        .map_or(draw_ms, |d| d.timestamp_millis());
+    let index = (draw_ms.div_euclid(60_000) - (day_start_ms + 59_999).div_euclid(60_000) + 1).max(1);
+    format!("{}-{:03}", at.format("%Y%m%d"), index)
 }
 
 /// Partial Fisher-Yates with rejection sampling through Entropy::below. TOTO
@@ -918,6 +943,6 @@ pub fn verify(value: &Value) -> Result<Value, String> {
         json!({ "kind": "lottery", "valid": true, "game": game.as_str(), "period": proof.plan.period,
         "commitment": proof.plan.commitment, "numbers": proof.numbers, "bonus": proof.bonus,
         "bonus_numbers": proof.bonus_numbers, "ticket": receipt_result,
-        "publication": "compare with the plan saved before purchase; this file alone does not prove publication time" }),
+        "publication": "compare with the plan saved with the purchase receipt, before its beacon round; this file alone does not prove publication time" }),
     )
 }

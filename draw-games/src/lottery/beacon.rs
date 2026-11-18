@@ -19,7 +19,8 @@ pub async fn fetch(round: u64) -> Result<Option<Beacon>, String> {
     {
         let cache = cache.lock().await;
         if let Some(entry) = cache.get(&round) {
-            if entry.beacon.is_some() || entry.checked.elapsed() < Duration::from_secs(5) {
+            // A round not out yet is asked again soon: draws wait on it.
+            if entry.beacon.is_some() || entry.checked.elapsed() < Duration::from_millis(400) {
                 return Ok(entry.beacon.clone());
             }
         }

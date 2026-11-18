@@ -624,9 +624,10 @@ impl GameHand {
     /// every dealt seat's hole cards are known (`showdown` plus
     /// `folded_hole_cards`, which the sealed dealer fills after settlement).
     ///
-    /// Requires the flop to have been dealt and a 7-2 offsuit holder among the
-    /// main pot's winners. Each such winner collects the full configured
-    /// amount from every other dealt player. Shortages are explicit automatic
+    /// Requires the flop to have been dealt and a 7-2 offsuit holder to be the
+    /// main pot's sole winner; a split main pot never qualifies (when running
+    /// twice, the holder must win the main pot on both runs). The winner
+    /// collects the full configured amount from every other dealt player. Shortages are explicit automatic
     /// funding in `bounty_topups`: economic net remains zero-sum; `pots` and
     /// `chips_awarded` stay pot-only. The queued `HandFinished` event is
     /// updated to the same result. Idempotent: a result that already carries
@@ -658,16 +659,16 @@ impl GameHand {
                 .map(|entry| entry.hole_cards)
                 .or_else(|| result.folded_hole_cards.get(&pid.inner()).copied())
         };
+        let [sole] = main_pot.winners.as_slice() else {
+            return;
+        };
+        if sole.amount_won.0 == 0 {
+            return;
+        }
         let winners: Vec<(PlayerId, HoleCards)> = self
             .seats
             .iter()
-            .filter(|seat| !seat.folded)
-            .filter(|seat| {
-                main_pot
-                    .winners
-                    .iter()
-                    .any(|w| w.player_id == seat.player_id && w.amount_won.0 > 0)
-            })
+            .filter(|seat| !seat.folded && seat.player_id == sole.player_id)
             .filter_map(|seat| hole_cards(seat.player_id).map(|cards| (seat.player_id, cards)))
             .filter(|(_, cards)| is_seven_deuce_offsuit(cards))
             .collect();

@@ -35,14 +35,26 @@ fn match_receipt(proof: &Value, receipt: &Value) -> Result<(), String> {
     }
     if kind == "lottery" {
         if receipt["commitment"] != proof["plan"] || terms["period"] != proof["plan"]["period"] {
-            return Err("Draw differs from saved pre-purchase plan".into());
+            return Err("Draw differs from the plan saved with the purchase receipt".into());
+        }
+        // The receipt must have been saved before the preselected round existed.
+        let round = proof["plan"]["beacon_round"]
+            .as_u64()
+            .ok_or("Missing beacon round")?;
+        let observed = receipt["observed_at_ms"]
+            .as_i64()
+            .ok_or("Missing receipt time")?;
+        if observed >= crate::beacon::round_time_ms(round) {
+            return Err("Receipt was saved after the beacon round was published".into());
         }
         if let Some(ticket) = proof.get("ticket") {
             let selections = terms["tickets"]
                 .as_array()
                 .ok_or("Missing saved selections")?;
             if terms["all_in"].as_bool() == Some(true) {
-                if proof["plan"]["protocol"].as_str() != Some(crate::lottery::PROTOCOL)
+                if !proof["plan"]["protocol"]
+                    .as_str()
+                    .is_some_and(crate::lottery::known_protocol)
                     || terms["multiplier"].as_i64() != Some(1)
                 {
                     return Err("Invalid ALL-IN receipt mode or protocol".into());
@@ -103,7 +115,7 @@ fn match_receipt(proof: &Value, receipt: &Value) -> Result<(), String> {
                 return Err("Saved receipt hand differs from the committed hand".into());
             }
         }
-        if !matches!(kind, "sicbo-room" | "zjh") && receipt["client_seed"] != reveal.client_seed {
+        if !matches!(kind, "sicbo-room" | "yuxiaxie-room" | "zjh") && receipt["client_seed"] != reveal.client_seed {
             return Err("Client seed differs from saved challenge".into());
         }
         if kind == "scratch" {
@@ -127,6 +139,8 @@ fn match_receipt(proof: &Value, receipt: &Value) -> Result<(), String> {
         }
         let fields: &[&str] = if kind == "scratch" {
             &["cost", "count"]
+        } else if kind == "yuxiaxie-room" && proof.get("stake").is_some() {
+            &["bets", "stake"]
         } else if proof.get("stake").is_some() {
             &["side", "stake"]
         } else {

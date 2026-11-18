@@ -166,10 +166,8 @@ pub struct Purchase {
 #[serde(deny_unknown_fields)]
 pub struct NumberBuy {
     pub request_id: Uuid,
-    pub period: i64,
     pub multiplier: i64,
     pub tickets: Vec<Value>,
-    pub proof_commitment: String,
     #[serde(default)]
     pub all_in: bool,
     #[serde(default)]
@@ -448,7 +446,7 @@ pub async fn draws(
 /// Public, account-free proof retrieval. No player or private ticket data leaves
 /// this endpoint. The same URL serves the pre-draw plan and the revealed result.
 pub async fn proof(pool: &PgPool, game: Game, period: i64) -> Result<Value, Error> {
-    if game.schedule().is_none() {
+    if !game.drawn() {
         return Err(Error::InvalidEntry);
     }
     let row = sqlx::query(

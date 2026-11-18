@@ -705,6 +705,8 @@ pub async fn debit_refund_on(
 pub enum LeaderboardSort {
     #[default]
     Profit,
+    /// Deepest lifetime losses: the profit index read from its losing end.
+    Loss,
     Balance,
 }
 
@@ -720,8 +722,9 @@ pub struct LeaderboardRow {
 /// Fixed size of each lobby gold-bean ranking; there is no pagination.
 pub const LEADERBOARD_LIMIT: usize = 20;
 
-/// Top [`LEADERBOARD_LIMIT`] active players by lifetime profit or current
-/// total wallet balance, served from the in-memory wallet read model.
+/// Top [`LEADERBOARD_LIMIT`] active players by lifetime profit, deepest
+/// lifetime loss or current total wallet balance, served from the in-memory
+/// wallet read model.
 pub async fn leaderboard(
     pool: &PgPool,
     sort: LeaderboardSort,
