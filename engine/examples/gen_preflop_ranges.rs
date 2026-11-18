@@ -54,9 +54,7 @@
 //! (`--release` is ~10× faster; the OUTPUT is identical to a debug run.)
 
 use engine::solver::all_hand_keys;
-use engine::solver::preflop_cfr::{
-    solve, Bucket, Position, CFR_ITERS, EQUITY_SEED, EQUITY_TRIALS,
-};
+use engine::solver::preflop_cfr::{solve, Bucket, Position, CFR_ITERS, EQUITY_SEED, EQUITY_TRIALS};
 
 /// Premiums force-included in EVERY continuing bucket at full frequency (never
 /// let the model drop the nuts, and satisfy the contract's AA/KK/AKs invariant).

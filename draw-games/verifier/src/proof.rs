@@ -36,8 +36,10 @@ pub struct Commitment {
 }
 
 pub fn commit(game: &str, draw_id: &str, server_seed: &str) -> Result<Commitment, String> {
-    if !matches!(game, "scratch" | "sicbo" | "sicbo-room" | "yuxiaxie-room" | "zjh")
-        || draw_id.is_empty()
+    if !matches!(
+        game,
+        "scratch" | "sicbo" | "sicbo-room" | "yuxiaxie-room" | "zjh"
+    ) || draw_id.is_empty()
         || draw_id.len() > 128
         || !draw_id.is_ascii()
     {

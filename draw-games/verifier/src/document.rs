@@ -115,7 +115,9 @@ fn match_receipt(proof: &Value, receipt: &Value) -> Result<(), String> {
                 return Err("Saved receipt hand differs from the committed hand".into());
             }
         }
-        if !matches!(kind, "sicbo-room" | "yuxiaxie-room" | "zjh") && receipt["client_seed"] != reveal.client_seed {
+        if !matches!(kind, "sicbo-room" | "yuxiaxie-room" | "zjh")
+            && receipt["client_seed"] != reveal.client_seed
+        {
             return Err("Client seed differs from saved challenge".into());
         }
         if kind == "scratch" {
