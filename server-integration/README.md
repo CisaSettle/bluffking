@@ -28,6 +28,42 @@ just the library.
   `session_registry`, `runtime_checkpoint`, `outbound`). Its one submodule under
   `sealed_dealer/` is published with it: `authorization.rs` (the game-process signature
   every internal game-server-to-dealer request must carry).
+- `zjh/` — the **Zha Jin Hua (炸金花) dealer** as deployed, published for the
+  same transparency reason as `sealed_dealer.rs`:
+  - `zjh/fairness.rs` — per-hand deal state: draws a fresh master seed, locks an
+    encrypted, verifiably shuffled standard deck (`mental-poker` `pf2_zjh`,
+    scheme `zjh-pf-shuffle-v2`; the game, hand id and frozen seat roster are
+    bound into the deck context) and publishes only its commitment before any
+    player seed exists; runs the two-round player-seed commit → reveal exchange
+    (seats that commit but do not reveal are recorded as `withheld_seats`);
+    derives the final card order from the commitment and the revealed seeds;
+    and after the hand builds the proof bundle (shuffle proof plus decryption
+    proofs only for cards that were already shown). The master seed is never
+    published.
+  - `zjh/hand.rs` + `zjh/rules.rs` — the pure hand state machine and hand
+    ranking. `Hand::new` gives the i-th dealt seat (ascending seat order, the
+    same roster bound into the commitment) cards `3i, 3i+1, 3i+2` of the final
+    deck order. For natural-deck rooms the closed room module converts each
+    `mental-poker` card id (rank-major, `id % 4` indexing ♠♥♦♣) to a ZJH card
+    with rank `id / 4 + 2` and the same physical suit, remapped to ZJH's
+    internal ♠♥♣♦ index (`[0, 1, 3, 2][id % 4]`); `fairness::bundle` checks every
+    opened card against the stored hand with `card_id::id_to_card`. 大小王
+    (joker) rooms use the `card_proof` `zjh-jokers` id space instead:
+    suit-major ♠♥♣♦ × 2..A, then 52 = small joker, 53 = big joker.
+  - `pf_dealing.rs` — the player-seed commitment/reveal bookkeeping
+    (`SeedInputs`, `client_seed_commitment`) shared with Hold'em's sealed dealer.
+  - `card_proofs.rs` — the generic `mental-poker` `card_proof` deck pool and
+    receipts used by 大小王 (joker) ZJH rooms and other card games.
+
+  Like the dealer above, the ZJH dealer is a single trusted dealer, **not**
+  mental poker: the server holds the deck while the hand runs, and the proofs
+  show that the committed standard deck was neither swapped nor re-ordered after
+  the commitment. These files are a source offer, not a build target: they
+  reference closed server modules (`rate_limit`, `db_writer`, `app_state`,
+  `auth`, `protocol`, `session_registry`, the generic card-room hub that creates
+  the pending deal, advances the exchange and takes the final deck order at deal
+  time, and the ZJH room/bot modules). `room_clock` is published in
+  [`draw-games/`](../draw-games).
 - `texas-h5-Cargo.lock` (U47) — the **deployed server binary's exact dependency
   resolution**, i.e. the §13 reproduce artifact. It pins every version — including
   the git-pinned `postflop-solver` commit — as actually built and deployed. Use

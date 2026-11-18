@@ -246,15 +246,19 @@ pub struct HandResult {
     /// `final_stacks` already include them; `chips_awarded` and `pots` stay
     /// pot-only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub seven_deuce: Vec<SevenDeuceBounty>,
+    pub seven_deuce: Vec<HandBounty>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub premium_hand: Vec<HandBounty>,
+    /// Automatic funding consumed immediately by room bounties. Physical final
+    /// stacks include it; economic net is final - starting - this funding.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub bounty_topups: HashMap<u64, u64>,
 }
 
-/// One 7-2 offsuit winner's bounty: after the flop was dealt, the winner of
-/// (a share of) the main pot collects the configured amount from every other
-/// dealt player, capped by what each payer has left after the pots.
+/// A room-rule bounty collected from other dealt players after pot settlement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SevenDeuceBounty {
-    /// The 7-2 offsuit winner who collects.
+pub struct HandBounty {
+    /// The qualifying winner who collects.
     pub winner: PlayerId,
     /// The winner's hole cards (published with the bounty).
     pub hole_cards: HoleCards,
@@ -451,6 +455,7 @@ pub struct GameHand {
     ante: Chips,
     /// Seven-deuce bounty per payer (zero = off). Plaintext hands only.
     seven_deuce_bounty: Chips,
+    premium_hand_bounty: Chips,
     /// Tournament dead money paid by the big blind, after reserving its live blind.
     big_blind_ante: Chips,
     posted_big_blind_ante: Option<(PlayerId, Chips)>,

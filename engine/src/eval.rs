@@ -161,6 +161,12 @@ impl HandRank {
 /// deliberately no release-time check on this hot path — the engine
 /// guarantees the invariant internally (the deck deals unique cards; the
 /// solver pre-validates), so external callers must do the same.
+/// Rank a complete five-card board without hole cards.
+pub fn rank_board(board: &BoardCards) -> HandRank {
+    assert_eq!(board.count(), 5);
+    rs_rank_to_hand_rank(board_eval(board).hand.rank())
+}
+
 pub fn rank_hand(hole: &HoleCards, board: &BoardCards) -> HandRank {
     rank_with_board(&board_eval(board), hole)
 }

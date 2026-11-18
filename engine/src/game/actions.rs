@@ -50,6 +50,7 @@ impl GameHand {
             bomb_pot: self.bomb_pot,
             ante: self.ante,
             seven_deuce_bounty: self.seven_deuce_bounty,
+            premium_hand_bounty: self.premium_hand_bounty,
             big_blind_ante: self.big_blind_ante,
             posted_big_blind_ante: self.posted_big_blind_ante,
             preflop_bring_in: self.preflop_bring_in,
