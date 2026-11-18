@@ -56,6 +56,8 @@ pub struct RecordEntry {
 
 #[derive(Debug, Serialize)]
 pub struct RecordsResponse {
+    /// Sum of recorded results across games, including room points; not wallet balance.
+    pub total_net: i64,
     pub summary: Vec<GameSummary>,
     pub entries: Vec<RecordEntry>,
     /// Pass back as `before`, `before_id`, `before_game` to fetch the next
@@ -295,8 +297,8 @@ pub async fn load_history_page_filtered(
         ") SELECT 0::smallint AS row_kind, t.game AS summary_order, t.game, \
          NULL::uuid AS record_id, NULL::uuid AS session_id, \
          t.last_played_at AS played_at, NULL::bigint AS delta, NULL::jsonb AS detail, \
-         t.played, t.net FROM (SELECT game, max(last_played_at) AS last_played_at, \
-         sum(played)::bigint AS played, CASE WHEN game IN (",
+         t.played, t.net, t.total_net FROM (SELECT game, max(last_played_at) AS last_played_at, \
+         sum(played)::bigint AS played, sum(sum(net)) OVER ()::bigint AS total_net, CASE WHEN game IN (",
     );
     // Card-game points stay in their room, so those games have no account net.
     query.push(card_codes());
@@ -325,13 +327,17 @@ pub async fn load_history_page_filtered(
         query.push("NULL::jsonb");
     }
     query.push(
-        ", NULL::bigint, NULL::bigint FROM page \
+        ", NULL::bigint, NULL::bigint, NULL::bigint FROM page \
          ORDER BY row_kind, summary_order, played_at DESC, record_id DESC, game DESC",
     );
     // The page and its detail statement are sequential: one pooled connection
     // serves both instead of an acquire (and idle-connection ping) each.
     let mut conn = pool.acquire().await?;
     let rows = query.build().fetch_all(&mut *conn).await?;
+    let total_net = rows
+        .iter()
+        .find(|r| r.get::<i16, _>("row_kind") == 0)
+        .map_or(0, |r| r.get("total_net"));
     let summary = rows
         .iter()
         .filter(|r| r.get::<i16, _>("row_kind") == 0)
@@ -389,6 +395,7 @@ pub async fn load_history_page_filtered(
         None
     };
     Ok(RecordsResponse {
+        total_net,
         summary,
         entries,
         next_cursor,

@@ -72,6 +72,7 @@ impl GameHand {
             bomb_pot: None,
             ante: Chips::ZERO,
             seven_deuce_bounty: Chips::ZERO,
+            premium_hand_bounty: Chips::ZERO,
             big_blind_ante: Chips::ZERO,
             posted_big_blind_ante: None,
             preflop_bring_in: big_blind,
@@ -147,6 +148,7 @@ impl GameHand {
             bomb_pot: None,
             ante: Chips::ZERO,
             seven_deuce_bounty: Chips::ZERO,
+            premium_hand_bounty: Chips::ZERO,
             big_blind_ante: Chips::ZERO,
             posted_big_blind_ante: None,
             preflop_bring_in: big_blind,
@@ -201,10 +203,15 @@ impl GameHand {
 
     /// Enable the seven-deuce bounty for this hand: once the flop is dealt, a
     /// 7-2 offsuit winner of the main pot collects `amount` from every other
-    /// dealt player (capped by their remaining stack). Zero disables it.
+    /// dealt player (shortfalls are automatically funded). Zero disables it.
     /// Plaintext hands only; blind-mode hands ignore it.
     pub fn with_seven_deuce_bounty(mut self, amount: Chips) -> Self {
         self.seven_deuce_bounty = amount;
+        self
+    }
+
+    pub fn with_premium_hand_bounty(mut self, amount: Chips) -> Self {
+        self.premium_hand_bounty = amount;
         self
     }
 

@@ -44,6 +44,23 @@ fn writers() -> &'static Mutex<Vec<Weak<DrainState>>> {
     WRITERS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+/// Point-in-time accepted writes not yet durable, for the existing local load
+/// observer. This does not change admission, queue limits or completion order.
+pub(crate) fn pending_writes() -> u64 {
+    writers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter_map(Weak::upgrade)
+        .map(|state| {
+            state
+                .queued
+                .load(Ordering::Acquire)
+                .saturating_sub(state.completed.load(Ordering::Acquire))
+        })
+        .sum()
+}
+
 /// Called after HTTP/WS connections drain. Flush every snapshot already accepted
 /// before shutdown, including workers whose actor has just dropped its sender.
 pub async fn drain_all(timeout: Duration) -> bool {

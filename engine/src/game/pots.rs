@@ -615,6 +615,8 @@ impl GameHand {
             folded_hole_cards,
             run_twice: None,
             seven_deuce: Vec::new(),
+            premium_hand: Vec::new(),
+            bounty_topups: HashMap::new(),
         }
     }
 
@@ -623,9 +625,9 @@ impl GameHand {
     /// `folded_hole_cards`, which the sealed dealer fills after settlement).
     ///
     /// Requires the flop to have been dealt and a 7-2 offsuit holder among the
-    /// main pot's winners. Each such winner collects up to the configured
-    /// amount from every other dealt player's settled stack. Chips only move
-    /// between `final_stacks`, so the hand stays chip-conserving; `pots` and
+    /// main pot's winners. Each such winner collects the full configured
+    /// amount from every other dealt player. Shortages are explicit automatic
+    /// funding in `bounty_topups`: economic net remains zero-sum; `pots` and
     /// `chips_awarded` stay pot-only. The queued `HandFinished` event is
     /// updated to the same result. Idempotent: a result that already carries
     /// bounties is left unchanged. `exempt` players pay nothing (the server
@@ -672,6 +674,148 @@ impl GameHand {
         if winners.is_empty() {
             return;
         }
+        let bounties = self.collect_bounties(result, amount, winners, exempt);
+        result.seven_deuce = bounties;
+        for event in self.events.iter_mut().rev() {
+            if let EngineEvent::HandFinished { result: queued } = event {
+                queued.final_stacks = result.final_stacks.clone();
+                queued.seven_deuce = result.seven_deuce.clone();
+                queued.bounty_topups = result.bounty_topups.clone();
+                break;
+            }
+        }
+    }
+
+    /// Pay a rare-hand main-pot winner once per hand. Shared-board hands and
+    /// split main pots do not qualify. Either run can qualify when running twice.
+    pub fn apply_premium_hand_bounty(
+        &mut self,
+        result: &mut HandResult,
+        exempt: &HashSet<PlayerId>,
+    ) {
+        let amount = self.premium_hand_bounty.0;
+        if amount == 0 || !result.premium_hand.is_empty() {
+            return;
+        }
+        let qualifies = |board: &BoardCards, pots: &[PotResult], entries: &[ShowdownEntry]| {
+            let main = pots
+                .iter()
+                .filter(|p| !p.is_refund)
+                .min_by_key(|p| p.index)?;
+            if main.winners.len() != 1 {
+                return None;
+            }
+            let winner = &main.winners[0];
+            if winner.amount_won.0 == 0 {
+                return None;
+            }
+            if board.count() < 3 {
+                return None;
+            }
+            let hole_cards = entries
+                .iter()
+                .find(|e| e.player_id == winner.player_id)
+                .map(|e| e.hole_cards)
+                .or_else(|| {
+                    result
+                        .folded_hole_cards
+                        .get(&winner.player_id.inner())
+                        .copied()
+                })?;
+            let rank = crate::eval::rank_hand(&hole_cards, board);
+            if !matches!(rank, HandRank::StraightFlush(_) | HandRank::FourOfAKind(_)) {
+                return None;
+            }
+            // Board quads never qualify, including a turn fold-around.
+            if matches!(rank, HandRank::FourOfAKind(_)) {
+                let cards = board.all_cards();
+                if cards
+                    .iter()
+                    .any(|c| cards.iter().filter(|other| other.rank == c.rank).count() == 4)
+                {
+                    return None;
+                }
+            }
+            // At least one hole card must improve the five-card board.
+            if board.count() == 5 {
+                let board_rank = crate::eval::rank_board(board);
+                if board_rank == rank || matches!(board_rank, HandRank::FourOfAKind(_)) {
+                    return None;
+                }
+            }
+            Some((winner.player_id, hole_cards))
+        };
+        let mut winners = Vec::new();
+        if let Some(runs) = &result.run_twice {
+            for winner in [
+                qualifies(&result.board, &runs.first_pots, &result.showdown),
+                qualifies(&runs.second_board, &runs.second_pots, &runs.second_showdown),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if !winners.iter().any(|(pid, _)| *pid == winner.0) {
+                    winners.push(winner);
+                }
+            }
+        } else if let Some(winner) = qualifies(&result.board, &result.pots, &result.showdown) {
+            winners.push(winner);
+        }
+        result.premium_hand = self.collect_premium_bounties(result, amount, winners, exempt);
+        for event in self.events.iter_mut().rev() {
+            if let EngineEvent::HandFinished { result: queued } = event {
+                queued.final_stacks = result.final_stacks.clone();
+                queued.premium_hand = result.premium_hand.clone();
+                queued.bounty_topups = result.bounty_topups.clone();
+                break;
+            }
+        }
+    }
+
+    /// Qualifying winners do not pay each other. Each other player pays
+    /// every qualifying winner in full, with automatic funding if necessary.
+    fn collect_premium_bounties(
+        &self,
+        result: &mut HandResult,
+        amount: u32,
+        mut winners: Vec<(PlayerId, HoleCards)>,
+        exempt: &HashSet<PlayerId>,
+    ) -> Vec<HandBounty> {
+        if winners.is_empty() {
+            return Vec::new();
+        }
+        winners.sort_by_key(|(pid, _)| self.seats.iter().position(|s| s.player_id == *pid));
+        let mut bounties: Vec<_> = winners
+            .iter()
+            .map(|(winner, hole_cards)| HandBounty {
+                winner: *winner,
+                hole_cards: *hole_cards,
+                amount: Chips(amount),
+                payments: Vec::new(),
+            })
+            .collect();
+        for seat in &self.seats {
+            let payer = seat.player_id;
+            if exempt.contains(&payer) || winners.iter().any(|(pid, _)| *pid == payer) {
+                continue;
+            }
+            for bounty in &mut bounties {
+                if let Some(payment) = Self::pay_bounty(result, payer, bounty.winner, amount) {
+                    bounty.payments.push(payment);
+                }
+            }
+        }
+        bounties
+    }
+
+    fn collect_bounties(
+        &self,
+        result: &mut HandResult,
+        amount: u32,
+        winners: Vec<(PlayerId, HoleCards)>,
+        exempt: &HashSet<PlayerId>,
+    ) -> Vec<HandBounty> {
+        let mut bounties = Vec::new();
         for (winner, hole_cards) in winners {
             let mut payments = Vec::new();
             for seat in &self.seats {
@@ -679,45 +823,56 @@ impl GameHand {
                 if payer == winner || exempt.contains(&payer) {
                     continue;
                 }
-                let payer_stack = result
-                    .final_stacks
-                    .get(&payer.inner())
-                    .copied()
-                    .unwrap_or(0);
-                let winner_stack = result
-                    .final_stacks
-                    .get(&winner.inner())
-                    .copied()
-                    .unwrap_or(0);
-                let paid = amount.min(payer_stack).min(u32::MAX - winner_stack);
-                if paid == 0 {
-                    continue;
+                if let Some(payment) = Self::pay_bounty(result, payer, winner, amount) {
+                    payments.push(payment);
                 }
-                result
-                    .final_stacks
-                    .insert(payer.inner(), payer_stack - paid);
-                result
-                    .final_stacks
-                    .insert(winner.inner(), winner_stack + paid);
-                payments.push(PotWinner {
-                    player_id: payer,
-                    amount_won: Chips(paid),
-                });
             }
-            result.seven_deuce.push(SevenDeuceBounty {
+            bounties.push(HandBounty {
                 winner,
                 hole_cards,
                 amount: Chips(amount),
                 payments,
             });
         }
-        for event in self.events.iter_mut().rev() {
-            if let EngineEvent::HandFinished { result: queued } = event {
-                queued.final_stacks = result.final_stacks.clone();
-                queued.seven_deuce = result.seven_deuce.clone();
-                break;
-            }
+        bounties
+    }
+
+    /// Shared full payment for 27 and premium-hand bounties; shortages are
+    /// explicit automatic funding, never forgiven or silently minted.
+    fn pay_bounty(
+        result: &mut HandResult,
+        payer: PlayerId,
+        winner: PlayerId,
+        amount: u32,
+    ) -> Option<PotWinner> {
+        let payer_stack = result
+            .final_stacks
+            .get(&payer.inner())
+            .copied()
+            .unwrap_or(0);
+        let winner_stack = result
+            .final_stacks
+            .get(&winner.inner())
+            .copied()
+            .unwrap_or(0);
+        if amount == 0 {
+            return None;
         }
+        let topup = amount.saturating_sub(payer_stack);
+        let winner_stack = winner_stack
+            .checked_add(amount)
+            .expect("bounty winner stack overflow");
+        if topup > 0 {
+            *result.bounty_topups.entry(payer.inner()).or_default() += u64::from(topup);
+        }
+        result
+            .final_stacks
+            .insert(payer.inner(), payer_stack.saturating_sub(amount));
+        result.final_stacks.insert(winner.inner(), winner_stack);
+        Some(PotWinner {
+            player_id: payer,
+            amount_won: Chips(amount),
+        })
     }
 
     /// Compute the WSOP / TDA canonical show-order for the current showdown.
@@ -1361,4 +1516,299 @@ fn is_seven_deuce_offsuit(cards: &HoleCards) -> bool {
     let ranks = (cards.card1.rank, cards.card2.rank);
     let seven_deuce = matches!(ranks, (Rank::Seven, Rank::Two) | (Rank::Two, Rank::Seven));
     seven_deuce && cards.card1.suit != cards.card2.suit
+}
+
+#[cfg(test)]
+mod premium_bounty_tests {
+    use super::*;
+    fn card(value: &str) -> Card {
+        {
+            use crate::card::{Rank, Suit};
+            let rank = match value.as_bytes()[0] {
+                b'A' => Rank::Ace,
+                b'K' => Rank::King,
+                b'Q' => Rank::Queen,
+                b'J' => Rank::Jack,
+                b'T' => Rank::Ten,
+                b'2' => Rank::Two,
+                b'3' => Rank::Three,
+                b'4' => Rank::Four,
+                b'7' => Rank::Seven,
+                _ => panic!("test rank"),
+            };
+            let suit = match value.as_bytes()[1] {
+                b's' => Suit::Spades,
+                b'h' => Suit::Hearts,
+                b'd' => Suit::Diamonds,
+                b'c' => Suit::Clubs,
+                _ => panic!("test suit"),
+            };
+            Card::new(rank, suit)
+        }
+    }
+    fn fixture(hole: [&str; 2], board: [&str; 5]) -> (GameHand, HandResult) {
+        let players = (1..=4)
+            .map(|p| (PlayerId(p), Chips(100), p as u8))
+            .collect();
+        let mut hand = GameHand::new_with_rng(
+            players,
+            0,
+            Chips(2),
+            Chips(1),
+            PokerRng::from_seed_bytes([1; 32]),
+        )
+        .with_premium_hand_bounty(Chips(20));
+        let holes = HoleCards::new(card(hole[0]), card(hole[1]));
+        let board = BoardCards {
+            flop: Some([card(board[0]), card(board[1]), card(board[2])]),
+            turn: Some(card(board[3])),
+            river: Some(card(board[4])),
+        };
+        let result = HandResult {
+            deck_seed: [1; 32],
+            board: board.clone(),
+            pots: vec![PotResult {
+                index: 0,
+                amount: Chips(40),
+                eligible_player_ids: vec![PlayerId(1), PlayerId(2)],
+                winners: vec![PotWinner {
+                    player_id: PlayerId(1),
+                    amount_won: Chips(40),
+                }],
+                is_refund: false,
+            }],
+            chips_awarded: HashMap::from([(1, 40)]),
+            final_stacks: HashMap::from([(1, 140), (2, 7), (3, 100), (4, 100)]),
+            actions: vec![],
+            showdown: vec![ShowdownEntry {
+                player_id: PlayerId(1),
+                hole_cards: holes,
+                rank: crate::eval::rank_hand(&holes, &board),
+                rank_name: "test".into(),
+            }],
+            show_order: vec![PlayerId(1)],
+            folded_hole_cards: HashMap::new(),
+            run_twice: None,
+            seven_deuce: vec![],
+            premium_hand: vec![],
+            bounty_topups: HashMap::new(),
+        };
+        hand.events.push(EngineEvent::HandFinished {
+            result: result.clone(),
+        });
+        (hand, result)
+    }
+    #[test]
+    fn bounty_shared_transfer_matches_27_and_quads() {
+        for premium in [false, true] {
+            let (hole, board) = if premium {
+                (["Ah", "Ad"], ["As", "Ac", "2s", "3d", "4c"])
+            } else {
+                (["7s", "2h"], ["As", "Kd", "Qs", "Jd", "3c"])
+            };
+            let (mut hand, mut result) = fixture(hole, board);
+            hand.seven_deuce_bounty = Chips(20);
+            let exempt = HashSet::from([PlayerId(4)]);
+            for _ in 0..2 {
+                if premium {
+                    hand.apply_premium_hand_bounty(&mut result, &exempt);
+                } else {
+                    hand.apply_seven_deuce_bounty(&mut result, &exempt);
+                }
+                assert_eq!(
+                    result.final_stacks,
+                    HashMap::from([(1, 180), (2, 0), (3, 80), (4, 100)])
+                );
+                assert_eq!(
+                    result.final_stacks.values().sum::<u32>(),
+                    347 + result.bounty_topups.values().sum::<u64>() as u32
+                );
+                assert_eq!(result.chips_awarded[&1], 40);
+            }
+            let bounties = if premium {
+                &result.premium_hand
+            } else {
+                &result.seven_deuce
+            };
+            assert_eq!(bounties.len(), 1);
+            assert_eq!(bounties[0].payments.len(), 2);
+            assert_eq!(
+                bounties[0]
+                    .payments
+                    .iter()
+                    .map(|p| p.amount_won.0)
+                    .sum::<u32>(),
+                40
+            );
+        }
+    }
+    #[test]
+    fn bounty_all_in_payers_still_pay_full_10bb() {
+        for premium in [false, true] {
+            let (hole, board) = if premium {
+                (["Ah", "Ad"], ["As", "Ac", "2s", "3d", "4c"])
+            } else {
+                (["7s", "2h"], ["As", "Kd", "Qs", "Jd", "3c"])
+            };
+            let (mut hand, mut result) = fixture(hole, board);
+            result.final_stacks = HashMap::from([(1, 140), (2, 0), (3, 0), (4, 0)]);
+            hand.seven_deuce_bounty = Chips(20);
+            if premium {
+                hand.apply_premium_hand_bounty(&mut result, &HashSet::new());
+            } else {
+                hand.apply_seven_deuce_bounty(&mut result, &HashSet::new());
+            }
+            assert_eq!(result.final_stacks[&1], 200);
+            assert_eq!(
+                result.bounty_topups,
+                HashMap::from([(2, 20), (3, 20), (4, 20)])
+            );
+            // Real P&L is zero-sum even though table chips grew by auto funding.
+            assert_eq!(
+                result
+                    .final_stacks
+                    .values()
+                    .map(|v| i64::from(*v))
+                    .sum::<i64>()
+                    - 140
+                    - result.bounty_topups.values().sum::<u64>() as i64,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn bounty_27_trigger_and_fold_around_remain_unchanged() {
+        let (mut hand, mut result) = fixture(["7s", "2h"], ["As", "Kd", "Qs", "Jd", "3c"]);
+        hand.seven_deuce_bounty = Chips(20);
+        // No flop, no 27 payment.
+        let board = result.board.clone();
+        result.board = BoardCards::empty();
+        hand.apply_seven_deuce_bounty(&mut result, &HashSet::new());
+        assert!(result.seven_deuce.is_empty());
+        // Fold-around: released winner cards still collect after a flop.
+        result.board = board;
+        let hole = result.showdown.remove(0).hole_cards;
+        result.folded_hole_cards.insert(1, hole);
+        hand.apply_seven_deuce_bounty(&mut result, &HashSet::new());
+        assert_eq!(result.seven_deuce.len(), 1);
+        assert_eq!(result.final_stacks[&1], 200);
+    }
+
+    #[test]
+    fn premium_bounty_full_funding_conserves_exempts_and_is_idempotent() {
+        for (hole, board) in [
+            (["As", "Ks"], ["Qs", "Js", "Ts", "2d", "3c"]),
+            (["Ah", "Ad"], ["As", "Ac", "2s", "3d", "4c"]),
+        ] {
+            let (mut hand, mut result) = fixture(hole, board);
+            let before: u32 = result.final_stacks.values().sum();
+            hand.apply_premium_hand_bounty(&mut result, &HashSet::from([PlayerId(4)]));
+            assert_eq!(result.premium_hand.len(), 1);
+            assert_eq!(
+                result.final_stacks,
+                HashMap::from([(1, 180), (2, 0), (3, 80), (4, 100)])
+            );
+            assert_eq!(
+                before + result.bounty_topups.values().sum::<u64>() as u32,
+                result.final_stacks.values().sum::<u32>()
+            );
+            assert_eq!(result.chips_awarded[&1], 40);
+            hand.apply_premium_hand_bounty(&mut result, &HashSet::new());
+            assert_eq!(result.final_stacks[&1], 180);
+            if let EngineEvent::HandFinished { result: queued } = &hand.events[0] {
+                assert_eq!(queued.final_stacks, result.final_stacks);
+            }
+        }
+    }
+    #[test]
+    fn premium_bounty_rejects_board_quads_even_with_better_hole_kicker() {
+        let (mut hand, mut result) = fixture(["As", "Kd"], ["2s", "2h", "2d", "2c", "3c"]);
+        hand.apply_premium_hand_bounty(&mut result, &HashSet::new());
+        assert!(result.premium_hand.is_empty());
+        result.board.river = None;
+        hand.apply_premium_hand_bounty(&mut result, &HashSet::new());
+        assert!(result.premium_hand.is_empty());
+    }
+    #[test]
+    fn premium_bounty_rejects_shared_straight_flush_split_and_disabled() {
+        for (hole, board) in [
+            (["2h", "3d"], ["As", "Ks", "Qs", "Js", "Ts"]),
+            (["As", "Ks"], ["Qs", "Js", "Ts", "2d", "3c"]),
+        ] {
+            let (mut hand, mut result) = fixture(hole, board);
+            result.pots[0].winners.push(PotWinner {
+                player_id: PlayerId(2),
+                amount_won: Chips(20),
+            });
+            hand.apply_premium_hand_bounty(&mut result, &HashSet::new());
+            assert!(result.premium_hand.is_empty());
+            result.pots[0].winners.pop();
+            hand.premium_hand_bounty = Chips::ZERO;
+            hand.apply_premium_hand_bounty(&mut result, &HashSet::new());
+            assert!(result.premium_hand.is_empty());
+        }
+    }
+    #[test]
+    fn premium_bounty_fold_around_uses_released_deck_cards() {
+        let (mut hand, mut result) = fixture(["Ah", "Ad"], ["As", "Ac", "2s", "3d", "4c"]);
+        let hole = result.showdown.remove(0).hole_cards;
+        result.folded_hole_cards.insert(1, hole);
+        hand.apply_premium_hand_bounty(&mut result, &HashSet::new());
+        assert_eq!(result.premium_hand.len(), 1);
+        assert_eq!(result.final_stacks[&1], 200);
+    }
+
+    #[test]
+    fn premium_bounty_two_run_winners_never_pay_each_other() {
+        let (mut hand, mut result) = fixture(["As", "Ks"], ["Qs", "Js", "Ts", "2d", "3c"]);
+        let other_hole = HoleCards::new(card("Ah"), card("Kh"));
+        let other_board = BoardCards {
+            flop: Some([card("Qh"), card("Jh"), card("Th")]),
+            turn: Some(card("2d")),
+            river: Some(card("3c")),
+        };
+        let mut second_pots = result.pots.clone();
+        second_pots[0].winners[0].player_id = PlayerId(2);
+        result.run_twice = Some(RunTwiceResult {
+            from_street: Street::Preflop,
+            second_board: other_board.clone(),
+            first_pots: result.pots.clone(),
+            second_pots,
+            second_showdown: vec![ShowdownEntry {
+                player_id: PlayerId(2),
+                hole_cards: other_hole,
+                rank: crate::eval::rank_hand(&other_hole, &other_board),
+                rank_name: "straight_flush".into(),
+            }],
+        });
+        result.final_stacks = HashMap::from([(1, 3), (2, 3), (3, 7), (4, 100)]);
+        hand.apply_premium_hand_bounty(&mut result, &HashSet::new());
+        assert_eq!(result.premium_hand.len(), 2);
+        assert_eq!(
+            result.final_stacks,
+            HashMap::from([(1, 43), (2, 43), (3, 0), (4, 60)])
+        );
+        assert!(result.premium_hand.iter().all(|b| b
+            .payments
+            .iter()
+            .all(|p| p.player_id != PlayerId(1) && p.player_id != PlayerId(2))));
+    }
+
+    #[test]
+    fn premium_bounty_second_run_qualifies_once() {
+        let (mut hand, mut result) = fixture(["As", "Ks"], ["Qs", "Js", "Ts", "2d", "3c"]);
+        result.run_twice = Some(RunTwiceResult {
+            from_street: Street::Preflop,
+            second_board: result.board.clone(),
+            first_pots: result.pots.clone(),
+            second_pots: result.pots.clone(),
+            second_showdown: result.showdown.clone(),
+        });
+        // First run is only a pair; the second run still qualifies.
+        result.board.flop = Some([card("Ah"), card("2h"), card("3h")]);
+        hand.apply_premium_hand_bounty(&mut result, &HashSet::new());
+        assert_eq!(result.premium_hand.len(), 1);
+        assert_eq!(result.final_stacks[&1], 200);
+    }
 }

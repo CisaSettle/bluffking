@@ -6,7 +6,6 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use tokio::sync::mpsc;
 #[derive(Deserialize)]
 pub struct Parameters {
     game: String,
@@ -85,7 +84,7 @@ pub async fn handler(
         user.user_id,
         q.client_source.as_deref(),
     );
-    ws.max_message_size(65536).on_upgrade(move|socket|async move{let _guard=guard;let pool=app.pool;let owner=user.user_id;let attach_pool=pool.clone();let outbound:Arc<Mutex<Option<mpsc::Sender<String>>>>=Arc::new(Mutex::new(None));let attach_out=outbound.clone();
+    ws.max_message_size(65536).on_upgrade(move|socket|async move{let _guard=guard;let pool=app.pool;let owner=user.user_id;let attach_pool=pool.clone();let outbound:Arc<Mutex<Option<crate::game_socket::Sender>>>=Arc::new(Mutex::new(None));let attach_out=outbound.clone();
  crate::game_socket::serve::<Client,_,_,_>(socket,auth,16,move|out|async move{
   let state=state(&attach_pool);let mut notices=state.changed.subscribe();let wallet_changed=beans_read_memory::changed(&attach_pool);out.send(frame(&attach_pool,owner,game).await.unwrap_or_else(|error| error)).await.map_err(|_|"closed".to_string())?;*attach_out.lock().unwrap_or_else(|e|e.into_inner())=Some(out.clone());
   let publisher=attach_out.clone();

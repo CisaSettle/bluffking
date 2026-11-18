@@ -83,6 +83,7 @@ pub fn public_rule_config() -> serde_json::Map<String, serde_json::Value> {
     rules.insert("squid_funding".into(), "stack".into());
     rules.insert("bomb_pot_bb".into(), BOMB_POT_BB.into());
     rules.insert("seven_deuce_bb".into(), SEVEN_DEUCE_BB.into());
+    rules.insert("premium_hand_bonus".into(), true.into());
     rules.insert(
         "bomb_pot_interval_minutes".into(),
         serde_json::json!(BOMB_POT_INTERVAL_MINUTES),
@@ -104,6 +105,9 @@ pub(crate) fn reentry_chips(
     };
     let saved: crate::runtime_checkpoint::StandingChips =
         serde_json::from_value(value.clone()).map_err(|_| "room_unavailable")?;
+    if saved.pending_squid_round.is_some() {
+        return Err("chips_settling");
+    }
     if saved
         .stack
         .checked_add(saved.pending_chips)
@@ -180,6 +184,7 @@ pub(crate) fn reentry_stack(
         // Owner 2026-11-13: nobody sits back down with 0 chips. A busted
         // departure returns only with a fresh buy-in, like a new seat.
         return Some(crate::runtime_checkpoint::StandingChips {
+            pending_squid_round: None,
             stack: fresh,
             buyin_total: fresh,
             pending_chips: 0,
@@ -193,6 +198,7 @@ pub(crate) fn reentry_stack(
         return Some(saved);
     }
     Some(crate::runtime_checkpoint::StandingChips {
+        pending_squid_round: None,
         stack: available,
         buyin_total: available,
         pending_chips: 0,
@@ -303,6 +309,7 @@ pub struct Profile {
     pub squid_penalty: u32,
     /// 7-2 bounty per other dealt player, in beans.
     pub seven_deuce: u32,
+    pub premium_hand: u32,
     /// Per-seat Bomb Pot contribution in beans (0 = no Bomb Pot).
     pub bomb_pot: u32,
     pub daily_refill_to: i64,
@@ -332,6 +339,7 @@ pub async fn profile(pool: &PgPool, user: Uuid) -> sqlx::Result<Profile> {
         ante: ANTE,
         squid_penalty: BB * u32::from(SQUID_PENALTY_BB),
         seven_deuce: BB * u32::from(SEVEN_DEUCE_BB),
+        premium_hand: BB * 10,
         bomb_pot: BB * BOMB_POT_BB as u32,
         daily_refill_to: DAILY_REFILL_TO,
         initial_grant: crate::auth::registration_reward::BEANS,

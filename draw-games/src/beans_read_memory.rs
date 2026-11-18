@@ -28,11 +28,11 @@ pub(crate) use pending_effects::{
     accept_effect, daily_claimed, effect_abandoned, effect_committed, lottery_read_balance,
     settlement_balance, PendingEffect,
 };
-pub(crate) use reservations::release_poker_session;
 pub use reservations::{
     available, dealer_accepted, dealer_committed, note_squid_unbacked, poker_checkpoint_durable,
     reserve_poker_stack, reserve_poker_top_up, squid_departure_unbacked, sync_poker_checkpoint,
 };
+pub(crate) use reservations::{recovery_settled, release_poker_session};
 
 const PAGE: i64 = 500;
 const MAX_USERS: usize = 1_000_000;
@@ -456,7 +456,7 @@ pub(crate) fn accept_poker_effects_with<T>(
 ) -> sqlx::Result<T> {
     let state = state(pool);
     let mut inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
-    if !inner.ready || players.is_empty() || players.len() > 10 {
+    if !inner.ready || players.is_empty() || players.len() > MAX_USERS {
         return Err(unavailable());
     }
     if let Some(existing) = inner.poker.get(&record) {

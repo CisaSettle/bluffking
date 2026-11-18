@@ -296,7 +296,7 @@ struct Room<R: DealerRoom> {
     /// Removed from the registry; a stale handle must not seat anyone.
     closed: bool,
     /// Live state sockets: `(connection id, player, outgoing frames)`.
-    subscribers: Vec<(u64, Uuid, tokio::sync::mpsc::Sender<String>)>,
+    subscribers: Vec<(u64, Uuid, crate::game_socket::Sender)>,
     /// Read-only sockets of friends watching: never members, never counted as
     /// subscribers, so they deal no round and hold nothing open.
     spectators: Spectators,
@@ -458,6 +458,7 @@ fn shared_snapshot<R: DealerRoom>(snapshot: &Snapshot<R>) -> crate::game_checkpo
     crate::game_checkpoint::Snapshot {
         revision: snapshot.revision,
         state: Arc::new(checkpoint_value::<R>(&snapshot.state, &snapshot.names)),
+        frozen_fields: None,
         members: snapshot.users.clone(),
         memberships: snapshot.memberships.clone(),
         settlement: snapshot.round.clone().and_then(R::checkpoint_settlement),
@@ -1798,7 +1799,7 @@ async fn subscribe<R: DealerRoom>(
     code: &str,
     uid: Uuid,
     id: u64,
-    out: tokio::sync::mpsc::Sender<String>,
+    out: crate::game_socket::Sender,
 ) -> std::result::Result<(), String> {
     let refused = || json!({"t":"error","code":"room_not_found"}).to_string();
     let shared = R::registry().room(code).ok_or_else(refused)?;
@@ -1833,7 +1834,7 @@ async fn watch<R: DealerRoom>(
     code: &str,
     uid: Uuid,
     id: u64,
-    out: tokio::sync::mpsc::Sender<String>,
+    out: crate::game_socket::Sender,
 ) -> std::result::Result<(), String> {
     let refused = |code: RoomError| json!({"t":"error","code":code}).to_string();
     let shared = R::registry()

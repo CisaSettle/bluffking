@@ -573,11 +573,10 @@ pub fn available(
     available_locked(pool, &inner, user, balance, sql_balance, excluding_dealer)
 }
 
-pub(super) fn available_locked(
+fn checked_reserved(
     pool: &PgPool,
     inner: &Inner,
     user: Uuid,
-    balance: i64,
     sql_balance: bool,
     excluding_dealer: Option<(&str, &str)>,
 ) -> sqlx::Result<i64> {
@@ -599,13 +598,35 @@ pub(super) fn available_locked(
     {
         return Err(unavailable());
     }
+    reserved(inner, &directory, user, sql_balance, None, excluding_dealer)
+}
+
+/// Recovery can keep a busted seat, but never a stack, bet or unsettled hold.
+pub(crate) fn recovery_settled(pool: &PgPool, user: Uuid) -> sqlx::Result<bool> {
+    if crate::beans::holds::outstanding(user)
+        || crate::local_runtime::beans_held(user).map_err(sqlx::Error::Io)?
+    {
+        return Ok(false);
+    }
+    let state = state(pool);
+    let inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
+    Ok(checked_reserved(pool, &inner, user, true, None)? == 0)
+}
+
+pub(super) fn available_locked(
+    pool: &PgPool,
+    inner: &Inner,
+    user: Uuid,
+    balance: i64,
+    sql_balance: bool,
+    excluding_dealer: Option<(&str, &str)>,
+) -> sqlx::Result<i64> {
     Ok(balance
-        .saturating_sub(reserved(
+        .saturating_sub(checked_reserved(
+            pool,
             inner,
-            &directory,
             user,
             sql_balance,
-            None,
             excluding_dealer,
         )?)
         .max(0))

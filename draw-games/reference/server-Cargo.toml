@@ -50,8 +50,8 @@ tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.5", features = ["fs", "set-header"] }
 
 # Serialization
-serde = { workspace = true }
-serde_json = { workspace = true }
+serde = { workspace = true, features = ["rc"] }
+serde_json = { workspace = true, features = ["raw_value"] }
 prost = "0.14.4"
 flate2 = "1"
 
@@ -148,7 +148,7 @@ dashmap = "5"
 # deploy/docker-compose.prod.yml (NOT auto-wired in code — without that env
 # jemalloc runs stock defaults). See ADR-052.
 tikv-jemallocator = "0.6"
-image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
 async-stream = "0.3.6"
 
 [build-dependencies]
