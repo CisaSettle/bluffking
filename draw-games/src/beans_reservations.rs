@@ -127,6 +127,11 @@ impl Reservations {
             }
         }
     }
+    fn raise_squid_unbacked(&mut self, user: Uuid, amount: i64) {
+        if amount > self.squid_unbacked(user) {
+            self.squid_unbacked.insert(user, amount);
+        }
+    }
     pub(super) fn note_squid_unbacked(&mut self, user: Uuid, amount: i64) {
         if amount > 0 {
             let entry = self.squid_unbacked.entry(user).or_default();
@@ -774,4 +779,49 @@ pub fn note_squid_unbacked(pool: &PgPool, user: Uuid, amount: i64) {
     let state = state(pool);
     let mut inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
     inner.reservations.note_squid_unbacked(user, amount);
+}
+
+/// Earliest join time of `user`'s open gold-bean seats, if any.
+pub(crate) fn earliest_open_bean_seat(
+    pool: &PgPool,
+    user: Uuid,
+) -> sqlx::Result<Option<DateTime<Utc>>> {
+    let directory = crate::live_directory::memory_snapshot_for_user(pool, user)?;
+    Ok(directory
+        .memberships_for(user)
+        .filter(|(room, member)| {
+            is_beans(room) && room.ended_at.is_none() && member.left_at.is_none()
+        })
+        .map(|(_, member)| member.joined_at)
+        .min())
+}
+
+/// The squid tolerance is memory only, so a restart loses it while the
+/// over-reservation it explained is still seated. Restore at most
+/// `explained` (squid charges the ledger shows since the seat was taken),
+/// capped by the wallet's present deficit: never more than the previous
+/// process could have held. The usual ratchet shrinks it from there.
+/// `false` when the wallet or its reservations could not be read.
+pub(crate) fn restore_squid_unbacked(pool: &PgPool, user: Uuid, explained: i64) -> bool {
+    let state = state(pool);
+    let mut inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
+    if !inner.ready {
+        return false;
+    }
+    let Some(balance) = inner
+        .users
+        .get(&user)
+        .and_then(|entry| entry.wallet.as_ref())
+        .map(|wallet| wallet.balance)
+    else {
+        return false;
+    };
+    let Ok(reserved) = crate::live_directory::memory_snapshot_for_user(pool, user)
+        .and_then(|directory| reserved(&inner, &directory, user, false, None, None))
+    else {
+        return false;
+    };
+    let restored = explained.min(reserved.saturating_sub(balance));
+    inner.reservations.raise_squid_unbacked(user, restored);
+    true
 }

@@ -32,7 +32,9 @@ pub use reservations::{
     available, dealer_accepted, dealer_committed, note_squid_unbacked, poker_checkpoint_durable,
     reserve_poker_stack, reserve_poker_top_up, squid_departure_unbacked, sync_poker_checkpoint,
 };
-pub(crate) use reservations::{recovery_settled, release_poker_session};
+pub(crate) use reservations::{
+    earliest_open_bean_seat, recovery_settled, release_poker_session, restore_squid_unbacked,
+};
 
 const PAGE: i64 = 500;
 const MAX_USERS: usize = 1_000_000;
@@ -324,7 +326,13 @@ impl Drop for Mutation {
         state.wake.notify_one();
     }
 }
+/// A retryable 503 for bean handlers: this projection, or the live directory
+/// its reservation reads use, is not readable yet (startup hydration, a
+/// handoff, a fenced write).
 pub fn is_unavailable(error: &sqlx::Error) -> bool {
+    projection_unavailable(error) || crate::live_directory::is_unavailable(error)
+}
+fn projection_unavailable(error: &sqlx::Error) -> bool {
     matches!(error, sqlx::Error::Protocol(message) if message == "beans read memory unavailable")
 }
 fn unavailable() -> sqlx::Error {
@@ -347,7 +355,7 @@ async fn read_after_publication_in<T>(
     mut read: impl FnMut() -> sqlx::Result<T>,
 ) -> sqlx::Result<T> {
     match read() {
-        Err(error) if is_unavailable(&error) => {}
+        Err(error) if projection_unavailable(&error) => {}
         result => return result,
     }
     let state = { state(pool) };
@@ -368,7 +376,7 @@ async fn read_after_publication_in<T>(
         tokio::pin!(published);
         published.as_mut().enable();
         match read() {
-            Err(error) if is_unavailable(&error) => {}
+            Err(error) if projection_unavailable(&error) => {}
             result => return result,
         }
         state.wake.notify_one();

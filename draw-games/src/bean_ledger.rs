@@ -1261,7 +1261,33 @@ pub async fn reconcile(pool: &PgPool) -> sqlx::Result<Reconciliation> {
             })
         })
         .collect();
-    let over = crate::beans_read_memory::over_reserved(pool);
+    let mut over = crate::beans_read_memory::over_reserved(pool);
+    // The first evaluated pass after a start restores the squid tolerance the
+    // previous process held only in memory (a release handoff loses it while
+    // the charged player is still seated), then checks again. Best effort: a
+    // failure only logs, and the next pass tries again.
+    static SQUID_TOLERANCE_RESTORED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    if !SQUID_TOLERANCE_RESTORED.load(std::sync::atomic::Ordering::Relaxed)
+        && crate::beans_read_memory::ready(pool)
+        && crate::live_directory::memory_snapshot(pool).is_ok()
+    {
+        let restored = if over.is_empty() {
+            true
+        } else {
+            match restore_squid_tolerance(pool, &over).await {
+                Ok(complete) => complete,
+                Err(error) => {
+                    tracing::warn!(%error, "bean_ledger_squid_tolerance_unread");
+                    false
+                }
+            }
+        };
+        if restored {
+            SQUID_TOLERANCE_RESTORED.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        over = crate::beans_read_memory::over_reserved(pool);
+    }
     Ok(Reconciliation {
         checked_at: Some(chrono::Utc::now()),
         elapsed_ms: started.elapsed().as_millis() as u64,
@@ -1277,6 +1303,53 @@ pub async fn reconcile(pool: &PgPool) -> sqlx::Result<Reconciliation> {
         over_reserved_examples: over.into_iter().take(RECONCILE_EXAMPLES as usize).collect(),
         error: None,
     })
+}
+
+/// Squid charges (a squid round's debit, or a hand row's negative
+/// `squid_delta`) posted to each over-reserved wallet since its open
+/// gold-bean seat was taken; bounded to the few flagged accounts. `false`
+/// when some account could not be evaluated (memory not readable).
+async fn restore_squid_tolerance(pool: &PgPool, users: &[Uuid]) -> sqlx::Result<bool> {
+    let mut complete = true;
+    let mut seated: Vec<(Uuid, chrono::DateTime<chrono::Utc>)> = Vec::new();
+    for user in users {
+        match crate::beans_read_memory::earliest_open_bean_seat(pool, *user) {
+            Ok(Some(at)) => seated.push((*user, at)),
+            Ok(None) => {}
+            Err(_) => complete = false,
+        }
+    }
+    if seated.is_empty() {
+        return Ok(complete);
+    }
+    let (ids, since): (Vec<Uuid>, Vec<chrono::DateTime<chrono::Utc>>) = seated.into_iter().unzip();
+    let mut tx = pool.begin_read().await?;
+    sqlx::query(&format!(
+        "SET LOCAL statement_timeout = {RECONCILE_STATEMENT_TIMEOUT_MS}"
+    ))
+    .execute(&mut *tx)
+    .await?;
+    let rows: Vec<(Uuid, i64)> = sqlx::query_as(
+        "/* bk:bean_ledger_squid_tolerance */ \
+         SELECT s.user_id, trunc(COALESCE(sum(CASE \
+                WHEN l.details->>'game'='squid' THEN greatest(-l.delta,0) \
+                WHEN jsonb_typeof(l.details->'meta'->'squid_delta')='number' \
+                  THEN greatest(-(l.details->'meta'->>'squid_delta')::numeric,0) \
+                ELSE 0 END),0))::bigint \
+           FROM unnest($2::uuid[],$3::timestamptz[]) AS s(user_id,since) \
+           JOIN wallet_ledger l ON l.user_id=s.user_id AND l.game=$1 AND l.created_at>=s.since \
+          GROUP BY s.user_id",
+    )
+    .bind(GAME)
+    .bind(&ids)
+    .bind(&since)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    for (user, explained) in rows {
+        complete &= crate::beans_read_memory::restore_squid_unbacked(pool, user, explained);
+    }
+    Ok(complete)
 }
 
 /// Background reconciliation: once shortly after startup (readiness never
