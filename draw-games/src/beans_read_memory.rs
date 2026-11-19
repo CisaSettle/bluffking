@@ -30,7 +30,8 @@ pub(crate) use pending_effects::{
 };
 pub use reservations::{
     available, dealer_accepted, dealer_committed, note_squid_unbacked, poker_checkpoint_durable,
-    reserve_poker_stack, reserve_poker_top_up, squid_departure_unbacked, sync_poker_checkpoint,
+    poker_stack_backing, reserve_poker_stack, reserve_poker_top_up, squid_departure_unbacked,
+    sync_poker_checkpoint,
 };
 pub(crate) use reservations::{
     earliest_open_bean_seat, recovery_settled, release_poker_session, restore_squid_unbacked,

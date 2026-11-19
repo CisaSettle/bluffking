@@ -499,6 +499,25 @@ pub(crate) fn alert_negative_settlement(record: Uuid, user: Option<Uuid>, wallet
     );
 }
 
+/// Owner 2026-11-19: a human's gold-bean table stack exceeded what the wallet
+/// backs when the hand was dealt; it was clamped down before the deal
+/// (`session::rebuy::clamp_unbacked_bean_stack`). Always a bug.
+pub(crate) fn alert_unbacked_stack_clamped(
+    session: Uuid,
+    seat: u8,
+    user: Uuid,
+    stack: u64,
+    clamped_to: u64,
+    backed: u64,
+) {
+    tracing::error!(
+        alert_error = "Gold-bean table stack exceeded the wallet and was clamped before the deal",
+        alert_cause = "the seat held more chips than the wallet backs beside its other reservations; the stack was cut to the backed amount and no beans moved / 座位筹码超过了钱包在扣除其他占用后能覆盖的金豆；发牌前已把筹码压到可覆盖额度，金豆未变动",
+        alert_action = "AI team finds which path credited this seat unbacked chips and fixes it; Loong decides whether the player needs any correction / AI 排查是哪条路径给该座位加了没有金豆覆盖的筹码并修复；是否需要补偿或修正由 Loong 决定",
+        "[bean_stack_unbacked_clamped] session={session} seat={seat} user={user} stack={stack} clamped_to={clamped_to} backed={backed}"
+    );
+}
+
 /// Beans a 7-2 or premium-hand bounty took from `user` beyond its table
 /// stack (`SeatRecord::bounty_topup`): automatic extra buy-in that is charged
 /// in full even past the wallet, like a squid penalty.

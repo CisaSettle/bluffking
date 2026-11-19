@@ -689,6 +689,36 @@ pub fn reserve_poker_stack(
     Ok(true)
 }
 
+/// Owner 2026-11-19 — the most beans a human's whole stack (plus pending
+/// chips) at `session` may hold: the accepted balance beside every other
+/// reservation, the same test [`reserve_poker_stack`] admits a stack with,
+/// plus the over-reservation a squid charge posted past the wallet explains
+/// (the tolerance [`super::over_reserved`] grants). `None` when the
+/// projection cannot answer right now (not ready, a wallet mutation in
+/// flight, a reservation it cannot read): the caller then changes nothing.
+/// No SQL: one bean-mutex hold, the cached directory snapshot and the
+/// hold-file probe every admission also makes.
+pub fn poker_stack_backing(pool: &PgPool, session: Uuid, user: Uuid) -> Option<u64> {
+    let state = state(pool);
+    let inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
+    if !inner.ready || inner.active_users.contains_key(&user) {
+        return None;
+    }
+    let balance = inner
+        .users
+        .get(&user)
+        .filter(|u| u.available)
+        .and_then(|u| u.wallet.as_ref())?
+        .balance;
+    let directory = crate::live_directory::memory_snapshot_for_user(pool, user).ok()?;
+    let other = reserved(&inner, &directory, user, false, Some(session), None).ok()?;
+    let backed = balance
+        .saturating_sub(other)
+        .saturating_add(inner.reservations.squid_unbacked(user))
+        .max(0);
+    Some(backed as u64)
+}
+
 /// Owner 2026-11-12 — a squid loser short of the penalty tops up the whole
 /// shortfall from the wallet, which may go negative (「金豆不够 金豆就是负数」).
 /// Grows this seat's whole-stack reservation by the part of `wanted` the
