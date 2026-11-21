@@ -228,6 +228,10 @@ impl GameHand {
         self.seven_deuce_bounty
     }
 
+    pub fn premium_hand_bounty(&self) -> Chips {
+        self.premium_hand_bounty
+    }
+
     pub fn posted_big_blind_ante(&self) -> Chips {
         self.posted_big_blind_ante
             .map_or(Chips::ZERO, |(_, amount)| amount)

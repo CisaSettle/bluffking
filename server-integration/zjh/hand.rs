@@ -267,6 +267,11 @@ pub struct Hand {
     pub zk: Option<super::fairness::Stored>,
 }
 
+enum AllInLayer {
+    Return { idx: usize, amount: u64 },
+    Award { eligible: Vec<usize>, amount: u64 },
+}
+
 impl Hand {
     /// `seats` = `(seat, stack)` for every dealt-in player, any order.
     /// `deck` must hold at least `3 * seats.len()` cards.
@@ -630,7 +635,7 @@ impl Hand {
                 .iter()
                 .any(|p| p.active() && p.contributed == p.stack_start);
         let (awards, pot_winners, returned) = if layered {
-            self.all_in_awards(&winners, dealer_idx)
+            self.all_in_awards(dealer_idx)
         } else {
             let mut awards = vec![0; n];
             self.split_award(self.pot, &winners, &mut awards);
@@ -714,20 +719,55 @@ impl Hand {
         awards[winners[0]] += amount % winners.len() as u64;
     }
 
-    /// Keep original contributions and the gross pot for history and bonus
-    /// exposure. Returns are payouts, not winnings or fresh bonus funds.
-    fn all_in_awards(&mut self, best: &[usize], dealer_idx: usize) -> (Vec<u64>, Vec<usize>, u64) {
-        let n = self.players.len();
-        let mut levels: Vec<u64> = self.players.iter().map(|p| p.contributed).collect();
+    /// Price the public pot layers if this seat spends its remaining chips
+    /// and ends betting. The bot supplies its equity against each eligible
+    /// opponent from public action reads and its own cards.
+    pub(super) fn all_in_expected_payout(
+        &self,
+        seat: usize,
+        equity_against: impl Fn(usize) -> f64,
+    ) -> f64 {
+        let idx = self.idx(seat).expect("acting seat");
+        self.all_in_layers(Some(idx))
+            .into_iter()
+            .map(|layer| match layer {
+                AllInLayer::Return { idx: owner, amount } if owner == idx => amount as f64,
+                AllInLayer::Award { eligible, amount } if eligible.contains(&idx) => {
+                    let probability: f64 = eligible
+                        .into_iter()
+                        .filter(|&i| i != idx)
+                        .map(|i| equity_against(self.players[i].seat))
+                        .product();
+                    probability * amount as f64
+                }
+                _ => 0.0,
+            })
+            .sum()
+    }
+
+    fn all_in_layers(&self, all_in_seat: Option<usize>) -> Vec<AllInLayer> {
+        let contributions: Vec<u64> = self
+            .players
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                if all_in_seat == Some(i) {
+                    p.stack_start
+                } else {
+                    p.contributed
+                }
+            })
+            .collect();
+        let mut levels = contributions.clone();
         levels.sort_unstable();
         levels.dedup();
-        let mut awards = vec![0; n];
-        let mut pot_winners = Vec::new();
-        let mut returned = 0;
+        let mut layers = Vec::with_capacity(levels.len());
         let mut previous = 0;
         for level in levels {
-            let contributors: Vec<usize> = (0..n)
-                .filter(|&i| self.players[i].contributed >= level)
+            let contributors: Vec<usize> = contributions
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &contributed)| (contributed >= level).then_some(i))
                 .collect();
             let amount = (level - previous) * contributors.len() as u64;
             previous = level;
@@ -736,32 +776,55 @@ impl Hand {
             }
             if let [i] = contributors.as_slice() {
                 if self.players[*i].active() {
-                    awards[*i] += amount;
+                    layers.push(AllInLayer::Return { idx: *i, amount });
+                    continue;
+                }
+            }
+            let mut eligible: Vec<usize> = contributors
+                .into_iter()
+                .filter(|&i| self.players[i].active())
+                .collect();
+            if eligible.is_empty() {
+                // ZJH permits an off-turn fold after unequal payments. Dead
+                // money with no eligible contributor stays with the best live
+                // hand; folding never earns an uncalled-bet refund.
+                eligible.extend(
+                    self.players
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, p)| p.active().then_some(i)),
+                );
+            }
+            layers.push(AllInLayer::Award { eligible, amount });
+        }
+        layers
+    }
+
+    /// Keep original contributions and the gross pot for history and bonus
+    /// exposure. Returns are payouts, not winnings or fresh bonus funds.
+    fn all_in_awards(&mut self, dealer_idx: usize) -> (Vec<u64>, Vec<usize>, u64) {
+        let n = self.players.len();
+        let mut awards = vec![0; n];
+        let mut pot_winners = Vec::new();
+        let mut returned = 0;
+        for layer in self.all_in_layers(None) {
+            let (eligible, amount) = match layer {
+                AllInLayer::Return { idx, amount } => {
+                    awards[idx] += amount;
                     returned += amount;
                     self.log.push(LogEntry::UncalledReturn {
-                        seat: self.players[*i].seat,
+                        seat: self.players[idx].seat,
                         amount,
                     });
                     continue;
                 }
-            }
-            let eligible: Vec<usize> = contributors
-                .into_iter()
-                .filter(|&i| self.players[i].active())
-                .collect();
-            let mut layer_winners = if eligible.is_empty() {
-                // ZJH permits an off-turn fold after unequal payments. Dead
-                // money with no eligible contributor stays with the best live
-                // hand; folding never earns an uncalled-bet refund.
-                best.to_vec()
-            } else {
-                let values: Vec<HandValue> =
-                    eligible.iter().map(|&i| self.players[i].value).collect();
-                rules::showdown_winners(&values)
-                    .into_iter()
-                    .map(|i| eligible[i])
-                    .collect()
+                AllInLayer::Award { eligible, amount } => (eligible, amount),
             };
+            let values: Vec<HandValue> = eligible.iter().map(|&i| self.players[i].value).collect();
+            let mut layer_winners: Vec<usize> = rules::showdown_winners(&values)
+                .into_iter()
+                .map(|i| eligible[i])
+                .collect();
             layer_winners.sort_by_key(|&i| (i + n - dealer_idx - 1) % n);
             self.split_award(amount, &layer_winners, &mut awards);
             self.log.push(LogEntry::PotAward {

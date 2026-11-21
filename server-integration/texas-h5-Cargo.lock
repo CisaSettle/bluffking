@@ -3088,6 +3088,7 @@ dependencies = [
  "bip32",
  "bip39",
  "bnb-hd-recovery",
+ "bytemuck",
  "chrono",
  "curve25519-dalek",
  "dashmap",
