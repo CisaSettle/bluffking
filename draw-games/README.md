@@ -2,7 +2,7 @@
 
 [中文 / English：完整说明与语言切换](index.html)
 
-本目录公开双色球、大乐透、TOTO、快乐8、福彩3D、刮刮乐、骰宝和鱼虾蟹的开奖输入、抽样、中奖计算与结算相关源码，并提供独立离线验证器。采用仓库根目录的 [AGPL-3.0-only 许可证](../LICENSE)，公开内容由上游逐文件同步。
+本目录公开双色球、大乐透、TOTO、快乐8、福彩3D、刮刮乐、骰宝和鱼虾蟹的开奖输入、抽样、中奖计算源码，并提供独立离线验证器。采用仓库根目录的 [AGPL-3.0-only 许可证](../LICENSE)，公开内容由上游逐文件同步。
 
 **生产核实（2026-10-25）：定期开奖证明已上线。**双色球、大乐透、TOTO、快乐8和福彩3D的公开证明接口均返回 `proof_status=available`，计划协议为 `bluffking-lottery-drand-v2-minute`；可按游戏与期号读取 [生产证明示例](https://app.bluffking.ai/api/draws/toto/29881827/proof)。本次生产发布标识为 `web-2026.10.25.68`，源码提交为 `08305a4af48208bafb9d1553ba0f367e64e109fd`。
 
@@ -21,4 +21,4 @@ cargo build --locked --manifest-path draw-games/verifier/Cargo.toml
 
 浏览器导出的 `{proof, receipt}` 文件可直接作为唯一参数。没有开奖前回执时仍能重算，但不能声称已与先前看到的承诺核对。验证器不联网，也不证明实际钱包入账、发布时间或部署身份。
 
-完整协议、无需服务器的定期开奖重算、保存期限与源码导航见 [index.html](index.html)，默认中文，可切换 English。`src/` 保留原始服务端集成代码，依赖上游主服务，不能作为独立服务器构建；`verifier/` 不受此限制。
+完整协议、无需服务器的定期开奖重算、保存期限与源码导航见 [index.html](index.html)，默认中文，可切换 English。

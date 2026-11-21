@@ -92,13 +92,8 @@
         <h2>源码导航与构建范围</h2>
         <ul>
           <li>可独立构建的共用规则库：<a href="verifier/Cargo.toml">Cargo.toml</a>、<a href="verifier/Cargo.lock">Cargo.lock</a>；<a href="verifier/src/proof.rs">承诺、揭示与抽样流</a>、<a href="verifier/src/beacon.rs">信标签名</a>、<a href="verifier/src/lottery.rs">定期开奖与奖表</a>、<a href="verifier/src/scratch.rs">刮刮乐</a>、<a href="verifier/src/sicbo.rs">骰宝</a>、<a href="verifier/src/yuxiaxie.rs">鱼虾蟹</a>、<a href="verifier/src/bin/draw-verify.rs">命令行验证器</a>。</li>
-          <li>彩票服务集成：<a href="src/lottery/mod.rs">模块</a>、<a href="src/lottery/rules.rs">共用规则引用</a>、<a href="src/lottery/store.rs">购票与查询</a>、<a href="src/lottery/draw_loop.rs">开奖与派奖</a>、<a href="src/lottery/beacon.rs">有界信标请求</a>、<a href="src/lottery/scratch.rs">刮刮乐揭示</a>、<a href="src/lottery/handlers.rs">HTTP 接口</a>。</li>
-          <li>即时承诺与骰宝：<a href="src/draw_fairness.rs">draw_fairness.rs</a>、<a href="src/sicbo.rs">单人骰宝</a>、<a href="src/sicbo_room/mod.rs">房间模块</a>、<a href="src/sicbo_room/store.rs">房间承诺与结算</a>、<a href="src/yuxiaxie/store.rs">鱼虾蟹房间承诺与结算</a>。</li>
-          <li>持久化与账务：<a href="src/casino_room.rs">房间推进及确认</a>、<a href="src/casino_room_lifecycle.rs">房间生命周期</a>、<a href="src/write_behind.rs">有序写入</a>、<a href="src/bean_ledger.rs">账本</a>、<a href="src/beans.rs">练习豆钱包</a>、<a href="src/game_records.rs">游戏记录</a>、<a href="src/room_clock.rs">时钟</a>、<a href="src/casino_bots.rs">机器人</a>、<a href="src/game_catalog.rs">游戏编号</a>。</li>
-          <li>当前结构：<a href="schema/current.sql">彩票与开奖证明结构摘录</a>，由当前服务端结构生成，包含相关表、约束、索引和证明触发器；不是完整服务器数据库安装脚本。</li>
-          <li>依赖参考：<a href="reference/server-Cargo.toml">后台依赖</a>、<a href="../server-integration/texas-h5-Cargo.toml">上游工作区</a>、<a href="../server-integration/texas-h5-Cargo.lock">上游锁文件</a>。</li>
         </ul>
-        <p><code>verifier/</code> 自带工作区，可按上面的命令单独构建；公开仓库根工作区的普通构建不包括它。<code>src/</code> 是逐字同步的原始服务端集成源码，不是独立服务器；认证、账号生命周期、基础数据库结构、完整 checkpoint 恢复及主服务路由等仍由上游服务提供。发布流程对明确列出的源码计算散列并下载公开标签逐文件比对；这能标识公开代码快照，不能证明线上部署身份。</p>
+        <p><code>verifier/</code> 自带工作区，可按上面的命令单独构建；公开仓库根工作区的普通构建不包括它。</p>
       </article>
       <article id="en" lang="en" hidden>
         <h1>Lottery and Sicbo: public process, independent replay</h1>
@@ -165,13 +160,8 @@
         <h2>Source navigation and build scope</h2>
         <ul>
           <li>Independently buildable shared library: <a href="verifier/Cargo.toml">Cargo.toml</a>, <a href="verifier/Cargo.lock">Cargo.lock</a>; <a href="verifier/src/proof.rs">commitments, reveals and sampling stream</a>, <a href="verifier/src/beacon.rs">beacon signatures</a>, <a href="verifier/src/lottery.rs">lottery rules and prizes</a>, <a href="verifier/src/scratch.rs">scratch cards</a>, <a href="verifier/src/sicbo.rs">Sicbo</a>, <a href="verifier/src/yuxiaxie.rs">Fish Prawn Crab</a>, <a href="verifier/src/bin/draw-verify.rs">CLI verifier</a>.</li>
-          <li>Lottery integration: <a href="src/lottery/mod.rs">module</a>, <a href="src/lottery/rules.rs">shared rule imports</a>, <a href="src/lottery/store.rs">purchases and queries</a>, <a href="src/lottery/draw_loop.rs">draws and settlement</a>, <a href="src/lottery/beacon.rs">bounded beacon requests</a>, <a href="src/lottery/scratch.rs">scratch reveals</a>, <a href="src/lottery/handlers.rs">HTTP handlers</a>.</li>
-          <li>Immediate commitments and Sicbo: <a href="src/draw_fairness.rs">draw_fairness.rs</a>, <a href="src/sicbo.rs">solo Sicbo</a>, <a href="src/sicbo_room/mod.rs">room module</a>, <a href="src/sicbo_room/store.rs">room commitments and settlement</a>, <a href="src/yuxiaxie/store.rs">Fish Prawn Crab room commitments and settlement</a>.</li>
-          <li>Persistence and accounting: <a href="src/casino_room.rs">room progression and acknowledgements</a>, <a href="src/casino_room_lifecycle.rs">room lifecycle</a>, <a href="src/write_behind.rs">ordered persistence</a>, <a href="src/bean_ledger.rs">ledger</a>, <a href="src/beans.rs">shared practice wallet</a>, <a href="src/game_records.rs">game records</a>, <a href="src/room_clock.rs">clock</a>, <a href="src/casino_bots.rs">bots</a>, <a href="src/game_catalog.rs">game identifiers</a>.</li>
-          <li>Current schema: <a href="schema/current.sql">lottery and draw-proof schema excerpt</a>, generated from the current server snapshot with its tables, constraints, indexes and proof triggers; not a complete server database installation script.</li>
-          <li>Dependency references: <a href="reference/server-Cargo.toml">server dependencies</a>, <a href="../server-integration/texas-h5-Cargo.toml">upstream workspace</a>, <a href="../server-integration/texas-h5-Cargo.lock">upstream lockfile</a>.</li>
         </ul>
-        <p><code>verifier/</code> has its own workspace and builds with the command above; a normal build of the public root workspace does not include it. <code>src/</code> is byte-for-byte server integration source, not a standalone server. Authentication, account lifecycle, base database schema, complete checkpoint recovery and main-service routing still come from the upstream service. Publication hashes the explicit source subset and downloads the public tag for per-file comparison. This identifies a public source snapshot, not a live deployment.</p>
+        <p><code>verifier/</code> has its own workspace and builds with the command above; a normal build of the public root workspace does not include it.</p>
       </article>
     </main>
     <script>

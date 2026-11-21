@@ -62,8 +62,7 @@ just the library.
   reference closed server modules (`rate_limit`, `db_writer`, `app_state`,
   `auth`, `protocol`, `session_registry`, the generic card-room hub that creates
   the pending deal, advances the exchange and takes the final deck order at deal
-  time, and the ZJH room/bot modules). `room_clock` is published in
-  [`draw-games/`](../draw-games).
+  time, and the ZJH room/bot modules, and the room clock).
 - `texas-h5-Cargo.lock` (U47) — the **deployed server binary's exact dependency
   resolution**, i.e. the §13 reproduce artifact. It pins every version — including
   the git-pinned `postflop-solver` commit — as actually built and deployed. Use
