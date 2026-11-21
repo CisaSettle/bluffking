@@ -73,6 +73,10 @@ reqwest = { version = "0.12", features = ["json"] }
 # tokio-stream for ReceiverStream (SSE sender→stream bridge in coach handler).
 tokio-stream = "0.1"
 
+# Async MX lookups for the farm guard's temp-mail check (system resolver;
+# default features only — no DNS-over-TLS, so no second TLS stack).
+hickory-resolver = "0.26"
+
 # Offline IP-to-city lookup; no player IP is sent to a third party.
 maxminddb = "0.27"
 

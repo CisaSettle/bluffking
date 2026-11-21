@@ -505,8 +505,17 @@ pub(crate) fn accept_poker_effects_with<T>(
     } else {
         (enqueue()?, Vec::new())
     };
+    let mut squid_checkpoint = None;
     if let Some((session, checkpoint)) = checkpoint {
         let published = reservations::published_poker_checkpoint(pool, session).flatten();
+        if players.iter().any(|(id, effect)| {
+            effect.squid_delta < 0
+                && published.as_ref().is_some_and(|value| {
+                    value["squid_progress"]["detached_debts"].get(id.to_string()).is_some()
+                })
+        }) {
+            squid_checkpoint = Some((session, checkpoint));
+        }
         let deltas: Vec<(Uuid, i64)> = players.iter().map(|(id, e)| (*id, e.delta)).collect();
         inner
             .reservations
@@ -538,6 +547,16 @@ pub(crate) fn accept_poker_effects_with<T>(
             departures,
         },
     );
+    // Replace the departed squid hold with the accepted wallet debit under
+    // the same mutex. A simultaneous deal must never see both deductions.
+    if let Some((session, checkpoint)) = squid_checkpoint {
+        let publication = serde_json::to_value(checkpoint)
+            .map_err(|error| sqlx::Error::Protocol(error.to_string()))
+            .and_then(|value| crate::live_directory::publish_checkpoint(pool, session, &value));
+        if let Err(error) = publication {
+            tracing::error!(%session, %error, "squid_settlement_checkpoint_publication_failed");
+        }
+    }
     state.published.notify_waiters();
     Ok(result)
 }
@@ -664,9 +683,11 @@ pub(crate) fn over_reserved(pool: &PgPool) -> Vec<Uuid> {
             else {
                 return false;
             };
-            let Ok(reserved) = crate::live_directory::memory_snapshot_for_user(pool, *user)
+            // A pending squid charge is contingent. It limits new spending,
+            // but it is not an independently funded seat or confirmed debit.
+            let Ok((reserved, _)) = crate::live_directory::memory_snapshot_for_user(pool, *user)
                 .and_then(|directory| {
-                    reservations::reserved(&inner, &directory, *user, false, None, None)
+                    reservations::reservation_amounts(&inner, &directory, *user, false, None, None)
                 })
             else {
                 return false;

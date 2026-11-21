@@ -398,6 +398,20 @@ pub(super) fn reserved(
     excluding_poker: Option<Uuid>,
     excluding_dealer: Option<(&str, &str)>,
 ) -> sqlx::Result<i64> {
+    let (reserved, squid_debt) = reservation_amounts(
+        inner, directory, user, sql_balance, excluding_poker, excluding_dealer,
+    )?;
+    reserved.checked_add(squid_debt).ok_or_else(unavailable)
+}
+
+pub(super) fn reservation_amounts(
+    inner: &Inner,
+    directory: &crate::live_directory::Directory,
+    user: Uuid,
+    sql_balance: bool,
+    excluding_poker: Option<Uuid>,
+    excluding_dealer: Option<(&str, &str)>,
+) -> sqlx::Result<(i64, i64)> {
     if crate::local_runtime::dealer_held(user).map_err(sqlx::Error::Io)?
         && !inner
             .users
@@ -426,6 +440,7 @@ pub(super) fn reserved(
     }
     let (mut poker, fixed_departure_losses) = crate::beans::holds::amounts(user);
     let mut seats: HashMap<Uuid, i64> = HashMap::new();
+    let mut squid_debt = 0i64;
     for (room, member) in directory.memberships_for(user) {
         if !is_beans(room) || room.ended_at.is_some() {
             continue;
@@ -464,8 +479,17 @@ pub(super) fn reserved(
             // beans again. Unsettled hand holds are included in `poker` above.
             0
         };
-        let entry = seats.entry(room.id).or_default();
-        *entry = (*entry).max(amount);
+        match seats.entry(room.id) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                squid_debt = squid_debt
+                    .checked_add(crate::session::detached_squid_reservation(room, user)?)
+                    .ok_or_else(unavailable)?;
+                entry.insert(amount);
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                *entry.get_mut() = (*entry.get()).max(amount);
+            }
+        }
     }
     // Beans a table released whose write has not committed: a crash returns
     // them to that table, so they stay reserved there until it does.
@@ -566,7 +590,7 @@ pub(super) fn reserved(
                 .ok_or_else(unavailable)?;
         }
     }
-    Ok(total)
+    Ok((total, squid_debt))
 }
 
 /// Debit callers hold Mutation before BEGIN and the wallet row through COMMIT.
@@ -711,7 +735,10 @@ pub fn poker_stack_backing(pool: &PgPool, session: Uuid, user: Uuid) -> Option<u
         .and_then(|u| u.wallet.as_ref())?
         .balance;
     let directory = crate::live_directory::memory_snapshot_for_user(pool, user).ok()?;
-    let other = reserved(&inner, &directory, user, false, Some(session), None).ok()?;
+    // A contingent squid hold limits new spending. An increase in its
+    // estimate must not retroactively remove chips from a funded seat.
+    let (other, _) =
+        reservation_amounts(&inner, &directory, user, false, Some(session), None).ok()?;
     let backed = balance
         .saturating_sub(other)
         .saturating_add(inner.reservations.squid_unbacked(user))
@@ -784,7 +811,12 @@ pub fn reserve_poker_top_up(
 /// Owner 2026-11-12 — a gold-bean squid leaver's extra buy-in is charged in
 /// full from the wallet: the part past its free beans now (the wallet may go
 /// negative). Record it with [`note_squid_unbacked`] once the leave commits.
-pub fn squid_departure_unbacked(pool: &PgPool, user: Uuid, wanted: u64) -> sqlx::Result<i64> {
+pub fn squid_departure_unbacked(
+    pool: &PgPool,
+    user: Uuid,
+    wanted: u64,
+    detached_session: Option<Uuid>,
+) -> sqlx::Result<i64> {
     let state = state(pool);
     let inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
     if !inner.ready {
@@ -798,7 +830,15 @@ pub fn squid_departure_unbacked(pool: &PgPool, user: Uuid, wanted: u64) -> sqlx:
         .balance;
     let directory = crate::live_directory::memory_snapshot_for_user(pool, user)?;
     let all = reserved(&inner, &directory, user, false, None, None)?;
-    let free = balance.saturating_sub(all).max(0);
+    // The hold for this charge is already included in `all`. Use it to
+    // fund this settlement while keeping other rounds' holds in place.
+    let held = detached_session
+        .and_then(|id| directory.sessions.get(&id))
+        .filter(|room| room.ended_at.is_none() && is_beans(room))
+        .map(|room| crate::session::detached_squid_reservation(room, user))
+        .transpose()?
+        .unwrap_or(0);
+    let free = balance.saturating_sub(all.saturating_sub(held)).max(0);
     let wanted = i64::try_from(wanted).unwrap_or(i64::MAX);
     Ok(wanted.saturating_sub(free).max(0))
 }
@@ -846,8 +886,8 @@ pub(crate) fn restore_squid_unbacked(pool: &PgPool, user: Uuid, explained: i64) 
     else {
         return false;
     };
-    let Ok(reserved) = crate::live_directory::memory_snapshot_for_user(pool, user)
-        .and_then(|directory| reserved(&inner, &directory, user, false, None, None))
+    let Ok((reserved, _)) = crate::live_directory::memory_snapshot_for_user(pool, user)
+        .and_then(|directory| reservation_amounts(&inner, &directory, user, false, None, None))
     else {
         return false;
     };
