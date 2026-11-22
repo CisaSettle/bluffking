@@ -647,16 +647,12 @@ pub fn sgt() -> FixedOffset {
     FixedOffset::east_opt(SGT_OFFSET_SECS).expect("Singapore UTC offset is valid")
 }
 
-/// v5 = purchase-opened periods (id = draw time) with the v4 prize tables.
+/// v5 uses the draw time as the period ID for purchase-opened periods.
 pub const PROTOCOL: &str = "bluffking-lottery-drand-v5-instant";
-/// The retired minute schedule (period = minute index, draw at its end, sales
-/// closed 5 s before). Kept only so periods accepted under it still validate,
-/// settle and verify until retention deletes them; remove after 2026-12-31.
-pub const PROTOCOL_V4_MINUTE: &str = "bluffking-lottery-drand-v4-minute";
 
 /// A protocol whose accepted plans this verifier can replay.
 pub fn known_protocol(protocol: &str) -> bool {
-    protocol == PROTOCOL || protocol == PROTOCOL_V4_MINUTE
+    protocol == PROTOCOL
 }
 
 /// All choice points are derived from the game and period id. The commitment
@@ -683,18 +679,11 @@ impl Plan {
         if !game.drawn() {
             return Err("not a drawn lottery".into());
         }
-        let (draw_at_ms, close_ms) = match protocol {
-            PROTOCOL => (period, CLOSE_MS),
-            PROTOCOL_V4_MINUTE => (
-                period
-                    .checked_add(1)
-                    .and_then(|n| n.checked_mul(60_000))
-                    .ok_or("period overflow")?,
-                5_000,
-            ),
-            _ => return Err("unsupported lottery protocol".into()),
-        };
-        let closes_at_ms = draw_at_ms.checked_sub(close_ms).ok_or("period overflow")?;
+        if !known_protocol(protocol) {
+            return Err("unsupported lottery protocol".into());
+        }
+        let draw_at_ms = period;
+        let closes_at_ms = draw_at_ms.checked_sub(CLOSE_MS).ok_or("period overflow")?;
         let beacon_round = crate::beacon::round_at_or_after(draw_at_ms)?;
         let commitment = hex::encode(sha256_fields(&[
             protocol.as_bytes(),
@@ -728,13 +717,8 @@ impl Plan {
     /// Use the accepted plan's own protocol for saved ticket windows and labels.
     pub fn sales_opens_at_ms(&self) -> Result<i64, String> {
         self.validate()?;
-        let window = if self.protocol == PROTOCOL {
-            COUNTDOWN_MS
-        } else {
-            60_000
-        };
         self.draw_at_ms
-            .checked_sub(window)
+            .checked_sub(COUNTDOWN_MS)
             .ok_or_else(|| "sales window overflow".into())
     }
 
@@ -745,27 +729,8 @@ impl Plan {
 
     pub fn label(&self) -> Result<String, String> {
         self.validate()?;
-        Ok(if self.protocol == PROTOCOL {
-            label(self.draw_at_ms)
-        } else {
-            legacy_minute_label(self.draw_at_ms)
-        })
+        Ok(label(self.draw_at_ms))
     }
-}
-
-/// v4 labels: `YYYYMMDD-NNN`, the draw's 1-based minute index within its SGT day.
-fn legacy_minute_label(draw_ms: i64) -> String {
-    let sgt = sgt();
-    let Some(at) = sgt.timestamp_millis_opt(draw_ms).single() else {
-        return label(draw_ms);
-    };
-    let day_start_ms = sgt
-        .from_local_datetime(&at.date_naive().and_hms_opt(0, 0, 0).expect("midnight"))
-        .single()
-        .map_or(draw_ms, |d| d.timestamp_millis());
-    let index =
-        (draw_ms.div_euclid(60_000) - (day_start_ms + 59_999).div_euclid(60_000) + 1).max(1);
-    format!("{}-{:03}", at.format("%Y%m%d"), index)
 }
 
 /// Partial Fisher-Yates with rejection sampling through Entropy::below. TOTO

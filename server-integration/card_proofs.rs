@@ -182,7 +182,12 @@ pub async fn handler(
         return StatusCode::BAD_REQUEST.into_response();
     };
     let Ok(permit) = PROOFS.try_acquire() else {
-        return StatusCode::TOO_MANY_REQUESTS.into_response();
+        return crate::admission::refusal(
+            StatusCode::TOO_MANY_REQUESTS,
+            "verifier_busy",
+            2,
+            "The card proof verifier is busy. Please retry shortly.",
+        );
     };
     let stored: Result<Option<serde_json::Value>, _> = sqlx::query_scalar(
         "SELECT receipt FROM card_proof_receipts WHERE game=$1 AND id=$2 AND $3=ANY(participants)",
