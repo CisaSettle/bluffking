@@ -617,6 +617,7 @@ impl GameHand {
             seven_deuce: Vec::new(),
             premium_hand: Vec::new(),
             bounty_topups: HashMap::new(),
+            host_insurance: None,
         }
     }
 
@@ -836,6 +837,60 @@ impl GameHand {
             });
         }
         bounties
+    }
+
+    /// Apply a single accepted insurance quote without changing any pot award.
+    /// An uncovered host payment is recorded as automatic funding, so the
+    /// host's economic loss includes the shortage even with a zero stack.
+    pub fn apply_host_insurance(
+        &mut self,
+        result: &mut HandResult,
+        mut insurance: HostInsurance,
+    ) -> bool {
+        let buyer = insurance.buyer.inner();
+        let host = insurance.host.inner();
+        let (Some(&buyer_stack), Some(&host_stack)) = (
+            result.final_stacks.get(&buyer),
+            result.final_stacks.get(&host),
+        ) else {
+            return false;
+        };
+        if buyer == host || result.host_insurance.is_some() || insurance.premium == 0 {
+            return false;
+        }
+        let (buyer_end, host_end) = if insurance.payout > 0 {
+            let Some(payment) = insurance.payout.checked_sub(insurance.premium) else {
+                return false;
+            };
+            let Some(buyer_end) = buyer_stack
+                .checked_add(payment)
+                .filter(|&v| i32::try_from(v).is_ok())
+            else {
+                return false;
+            };
+            insurance.host_topup = payment.saturating_sub(host_stack);
+            (buyer_end, host_stack.saturating_sub(payment))
+        } else {
+            let (Some(buyer_end), Some(host_end)) = (
+                buyer_stack.checked_sub(insurance.premium),
+                host_stack
+                    .checked_add(insurance.premium)
+                    .filter(|&v| i32::try_from(v).is_ok()),
+            ) else {
+                return false;
+            };
+            (buyer_end, host_end)
+        };
+        result.final_stacks.insert(buyer, buyer_end);
+        result.final_stacks.insert(host, host_end);
+        result.host_insurance = Some(insurance);
+        for event in &mut self.events {
+            if let EngineEvent::HandFinished { result: queued } = event {
+                queued.final_stacks.clone_from(&result.final_stacks);
+                queued.host_insurance = Some(insurance);
+            }
+        }
+        true
     }
 
     /// Shared full payment for 27 and premium-hand bounties; shortages are
@@ -1593,12 +1648,44 @@ mod premium_bounty_tests {
             seven_deuce: vec![],
             premium_hand: vec![],
             bounty_topups: HashMap::new(),
+            host_insurance: None,
         };
         hand.events.push(EngineEvent::HandFinished {
             result: result.clone(),
         });
         (hand, result)
     }
+
+    #[test]
+    fn host_insurance_funds_shortage_without_changing_pot_awards() {
+        let (mut hand, mut result) =
+            fixture(["Ah", "Ad"], ["As", "Kc", "2s", "3d", "4c"]);
+        let awards = result.chips_awarded.clone();
+        let contract = HostInsurance {
+            host: PlayerId(2),
+            buyer: PlayerId(1),
+            outs: 4,
+            odds_tenths: 80,
+            premium: 5,
+            payout: 40,
+            host_topup: 0,
+        };
+
+        assert!(hand.apply_host_insurance(&mut result, contract));
+        assert_eq!(result.final_stacks[&1], 175);
+        assert_eq!(result.final_stacks[&2], 0);
+        assert_eq!(result.insurance_topup(2), 28);
+        assert_eq!(i64::from(result.final_stacks[&2]) - 7 - 28, -35);
+        assert_eq!(result.chips_awarded, awards);
+        assert!(!hand.apply_host_insurance(&mut result, contract));
+        assert_eq!(result.final_stacks[&1], 175);
+        assert!(matches!(
+            hand.events.last(),
+            Some(EngineEvent::HandFinished { result: queued })
+                if queued.host_insurance == result.host_insurance
+        ));
+    }
+
     #[test]
     fn bounty_shared_transfer_matches_27_and_quads() {
         for premium in [false, true] {

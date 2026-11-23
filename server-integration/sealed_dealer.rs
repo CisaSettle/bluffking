@@ -153,6 +153,17 @@ pub struct RevealShowdownResponse {
     pub seats: Vec<RevealedSeat>,
 }
 
+#[derive(Deserialize, Serialize)]
+struct InsuranceOutsRequest {
+    seats: [u8; 2],
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct InsuranceOuts {
+    pub seat: u8,
+    pub outs: u8,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FinalDeckResponse {
     pub cards: Vec<u8>,
@@ -456,6 +467,46 @@ impl SealedHand {
             .ok_or("second run exceeds the deck")
     }
 
+    fn insurance_outs(&self, seats: [u8; 2]) -> Option<InsuranceOuts> {
+        if self.stage != DealerStage::Turn || seats[0] == seats[1] {
+            return None;
+        }
+        let holes = [
+            decode_hole(self.hole_cards(seats[0])?).ok()?,
+            decode_hole(self.hole_cards(seats[1])?).ok()?,
+        ];
+        let board_start = 2 * self.seats.len();
+        // Use only the contenders' cards and the already disclosed board.
+        // The river and the folded players' private blockers do not price insurance.
+        let cards = deck_cards(self.deck.get(board_start..board_start + 4)?)?;
+        let mut board = engine::hand::BoardCards {
+            flop: Some(cards.get(..3)?.try_into().ok()?),
+            turn: Some(cards[3]),
+            river: None,
+        };
+        let rank = engine::eval::rank_hand;
+        let leader = match rank(&holes[0], &board).cmp(&rank(&holes[1], &board)) {
+            std::cmp::Ordering::Greater => 0,
+            std::cmp::Ordering::Less => 1,
+            std::cmp::Ordering::Equal => return None,
+        };
+        let known = [holes[0].as_array(), holes[1].as_array()].concat();
+        let mut outs = 0;
+        for card in (0..52).filter_map(mental_poker::card_id::id_to_card) {
+            if known.contains(&card) || cards.contains(&card) {
+                continue;
+            }
+            board.river = Some(card);
+            if rank(&holes[1 - leader], &board) > rank(&holes[leader], &board) {
+                outs += 1;
+            }
+        }
+        Some(InsuranceOuts {
+            seat: seats[leader],
+            outs,
+        })
+    }
+
     fn reveal_showdown(&mut self, mut seats: Vec<u8>) -> Result<Vec<RevealedSeat>, &'static str> {
         if self.stage < DealerStage::River {
             return Err("showdown is available only after the river");
@@ -750,6 +801,22 @@ async fn reveal_second_run(
     }
 }
 
+async fn insurance_outs(
+    State(state): State<WorkerState>,
+    Path(hand_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(request): Json<InsuranceOutsRequest>,
+) -> impl IntoResponse {
+    if !internal_authorized(&headers, &state) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let hands = state.hands.read().await;
+    let Some(hand) = hands.get(&hand_id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    Json(hand.insurance_outs(request.seats)).into_response()
+}
+
 async fn reveal_showdown(
     State(state): State<WorkerState>,
     Path(hand_id): Path<Uuid>,
@@ -985,6 +1052,10 @@ fn worker_router(state: WorkerState) -> Router {
         )
         .route("/internal/hands/:hand_id/board", post(reveal_board))
         .route("/internal/hands/:hand_id/showdown", post(reveal_showdown))
+        .route(
+            "/internal/hands/:hand_id/insurance-outs",
+            post(insurance_outs),
+        )
         .route(
             "/internal/hands/:hand_id/second-run",
             post(reveal_second_run),
@@ -1455,6 +1526,19 @@ impl ActiveHand {
         self.seats.contains(&seat)
             && !self.bot_holes.contains_key(&seat)
             && self.client.delivery_received(self.hand_id, seat).await.ok() == Some(false)
+    }
+
+    pub async fn insurance_outs(&self, seats: [u8; 2]) -> Result<Option<InsuranceOuts>, String> {
+        let request = self.client.request(self.client.http.post(format!(
+            "{}/internal/hands/{}/insurance-outs",
+            self.client.base_url, self.hand_id
+        )));
+        self.client
+            .send_with_retry(request.json(&InsuranceOutsRequest { seats }))
+            .await?
+            .json()
+            .await
+            .map_err(|e| e.to_string())
     }
 
     /// Reveal one street; coordinators choose when to publish its snapshot.

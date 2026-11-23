@@ -253,6 +253,46 @@ pub struct HandResult {
     /// stacks include it; economic net is final - starting - this funding.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub bounty_topups: HashMap<u64, u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_insurance: Option<HostInsurance>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostInsurance {
+    pub host: PlayerId,
+    pub buyer: PlayerId,
+    pub outs: u8,
+    pub odds_tenths: u16,
+    pub premium: u32,
+    /// Actual gross payout. Zero when the river did not hit.
+    pub payout: u32,
+    /// Automatic funding for the part of the net payout beyond the host stack.
+    pub host_topup: u32,
+}
+
+impl HostInsurance {
+    pub fn delta_for(self, player: u64) -> i64 {
+        let buyer_delta = i64::from(self.payout) - i64::from(self.premium);
+        if player == self.buyer.inner() {
+            buyer_delta
+        } else if player == self.host.inner() {
+            -buyer_delta
+        } else {
+            0
+        }
+    }
+}
+
+impl HandResult {
+    pub fn insurance_topup(&self, player: u64) -> u64 {
+        self.host_insurance
+            .filter(|insurance| insurance.host.inner() == player)
+            .map_or(0, |insurance| u64::from(insurance.host_topup))
+    }
+
+    pub fn settlement_topup(&self, player: u64) -> u64 {
+        self.bounty_topups.get(&player).copied().unwrap_or(0) + self.insurance_topup(player)
+    }
 }
 
 /// A room-rule bounty collected from other dealt players after pot settlement.
