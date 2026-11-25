@@ -10,6 +10,12 @@
 //! ([`rules::evaluate_with`]); a hand made with a 赖子 collects the 喜钱 bonus
 //! only when the room enables `wild_bonus`.
 //!
+//! 五选三 (room setting): each seat is dealt five cards and keeps three. A
+//! player picks after looking, before any further bet, and the two discards
+//! are then public. A seat that has not picked plays the best three of its
+//! five: a compare or the end of the hand fixes that choice, and a blind
+//! seat's discards stay hidden until it looks or its cards are shown.
+//!
 //! Admission funds the ante and one looked minimum call. Later actions are
 //! limited by the remaining stack; folding stays available. When the remaining
 //! stack cannot cover more than a call, all-in pays what is left and immediately
@@ -76,6 +82,10 @@ pub struct HandConfig {
     /// Rooms checkpointed before this setting existed priced 比牌 at two units.
     #[serde(default = "default_compare_mult")]
     pub compare_mult: u64,
+    /// 五选三: five cards per seat, keep three, discards public. Absent
+    /// (false) in an ordinary room.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub five_pick: bool,
 }
 
 fn default_compare_mult() -> u64 {
@@ -92,7 +102,18 @@ impl HandConfig {
     pub fn max_level(&self) -> u64 {
         self.ante * MAX_BET_ANTES
     }
+    /// Cards dealt to each seat.
+    pub fn hand_size(&self) -> usize {
+        if self.five_pick {
+            FIVE_PICK_DEALT
+        } else {
+            3
+        }
+    }
 }
+
+/// 五选三 deals this many cards to each seat.
+pub const FIVE_PICK_DEALT: usize = 5;
 
 pub fn min_stack(cfg: &HandConfig) -> u64 {
     cfg.ante * 3
@@ -102,7 +123,15 @@ pub fn min_stack(cfg: &HandConfig) -> u64 {
 pub struct Participant {
     pub seat: usize,
     pub stack_start: u64,
+    /// The three cards the seat plays. 五选三: the best three of `dealt`
+    /// until `keep` fixes them.
     pub cards: [Card; 3],
+    /// 五选三: all five dealt cards in deal order; empty in a three-card room.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dealt: Vec<Card>,
+    /// 五选三: the `dealt` slots of `cards` once fixed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep: Option<[u8; 3]>,
     pub value: HandValue,
     pub looked: bool,
     pub folded: bool,
@@ -115,11 +144,27 @@ impl Participant {
     pub fn active(&self) -> bool {
         !self.folded
     }
+    /// The three cards are final: always in a three-card room.
+    pub fn picked(&self) -> bool {
+        self.dealt.is_empty() || self.keep.is_some()
+    }
+    /// 五选三: the slots and cards set aside once the pick is fixed.
+    pub fn discards(&self) -> Option<([u8; 2], [Card; 2])> {
+        let keep = self.keep?;
+        let mut slots = (0..self.dealt.len() as u8).filter(|s| !keep.contains(s));
+        let slots = [slots.next()?, slots.next()?];
+        Some((slots, slots.map(|s| self.dealt[usize::from(s)])))
+    }
+    fn best_keep(&self, wild: rules::Wild) -> ([u8; 3], HandValue) {
+        rules::best_three(&self.dealt, wild)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Look,
+    /// 五选三: keep these three `dealt` slots.
+    Pick { keep: [u8; 3] },
     Call,
     Raise { level: u64 },
     Fold,
@@ -140,6 +185,9 @@ pub enum ActionError {
     AllInNotAllowed,
     InvalidTarget,
     InsufficientChips,
+    /// 五选三: the looked seat must pick its three cards before betting.
+    MustPick,
+    InvalidPick,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -154,6 +202,12 @@ pub enum LogEntry {
     },
     Look {
         seat: usize,
+    },
+    /// 五选三: `seat`'s two discards, public from here on.
+    Discard {
+        seat: usize,
+        slots: [u8; 2],
+        cards: [String; 2],
     },
     Call {
         seat: usize,
@@ -240,6 +294,8 @@ pub struct RaiseOption {
 pub struct Legal {
     pub can_show_cards: bool,
     pub can_look: bool,
+    /// 五选三: looked and still choosing; betting waits for the pick.
+    pub can_pick: bool,
     pub can_fold: bool,
     pub your_turn: bool,
     pub call_cost: Option<u64>,
@@ -274,7 +330,7 @@ enum AllInLayer {
 
 impl Hand {
     /// `seats` = `(seat, stack)` for every dealt-in player, any order.
-    /// `deck` must hold at least `3 * seats.len()` cards.
+    /// `deck` must hold at least `cfg.hand_size() * seats.len()` cards.
     pub fn new(
         cfg: HandConfig,
         seats: &[(usize, u64)],
@@ -283,7 +339,8 @@ impl Hand {
     ) -> Result<Self, ActionError> {
         let mut seats = seats.to_vec();
         seats.sort_by_key(|s| s.0);
-        if seats.len() < 2 || deck.len() < seats.len() * 3 {
+        let size = cfg.hand_size();
+        if seats.len() < 2 || deck.len() < seats.len() * size {
             return Err(ActionError::NotInHand);
         }
         let need = min_stack(&cfg);
@@ -294,18 +351,30 @@ impl Hand {
             .iter()
             .enumerate()
             .map(|(i, &(seat, stack))| {
-                let cards = [deck[i * 3], deck[i * 3 + 1], deck[i * 3 + 2]];
-                Participant {
+                let dealt = &deck[i * size..(i + 1) * size];
+                let mut p = Participant {
                     seat,
                     stack_start: stack,
-                    cards,
-                    value: rules::evaluate_with(&cards, cfg.wild()),
+                    cards: [dealt[0], dealt[1], dealt[2]],
+                    dealt: if cfg.five_pick {
+                        dealt.to_vec()
+                    } else {
+                        Vec::new()
+                    },
+                    keep: None,
+                    value: rules::evaluate_with(&[dealt[0], dealt[1], dealt[2]], cfg.wild()),
                     looked: false,
                     folded: false,
                     lost_compare: false,
                     contributed: cfg.ante,
                     last_acted_round: 0,
+                };
+                if cfg.five_pick {
+                    let (keep, value) = p.best_keep(cfg.wild());
+                    p.cards = keep.map(|s| p.dealt[usize::from(s)]);
+                    p.value = value;
                 }
+                p
             })
             .collect();
         let log = players
@@ -399,6 +468,7 @@ impl Hand {
         }
         let mut legal = Legal {
             can_look: !p.looked,
+            can_pick: p.looked && !p.picked(),
             can_fold: true,
             ..Legal::default()
         };
@@ -406,6 +476,9 @@ impl Hand {
             return legal;
         }
         legal.your_turn = true;
+        if legal.can_pick {
+            return legal;
+        }
         let unit = self.unit(idx);
         let mult = if p.looked { 2 } else { 1 };
         let available = p.stack_start - p.contributed;
@@ -475,6 +548,19 @@ impl Hand {
                 }
                 self.players[idx].looked = true;
                 self.log.push(LogEntry::Look { seat });
+                // A pick fixed while blind (a won compare) is public now.
+                self.log_discards(idx);
+                return Ok(());
+            }
+            Action::Pick { keep } => {
+                let p = &self.players[idx];
+                let n = p.dealt.len() as u8;
+                let distinct = keep[0] != keep[1] && keep[0] != keep[2] && keep[1] != keep[2];
+                if !p.looked || p.picked() || !distinct || keep.iter().any(|&s| s >= n) {
+                    return Err(ActionError::InvalidPick);
+                }
+                self.set_keep(idx, keep);
+                self.log_discards(idx);
                 return Ok(());
             }
             Action::Fold => {
@@ -491,6 +577,9 @@ impl Hand {
         }
         if self.to_act != idx {
             return Err(ActionError::NotYourTurn);
+        }
+        if self.players[idx].looked && !self.players[idx].picked() {
+            return Err(ActionError::MustPick);
         }
         match action {
             Action::Call => {
@@ -529,6 +618,8 @@ impl Hand {
                 }
                 let amount = self.compare_price(idx);
                 self.pay(idx, amount)?;
+                self.fix_pick(idx);
+                self.fix_pick(t);
                 let winner = self.resolve_compare(idx, t);
                 self.log.push(LogEntry::Compare {
                     seat,
@@ -547,7 +638,7 @@ impl Hand {
                 self.finish_showdown();
                 return Ok(());
             }
-            Action::Look | Action::Fold => unreachable!(),
+            Action::Look | Action::Pick { .. } | Action::Fold => unreachable!(),
         }
         self.players[idx].last_acted_round = self.round;
         if self.active_count() == 1 {
@@ -577,6 +668,45 @@ impl Hand {
         self.players[winner].seat
     }
 
+    fn set_keep(&mut self, idx: usize, keep: [u8; 3]) {
+        let wild = self.cfg.wild();
+        let p = &mut self.players[idx];
+        p.cards = keep.map(|s| p.dealt[usize::from(s)]);
+        p.value = rules::evaluate_with(&p.cards, wild);
+        p.keep = Some(keep);
+    }
+
+    /// 五选三: an undecided seat plays its best three from here on. A looked
+    /// seat's discards become public; a blind seat's wait for its look.
+    fn fix_pick(&mut self, idx: usize) {
+        if self.players[idx].picked() {
+            return;
+        }
+        let (keep, _) = self.players[idx].best_keep(self.cfg.wild());
+        self.set_keep(idx, keep);
+        self.log_discards(idx);
+    }
+
+    fn log_discards(&mut self, idx: usize) {
+        let p = &self.players[idx];
+        if let (true, Some((slots, cards))) = (p.looked, p.discards()) {
+            self.log.push(LogEntry::Discard {
+                seat: p.seat,
+                slots,
+                cards: cards.map(Card::code),
+            });
+        }
+    }
+
+    /// The live seats' cards decide the hand: fix every open pick.
+    fn fix_live_picks(&mut self) {
+        for idx in 0..self.players.len() {
+            if self.players[idx].active() {
+                self.fix_pick(idx);
+            }
+        }
+    }
+
     fn advance(&mut self) {
         let n = self.players.len();
         let mut next = (self.to_act + 1) % n;
@@ -594,6 +724,8 @@ impl Hand {
         self.to_act = next;
     }
 
+    /// Nobody else is left, so nothing is compared: an undecided winner's
+    /// cards stay unshown unless the bonus (or a voluntary show) opens them.
     fn finish_last_standing(&mut self) {
         let winner = self
             .players
@@ -604,6 +736,7 @@ impl Hand {
     }
 
     fn finish_showdown(&mut self) {
+        self.fix_live_picks();
         let active: Vec<usize> = (0..self.players.len())
             .filter(|&i| self.players[i].active())
             .collect();
@@ -674,6 +807,7 @@ impl Hand {
                 }
                 deltas[*winner].1 += amount as i64;
                 let seat = self.players[*winner].seat;
+                self.fix_pick(*winner);
                 // Public proof for the charge, even when everyone else folded.
                 if !self.showdown_seats.contains(&seat) {
                     self.showdown_seats.push(seat);
@@ -853,6 +987,9 @@ impl Hand {
         if !self.can_show_cards(seat) {
             return false;
         }
+        if let Ok(idx) = self.idx(seat) {
+            self.fix_pick(idx);
+        }
         self.showdown_seats.push(seat);
         self.log.push(LogEntry::ShowCards { seat });
         true
@@ -871,5 +1008,34 @@ impl Hand {
         let compared = unblind && viewer.is_some_and(|v| self.reveals.contains(&(v, target)));
         let shown = self.showdown_seats.contains(&target);
         (own || compared || shown).then_some(p.cards)
+    }
+
+    /// Every card dealt to `target` (five in 五选三) under the same rule as
+    /// [`Self::visible_cards`].
+    pub fn visible_dealt(&self, viewer: Option<usize>, target: usize) -> Option<Vec<Card>> {
+        let cards = self.visible_cards(viewer, target)?;
+        let p = self.participant(target)?;
+        Some(if p.dealt.is_empty() {
+            cards.to_vec()
+        } else {
+            p.dealt.clone()
+        })
+    }
+
+    /// 五选三: discards everyone may see (the seat looked and its pick is fixed).
+    pub fn public_discards(&self, target: usize) -> Option<([u8; 2], [Card; 2])> {
+        self.participant(target)
+            .filter(|p| p.looked)
+            .and_then(Participant::discards)
+    }
+
+    /// 五选三: the slots `target`'s three cards occupy in [`Self::visible_dealt`]
+    /// (fixed, or the best three while undecided) and whether they are final.
+    pub fn keep_slots(&self, target: usize) -> Option<([u8; 3], bool)> {
+        let p = self.participant(target).filter(|p| !p.dealt.is_empty())?;
+        Some(match p.keep {
+            Some(keep) => (keep, true),
+            None => (p.best_keep(self.cfg.wild()).0, false),
+        })
     }
 }

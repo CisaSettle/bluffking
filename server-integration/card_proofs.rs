@@ -273,7 +273,7 @@ pub async fn disclose_on(
     receipt: &Receipt,
 ) -> sqlx::Result<()> {
     let value: serde_json::Value =
-        sqlx::query_scalar("SELECT receipt FROM card_proof_receipts WHERE id=$1 FOR UPDATE")
+        sqlx::query_scalar("SELECT receipt FROM card_proof_receipts WHERE id=$1")
             .bind(receipt.secret.context.hand_id)
             .fetch_one(conn.writer())
             .await?;

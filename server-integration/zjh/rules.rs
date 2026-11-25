@@ -234,6 +234,25 @@ pub fn evaluate(cards: &[Card; 3]) -> HandValue {
     }
 }
 
+/// 五选三: the slots of the best three of `cards` (the natural ranking,
+/// without the 235 rule; the first such three on a tie) and their value.
+pub fn best_three(cards: &[Card], wild: Wild) -> ([u8; 3], HandValue) {
+    let mut best: Option<([u8; 3], HandValue)> = None;
+    let n = cards.len() as u8;
+    for a in 0..n {
+        for b in a + 1..n {
+            for c in b + 1..n {
+                let three = [a, b, c].map(|s| cards[usize::from(s)]);
+                let value = evaluate_with(&three, wild);
+                if best.is_none_or(|(_, v)| value.base_cmp(&v).is_gt()) {
+                    best = Some(([a, b, c], value));
+                }
+            }
+        }
+    }
+    best.expect("at least three cards")
+}
+
 /// Head-to-head comparison including the 235-beats-豹子 rule.
 pub fn compare(a: &HandValue, b: &HandValue) -> Ordering {
     if a.is_235 && b.category == Category::Leopard {
