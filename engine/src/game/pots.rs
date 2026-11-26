@@ -316,16 +316,17 @@ impl GameHand {
         &self,
         eligible: &[(PlayerId, HoleCards)],
     ) -> Vec<ShowdownEntry> {
-        Self::showdown_on(eligible, &self.board)
+        self.showdown_on(eligible, &self.board)
     }
 
     /// Rank a non-empty eligible set on `board` (first or second run).
     pub(super) fn showdown_on(
+        &self,
         eligible: &[(PlayerId, HoleCards)],
         board: &BoardCards,
     ) -> Vec<ShowdownEntry> {
         if eligible.len() > 1 {
-            let ranked = rank_players(eligible, board);
+            let ranked = rank_players_by_variant(self.variant, eligible, board);
             ranked
                 .into_iter()
                 .map(|(pid, rank)| {
@@ -350,7 +351,7 @@ impl GameHand {
             eligible
                 .iter()
                 .map(|(pid, hole)| {
-                    let rank = crate::eval::rank_hand(hole, board);
+                    let rank = rank_by_variant(self.variant, hole, board);
                     ShowdownEntry {
                         player_id: *pid,
                         hole_cards: *hole,
@@ -404,14 +405,16 @@ impl GameHand {
             // own board. Uncalled-overage refunds stay whole in the first run.
             (Some(from_street), Some(second_board)) => {
                 let (first_half, second_half) = split_pots_for_two_runs(&settlement_pots);
-                let first_pots = distribute_pots(
+                let first_pots = distribute_variant_pots(
+                    self.variant,
                     &first_half,
                     &eligible,
                     &self.board,
                     &button_order,
                     forfeiters,
                 );
-                let second_pots = distribute_pots(
+                let second_pots = distribute_variant_pots(
+                    self.variant,
                     &second_half,
                     &eligible,
                     second_board,
@@ -422,7 +425,7 @@ impl GameHand {
                 let second_showdown = if eligible.is_empty() {
                     Vec::new()
                 } else {
-                    Self::showdown_on(&eligible, second_board)
+                    self.showdown_on(&eligible, second_board)
                 };
                 (
                     merged,
@@ -436,7 +439,8 @@ impl GameHand {
                 )
             }
             _ => (
-                distribute_pots(
+                distribute_variant_pots(
+                    self.variant,
                     &settlement_pots,
                     &eligible,
                     &self.board,
@@ -1100,7 +1104,7 @@ pub(super) fn split_pots_for_two_runs(pots: &[SidePot]) -> (Vec<SidePot>, Vec<Si
     let mut second = Vec::with_capacity(pots.len());
     for pot in pots {
         let second_amount = if pot.refund_to.is_empty() {
-            pot.amount.0 / 2
+            crate::betting::runout_halves(u64::from(pot.amount.0)).1 as u32
         } else {
             0
         };
@@ -1192,6 +1196,17 @@ pub fn distribute_pots(
     button_order: &HashMap<u64, usize>,
     forfeiters: &HashSet<u64>,
 ) -> Vec<PotResult> {
+    distribute_variant_pots(PokerVariant::Holdem, pots, eligible_with_cards, board, button_order, forfeiters)
+}
+
+fn distribute_variant_pots(
+    variant: PokerVariant,
+    pots: &[SidePot],
+    eligible_with_cards: &[(PlayerId, HoleCards)],
+    board: &BoardCards,
+    button_order: &HashMap<u64, usize>,
+    forfeiters: &HashSet<u64>,
+) -> Vec<PotResult> {
     if pots.is_empty() {
         return vec![];
     }
@@ -1274,7 +1289,7 @@ pub fn distribute_pots(
                             amount_won: pot.amount,
                         }]
                     } else {
-                        let ranked = rank_players(eligible_with_cards, board);
+                        let ranked = rank_players_by_variant(variant, eligible_with_cards, board);
                         let best = ranked[0].1;
                         let shared: Vec<PlayerId> = ranked
                             .iter()
@@ -1340,7 +1355,7 @@ pub fn distribute_pots(
                     amount_won: pot.amount,
                 }]
             } else {
-                let ranked = rank_players(&contenders, board);
+                let ranked = rank_players_by_variant(variant, &contenders, board);
                 let best = ranked[0].1;
                 let shared: Vec<PlayerId> = ranked
                     .iter()
@@ -1654,6 +1669,26 @@ mod premium_bounty_tests {
             result: result.clone(),
         });
         (hand, result)
+    }
+
+    #[test]
+    fn shortdeck_pays_flush_over_full_house() {
+        let card = |s| crate::card::parse_card(s).unwrap();
+
+        let board = BoardCards {
+            flop: Some([card("Ah"), card("Kh"), card("Kc")]),
+            turn: Some(card("Jh")),
+            river: Some(card("7s")),
+        };
+        let flush = HoleCards::new(card("9h"), card("6h"));
+        let full_house = HoleCards::new(card("Ad"), card("As"));
+        let players = [(PlayerId(1), flush), (PlayerId(2), full_house)];
+        let ranked = rank_players_by_variant(PokerVariant::Shortdeck, &players, &board);
+        assert_eq!(ranked[0].0, PlayerId(1));
+        assert_eq!(ranked[0].1.name(), "flush");
+        assert_eq!(ranked[1].1.name(), "full_house");
+        let ranked = rank_players_by_variant(PokerVariant::Holdem, &players, &board);
+        assert_eq!(ranked[0].0, PlayerId(2));
     }
 
     #[test]

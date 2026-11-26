@@ -41,6 +41,7 @@ impl GameHand {
     /// its own heap payloads) and a `HashMap` on every single action.
     pub(super) fn preview_clone(&self) -> Self {
         Self {
+            variant: self.variant,
             seats: self.seats.clone(),
             dealer_idx: self.dealer_idx,
             big_blind: self.big_blind,

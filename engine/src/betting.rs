@@ -111,3 +111,8 @@ where
     }
     pots
 }
+
+/// An odd chip goes to the first run of the same pot.
+pub fn runout_halves(amount: u64) -> (u64, u64) {
+    (amount.div_ceil(2), amount / 2)
+}

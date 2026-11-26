@@ -12,7 +12,25 @@ pub enum DeckError {
     Exhausted,
 }
 
-/// A standard 52-card deck, shuffled at construction time.
+/// The deck and ranking rules to use for a poker hand.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PokerVariant {
+    #[default]
+    Holdem,
+    Shortdeck,
+}
+
+impl PokerVariant {
+    pub const fn lowest_rank(self) -> Rank {
+        match self {
+            Self::Holdem => Rank::Two,
+            Self::Shortdeck => Rank::Six,
+        }
+    }
+}
+
+/// A deck shuffled at construction time.
 ///
 /// Cards are dealt in order from the top. The deck cannot be reused once
 /// all 52 cards are dealt; callers should construct a new [`Deck`] for each hand.
@@ -25,7 +43,11 @@ pub struct Deck {
 impl Deck {
     /// Construct a freshly shuffled deck using the provided RNG.
     pub fn new(rng: &mut PokerRng) -> Self {
-        let mut cards: Vec<Card> = Rank::ALL
+        Self::for_variant(rng, PokerVariant::Holdem)
+    }
+
+    pub fn for_variant(rng: &mut PokerRng, variant: PokerVariant) -> Self {
+        let mut cards: Vec<Card> = Rank::ALL[variant.lowest_rank() as usize..]
             .iter()
             .flat_map(|&rank| Suit::ALL.iter().map(move |&suit| Card::new(rank, suit)))
             .collect();

@@ -327,6 +327,7 @@ pub fn decode_32(hex_str: &str) -> Option<[u8; 32]> {
 /// are ever sent to a client; every other field stays server-side.
 #[derive(Debug, Clone)]
 pub struct PfSecrets {
+    pub variant: engine::PokerVariant,
     /// The same UUID used for `HandStarted` / persist / reveal.
     pub hand_id: Uuid,
     /// 32-byte master seed of the locked deck (`pf2::LockedDeck::new`). Never

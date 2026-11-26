@@ -339,12 +339,90 @@ pub fn deck_hash(deck: &[Ct]) -> crate::hash::Hash {
 /// The canonical starting deck `D_0` = trivial encryption of card order
 /// `0..52` under any `Q` (the trivial encryption ignores `Q`, since `r = 0`).
 pub fn canonical_starting_deck() -> EncDeck {
+    canonical_poker_deck(crate::card_id::PokerDeck::Holdem)
+}
+
+/// Trivial encryptions of the variant's public, ordered card alphabet.
+pub fn canonical_poker_deck(manifest: crate::card_id::PokerDeck) -> EncDeck {
     // Public constants: computed once (52 fixed-base mults per hand otherwise).
     static DECK: OnceLock<EncDeck> = OnceLock::new();
     DECK.get_or_init(|| {
         (0..DECK_SIZE as u8)
             .map(|id| Ct::trivial(&card_point(id)))
             .collect()
-    })
-    .clone()
+    })[usize::from(crate::card_id::first_id(manifest))..]
+        .to_vec()
+}
+
+#[cfg(test)]
+mod poker_deck_tests {
+    use super::*;
+    use crate::card_id::{card_to_id, id_to_card, PokerDeck};
+    use engine::Rank;
+
+    #[test]
+    fn short_deck_uses_exactly_the_six_through_ace_alphabet() {
+        let manifest = PokerDeck::Shortdeck;
+        let starting = canonical_poker_deck(manifest);
+        let standard = canonical_starting_deck();
+        assert_eq!(crate::card_id::deck_size(manifest), 36);
+        assert_eq!(starting.len(), crate::card_id::deck_size(manifest));
+
+        let expected: Vec<_> = (0..standard.len() as u8)
+            .map(|id| id_to_card(id).unwrap())
+            .filter(|card| card.rank >= Rank::Six)
+            .map(card_to_id)
+            .collect();
+        for (ct, &id) in starting.iter().zip(&expected) {
+            assert_eq!(ct.to_wire().c2, standard[id as usize].to_wire().c2);
+        }
+        for id in 0..=u8::MAX {
+            assert_eq!(crate::card_id::contains(manifest, id), expected.contains(&id));
+        }
+    }
+
+    #[test]
+    fn the_same_shuffle_proof_accepts_both_poker_alphabets() {
+        use crate::crypto_real::{
+            dkg::DkgParty,
+            shuffle::{verify_shuffle, Shuffle},
+        };
+        use rand::SeedableRng;
+        use rand_chacha::ChaCha20Rng;
+
+        let mut rng = ChaCha20Rng::seed_from_u64(36);
+        let alice = DkgParty::generate("alice", &mut rng);
+        let bob = DkgParty::generate("bob", &mut rng);
+        let joint_key = alice.q_i + bob.q_i;
+        let joint_key_hex = point_to_hex(&joint_key);
+
+        for manifest in [PokerDeck::Holdem, PokerDeck::Shortdeck] {
+            let starting = canonical_poker_deck(manifest);
+            let input_hash = deck_hash(&starting);
+            let shuffle = Shuffle::perform(starting, &joint_key, &mut rng);
+            let output_hash = deck_hash(&shuffle.output);
+            let proof = shuffle.prove(&alice.party_id, 0, &mut rng);
+            assert!(verify_shuffle(
+                &alice.party_id,
+                0,
+                &input_hash,
+                &output_hash,
+                &joint_key_hex,
+                &proof,
+            ));
+
+            let other_manifest = match manifest {
+                PokerDeck::Holdem => PokerDeck::Shortdeck,
+                PokerDeck::Shortdeck => PokerDeck::Holdem,
+            };
+            assert!(!verify_shuffle(
+                &alice.party_id,
+                0,
+                &deck_hash(&canonical_poker_deck(other_manifest)),
+                &output_hash,
+                &joint_key_hex,
+                &proof,
+            ));
+        }
+    }
 }

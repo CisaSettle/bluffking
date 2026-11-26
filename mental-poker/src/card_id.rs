@@ -17,6 +17,21 @@ pub type CardId = u8;
 /// Number of cards in a standard deck.
 pub const DECK_SIZE: usize = 52;
 
+/// The canonical card alphabet follows the engine's rules variant.
+pub use engine::PokerVariant as PokerDeck;
+
+pub const fn first_id(deck: PokerDeck) -> CardId {
+    (deck.lowest_rank() as CardId) * Suit::ALL.len() as CardId
+}
+
+pub const fn deck_size(deck: PokerDeck) -> usize {
+    DECK_SIZE - first_id(deck) as usize
+}
+
+pub const fn contains(deck: PokerDeck, id: CardId) -> bool {
+    id >= first_id(deck) && (id as usize) < DECK_SIZE
+}
+
 /// Convert an engine [`Card`] to its canonical [`CardId`].
 pub fn card_to_id(card: Card) -> CardId {
     let rank_index = Rank::ALL.iter().position(|&r| r == card.rank).unwrap_or(0);

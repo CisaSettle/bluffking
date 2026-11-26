@@ -116,11 +116,10 @@ impl WasmParty {
         // T-ACTIVE-COORDINATOR). Validate its length BEFORE proving: an empty deck
         // would underflow `prod_blind[n - 1]` in the permutation prover and TRAP
         // the whole wasm instance instead of returning `Err`, and an over-large
-        // deck is O(n) needless work. The shuffle only ever operates on the full
-        // 52-card deck, so require exactly that.
-        if wires.len() != DECK_SIZE {
+        // deck is O(n) needless work. Limit it to the supported poker decks.
+        if !matches!(wires.len(), DECK_SIZE | 36) {
             return Err(format!(
-                "deck must have {DECK_SIZE} cards, got {}",
+                "deck must have {DECK_SIZE} or 36 cards, got {}",
                 wires.len()
             ));
         }
@@ -162,7 +161,7 @@ impl WasmParty {
         let keys: Vec<r::RecoveryKey> =
             serde_json::from_str(&keys_json).map_err(|_| "recovery_keys")?;
         let deck: Vec<CtWire> = serde_json::from_str(&deck_json).map_err(|_| "recovery_deck")?;
-        if deck.len() != 52 {
+        if !matches!(deck.len(), DECK_SIZE | 36) {
             return Err("recovery_deck".into());
         }
         let n = keys.len();

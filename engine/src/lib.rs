@@ -27,12 +27,13 @@ pub mod hand;
 pub mod player;
 pub mod rng;
 pub mod round;
+pub mod shortdeck;
 pub mod solver;
 
 // Re-export the main public API.
 pub use action::{ActionError, ActionRecord, BlindKind, PlayerAction};
 pub use card::{Card, Rank, Suit};
-pub use deck::Deck;
+pub use deck::{Deck, PokerVariant};
 pub use eval::{describe_hand, rank_hand, rank_players, HandRank, RankDescription};
 pub use event::EngineEvent;
 pub use game::{

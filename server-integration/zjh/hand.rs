@@ -1,8 +1,9 @@
 //! One 炸金花 hand as a pure state machine (no IO, no clocks, no RNG).
 //!
 //! Betting unit: a blind (闷牌) player pays the current level, a player who
-//! has looked pays twice the level. Raising lifts the level in ante increments.
-//! Each payment is capped at 200 antes. Compare (比牌) is allowed from round 2, costs
+//! has looked pays the room's look multiplier times the level. Raising lifts the
+//! level in ante increments. Each payment is capped at the room's bet limit.
+//! Compare (比牌) is allowed from round 2 and costs
 //! `compare_mult` call units (room setting, default two), and a tie loses for the
 //! initiator. After `max_rounds` full rounds all remaining players are forced to
 //! show down. An optional 赖子 rank makes every card of that rank wild, and
@@ -32,7 +33,12 @@ use super::rules::{self, Card, Category, HandValue};
 
 /// Conservative bot sizing preferences, not the legal raise limit.
 pub const RAISE_MULTS: [u64; 4] = [2, 3, 5, 10];
-pub const MAX_BET_ANTES: u64 = 200;
+pub const DEFAULT_LOOK_MULT: u64 = 2;
+pub const MAX_LOOK_MULT: u64 = 3;
+pub const DEFAULT_BET_CAP_ANTES: u64 = 100;
+pub const MAX_BET_CAP_ANTES: u64 = 1000;
+pub const DEFAULT_BUY_IN_CAP_ANTES: u64 = 200;
+pub const MAX_BUY_IN_CAP_ANTES: u64 = 1000;
 pub const DEFAULT_MAX_ROUNDS: u8 = 3;
 pub const MIN_ROUNDS: u8 = 3;
 pub const MAX_ROUNDS: u8 = 10;
@@ -82,6 +88,10 @@ pub struct HandConfig {
     /// Rooms checkpointed before this setting existed priced 比牌 at two units.
     #[serde(default = "default_compare_mult")]
     pub compare_mult: u64,
+    #[serde(default = "default_look_mult")]
+    pub look_mult: u64,
+    #[serde(default = "default_bet_cap_antes")]
+    pub bet_cap_antes: u64,
     /// 五选三: five cards per seat, keep three, discards public. Absent
     /// (false) in an ordinary room.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -92,6 +102,14 @@ fn default_compare_mult() -> u64 {
     DEFAULT_COMPARE_MULT
 }
 
+fn default_look_mult() -> u64 {
+    DEFAULT_LOOK_MULT
+}
+
+fn default_bet_cap_antes() -> u64 {
+    DEFAULT_BET_CAP_ANTES
+}
+
 impl HandConfig {
     pub fn wild(&self) -> rules::Wild {
         rules::Wild {
@@ -100,7 +118,14 @@ impl HandConfig {
         }
     }
     pub fn max_level(&self) -> u64 {
-        self.ante * MAX_BET_ANTES
+        self.ante * self.bet_cap_antes
+    }
+    pub fn bet_multiplier(&self, looked: bool) -> u64 {
+        if looked {
+            self.look_mult
+        } else {
+            1
+        }
     }
     /// Cards dealt to each seat.
     pub fn hand_size(&self) -> usize {
@@ -116,7 +141,7 @@ impl HandConfig {
 pub const FIVE_PICK_DEALT: usize = 5;
 
 pub fn min_stack(cfg: &HandConfig) -> u64 {
-    cfg.ante * 3
+    cfg.ante + (cfg.ante * cfg.bet_multiplier(true)).min(cfg.max_level())
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -439,12 +464,8 @@ impl Hand {
     }
 
     fn unit(&self, idx: usize) -> u64 {
-        let amount = if self.players[idx].looked {
-            self.level * 2
-        } else {
-            self.level
-        };
-        amount.min(self.cfg.max_level())
+        let mult = self.cfg.bet_multiplier(self.players[idx].looked);
+        (self.level * mult).min(self.cfg.max_level())
     }
 
     fn compare_price(&self, idx: usize) -> u64 {
@@ -480,15 +501,14 @@ impl Hand {
             return legal;
         }
         let unit = self.unit(idx);
-        let mult = if p.looked { 2 } else { 1 };
+        let mult = self.cfg.bet_multiplier(p.looked);
         let available = p.stack_start - p.contributed;
         legal.call_cost = (unit <= available).then_some(unit);
         legal.all_in_cost = (unit >= available).then_some(available);
-        legal.raises = (2..=MAX_BET_ANTES)
+        let next = self.level / self.cfg.ante + 1;
+        let max = available.min(self.cfg.max_level()) / mult / self.cfg.ante;
+        legal.raises = (next..=max)
             .map(|m| m * self.cfg.ante)
-            .filter(|&level| {
-                level > self.level && level * mult <= available.min(self.cfg.max_level())
-            })
             .map(|level| RaiseOption {
                 level,
                 cost: level * mult,
@@ -588,18 +608,14 @@ impl Hand {
                 self.log.push(LogEntry::Call { seat, amount });
             }
             Action::Raise { level } => {
-                let mult = if self.players[idx].looked { 2 } else { 1 };
+                let mult = self.cfg.bet_multiplier(self.players[idx].looked);
                 let valid = level > self.level
                     && level <= self.cfg.max_level() / mult
                     && level.is_multiple_of(self.cfg.ante);
                 if !valid {
                     return Err(ActionError::InvalidRaise);
                 }
-                let amount = if self.players[idx].looked {
-                    level * 2
-                } else {
-                    level
-                };
+                let amount = level * mult;
                 self.pay(idx, amount)?;
                 self.level = level;
                 self.log.push(LogEntry::Raise {

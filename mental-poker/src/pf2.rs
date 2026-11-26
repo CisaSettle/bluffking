@@ -38,12 +38,12 @@ use rand_core::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::card_id::card_to_id;
+use crate::card_id::{card_to_id, contains, deck_size, first_id, PokerDeck};
 use crate::crypto_real::decrypt::{
     verify_and_open, ThresholdDecryptionProof, SCHEME as DECRYPT_SCHEME,
 };
 use crate::crypto_real::ec::{
-    canonical_starting_deck, deck_hash, point_from_hex, point_to_bytes, point_to_hex, Ct, DECK_SIZE,
+    canonical_poker_deck, deck_hash, point_from_hex, point_to_bytes, point_to_hex, Ct,
 };
 use crate::crypto_real::shuffle::{output_deck_from_proof, verify_shuffle, ShuffleProof};
 use crate::hash::ds_hash;
@@ -65,25 +65,34 @@ const DS_ORDER: &str = "pf2:order:v2";
 const DS_ENGINE_SEED: &str = "pf2:engine-seed:v2";
 
 /// Encode a master seed for `hands.server_seed`.
-pub fn encode_stored_seed(master_seed: &[u8; 32]) -> Vec<u8> {
+const SHORTDECK_SEED_VERSION: u8 = 3;
+
+pub fn encode_stored_seed(master_seed: &[u8; 32], variant: PokerDeck) -> Vec<u8> {
     let mut out = Vec::with_capacity(33);
-    out.push(SEED_VERSION);
+    out.push(match variant {
+        PokerDeck::Holdem => SEED_VERSION,
+        PokerDeck::Shortdeck => SHORTDECK_SEED_VERSION,
+    });
     out.extend_from_slice(master_seed);
     out
 }
 
 /// Decode a `hands.server_seed` value. `None` for a legacy v1 (32-byte) or
 /// malformed value.
-pub fn decode_stored_seed(stored: &[u8]) -> Option<[u8; 32]> {
-    match stored {
-        [SEED_VERSION, rest @ ..] if rest.len() == 32 => rest.try_into().ok(),
-        _ => None,
-    }
+pub fn decode_stored_seed(stored: &[u8]) -> Option<([u8; 32], PokerDeck)> {
+    let (&version, rest) = stored.split_first()?;
+    let variant = match version {
+        SEED_VERSION => PokerDeck::Holdem,
+        SHORTDECK_SEED_VERSION => PokerDeck::Shortdeck,
+        _ => return None,
+    };
+    Some((rest.try_into().ok()?, variant))
 }
 
 /// The dealer's locked deck for one hand. Holds the secret key and shuffle
 /// witness; never serialize it.
 pub struct LockedDeck {
+    variant: PokerDeck,
     hand_id: Uuid,
     locked: crate::locked_shuffle::LockedShuffle,
     commit: [u8; 32],
@@ -117,18 +126,27 @@ impl LockedDeck {
     /// Rebuild the locked deck from its master seed. Deterministic: the same
     /// `(master_seed, hand_id)` always yields the same key, deck and commit.
     pub fn new(master_seed: &[u8; 32], hand_id: Uuid) -> Self {
+        Self::for_variant(master_seed, hand_id, PokerDeck::Holdem)
+    }
+
+    pub fn for_variant(master_seed: &[u8; 32], hand_id: Uuid, variant: PokerDeck) -> Self {
         let key = Scalar::random(&mut seeded_rng(DS_KEY, master_seed, hand_id));
         let locked = crate::locked_shuffle::LockedShuffle::new(
             key,
-            canonical_starting_deck(),
+            canonical_poker_deck(variant),
             &mut seeded_rng(DS_SHUFFLE, master_seed, hand_id),
         );
         let commit = commit_of(hand_id, &locked.public_key, &locked.shuffle.output);
         Self {
+            variant,
             hand_id,
             locked,
             commit,
         }
+    }
+
+    pub fn variant(&self) -> PokerDeck {
+        self.variant
     }
 
     /// The commitment published before any player seed is disclosed.
@@ -138,9 +156,9 @@ impl LockedDeck {
 
     /// Card ids of the final deck in deal order (`F[k]` plaintexts).
     pub fn final_card_ids(&self, client_seeds: &BTreeMap<u8, [u8; 32]>) -> Vec<u8> {
-        public_order(&self.commit, client_seeds, self.hand_id)
+        public_order_for_variant(&self.commit, client_seeds, self.hand_id, self.variant)
             .into_iter()
-            .map(|j| self.locked.shuffle.pi[j] as u8)
+            .map(|j| self.locked.shuffle.pi[j] as u8 + first_id(self.variant))
             .collect()
     }
 
@@ -154,7 +172,7 @@ impl LockedDeck {
         positions: &[usize],
         rng: &mut R,
     ) -> Result<Bundle, Pf2Error> {
-        let order = public_order(&self.commit, client_seeds, self.hand_id);
+        let order = public_order_for_variant(&self.commit, client_seeds, self.hand_id, self.variant);
         let openings = self
             .locked
             .openings(&order, positions, DEALER_PARTY.into(), DECRYPT_SCHEME, rng)
@@ -162,11 +180,12 @@ impl LockedDeck {
             .into_iter()
             .map(|(position, card, proof)| Opening {
                 position,
-                card: card as u8,
+                card: card as u8 + first_id(self.variant),
                 proof,
             })
             .collect();
         Ok(Bundle {
+            variant: self.variant,
             scheme: SCHEME.to_string(),
             hand_id: self.hand_id.to_string(),
             commit: hex::encode(self.commit),
@@ -203,6 +222,15 @@ pub fn public_order(
     client_seeds: &BTreeMap<u8, [u8; 32]>,
     hand_id: Uuid,
 ) -> Vec<usize> {
+    public_order_for_variant(commit, client_seeds, hand_id, PokerDeck::Holdem)
+}
+
+fn public_order_for_variant(
+    commit: &[u8; 32],
+    client_seeds: &BTreeMap<u8, [u8; 32]>,
+    hand_id: Uuid,
+    variant: PokerDeck,
+) -> Vec<usize> {
     let mut parts: Vec<&[u8]> = vec![commit];
     let seats: Vec<[u8; 1]> = client_seeds.keys().map(|s| [*s]).collect();
     for (seat, seed) in seats.iter().zip(client_seeds.values()) {
@@ -211,12 +239,10 @@ pub fn public_order(
     }
     parts.push(hand_id.as_bytes());
     let seed = ds_hash(DS_ORDER, &parts);
-    // The engine's unbiased Fisher-Yates; card ids are a fixed bijection onto
-    // 0..52, so the shuffled ids are a uniform permutation of 0..52.
-    Deck::new(&mut PokerRng::from_seed_bytes(seed))
+    Deck::for_variant(&mut PokerRng::from_seed_bytes(seed), variant)
         .cards()
         .iter()
-        .map(|card| card_to_id(*card) as usize)
+        .map(|card| (card_to_id(*card) - first_id(variant)) as usize)
         .collect()
 }
 
@@ -246,6 +272,8 @@ pub struct Opening {
 /// of a requester's own hole cards, which the server serves only to them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Bundle {
+    #[serde(default, skip_serializing_if = "is_holdem")]
+    pub variant: PokerDeck,
     pub scheme: String,
     pub hand_id: String,
     /// 64-hex commitment (the `SeedCommit.seed_commit` players received).
@@ -260,6 +288,10 @@ pub struct Bundle {
     /// Committed seats that did not reveal (excluded from the order).
     pub withheld_seats: Vec<u8>,
     pub openings: Vec<Opening>,
+}
+
+fn is_holdem(variant: &PokerDeck) -> bool {
+    *variant == PokerDeck::Holdem
 }
 
 /// What a valid bundle proves.
@@ -328,6 +360,7 @@ pub(crate) fn verify_deck(bundle: &Bundle, max_seats: usize) -> Result<Verified,
     if point_to_hex(&public_key) != bundle.public_key {
         return Err(Pf2Error::Malformed("public_key"));
     }
+    let variant = bundle.variant;
     let seats = &bundle.dealt_seats;
     if !(2..=max_seats).contains(&seats.len()) || seats.windows(2).any(|w| w[0] >= w[1]) {
         return Err(Pf2Error::Seats);
@@ -350,10 +383,10 @@ pub(crate) fn verify_deck(bundle: &Bundle, max_seats: usize) -> Result<Verified,
 
     // The shuffled deck, bound to the commitment and the pinned standard input.
     let deck = output_deck_from_proof(&bundle.shuffle_proof).ok_or(Pf2Error::Shuffle)?;
-    if deck.len() != DECK_SIZE || commit_of(hand_id, &public_key, &deck) != commit {
+    if deck.len() != deck_size(variant) || commit_of(hand_id, &public_key, &deck) != commit {
         return Err(Pf2Error::Commit);
     }
-    let input_hash = deck_hash(&canonical_starting_deck());
+    let input_hash = deck_hash(&canonical_poker_deck(variant));
     let output_hash = deck_hash(&deck);
     let q_hex = point_to_hex(&public_key);
     if !verify_shuffle(
@@ -367,7 +400,7 @@ pub(crate) fn verify_deck(bundle: &Bundle, max_seats: usize) -> Result<Verified,
         return Err(Pf2Error::Shuffle);
     }
 
-    let order = public_order(&commit, &client_seeds, hand_id);
+    let order = public_order_for_variant(&commit, &client_seeds, hand_id, variant);
     let dealer = [(DEALER_PARTY.to_string(), public_key)];
     let mut cards = BTreeMap::new();
     for opening in &bundle.openings {
@@ -379,7 +412,7 @@ pub(crate) fn verify_deck(bundle: &Bundle, max_seats: usize) -> Result<Verified,
             &opening.proof,
         )
         .map_err(|_| Pf2Error::Opening(opening.position))?;
-        if card != opening.card {
+        if card != opening.card || !contains(variant, card) {
             return Err(Pf2Error::Opening(opening.position));
         }
         if cards.insert(opening.position, card).is_some() {
@@ -407,4 +440,26 @@ pub(crate) fn verify_deck(bundle: &Bundle, max_seats: usize) -> Result<Verified,
         board,
         holes,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shortdeck_bundle_proves_the_same_36_card_alphabet_it_deals() {
+        let hand = LockedDeck::for_variant(&[7; 32], Uuid::from_u128(1), PokerDeck::Shortdeck);
+        let seeds = BTreeMap::new();
+        let deck = hand.final_card_ids(&seeds);
+        assert_eq!(deck.iter().copied().collect::<std::collections::BTreeSet<_>>(),
+                   (16..52).collect());
+        let mut rng = ChaCha20Rng::from_seed([6; 32]);
+        let mut bundle = hand.bundle(&seeds, &[0, 1], &[0, 1], &[0, 4], &mut rng)
+            .unwrap();
+        let verified = verify(&bundle).unwrap();
+        assert_eq!(verified.cards[&0], deck[0]);
+        assert_eq!(verified.cards[&4], deck[4]);
+        bundle.variant = PokerDeck::Holdem;
+        assert!(verify(&bundle).is_err());
+    }
 }

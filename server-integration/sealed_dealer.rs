@@ -70,6 +70,7 @@ pub struct SeatTicket {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CommitHandRequest {
     pub hand_id: Uuid,
+    pub variant: engine::PokerVariant,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -80,6 +81,7 @@ pub struct CommitHandResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CreateHandRequest {
     pub hand_id: Uuid,
+    pub variant: engine::PokerVariant,
     pub seats: Vec<u8>,
     #[serde(default)]
     pub bot_seats: Vec<u8>,
@@ -238,6 +240,7 @@ pub fn check_settled_cards(
 /// deck costs milliseconds of CPU, so it runs on the blocking pool.
 pub async fn verified_reveal(
     hand_id: Uuid,
+    variant: engine::PokerVariant,
     seed_commit: [u8; 32],
     deck: &FinalDeckResponse,
 ) -> Result<crate::pf_dealing::PfSecrets, String> {
@@ -247,7 +250,7 @@ pub async fn verified_reveal(
     let seed = deck.seed;
     tokio::task::spawn_blocking(move || {
         use mental_poker::pf2;
-        let locked = pf2::LockedDeck::new(&master, hand_id);
+        let locked = pf2::LockedDeck::for_variant(&master, hand_id, variant);
         if locked.commit() != seed_commit {
             return Err("sealed master seed does not match its commit".to_string());
         }
@@ -257,6 +260,7 @@ pub async fn verified_reveal(
         }
         Ok(crate::pf_dealing::PfSecrets {
             hand_id,
+            variant,
             server_seed: master,
             seed_commit,
             client_seeds,
@@ -272,18 +276,20 @@ pub async fn verified_reveal(
 
 pub fn validate_final_deck(
     hand_id: Uuid,
+    variant: engine::PokerVariant,
     commitment: &str,
     deck: &FinalDeckResponse,
 ) -> Result<(), String> {
-    if deck.cards.len() != 52
-        || deck.cards.iter().any(|card| *card >= 52)
+    let size = mental_poker::card_id::deck_size(variant);
+    if deck.cards.len() != size
+        || deck.cards.iter().any(|&card| !mental_poker::card_id::contains(variant, card))
         || deck
             .cards
             .iter()
             .copied()
             .collect::<std::collections::HashSet<_>>()
             .len()
-            != 52
+            != size
     {
         return Err("sealed recovery deck is invalid".to_string());
     }
@@ -319,6 +325,7 @@ enum DealerStage {
 
 #[derive(Debug)]
 struct SealedHand {
+    variant: engine::PokerVariant,
     seats: Vec<u8>,
     deck: Vec<u8>,
     seed: [u8; 32],
@@ -367,6 +374,7 @@ impl SealedHand {
         pending: PendingCommit,
         client_seeds: BTreeMap<u8, [u8; 32]>,
     ) -> Result<(Self, Vec<SeatTicket>), &'static str> {
+        let variant = pending.locked.variant();
         let deck = pending.locked.final_card_ids(&client_seeds);
         let seed = mental_poker::pf2::engine_seed(&pending.master, &client_seeds, hand_id);
         let server_seed = pending.master;
@@ -377,8 +385,8 @@ impl SealedHand {
         if seats.len() < 2 || seats.len() > 9 {
             return Err("sealed dealer requires 2..=9 distinct seats");
         }
-        if deck.len() != 52 {
-            return Err("sealed dealer requires a 52-card deck");
+        if deck.len() < 2 * seats.len() + 10 {
+            return Err("sealed deck cannot cover all dealt seats and both runouts");
         }
         let mut nonce = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut nonce);
@@ -402,6 +410,7 @@ impl SealedHand {
 
         Ok((
             Self {
+                variant,
                 seats,
                 deck,
                 seed,
@@ -661,7 +670,7 @@ async fn create_hand(
     let mut hands = state.hands.write().await;
     hands.drop_idle(std::time::Instant::now());
     if let Some(existing) = hands.get(&request.hand_id) {
-        if existing.seats != seats
+        if existing.variant != request.variant || existing.seats != seats
             || existing.bot_seats != bot_seats
             || existing.client_seeds != request.client_seeds
             || existing.seed_commit != request.seed_commit
@@ -679,7 +688,9 @@ async fn create_hand(
     // one the game server announced to the players, not missing (worker
     // restarted after the commit) and not another hand's.
     let committed = state.commits.write().await.remove(&request.hand_id);
-    let Some(pending) = committed.filter(|pending| pending.locked.commit() == request.seed_commit)
+    let Some(pending) = committed.filter(|pending| {
+        pending.locked.variant() == request.variant && pending.locked.commit() == request.seed_commit
+    })
     else {
         return (
             StatusCode::CONFLICT,
@@ -726,6 +737,9 @@ async fn commit_hand(
         commits.retain(|_, pending| now.duration_since(pending.at) < COMMIT_TTL);
         // A lost response is replayed with the same commit, never a new seed.
         if let Some(pending) = commits.get(&request.hand_id) {
+            if pending.locked.variant() != request.variant {
+                return StatusCode::CONFLICT.into_response();
+            }
             return Json(CommitHandResponse {
                 seed_commit: pending.locked.commit(),
             })
@@ -736,8 +750,9 @@ async fn commit_hand(
     // workers and without holding the commit map.
     let master = crate::pf_dealing::os_random_32();
     let hand_id = request.hand_id;
+    let variant = request.variant;
     let Ok(locked) =
-        tokio::task::spawn_blocking(move || mental_poker::pf2::LockedDeck::new(&master, hand_id))
+        tokio::task::spawn_blocking(move || mental_poker::pf2::LockedDeck::for_variant(&master, hand_id, variant))
             .await
     else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -749,6 +764,9 @@ async fn commit_hand(
         locked,
         at: now,
     });
+    if pending.locked.variant() != variant {
+        return StatusCode::CONFLICT.into_response();
+    }
     Json(CommitHandResponse {
         seed_commit: pending.locked.commit(),
     })
@@ -1140,14 +1158,14 @@ impl SealedDealerClient {
         .map_err(|e| e.to_string())
     }
 
-    pub async fn commit_hand(&self, hand_id: Uuid) -> Result<[u8; 32], String> {
+    pub async fn commit_hand(&self, hand_id: Uuid, variant: engine::PokerVariant) -> Result<[u8; 32], String> {
         let response: CommitHandResponse = self
             .send_with_retry(
                 self.request(
                     self.http
                         .post(format!("{}/internal/commits", self.base_url)),
                 )
-                .json(&CommitHandRequest { hand_id }),
+                .json(&CommitHandRequest { hand_id, variant }),
             )
             .await?
             .json()
@@ -1418,6 +1436,7 @@ pub struct ActiveHand {
 impl ActiveHand {
     pub async fn create(
         hand_id: Uuid,
+        variant: engine::PokerVariant,
         dealt_seats: &[u8],
         bots: &std::collections::HashSet<u8>,
         users: &HashMap<Uuid, u8>,
@@ -1436,6 +1455,7 @@ impl ActiveHand {
         let deal = client
             .create_hand(&CreateHandRequest {
                 hand_id,
+                variant,
                 seats: seats.clone(),
                 bot_seats: bots.iter().copied().filter(|s| seats.contains(s)).collect(),
                 client_seeds,
@@ -1467,8 +1487,8 @@ impl ActiveHand {
     }
 
     /// Phase one: obtain the dealer's seed commitment for `hand_id`.
-    pub async fn commit(hand_id: Uuid) -> Result<[u8; 32], String> {
-        client()?.commit_hand(hand_id).await
+    pub async fn commit(hand_id: Uuid, variant: engine::PokerVariant) -> Result<[u8; 32], String> {
+        client()?.commit_hand(hand_id, variant).await
     }
 
     pub fn ticket(&self, seat: u8) -> Option<crate::protocol::ServerMsg> {
@@ -1593,7 +1613,7 @@ impl ActiveHand {
             .client
             .finish_and_settle(self.hand_id, &self.deal.commitment, hand)
             .await?;
-        validate_final_deck(self.hand_id, &self.deal.commitment, &deck)?;
+        validate_final_deck(self.hand_id, hand.variant(), &self.deal.commitment, &deck)?;
         check_settled_cards(&self.seats, &deck.cards, &result, |pid| {
             hand.seats()
                 .iter()
@@ -1602,7 +1622,7 @@ impl ActiveHand {
         })?;
         // The dealer's copy is done once it has settled: release it while the
         // commitment is re-derived locally instead of after it, one round trip sooner.
-        let verify = verified_reveal(self.hand_id, self.commit.seed_commit, &deck);
+        let verify = verified_reveal(self.hand_id, hand.variant(), self.commit.seed_commit, &deck);
         let (verified, ()) = tokio::join!(verify, self.delete());
         let mut pf = verified?;
         if pf.client_seeds != self.commit.client_seeds {

@@ -63,6 +63,7 @@ impl GameHand {
             })
             .collect();
         Self {
+            variant: PokerVariant::Holdem,
             seats,
             dealer_idx,
             big_blind,
@@ -139,6 +140,7 @@ impl GameHand {
             })
             .collect();
         Self {
+            variant: PokerVariant::Holdem,
             seats,
             dealer_idx,
             big_blind,
@@ -174,6 +176,16 @@ impl GameHand {
             run_twice_from: None,
             second_board: None,
         }
+    }
+
+    /// Choose the hand ranking that matches the dealer's supplied deck.
+    pub fn with_variant(mut self, variant: PokerVariant) -> Self {
+        self.variant = variant;
+        self
+    }
+
+    pub fn variant(&self) -> PokerVariant {
+        self.variant
     }
 
     /// Enable a live, forced UTG straddle for this hand.

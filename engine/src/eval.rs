@@ -190,6 +190,34 @@ pub fn rank_players(
     ranked
 }
 
+/// Dispatch evaluation to the room's rules and return its rank for display.
+pub fn rank_by_variant(
+    variant: crate::PokerVariant,
+    hole: &HoleCards,
+    board: &BoardCards,
+) -> HandRank {
+    if variant == crate::PokerVariant::Holdem {
+        return rank_hand(hole, board);
+    }
+    crate::shortdeck::rank(hole, board).into()
+}
+
+pub(crate) fn rank_players_by_variant(
+    variant: crate::PokerVariant,
+    players: &[(PlayerId, HoleCards)],
+    board: &BoardCards,
+) -> Vec<(PlayerId, HandRank)> {
+    if variant == crate::PokerVariant::Holdem {
+        return rank_players(players, board);
+    }
+    let mut ranked: Vec<_> = players
+        .iter()
+        .map(|(id, hole)| (*id, crate::shortdeck::rank(hole, board)))
+        .collect();
+    ranked.sort_by_key(|&(_, value)| Reverse(value));
+    ranked.into_iter().map(|(id, value)| (id, value.into())).collect()
+}
+
 // ---------------------------------------------------------------------------
 // Allocation-free fast path for the equity Monte Carlo hot loop
 // ---------------------------------------------------------------------------

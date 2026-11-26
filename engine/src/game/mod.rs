@@ -7,7 +7,8 @@
 use crate::action::{ActionError, ActionRecord, BlindKind, PlayerAction};
 use crate::card::Card;
 use crate::deck::Deck;
-use crate::eval::{rank_players, HandRank};
+use crate::eval::{rank_by_variant, rank_players_by_variant, HandRank};
+use crate::PokerVariant;
 use crate::event::EngineEvent;
 use crate::hand::{BoardCards, HoleCards, Street};
 use crate::player::{Chips, PlayerId};
@@ -478,6 +479,7 @@ pub const fn cards_for_street(street: Street) -> usize {
 /// Orchestrates a complete Texas Hold'em hand.
 #[derive(Clone)]
 pub struct GameHand {
+    variant: PokerVariant,
     seats: Vec<HandSeat>,
     dealer_idx: usize,
     big_blind: Chips,
@@ -723,6 +725,11 @@ impl GameHand {
         &self.seats
     }
 
+    /// Public betting records in application order.
+    pub fn action_records(&self) -> &[ActionRecord] {
+        &self.actions
+    }
+
     /// The `PlayerId`s of every seat that has not folded, in seat order. Used by
     /// the engine-blind coordinator to decide contested vs uncontested and to
     /// identify the contenders that owe a showdown reveal.
@@ -836,10 +843,21 @@ impl GameHand {
 /// dual-AI OSS review — the public API must not panic on a degenerate seat
 /// count).
 impl GameHand {
+    pub fn blind_seats(&self) -> Option<(Option<u8>, u8)> {
+        if self.seats.len() < 2 {
+            return None;
+        }
+        let (sb, bb) = self.forced_blind_positions(self.seats.len());
+        Some((sb.map(|idx| self.seats[idx].seat), self.seats[bb].seat))
+    }
+
     /// Small/big blind indices for this hand: [`blind_positions`] unless the
     /// small blind is dead, in which case nobody posts it and the big blind is
     /// the seat immediately left of the dealer.
     pub(crate) fn forced_blind_positions(&self, n: usize) -> (Option<usize>, usize) {
+        if self.variant == PokerVariant::Shortdeck && self.small_blind == Chips::ZERO {
+            return (None, self.dealer_idx % n);
+        }
         if self.dead_small_blind && n >= 3 {
             return (None, (self.dealer_idx % n + 1) % n);
         }
