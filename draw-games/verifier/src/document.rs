@@ -10,6 +10,7 @@ pub fn verify_document(
 ) -> Result<Value, String> {
     let proof = document.get("proof").unwrap_or(document);
     let result = crate::verify(proof)?;
+    let observed_match = match_observed(proof, &result, document.get("observed"))?;
     let receipt = external_receipt
         .or_else(|| document.get("receipt"))
         .filter(|r| !r.is_null());
@@ -20,9 +21,79 @@ pub fn verify_document(
     Ok(json!({
         "outcome": "replayed",
         "receipt_match": receipt_match,
+        "observed_match": if observed_match { "matched" } else { "not_provided" },
         "result": result,
         "scope": "Checks the published algorithm and supplied receipt. A local receipt is not a signed timestamp, ledger audit, availability guarantee, or proof of the deployed binary."
     }))
+}
+
+/// Match the independently supplied game display against the replay.
+fn match_observed(proof: &Value, result: &Value, observed: Option<&Value>) -> Result<bool, String> {
+    let Some(observed) = observed else {
+        return Ok(false);
+    };
+    let kind = proof["kind"].as_str().ok_or("Missing proof kind")?;
+    let fields: &[&str] = match kind {
+        "roulette" => &["request_id", "wagers", "number", "bet", "payout"],
+        "fruit" => &[
+            "request_id",
+            "play",
+            "cell",
+            "lucky",
+            "number",
+            "bet",
+            "payout",
+        ],
+        "slots" => &["request_id", "reels", "bet", "payout", "jackpot_bonus"],
+        "claw" => &["request_id", "aim", "caught", "jackpot", "payout"],
+        "2048" => &["request_id", "cost", "seed"],
+        "scratch" => &[
+            "cost",
+            "lucky",
+            "numbers",
+            "prize",
+            "reward_version",
+            "reward",
+            "reward_beans",
+        ],
+        "sicbo-room" => &[
+            "dice",
+            "total",
+            "triple",
+            "side",
+            "stake",
+            "won",
+            "delta",
+            "jackpot_bonus",
+        ],
+        "yuxiaxie-room" => &["dice", "faces", "bets", "stake", "won", "delta"],
+        _ => return Err("Unsupported displayed-outcome check".into()),
+    };
+    for &field in fields {
+        let actual = observed
+            .get(field)
+            .ok_or("Missing displayed outcome field")?;
+        let expected = if field == "request_id" {
+            &proof[field]
+        } else {
+            &result[field]
+        };
+        let matches = match (kind, field) {
+            ("sicbo-room", "jackpot_bonus") if expected.is_null() || expected == 0 => {
+                actual.is_null() || actual == 0
+            }
+            ("claw", "aim") => {
+                let parse =
+                    |value: &Value| serde_json::from_value::<crate::claw::Aim>(value.clone());
+                parse(actual).ok() == parse(expected).ok()
+            }
+            _ => actual == expected,
+        };
+        if !matches {
+            return Err(format!("Displayed outcome differs from the proof: {field}"));
+        }
+    }
+    Ok(true)
 }
 
 fn match_receipt(proof: &Value, receipt: &Value) -> Result<&'static str, String> {

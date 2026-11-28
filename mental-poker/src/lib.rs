@@ -24,6 +24,7 @@
 // `unsafe` is a hard compile error, not a review judgement call.
 #![forbid(unsafe_code)]
 
+pub mod blind_transcript;
 pub mod card_id;
 pub mod card_proof;
 /// Real cryptography (`docs/architecture/mp-phase4-crypto-spec.md`) — **GA'd

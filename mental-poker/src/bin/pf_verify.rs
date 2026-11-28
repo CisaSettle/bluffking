@@ -35,40 +35,49 @@ fn main() {
 }
 
 fn run(args: &[String]) -> i32 {
-    match args.get(1).map(String::as_str) {
-        Some("--hand") => match args.get(2) {
-            Some(path) => verify_path(path),
-            None => {
-                print_usage();
-                2
-            }
-        },
-        Some("-") => verify_stdin(),
-        // U66 (dual-AI OSS review): explicitly-requested help is a SUCCESS
-        // (exit 0); only a genuine usage error (no argument, or `--hand`
-        // missing its path above) exits 2.
-        Some("-h") | Some("--help") => {
+    let (input, options) = match args.get(1).map(String::as_str) {
+        Some("-h" | "--help") => {
             print_usage();
-            0
+            return 0;
         }
-        None => {
+        Some("--hand") => (args.get(2).map(String::as_str), args.get(3..)),
+        input => (input, args.get(2..)),
+    };
+    let Some(input) = input else {
+        print_usage();
+        return 2;
+    };
+    let expected_fingerprint = match options.unwrap_or_default() {
+        [] => None,
+        [flag, fingerprint]
+            if flag == "--party-fingerprint"
+                && fingerprint.len() == 64
+                && fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+        {
+            Some(fingerprint.as_str())
+        }
+        _ => {
             print_usage();
-            2
+            return 2;
         }
-        // Bare path argument for convenience.
-        Some(path) => verify_path(path),
+    };
+    if input == "-" {
+        verify_stdin(expected_fingerprint)
+    } else {
+        verify_path(input, expected_fingerprint)
     }
 }
 
 fn print_usage() {
     eprintln!("usage:");
     eprintln!(
-        "  pf_verify --hand <bundle.json>   verify a saved verification bundle (pf-shuffle-v2)"
+        "  pf_verify --hand <bundle.json>   verify a saved dealing proof or encrypted-deal transcript"
     );
     eprintln!("  pf_verify -                      read the JSON from stdin");
+    eprintln!("  Add --party-fingerprint <64-hex> to match an independently recorded directory fingerprint.");
 }
 
-fn verify_path(path: &str) -> i32 {
+fn verify_path(path: &str, expected_fingerprint: Option<&str>) -> i32 {
     let json = match std::fs::read_to_string(path) {
         Ok(j) => j,
         Err(e) => {
@@ -76,19 +85,19 @@ fn verify_path(path: &str) -> i32 {
             return 2;
         }
     };
-    verify_json(&json)
+    verify_json(&json, expected_fingerprint)
 }
 
-fn verify_stdin() -> i32 {
+fn verify_stdin(expected_fingerprint: Option<&str>) -> i32 {
     let mut buf = String::new();
     if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
         eprintln!("error: cannot read stdin: {e}");
         return 2;
     }
-    verify_json(&buf)
+    verify_json(&buf, expected_fingerprint)
 }
 
-fn verify_json(json: &str) -> i32 {
+fn verify_json(json: &str, expected_fingerprint: Option<&str>) -> i32 {
     let value: serde_json::Value = match serde_json::from_str(json) {
         Ok(v) => v,
         Err(e) => {
@@ -97,6 +106,39 @@ fn verify_json(json: &str) -> i32 {
         }
     };
     let value = value.get("proof").cloned().unwrap_or(value);
+    if value["scheme"] == mental_poker::blind_transcript::SCHEME {
+        let result = serde_json::from_value::<mental_poker::blind_transcript::Bundle>(value)
+            .map_err(|e| e.to_string())
+            .and_then(|bundle| {
+                mental_poker::blind_transcript::verify(&bundle).map_err(str::to_owned)
+            });
+        return match result {
+            Ok(verified) => {
+                if expected_fingerprint.is_some_and(|expected| {
+                    !expected.eq_ignore_ascii_case(&verified.party_fingerprint)
+                }) {
+                    eprintln!("FAIL party-directory fingerprint mismatch");
+                    return 1;
+                }
+                if expected_fingerprint.is_some() {
+                    eprintln!("Party-directory fingerprint matched.");
+                } else {
+                    eprintln!("Signatures checked against the bundle's keys. Supply an independently recorded party-directory fingerprint to authenticate that directory.");
+                }
+                eprintln!("Verification covers supplied openings. Compare the board and shown seats with your hand record to check for omissions.");
+                println!("OK {}", serde_json::to_string(&verified).unwrap());
+                0
+            }
+            Err(error) => {
+                eprintln!("FAIL {error}");
+                1
+            }
+        };
+    }
+    if expected_fingerprint.is_some() {
+        eprintln!("error: --party-fingerprint requires an encrypted-deal transcript");
+        return 2;
+    }
     if value["scheme"] == mental_poker::pf2_zjh::SCHEME {
         let result = serde_json::from_value::<mental_poker::pf2_zjh::Bundle>(value)
             .map_err(|e| e.to_string())

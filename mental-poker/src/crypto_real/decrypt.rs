@@ -182,6 +182,16 @@ pub struct DecryptionShare {
     pub recovery: Option<Box<super::recovery::RecoveryEvidence>>,
 }
 
+impl DecryptionShare {
+    /// Direct DLEQ shares bind the ciphertext and position. Reconstructed
+    /// shares additionally carry evidence for the hand's recovery manifest.
+    pub fn matches_recovery_binding(&self, expected: &str) -> bool {
+        self.recovery
+            .as_ref()
+            .is_none_or(|evidence| evidence.core.binding == expected)
+    }
+}
+
 /// The full opening proof for one card: one share per party (spec §4.5).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThresholdDecryptionProof {

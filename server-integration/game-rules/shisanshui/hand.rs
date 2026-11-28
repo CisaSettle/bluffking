@@ -119,7 +119,7 @@ impl Hand {
             .iter()
             .enumerate()
             .map(|(i, (seat, stack))| {
-                let mut cards = deck[i * rules::HAND..(i + 1) * rules::HAND].to_vec();
+                let mut cards = rules::seat_cards(deck, i).to_vec();
                 cards.sort_by(|a, b| b.cmp(a));
                 let special_available = rules::special(&cards);
                 Player {

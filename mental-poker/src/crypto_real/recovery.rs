@@ -90,6 +90,15 @@ pub fn digest<T: Serialize>(value: &T) -> Result<String, String> {
     Ok(hex::encode(hash.finalize()))
 }
 
+pub fn hand_binding(
+    session_id: &str,
+    hand_id: &str,
+    final_deck_hash: &str,
+    party_set_hash: &str,
+) -> Result<String, String> {
+    digest(&[session_id, hand_id, final_deck_hash, party_set_hash])
+}
+
 fn point(value: &str) -> Result<RistrettoPoint, String> {
     if value.len() != 64
         || value

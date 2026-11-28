@@ -49,6 +49,11 @@ impl Card {
     }
 }
 
+/// Seat ordinal in the locked roster, unrestricted by physical seat gaps.
+pub fn seat_cards(deck: &[Card], index: usize) -> &[Card] {
+    &deck[index * HAND..(index + 1) * HAND]
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
