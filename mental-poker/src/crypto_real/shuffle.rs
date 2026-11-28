@@ -150,8 +150,8 @@ pub struct ShuffleProof {
 pub const SCHEME: &str = "reenc-shuffle-ristretto-v2";
 /// Generic-card scheme: binds the size-derived repetition count into the transcript.
 pub const CARD_SCHEME: &str = "reenc-shuffle-ristretto-v3";
-/// Bounded by the largest supported shoe (eight standard decks).
-pub const MAX_CARD_DECK: usize = 416;
+/// Largest generic manifest: the 144 tiles used in Shanghai Mahjong.
+pub const MAX_CARD_DECK: usize = 144;
 
 /// Conservative integer upper bound on log2(N!); no floating-point consensus.
 /// Since l > 2^252, N!/l^r <= 2^-128 at this repetition count.

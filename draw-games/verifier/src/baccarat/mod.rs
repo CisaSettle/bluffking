@@ -1,7 +1,10 @@
 //! Selective openings for an eight-deck Baccarat shoe in deal order.
 //! This binds revealed cards to the pre-bet root without exposing future cards.
 pub mod rules;
+pub mod shuffle;
+pub use shuffle::{verify as verify_shuffle, GAME as SHUFFLE_GAME};
 
+use crate::merkle_cards::{Domain, Opening, Tree};
 use crate::proof::{seed_bytes, sha256_fields};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -9,7 +12,12 @@ use serde_json::{json, Value};
 pub const GAME: &str = "baccarat-shoe";
 const PROTOCOL: &str = "bluffking-baccarat-shoe-v1";
 const DEPTH: usize = 9;
-const LEAVES: usize = 1 << DEPTH;
+const DOMAIN: Domain = Domain {
+    salt: b"bluffking-baccarat-shoe-v1/salt",
+    card: b"bluffking-baccarat-shoe-v1/card",
+    node: b"bluffking-baccarat-shoe-v1/node",
+    padding: b"bluffking-baccarat-shoe-v1/padding",
+};
 // 416 cards, with the exposed first card and 1–10 more burned.
 const MIN_CARDS: usize = 405;
 const MAX_CARDS: usize = 414;
@@ -25,6 +33,8 @@ pub struct Commitment {
     pub card_count: usize,
     pub start_index: usize,
     pub commitment: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shuffle: Option<shuffle::Plan>,
 }
 
 impl Commitment {
@@ -52,7 +62,19 @@ impl Commitment {
             card_count,
             start_index,
             commitment: hex::encode(commitment),
+            shuffle: None,
         }
+    }
+
+    pub fn with_shuffle(mut self, plan: shuffle::Plan) -> Self {
+        let previous = self.commitment.as_bytes();
+        self.commitment = hex::encode(sha256_fields(&[
+            b"bluffking-baccarat-shoe-v1/with-shuffle",
+            previous,
+            plan.commitment.as_bytes(),
+        ]));
+        self.shuffle = Some(plan);
+        self
     }
 
     fn verify(&self) -> Result<[u8; 32], String> {
@@ -62,15 +84,20 @@ impl Commitment {
             return Err("invalid Baccarat shoe length or deal position".into());
         }
         let root = seed_bytes(&self.shoe_root)?;
-        if *self
-            != Self::new(
-                self.draw_id.clone(),
-                self.shoe_id.clone(),
-                root,
-                self.card_count,
-                self.start_index,
-            )
-        {
+        let mut expected = Self::new(
+            self.draw_id.clone(),
+            self.shoe_id.clone(),
+            root,
+            self.card_count,
+            self.start_index,
+        );
+        if let Some(plan) = &self.shuffle {
+            if plan.draw_id != self.shoe_id {
+                return Err("Baccarat shuffle belongs to a different shoe".into());
+            }
+            expected = expected.with_shuffle(plan.clone());
+        }
+        if *self != expected {
             return Err("Baccarat round commitment mismatch".into());
         }
         Ok(root)
@@ -79,19 +106,10 @@ impl Commitment {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CardOpening {
-    index: usize,
-    card: u8,
-    salt: String,
-    path: [String; DEPTH],
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct DealProof {
     kind: String,
     plan: Commitment,
-    cards: Vec<CardOpening>,
+    cards: Vec<Opening>,
     result: rules::Outcome,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     wager: Option<WagerProof>,
@@ -107,6 +125,10 @@ struct WagerProof {
 
 impl DealProof {
     /// Attach only this viewer's settled wager to their private history proof.
+    pub fn plan(&self) -> &Commitment {
+        &self.plan
+    }
+
     pub fn with_wager(&self, bets: rules::Bets, delta: i64) -> Option<Self> {
         let stake = bets.total()?;
         Some(Self {
@@ -116,55 +138,22 @@ impl DealProof {
     }
 }
 
-fn card_salt(secret: &[u8; 32], index: usize) -> [u8; 32] {
-    sha256_fields(&[
-        b"bluffking-baccarat-shoe-v1/salt",
-        secret,
-        &(index as u64).to_be_bytes(),
-    ])
-}
-
-fn leaf(shoe_id: &str, index: usize, card: u8, salt: &[u8; 32]) -> [u8; 32] {
-    sha256_fields(&[
-        b"bluffking-baccarat-shoe-v1/card",
-        shoe_id.as_bytes(),
-        &(index as u64).to_be_bytes(),
-        &[card],
-        salt,
-    ])
-}
-
-fn parent(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
-    sha256_fields(&[b"bluffking-baccarat-shoe-v1/node", left, right])
-}
-
-pub struct ShoeTree {
-    nodes: Vec<[u8; 32]>,
-}
+pub struct ShoeTree(Tree);
 
 impl ShoeTree {
     /// `pop_order` is reversed: the server removes its next card with `pop`.
     pub fn new(shoe_id: &str, pop_order: &[u8], secret: &[u8; 32]) -> Self {
-        let mut nodes = vec![[0; 32]; LEAVES * 2];
-        let mut cards = pop_order.iter().rev();
-        for (index, node) in nodes[LEAVES..].iter_mut().enumerate() {
-            *node = match cards.next() {
-                Some(&card) => leaf(shoe_id, index, card, &card_salt(secret, index)),
-                None => sha256_fields(&[
-                    b"bluffking-baccarat-shoe-v1/padding",
-                    shoe_id.as_bytes(),
-                    &(index as u64).to_be_bytes(),
-                ]),
-            };
-        }
-        for index in (1..LEAVES).rev() {
-            nodes[index] = parent(&nodes[2 * index], &nodes[2 * index + 1]);
-        }
-        Self { nodes }
+        Self(Tree::new(
+            &DOMAIN,
+            DEPTH,
+            shoe_id,
+            pop_order.iter().rev().copied(),
+            secret,
+        ))
     }
 
     pub fn root(&self) -> [u8; 32] {
-        self.nodes[1]
+        self.0.root()
     }
 
     pub fn prove(
@@ -177,18 +166,12 @@ impl ShoeTree {
     ) -> DealProof {
         let cards = (plan.start_index..plan.start_index + count)
             .map(|index| {
-                let mut node = LEAVES + index;
-                let path = std::array::from_fn(|_| {
-                    let sibling = hex::encode(self.nodes[node ^ 1]);
-                    node /= 2;
-                    sibling
-                });
-                CardOpening {
+                self.0.open(
+                    &DOMAIN,
                     index,
-                    card: pop_order[pop_order.len() - 1 - index],
-                    salt: hex::encode(card_salt(secret, index)),
-                    path,
-                }
+                    pop_order[pop_order.len() - 1 - index],
+                    secret,
+                )
             })
             .collect();
         DealProof {
@@ -214,17 +197,7 @@ pub fn verify(value: &Value) -> Result<Value, String> {
         if opening.index != index || index >= proof.plan.card_count || opening.card >= 52 {
             return Err("invalid Baccarat card or position".into());
         }
-        let salt = seed_bytes(&opening.salt)?;
-        let mut node = leaf(&proof.plan.shoe_id, index, opening.card, &salt);
-        for (depth, sibling) in opening.path.iter().enumerate() {
-            let sibling = seed_bytes(sibling)?;
-            node = if index & (1 << depth) == 0 {
-                parent(&node, &sibling)
-            } else {
-                parent(&sibling, &node)
-            };
-        }
-        if node != root {
+        if !opening.verifies(&DOMAIN, DEPTH, &proof.plan.shoe_id, &root) {
             return Err("Baccarat card does not open the committed shoe".into());
         }
         cards.push(opening.card);

@@ -115,6 +115,14 @@ pub struct Outcome {
 /// Refill a shoe before the next round when fewer cards remain.
 pub const MIN_SHOE_CARDS: usize = 16;
 
+/// Remove the exposed card, then its rank's count (faces count as ten).
+pub(super) fn burn(cards: &mut Vec<u8>) {
+    if let Some(card) = cards.pop() {
+        let burn = (card % 13 + 1).min(10) as usize;
+        cards.truncate(cards.len() - burn);
+    }
+}
+
 fn point(card: u8) -> u8 {
     let rank = card % 13 + 1;
     if rank >= 10 {

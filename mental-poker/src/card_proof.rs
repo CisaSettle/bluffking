@@ -44,7 +44,6 @@ pub enum Game {
     Blackjack,
     Shisanshui,
     Tenhalf,
-    Baccarat,
     Colorcards,
     Paigow,
     Kwx,
@@ -61,7 +60,6 @@ impl Game {
             Self::Guandan | Self::Colorcards | Self::Chengdu | Self::Zhuoji => 108,
             Self::Kwx => 84,
             Self::Shanghai => 144,
-            Self::Baccarat => 416,
             _ => 52,
         }
     }
@@ -90,7 +88,6 @@ impl Game {
             Self::Blackjack => "blackjack",
             Self::Shisanshui => "shisanshui",
             Self::Tenhalf => "tenhalf",
-            Self::Baccarat => "baccarat",
             Self::Colorcards => "colorcards",
             Self::Paigow => "paigow",
             Self::Kwx => "kwx",
@@ -112,7 +109,6 @@ impl Game {
             Self::Blackjack,
             Self::Shisanshui,
             Self::Tenhalf,
-            Self::Baccarat,
             Self::Colorcards,
             Self::Paigow,
             Self::Kwx,
@@ -149,7 +145,6 @@ impl Context {
             Game::Zjh | Game::ZjhJokers | Game::Colorcards => 10,
             Game::Ddz | Game::Kwx => 3,
             Game::Guandan | Game::Shisanshui | Game::Chengdu | Game::Shanghai | Game::Zhuoji => 4,
-            Game::Baccarat => 1,
             Game::Tenhalf => 12,
             _ => 6,
         };
@@ -230,10 +225,6 @@ pub struct LockedDeck {
     context: Context,
     locked: crate::locked_shuffle::LockedShuffle,
     commit: [u8; 32],
-    // Baccarat never restricts its eight-deck shoe during rebind. Retain the
-    // ciphertext digest prepared off-thread instead of compressing 832 points
-    // again on the HTTP task for every offer. Context binding remains fresh.
-    baccarat_deck_hash: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -315,19 +306,12 @@ fn restrict(shuffle: &mut Shuffle, context: &Context) {
     shuffle.pi = chosen.iter().map(|(_, index)| *index).collect();
 }
 fn commit_of(context: &Context, public_key: &RistrettoPoint, deck: &[Ct]) -> [u8; 32] {
-    commit_of_deck_hash(context, public_key, &deck_hash(deck))
-}
-fn commit_of_deck_hash(
-    context: &Context,
-    public_key: &RistrettoPoint,
-    deck_hash: &[u8; 32],
-) -> [u8; 32] {
     ds_hash(
         "cards:commit:v1",
         &[
             &context.binding(),
             public_key.compress().as_bytes(),
-            deck_hash,
+            &deck_hash(deck),
         ],
     )
 }
@@ -410,17 +394,11 @@ impl LockedDeck {
             &mut random("cards:shuffle:v1", master, &context),
         );
         restrict(&mut locked.shuffle, &context);
-        let baccarat_deck_hash =
-            (context.game == Game::Baccarat).then(|| deck_hash(&locked.shuffle.output));
-        let commit = match &baccarat_deck_hash {
-            Some(hash) => commit_of_deck_hash(&context, &locked.public_key, hash),
-            None => commit_of(&context, &locked.public_key, &locked.shuffle.output),
-        };
+        let commit = commit_of(&context, &locked.public_key, &locked.shuffle.output);
         Ok(Self {
             context,
             locked,
             commit,
-            baccarat_deck_hash,
         })
     }
     /// Bind a precomputed deck to its actual hand and original roster. The key
@@ -433,14 +411,7 @@ impl LockedDeck {
             return Err(Error::Context);
         }
         restrict(&mut self.locked.shuffle, &context);
-        self.commit = match &self.baccarat_deck_hash {
-            Some(hash) => commit_of_deck_hash(&context, &self.locked.public_key, hash),
-            None => commit_of(
-                &context,
-                &self.locked.public_key,
-                &self.locked.shuffle.output,
-            ),
-        };
+        self.commit = commit_of(&context, &self.locked.public_key, &self.locked.shuffle.output);
         self.context = context;
         Ok(())
     }

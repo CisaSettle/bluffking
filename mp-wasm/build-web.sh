@@ -21,8 +21,9 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # the app tree is absent, so a fresh public clone still builds pkg-web/.
 vendor="${MP_WASM_VENDOR_DIR:-$here/../client-game/src/vendor/mp-wasm}"
 
-echo "[build-web] wasm-pack build --target web --out-dir pkg-web --release"
-( cd "$here" && wasm-pack build --target web --out-dir pkg-web --release )
+profile="${1:---release}"
+echo "[build-web] wasm-pack build --target web --out-dir pkg-web $profile"
+( cd "$here" && wasm-pack build --target web --out-dir pkg-web "$profile" )
 
 # U49: only vendor when the app tree exists (or an explicit MP_WASM_VENDOR_DIR
 # was given); otherwise the browser-ready artifacts stay in pkg-web/.

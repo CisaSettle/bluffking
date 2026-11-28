@@ -36,8 +36,10 @@ pub struct Commitment {
 }
 
 pub fn commit(game: &str, draw_id: &str, server_seed: &str) -> Result<Commitment, String> {
-    if !(matches!(game, "scratch" | "sicbo" | "sicbo-room" | "yuxiaxie-room")
-        || crate::solo::supports(game))
+    if !(matches!(
+        game,
+        "scratch" | "sicbo" | "sicbo-room" | "yuxiaxie-room" | crate::roulette::ROOM_GAME
+    ) || crate::solo::supports(game))
         || draw_id.is_empty()
         || draw_id.len() > 128
         || !draw_id.is_ascii()
@@ -79,7 +81,7 @@ impl Reveal {
         let server = seed_bytes(&self.server_seed)?;
         let client = if matches!(
             self.commitment.game.as_str(),
-            "sicbo-room" | "yuxiaxie-room"
+            "sicbo-room" | "yuxiaxie-room" | crate::roulette::ROOM_GAME
         ) && self.client_seed.is_empty()
         {
             // A round no player wagered on folds in no player seed.
@@ -144,12 +146,13 @@ impl Entropy {
     }
 }
 
-/// Fold sorted, distinct bettor seeds into one room contribution. The two
-/// domain labels give each game its own contribution stream.
+/// Fold sorted, distinct bettor seeds into one room contribution. Each game
+/// has its own domain label and contribution stream.
 pub fn dealer_client_seed(game: &str, player_seeds: &[String]) -> Result<String, String> {
     let domain: &[u8] = match game {
         "sicbo-room" => b"bluffking-draw-v1/sicbo-room-players",
         "yuxiaxie-room" => b"bluffking-draw-v1/yuxiaxie-room-players",
+        crate::roulette::ROOM_GAME => b"bluffking-draw-v1/roulette-room-players",
         _ => return Err("Unsupported seeded dealer room".into()),
     };
     if player_seeds.is_empty() {

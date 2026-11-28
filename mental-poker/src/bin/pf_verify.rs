@@ -106,6 +106,36 @@ fn verify_json(json: &str, expected_fingerprint: Option<&str>) -> i32 {
         }
     };
     let value = value.get("proof").cloned().unwrap_or(value);
+    if value["scheme"] == mental_poker::niuniu_transcript::SCHEME {
+        use mental_poker::niuniu_transcript as niuniu;
+        let result = serde_json::from_value::<niuniu::Bundle>(value)
+            .map_err(|error| error.to_string())
+            .and_then(|bundle| {
+                niuniu::verify(&bundle)
+                    .map_err(str::to_owned)
+                    .map(|()| bundle)
+            });
+        return match result {
+            Ok(bundle) if expected_fingerprint.is_none() => {
+                println!(
+                    "OK {}",
+                    serde_json::json!({
+                        "hand_id": bundle.hand_id, "seats": bundle.seats,
+                        "cards": bundle.cards, "final_hash": bundle.final_hash,
+                    })
+                );
+                0
+            }
+            Ok(_) => {
+                eprintln!("Use the retained Niuniu final deck hash to compare this transcript.");
+                2
+            }
+            Err(error) => {
+                eprintln!("FAIL {error}");
+                1
+            }
+        };
+    }
     if value["scheme"] == mental_poker::blind_transcript::SCHEME {
         let result = serde_json::from_value::<mental_poker::blind_transcript::Bundle>(value)
             .map_err(|e| e.to_string())

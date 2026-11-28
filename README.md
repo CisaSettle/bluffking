@@ -17,14 +17,14 @@ English · [中文](#中文)
 ## English
 
 > [!NOTE]
-> **This is the open-source subset of [BluffKing](https://bluffking.ai)** — a fair, **no-real-money** game center funded by memberships, offering Texas Hold'em alongside mahjong, card, board, dice and casual games on the web, Telegram, iOS and Android. These crates are the poker **engine**, the **verifiable ("mental poker") dealing**, and the **postflop CFR solver** behind its Texas Hold'em tables and public poker tools; the game server (except its sealed dealer, published as [`server-integration/sealed_dealer.rs`](server-integration/sealed_dealer.rs), its Zha Jin Hua dealer in [`server-integration/zjh/`](server-integration/zjh), plus [server game outcome rules](server-integration/#game-outcome-source) and the draw proof verifier in [`draw-games/`](draw-games)), web/mobile clients, and website stay closed-source. Running at **[bluffking.ai](https://bluffking.ai)**, which offers this repo as the AGPL §13 Corresponding Source for the solver it serves. Its real server-blind cryptography (`crypto_real`) is **live in production for opt-in all-human "engine-blind" tables** (the server can't see your folded or pre-showdown cards) — cross-vendor AI-audited (Claude + OpenAI Codex — the audit consensus is public) and open-source: read the code and run the offline verifier yourself.
+> **This is the open-source subset of [BluffKing](https://bluffking.ai)** — a fair, **no-real-money** game center funded by memberships, offering Texas Hold'em alongside mahjong, card, board, dice and casual games on the web, Telegram, iOS and Android. These crates are the poker **engine**, the **verifiable ("mental poker") dealing**, and the **postflop CFR solver** behind its Texas Hold'em tables and public poker tools; the game server (except its sealed dealer, published as [`server-integration/sealed_dealer.rs`](server-integration/sealed_dealer.rs), its Zha Jin Hua dealer in [`server-integration/zjh/`](server-integration/zjh), plus [server game outcome rules](server-integration/#game-outcome-source) and the draw proof verifier in [`draw-games/`](draw-games)), web/mobile clients, and website stay closed-source. Running at **[bluffking.ai](https://bluffking.ai)**, which offers this repo as the AGPL §13 Corresponding Source for the solver it serves. Its real server-blind cryptography (`crypto_real`) is **live in production for opt-in all-human "engine-blind" tables** with player-held shares. See the historical cross-vendor review and the current limits in the audit notes below.
 
 ### What's here
 
 | Crate | What it is |
 |---|---|
 | [`engine/`](engine) | Pure poker-logic crate. `GameHand` plays one complete hand end-to-end (blinds → flop/turn/river → side pots → result). Also hosts a Monte-Carlo **equity** estimator and a local **post-hand solver/coach**. No IO, no async, no DB — the same ruleset drives live play and deterministic replay. |
-| [`mental-poker/`](mental-poker) | Verifiable dealing: the default Hold'em scheme (`pf2`, `pf-shuffle-v2`) — the dealer locks an encrypted, verifiably shuffled standard deck and commits to it before the deal, player seeds decide the public order, and shown cards are opened with decryption proofs while unshown cards stay encrypted — plus the **offline verifier** `pf_verify` and its fixture generator `pf_demo_hand`. Also includes the real **server-blind** crypto path (n-of-n re-encryption-mixnet shuffle + threshold decryption) that powers the live *engine-blind* tables (cross-vendor AI-audited; open-source + independently verifiable). Depends on `engine` only for the `Card` type. |
+| [`mental-poker/`](mental-poker) | Verifiable dealing: the default Hold'em scheme (`pf2`, `pf-shuffle-v2`) — the dealer locks an encrypted, verifiably shuffled standard deck and commits to it before the deal, player seeds decide the public order, and shown cards are opened with decryption proofs while unshown cards stay encrypted — plus the **offline verifier** `pf_verify` and its fixture generator `pf_demo_hand`. Also includes the real **server-blind** crypto path (re-encryption mixnet, player-held decryption shares and multiplayer recovery) that powers the live *engine-blind* tables (open-source and independently verifiable, with a historical cross-vendor audit). Depends on `engine` only for the `Card` type. |
 | [`mp-wasm/`](mp-wasm) | A `wasm-bindgen` surface over `mental_poker::crypto_real` (the real server-blind path) so a browser can run the verifiable dealing locally. A detached crate with its own workspace. |
 | [`gto-solver/`](gto-solver) | Wraps the open-source **AGPL-3.0** `postflop-solver` (Discounted-CFR) behind BluffKing engine types (ADR-012); powers the free public `POST /api/tools/poker/solve` study tool. Its AGPL dependency is why this repo is AGPL-3.0. |
 | [`draw-games/verifier/`](draw-games/verifier) | Shared deterministic lottery, scratch-card, Sicbo, Fish Prawn Crab and Baccarat rules, pinned drand verification, and the network-free `draw-verify` CLI. Detached workspace; used by the backend code in this snapshot. |
@@ -50,7 +50,7 @@ public order, and shown cards are opened with decryption proofs; anyone can re-r
 the offline verifier on a hand's bundle to confirm the deal followed from the
 committed inputs (tamper-evidence + reproducibility). The
 `crypto_real` path provides stronger secrecy for unshown hole cards within the
-advanced encrypted-dealing hand — **live for the engine-blind table class** (ADR-070), cross-vendor AI-audited (audit consensus public) and open-source. Open-sourcing this is the point: fairness you can verify
+advanced encrypted-dealing hand — **live for the engine-blind table class** (ADR-070), open-source, with a historical cross-vendor audit. Open-sourcing this is the point: fairness you can verify
 beats fairness you are told to trust.
 
 Advanced encrypted dealing assumes one trusted operator and has delivery and recovery limits; it does not prove a remote binary or prevent operator censorship or settlement manipulation. See the current [trust boundary](https://bluffking.ai/en/blog/advanced-encrypted-dealing/).
@@ -64,7 +64,7 @@ cargo fmt --all -- --check
 cargo deny check                         # supply-chain gate (advisories + licenses)
 ```
 
-**Cross-vendor AI audit + how to verify:** [`audits/cross-vendor-ai-audit.html`](audits/cross-vendor-ai-audit.html) — the fairness trust model (open source + cross-vendor AI dual-audit + a runnable verifier), fact-gated to the ADRs.
+**Cross-vendor AI audit + how to verify:** [`audits/cross-vendor-ai-audit.html`](audits/cross-vendor-ai-audit.html) — the historical review, current privacy boundaries and how to run the default verifier.
 
 `mental-poker` ships two binaries — `pf_verify` and `pf_demo_hand`
 (`cargo run -p mental-poker --bin pf_verify -- --help`). `mp-wasm` targets `wasm32-unknown-unknown` — build it from inside the crate (see its `Cargo.toml`).
@@ -103,14 +103,14 @@ section) and [`SECURITY.md`](SECURITY.md).
 ## 中文
 
 > [!NOTE]
-> **这是 [BluffKing](https://bluffking.ai) 的开源子集** —— BluffKing 是一个**不涉及真钱**、靠会员服务盈利的公平游戏中心,提供德州扑克以及麻将、棋牌、骰子与休闲游戏(网页、Telegram、iOS 与 Android)。这些 crate 是其德州扑克牌桌与公开扑克工具背后的扑克 **引擎**、**可验证("mental poker")发牌** 与 **翻后 CFR 求解器**;游戏服务器(其中的密封发牌进程除外,已作为 [`server-integration/sealed_dealer.rs`](server-integration/sealed_dealer.rs) 公开,炸金花发牌见 [`server-integration/zjh/`](server-integration/zjh),[服务端开奖核心](server-integration/#game-outcome-source)及 [`draw-games/`](draw-games) 的开奖证明验证器)、Web/移动客户端与官网保持闭源。线上运行于 **[bluffking.ai](https://bluffking.ai)**,该站将本仓库作为其求解器的 AGPL §13 对应源码对外提供。它的真实服务端盲发密码学(`crypto_real`)已在生产环境 **为可选的全真人「engine-blind」牌桌启用**(服务器看不到你已弃牌或摊牌前的底牌)——经 AI 跨厂商独立审计(Claude + OpenAI Codex,审计共识已公开)、开源可复核:代码你能读、离线验证器你能自己跑。
+> **这是 [BluffKing](https://bluffking.ai) 的开源子集** —— BluffKing 是一个**不涉及真钱**、靠会员服务盈利的公平游戏中心,提供德州扑克以及麻将、棋牌、骰子与休闲游戏(网页、Telegram、iOS 与 Android)。这些 crate 是其德州扑克牌桌与公开扑克工具背后的扑克 **引擎**、**可验证("mental poker")发牌** 与 **翻后 CFR 求解器**;游戏服务器(其中的密封发牌进程除外,已作为 [`server-integration/sealed_dealer.rs`](server-integration/sealed_dealer.rs) 公开,炸金花发牌见 [`server-integration/zjh/`](server-integration/zjh),[服务端开奖核心](server-integration/#game-outcome-source)及 [`draw-games/`](draw-games) 的开奖证明验证器)、Web/移动客户端与官网保持闭源。线上运行于 **[bluffking.ai](https://bluffking.ai)**,该站将本仓库作为其求解器的 AGPL §13 对应源码对外提供。它的真实服务端盲发密码学(`crypto_real`)已在生产环境 **为可选的全真人「engine-blind」牌桌启用**，解密份额由玩家设备持有。下文链接的审计说明收录历史复核和当前机制的边界。
 
 ### 仓库内容
 
 | Crate | 说明 |
 |---|---|
 | [`engine/`](engine) | 纯逻辑扑克引擎。`GameHand` 端到端打完一手牌(盲注 → 翻牌/转牌/河牌 → 边池 → 结算)。内含蒙特卡洛 **胜率(equity)** 估算与本地 **牌后求解器/教练**。无 IO、无 async、无数据库——同一套规则驱动实战与确定性回放。 |
-| [`mental-poker/`](mental-poker) | 可验证发牌:默认德州方案(`pf2`,`pf-shuffle-v2`)——发牌前发牌方锁定一副逐张加密、可验证洗牌的标准牌并公布承诺,玩家种子决定公开的发牌顺序,亮出的牌用解密证明打开,未亮出的牌保持加密;另含**离线验证器** `pf_verify` 及其样例生成器 `pf_demo_hand`。另含真实的**服务端盲发**路径(n-of-n 重加密混洗 + 门限解密),驱动线上 *engine-blind* 牌桌(经 AI 跨厂商审计;开源且可独立验证)。仅依赖 `engine` 的 `Card` 类型。 |
+| [`mental-poker/`](mental-poker) | 可验证发牌:默认德州方案(`pf2`,`pf-shuffle-v2`)——发牌前发牌方锁定一副逐张加密、可验证洗牌的标准牌并公布承诺,玩家种子决定公开的发牌顺序,亮出的牌用解密证明打开,未亮出的牌保持加密;另含**离线验证器** `pf_verify` 及其样例生成器 `pf_demo_hand`。另含真实的**服务端盲发**路径(重加密混洗、玩家持有的解密份额与多人门限恢复),驱动线上 *engine-blind* 牌桌(开源且可独立验证，另有历史跨厂商审计)。仅依赖 `engine` 的 `Card` 类型。 |
 | [`mp-wasm/`](mp-wasm) | 对 `mental_poker::crypto_real`(真实服务端盲发路径)的 `wasm-bindgen` 封装,让浏览器本地运行可验证发牌。独立 crate,自带 workspace。 |
 | [`gto-solver/`](gto-solver) | 封装开源 **AGPL-3.0** 的 `postflop-solver`(Discounted-CFR),隐藏在 BluffKing engine 类型之后(ADR-012);为免费公开的 `POST /api/tools/poker/solve` 学习工具提供支持。它的 AGPL 依赖是本仓库采用 AGPL 的原因。 |
 | [`draw-games/verifier/`](draw-games/verifier) | 彩票、刮刮乐、骰宝、鱼虾蟹及百家乐共用的确定性规则、固定 drand 签名验证和不联网的 `draw-verify` 命令行。自带工作区,由本版本后台代码直接引用。 |
@@ -132,7 +132,7 @@ cargo build --locked --manifest-path draw-games/verifier/Cargo.toml
 ——而不是无条件信任运营方。`mental-poker` 的默认方案中,发牌方在开局前对一副逐张加密、
 可验证洗牌的牌公布承诺,玩家种子决定公开的发牌顺序,亮出的牌用解密证明打开;任何人都能
 对一手牌的验证包离线重跑验证器,确认发牌确由已承诺输入推导(防篡改 + 可复现)。更强的保证——服务器发出它自己都读不到的牌
-(服务端盲发,保护该手未公开底牌的保密性)——是 `crypto_real` 路径——**已为 engine-blind 牌桌启用**(ADR-070),经 AI 跨厂商审计(审计共识已公开)、开源可复核。
+(服务端盲发,保护该手未公开底牌的保密性)——是 `crypto_real` 路径——**已为 engine-blind 牌桌启用**(ADR-070),开源可复核，并有历史跨厂商审计记录。
 把这部分开源正是重点:可被验证的公平,胜过让你信任的公平。
 
 高级加密发牌以可信单一运营者为边界，并有交付与恢复限制；它不证明远端二进制，也不能排除运营方审查交付或操纵结算。见当前[信任边界](https://bluffking.ai/zh/blog/advanced-encrypted-dealing/)。
@@ -151,7 +151,7 @@ cargo deny check                         # 供应链门禁(漏洞 + 许可证)
 二者都无需数据库。各 crate 不带单元/集成测试套件;
 上游项目只用一套针对运行中游戏的端到端测试来验证行为。
 
-**跨厂商 AI 审计 + 如何自己核:** [`audits/cross-vendor-ai-audit.html`](audits/cross-vendor-ai-audit.html) —— 公平信任模型(开源 + 跨厂商 AI 双审 + 可运行验证器),事实可溯源到 ADR。
+**跨厂商 AI 审计 + 如何自己核:** [`audits/cross-vendor-ai-audit.html`](audits/cross-vendor-ai-audit.html) —— 收录历史审查、现行隐私边界和默认发牌验证方式。
 
 ### 许可证 / 商标 / 第三方
 

@@ -413,6 +413,8 @@ pub struct StreetActionFact {
     /// added contribution; `committed_to` includes earlier street wagers.
     pub amount: Chips,
     pub committed_to: Chips,
+    pub stack_before: Chips,
+    pub stack_after: Chips,
     /// Outstanding wager before the action (not capped to the actor's stack).
     pub to_call_before: Chips,
     pub pot_before: Chips,

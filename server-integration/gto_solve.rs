@@ -1351,7 +1351,7 @@ pub async fn solve_handler(
     // --- cheap, solve-free validation BEFORE the permit (F3 hardening) ---
     // Reject malformed input (bad board/range/stakes/sizing, or an IP-at-root
     // view) here so a flood of invalid requests can't each grab a scarce solve
-    // permit and starve real solves. `solve_spot` re-runs the same checks as the
+    // permit and starve real solves. `solve_spot_with` re-runs the same checks as the
     // single source of truth, so this is a fast-fail, not the only guard.
     if let Err(e) = gto_solver::validate_request(&req) {
         return map_solve_error(e);

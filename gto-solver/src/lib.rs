@@ -35,7 +35,7 @@
 //!
 //! # Cost / DoS guard
 //! Memory is dominated by `range-width × bet-size-count` (tree branching), only
-//! secondarily by iteration count. [`solve_spot`] calls the solver's
+//! secondarily by iteration count. [`solve_spot_with`] calls the solver's
 //! `memory_usage()` and REJECTS (without allocating) when the estimate exceeds
 //! [`SolveLimits::max_memory_bytes`]. The caller is additionally expected to
 //! impose a global concurrency cap (a wide-range flop solve is ~1 GB — U27:
@@ -370,7 +370,7 @@ pub enum SolveError {
 ///
 /// The server calls this BEFORE acquiring the scarce global solve permit, so a
 /// flood of malformed requests can't each consume a permit and starve real
-/// solves (a capacity-DoS hardening tied to F3). [`solve_spot`] re-runs the same
+/// solves (a capacity-DoS hardening tied to F3). [`solve_spot_with`] re-runs the same
 /// checks as the single source of truth, so callers that skip this are still
 /// safe — it is a cheap fast-fail, not the only guard.
 pub fn validate_request(req: &SolveRequest) -> Result<(), SolveError> {
@@ -386,7 +386,7 @@ fn parse_request(req: &SolveRequest) -> Result<(CardConfig, BetSizeOptions), Sol
     // before the solve permit — so the handler returns a clean 400 without
     // consuming a scarce permit. `get_hands_weights(dead_mask)` counts a single
     // player's combos against the board. (The rarer all-OOP-vs-all-IP collision
-    // is still caught post-build in `solve_spot` via `map_with_config_error`.)
+    // is still caught post-build in `solve_spot_with` via `map_with_config_error`.)
     let dead_mask = board_dead_mask(&flop, turn, river);
     if oop.get_hands_weights(dead_mask).0.is_empty() {
         return Err(SolveError::InvalidRange {
@@ -406,7 +406,7 @@ fn parse_request(req: &SolveRequest) -> Result<(CardConfig, BetSizeOptions), Sol
         .map_err(SolveError::InvalidBetSize)?;
     // F1: on every postflop tree OOP acts first, so the root actor is ALWAYS
     // OOP — only the OOP view has a well-defined root strategy here. Reject an
-    // IP view cheaply (before any permit/solve); `solve_spot`'s post-build
+    // IP view cheaply (before any permit/solve); `solve_spot_with`'s post-build
     // `current_player()` check in `project_output` is the runtime authority that
     // backs this structural assumption.
     if req.solving_player == Player::Ip {
@@ -427,7 +427,7 @@ fn parse_request(req: &SolveRequest) -> Result<(CardConfig, BetSizeOptions), Sol
 
 /// Parse + validate the board into `(flop, turn, river)` solver cards, enforcing
 /// the street↔card-count invariant and board-card uniqueness. Shared by
-/// [`validate_request`] and [`solve_spot`].
+/// [`validate_request`] and [`solve_spot_with`].
 fn parse_board(req: &SolveRequest) -> Result<([u8; 3], u8, u8), SolveError> {
     let flop_str = format!("{}{}{}", req.flop[0], req.flop[1], req.flop[2]);
     let flop = flop_from_str(&flop_str).map_err(SolveError::InvalidBoard)?;
@@ -496,7 +496,7 @@ fn board_dead_mask(flop: &[u8; 3], turn: u8, river: u8) -> u64 {
 }
 
 /// Parse both ranges and reject empty ones. Shared by [`validate_request`] and
-/// [`solve_spot`].
+/// [`solve_spot_with`].
 fn parse_ranges(req: &SolveRequest) -> Result<(Range, Range), SolveError> {
     let oop: Range = req
         .oop_range
@@ -554,7 +554,7 @@ fn validate_stakes(req: &SolveRequest) -> Result<(), SolveError> {
     // OSS dual-AI review 2026-07-01 (finding C4): bound the STAKE-to-POT ratio
     // (SPR), not just each value independently. `ActionTree::new` + `with_config`
     // build the game-tree node arena BEFORE the `memory_usage()` gate in
-    // `solve_spot`, and tree depth grows with SPR (≈ log₃(SPR) betting rounds
+    // `solve_spot_with`, and tree depth grows with SPR (≈ log₃(SPR) betting rounds
     // before the force-all-in threshold). Bounding each of pot/stack to
     // `MAX_STAKE` alone still permits SPR up to `MAX_STAKE` (e.g. pot=1,
     // stack=100_000), whose pre-gate tree is not covered by `max_memory_bytes`.
@@ -572,22 +572,11 @@ fn validate_stakes(req: &SolveRequest) -> Result<(), SolveError> {
     Ok(())
 }
 
-/// Solve one fully-described postflop spot to an approximate Nash equilibrium.
-///
-/// SYNCHRONOUS and CPU/RAM-heavy (a wide-range flop solve is ~1 GB / single-digit
-/// seconds). The server MUST call this inside `spawn_blocking` with a global
-/// concurrency cap. Validates every input and applies the [`SolveLimits`] memory
-/// cap BEFORE allocating; never panics on caller input (the upstream
-/// `unsafe`/SIMD paths are reached only after full validation). No wall-clock
-/// budget: use [`solve_spot_with`] for a deadline / cancellation.
-pub fn solve_spot(req: &SolveRequest) -> Result<SolveOutput, SolveError> {
-    solve_spot_with(req, &SolveControl::default())
-}
-
-/// [`solve_spot`] under cooperative [`SolveControl`]: stops at the deadline with
-/// the best-so-far strategy (honestly labeled [`SolveStop::TimeBudget`] with its
-/// measured exploitability and real iteration count), or abandons the solve with
-/// [`SolveError::Cancelled`] once the cancel flag is set.
+/// Solve a postflop spot on a blocking worker with a concurrency cap. The
+/// solve validates inputs and enforces the configured solver memory limit.
+/// The deadline returns the best strategy reached so far with its measured
+/// exploitability and iteration count. Cancellation returns
+/// [`SolveError::Cancelled`].
 pub fn solve_spot_with(req: &SolveRequest, ctl: &SolveControl) -> Result<SolveOutput, SolveError> {
     let (game, run) = solve_game(req, ctl)?;
     project_output(&game, req, run)
@@ -599,19 +588,8 @@ fn solve_game(
     ctl: &SolveControl,
 ) -> Result<(PostFlopGame, CfrRun), SolveError> {
     ctl.check_cancel()?;
-    // --- Cheap, solve-free validation (single source of truth) --------------
-    // N2 (codex MED): run the FULL `validate_request` first so EVERY input is
-    // validated before a game is constructed — honoring this crate's documented
-    // contract and closing a latent DoS footgun. Previously `solve_spot` ran
-    // `parse_board`/`parse_ranges`/`validate_stakes` inline but SKIPPED the
-    // IP-at-root rejection and the cheap board-blocked-range pre-check, so a
-    // direct crate caller with `solving_player == Ip` (or a fully-blocked range)
-    // would allocate + run the FULL CFR solve and only fail LATE in
-    // `project_output` with `PlayerNotAtRoot`. The HTTP handler already calls
-    // `validate_request` before the solve permit; doing it here too makes the
-    // crate safe for any caller (the server's call is then a redundant fast-fail,
-    // not the only guard). The board/range/stakes results are re-parsed below
-    // (cheap) for the game build.
+    // Validate before constructing the game. The server also runs the same
+    // checks before reserving a worker for an on-demand solve.
     let (card_config, bet_sizes) = parse_request(req)?;
 
     let initial_state = match req.street {

@@ -44,6 +44,35 @@ pub fn verify_document_with_key(
         }
         result["verified_roster"] = crate::bean_tools::open_roster(&result, opening)?;
     }
+    let (external_shoe_receipt, external_receipt) = external_receipt
+        .filter(|receipt| {
+            document.get("shoe_shuffle").is_some()
+                && receipt["terms"]["kind"] == crate::baccarat::shuffle::GAME
+        })
+        .map_or((None, external_receipt), |receipt| (Some(receipt), None));
+    if let Some(shuffle) = document.get("shoe_shuffle") {
+        use crate::baccarat::{self, shuffle as verifier};
+        if proof["kind"] != baccarat::GAME {
+            return Err("A linked shoe shuffle requires a Baccarat round proof".into());
+        }
+        let checked = verifier::verify(shuffle)?;
+        let plan = &proof["plan"];
+        if plan["shuffle"] != checked["plan"]
+            || plan["shoe_id"] != checked["plan"]["draw_id"]
+            || plan["shoe_root"] != checked["shoe_root"]
+            || plan["card_count"] != checked["card_count"]
+        {
+            return Err("Baccarat shuffle differs from the round's committed shoe".into());
+        }
+        let matched = external_shoe_receipt
+            .or_else(|| document.get("shoe_shuffle_receipt"))
+            .filter(|receipt| !receipt.is_null())
+            .map(|receipt| match_receipt(shuffle, receipt))
+            .transpose()?
+            .is_some();
+        result["shoe_shuffle_verified"] = json!(true);
+        result["shoe_shuffle_receipt_matched"] = json!(matched && external_shoe_receipt.is_some());
+    }
     let observed_match = match_observed(proof, &result, document.get("observed"))?;
     let receipt = external_receipt
         .or_else(|| document.get("receipt"))
@@ -70,6 +99,14 @@ pub fn verify_document_with_key(
     let receipt_match = match receipt {
         Some(receipt) if receipt["kind"] == crate::sicbo::ACCEPTANCE_KIND => {
             match_signed_wager(proof, receipt)?
+        }
+        Some(receipt) if proof["kind"] == crate::baccarat::shuffle::GAME => {
+            match_receipt(proof, receipt)?;
+            if external_receipt.is_some() {
+                "commitment_only"
+            } else {
+                "not_provided"
+            }
         }
         Some(receipt) => match_receipt(proof, receipt)?,
         None => wager
@@ -231,6 +268,7 @@ fn match_observed(proof: &Value, result: &Value, observed: Option<&Value>) -> Re
     let kind = proof["kind"].as_str().ok_or("Missing proof kind")?;
     let fields: &[&str] = match kind {
         "roulette" => &["request_id", "wagers", "number", "bet", "payout"],
+        crate::roulette::ROOM_GAME => &["number", "wagers", "stake", "payout", "delta"],
         "fruit" => &[
             "request_id",
             "play",
@@ -268,6 +306,7 @@ fn match_observed(proof: &Value, result: &Value, observed: Option<&Value>) -> Re
             &["dice", "faces", "bets", "stake", "won", "delta"]
         }
         crate::baccarat::GAME => &["result", "wager"],
+        crate::tournament_deal::GAME => &["board", "board2", "holes"],
         _ => return Err("Unsupported displayed-outcome check".into()),
     };
     for &field in fields {
@@ -421,6 +460,73 @@ fn match_receipt(proof: &Value, receipt: &Value) -> Result<&'static str, String>
         } else {
             Ok("commitment_only")
         }
+    } else if kind == crate::baccarat::shuffle::GAME {
+        let plan = &proof["plan"];
+        if receipt["commitment"] != *plan || terms["round_id"] != plan["draw_id"] {
+            return Err("Baccarat shuffle differs from the saved shoe commitment".into());
+        }
+        let observed = receipt["observed_at_ms"]
+            .as_i64()
+            .ok_or("Missing receipt time")?;
+        let pulse = plan["beacon_at_ms"].as_i64().ok_or("Missing beacon time")?;
+        if observed <= 0 || observed >= pulse {
+            return Err("Baccarat shoe receipt was saved after the beacon pulse".into());
+        }
+        Ok("commitment_only")
+    } else if kind == crate::tournament_deal::GAME {
+        let plan = &proof["plan"];
+        if terms["kind"] != kind
+            || receipt["commitment"] != *plan
+            || terms["round_id"] != plan["draw_id"]
+        {
+            return Err("Tournament deal differs from the saved commitment".into());
+        }
+        let seat = terms["seat"]
+            .as_u64()
+            .filter(|seat| *seat < 9)
+            .ok_or("Missing saved seat")?;
+        let cards = proof["holes"][seat.to_string()]
+            .as_array()
+            .ok_or("Missing own card openings")?;
+        let actual = cards
+            .iter()
+            .map(|card| {
+                let id = u8::try_from(card["card"].as_u64()?).ok()?;
+                crate::tournament_deal::card_code(id)
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or("Invalid own card openings")?;
+        if json!(actual) != terms["cards"] {
+            return Err("Tournament hole cards differ from the saved cards".into());
+        }
+        if let Some(observed) = receipt.get("tournament_cards") {
+            let result = crate::tournament_deal::verify(proof)?;
+            for field in ["board", "board2"] {
+                if observed.get(field) != result.get(field) {
+                    return Err("Tournament board differs from the saved result".into());
+                }
+            }
+            let holes = observed["holes"]
+                .as_object()
+                .ok_or("Missing saved hole cards")?;
+            for (seat, slots) in holes {
+                let slots = slots
+                    .as_array()
+                    .filter(|pair| pair.len() == 2)
+                    .ok_or("Invalid saved hole cards")?;
+                for (i, card) in slots.iter().enumerate() {
+                    if !card.is_null() && *card != result["holes"][seat][i] {
+                        return Err("Tournament shown card differs from the saved result".into());
+                    }
+                }
+            }
+            return Ok(if observed["holes"] == result["holes"] {
+                "matched"
+            } else {
+                "commitment_only"
+            });
+        }
+        Ok("commitment_only")
     } else if matches!(kind, crate::yuxiaxie::BEACON_GAME | crate::baccarat::GAME) {
         if receipt["commitment"] != proof["plan"] || terms["round_id"] != proof["plan"]["draw_id"] {
             return Err("Round differs from the plan saved before betting".into());
@@ -459,12 +565,17 @@ fn match_receipt(proof: &Value, receipt: &Value) -> Result<&'static str, String>
         {
             return Err("Revealed seed differs from saved commitment".into());
         }
-        if !matches!(kind, "sicbo-room" | "yuxiaxie-room")
-            && receipt["client_seed"] != reveal.client_seed
+        if !matches!(
+            kind,
+            "sicbo-room" | "yuxiaxie-room" | crate::roulette::ROOM_GAME
+        ) && receipt["client_seed"] != reveal.client_seed
         {
             return Err("Client seed differs from saved challenge".into());
         }
-        if matches!(kind, "sicbo-room" | "yuxiaxie-room") {
+        if matches!(
+            kind,
+            "sicbo-room" | "yuxiaxie-room" | crate::roulette::ROOM_GAME
+        ) {
             // A public proof has no wager to compare, including when one was refused.
             if proof.get("stake").is_none() {
                 return Ok("commitment_only");
@@ -480,24 +591,23 @@ fn match_receipt(proof: &Value, receipt: &Value) -> Result<&'static str, String>
             }
         }
         if kind == "sicbo-room" && proof.get("stake").is_some() {
-            if let Some(audit) = proof.get("audit") {
-                let acceptance = signed_evidence(&audit["acceptance"])?;
-                let key = audit["roster"]["public_key"]
-                    .as_str()
-                    .ok_or("Missing Sic Bo evidence key")?;
-                let claim = sicbo::verify_acceptance(&acceptance, key)?;
-                if terms["round_id"] != claim.round_id
-                    || terms["bet_revision"]
-                        .as_u64()
-                        .and_then(|revision| revision.checked_add(1))
-                        != Some(claim.revision)
-                    || terms["unit"] != json!(claim.unit)
-                    || receipt["client_seed"] != json!(claim.client_seed)
-                {
-                    return Err(
-                        "Sic Bo proof differs from the saved wager revision, unit or seed".into(),
-                    );
-                }
+            let audit = proof.get("audit").ok_or("Missing signed Sic Bo proof")?;
+            let acceptance = signed_evidence(&audit["acceptance"])?;
+            let key = audit["roster"]["public_key"]
+                .as_str()
+                .ok_or("Missing Sic Bo evidence key")?;
+            let claim = sicbo::verify_acceptance(&acceptance, key)?;
+            if terms["round_id"] != claim.round_id
+                || terms["bet_revision"]
+                    .as_u64()
+                    .and_then(|revision| revision.checked_add(1))
+                    != Some(claim.revision)
+                || terms["unit"] != json!(claim.unit)
+                || receipt["client_seed"] != json!(claim.client_seed)
+            {
+                return Err(
+                    "Sic Bo proof differs from the saved wager revision, unit or seed".into(),
+                );
             }
             match (
                 terms["unit"].as_str(),
@@ -506,7 +616,7 @@ fn match_receipt(proof: &Value, receipt: &Value) -> Result<&'static str, String>
             ) {
                 (Some("beans"), Some(seed), Some(_))
                     if receipt.get("client_seed") == Some(seed) => {}
-                (unit, None, None) if unit != Some("beans") => {}
+                (Some("practice"), None, None) => {}
                 _ => return Err("Jackpot proof differs from the saved wager unit or seed".into()),
             }
         }
@@ -534,6 +644,8 @@ fn match_receipt(proof: &Value, receipt: &Value) -> Result<&'static str, String>
         }
         let fields: &[&str] = if kind == "scratch" {
             &["cost", "count"]
+        } else if kind == crate::roulette::ROOM_GAME && proof.get("stake").is_some() {
+            &["wagers", "stake"]
         } else if kind == "yuxiaxie-room" && proof.get("stake").is_some() {
             &["bets", "stake"]
         } else if proof.get("stake").is_some() {
@@ -620,7 +732,7 @@ mod tests {
         let mut receipt = json!({
             "protocol": "bluffking-receipt-v1",
             "commitment": commitment,
-            "terms": {"kind": "sicbo-room", "side": "big", "stake": 20}
+            "terms": {"kind": "sicbo-room", "unit": "practice", "side": "big", "stake": 20}
         });
         assert_eq!(match_receipt(&proof, &receipt).unwrap(), "commitment_only");
 
@@ -628,9 +740,10 @@ mod tests {
         proof["stake"] = json!(20);
         assert!(match_receipt(&proof, &receipt).is_err());
         receipt["client_seed"] = json!(player_seed);
-        assert_eq!(match_receipt(&proof, &receipt).unwrap(), "matched");
-        receipt["client_seed"] = json!("33".repeat(32));
-        assert!(match_receipt(&proof, &receipt).is_err());
+        assert_eq!(
+            match_receipt(&proof, &receipt).unwrap_err(),
+            "Missing signed Sic Bo proof"
+        );
     }
 
     #[test]

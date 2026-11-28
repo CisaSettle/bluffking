@@ -470,6 +470,8 @@ impl GameHand {
                 action: record.action.clone(),
                 amount: record.amount,
                 committed_to: Chips(*committed),
+                stack_before: record.stack_before,
+                stack_after: record.stack_after,
                 to_call_before: Chips(to_call_before),
                 pot_before: record.pot_before,
                 increased_bet,

@@ -37,7 +37,7 @@
         <table>
           <thead><tr><th>游戏</th><th>开奖前</th><th>开奖后及边界</th></tr></thead>
           <tbody>
-            <tr><td>骰宝房间</td><td>每轮先承诺服务器种子。下注确认时持久化签名接单凭证，封盘时保存签名名单并选定其后固定的 drand Quicknet 轮次。</td><td>用承诺种子、签名名单和经验证的信标复算骰点。本人可核对接单凭证与名单中的哈希，也可查询签名作废证明。运营方签名记录了接单和锁定时间，其他种子是否来自真人需额外证据。</td></tr>
+            <tr><td>骰宝房间</td><td>每轮先承诺服务器种子。下注在内存受理后确认，签名接单凭证持久化后推送给玩家。封盘时保存签名名单并选定其后固定的 drand Quicknet 轮次。</td><td>用承诺种子、签名名单和经验证的信标复算骰点。本人可核对接单凭证与名单中的哈希，也可查询签名作废证明。运营方签名记录了接单和锁定时间，其他种子是否来自真人需额外证据。</td></tr>
             <tr><td>鱼虾蟹房间</td><td>轮次开始时公布下注截止时间与预先选定的未来 drand 轮次，下注请求绑定这份计划。</td><td>封盘后等待原定轮次，验证签名并复算骰点与派彩。</td></tr>
             <tr><td>百家乐</td><td>下注前公布牌靴的 Merkle 根和本轮起始位置。</td><td>用局后提供的已发牌索引、盐值和 Merkle 路径核对牌面，复算补牌和胜负。服务器持有整靴。</td></tr>
             <tr><td>标准炸金花</td><td>先锁定加密牌组和发牌座位，再由玩家随机数共同决定牌序。</td><td>局后用 <code>pf_verify</code> 核对 <code>zjh-pf-shuffle-v2</code> 证明。证明只打开请求者获准看到的牌，服务器在牌局中仍知道牌面。大小王和五选三使用桌内「发牌验证」。</td></tr>
@@ -109,7 +109,7 @@
         <table>
           <thead><tr><th>Game</th><th>Before the draw</th><th>Afterwards and limitations</th></tr></thead>
           <tbody>
-            <tr><td>Sicbo rooms</td><td>Each round commits to the server seed. A successful wager gets a durable signed acceptance. Closing betting saves the signed roster and fixes a later drand Quicknet round.</td><td>Replay the dice using the committed seed, signed roster and verified beacon. Compare your receipt with its roster hash, or recover a signed void by round ID. The operator signs the acceptance and lock times from its own clock. Other seeds still need separate evidence of their origin.</td></tr>
+            <tr><td>Sicbo rooms</td><td>Each round commits to the server seed. The table acknowledges a wager after accepting it in memory, then sends the signed receipt once it is durable. Closing betting saves the signed roster and fixes a later drand Quicknet round.</td><td>Replay the dice using the committed seed, signed roster and verified beacon. Compare your receipt with its roster hash, or recover a signed void by round ID. The operator signs the acceptance and lock times from its own clock. Other seeds still need separate evidence of their origin.</td></tr>
             <tr><td>Fish Prawn Crab rooms</td><td>The table publishes the betting cutoff and fixed future drand round before the first wager, and each wager names that plan.</td><td>After betting closes the table waits for the scheduled pulse, verifies its signature and derives the dice and payouts.</td></tr>
             <tr><td>Baccarat</td><td>The table publishes the shoe Merkle root and round start position before betting.</td><td>Use the indexes, salts and Merkle paths for dealt cards to replay the deal and verify the winner. The server holds the shoe.</td></tr>
             <tr><td>Standard Zha Jin Hua</td><td>The dealer locks the encrypted deck and seat roster before player randomness sets the deal order.</td><td>After play, <code>pf_verify</code> checks the <code>zjh-pf-shuffle-v2</code> proof for cards the requester may see. The server still knows the cards. For Joker and Five Pick Three modes, use Verify dealing in the table menu.</td></tr>

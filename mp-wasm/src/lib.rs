@@ -515,6 +515,15 @@ pub fn pf2_verify(bundle_json: String) -> String {
     }
 }
 
+/// Niuniu's complete n-of-n encrypted-deal transcript.
+#[wasm_bindgen]
+pub fn niuniu_transcript_verify(text: &str) -> bool {
+    use mental_poker::niuniu_transcript as niuniu;
+    text.len() <= 2 * 1024 * 1024
+        && serde_json::from_str::<niuniu::Bundle>(text)
+            .is_ok_and(|bundle| niuniu::verify(&bundle).is_ok())
+}
+
 /// Zha Jin Hua's three-card layout over the same encrypted-deck verifier.
 #[wasm_bindgen]
 pub fn zjh_pf2_verify(bundle_json: String) -> String {

@@ -41,5 +41,6 @@ pub mod crypto_real;
 pub mod events;
 pub mod hash;
 mod locked_shuffle;
+pub mod niuniu_transcript;
 pub mod pf2;
 pub mod pf2_zjh;

@@ -501,43 +501,11 @@ mod tests {
         assert_eq!(dice, [6, 6, 4]);
         assert_eq!(jackpot(&reveal, &seeds[0], true), JACKPOT_BONUS);
         let mut proof = payout_proof(&reveal, dice, &seeds, Side::Big, 5);
-        let receipt = json!({
-            "protocol":"bluffking-receipt-v1", "commitment":commitment, "client_seed":seeds[0],
-            "terms":{"kind":game,"round_id":draw_id,"unit":"beans","side":"big","stake":5}
-        });
-        assert!(verify_document(&proof, Some(&receipt)).is_err());
+        assert!(verify_document(&proof, None).is_ok());
         add_jackpot(&mut proof, &seeds[0], JACKPOT_BONUS);
-        assert_eq!(
-            verify_document(&proof, Some(&receipt)).unwrap()["receipt_match"],
-            "matched"
-        );
+        assert!(verify_document(&proof, None).is_ok());
         proof["jackpot_bonus"] = json!(0);
-        assert!(verify_document(&proof, Some(&receipt)).is_err());
-
-        let seeds = ["01".repeat(32), "02".repeat(32)];
-        let reveal = Reveal {
-            client_seed: dealer_client_seed(game, &seeds).unwrap(),
-            ..reveal
-        };
-        let dice = draw(&reveal, &seeds).unwrap();
-        let mut proof = payout_proof(&reveal, dice, &seeds, Side::Big, 5);
-        let mut receipt = receipt;
-        for unit in [Value::Null, json!("unknown"), json!("practice")] {
-            receipt["terms"]["unit"] = unit;
-            assert!(verify_document(&proof, Some(&receipt)).is_ok());
-        }
-        add_jackpot(
-            &mut proof,
-            &seeds[0],
-            jackpot(&reveal, &seeds[0], wins(dice, Side::Big)),
-        );
-        for unit in [Value::Null, json!("unknown"), json!("practice")] {
-            receipt["terms"]["unit"] = unit;
-            assert!(verify_document(&proof, Some(&receipt)).is_err());
-        }
-        receipt["terms"]["unit"] = json!("beans");
-        receipt["client_seed"] = json!(seeds[1]);
-        assert!(verify_document(&proof, Some(&receipt)).is_err());
+        assert!(verify_document(&proof, None).is_err());
     }
 }
 
@@ -663,6 +631,13 @@ mod signed_tests {
         receipt["terms"]["bet_revision"] = json!(1);
         assert!(verify(&proof, Some(&receipt), Some(&key)).is_err());
         receipt["terms"]["bet_revision"] = json!(0);
+        for unit in [Value::Null, json!("unknown"), json!("practice")] {
+            receipt["terms"]["unit"] = unit;
+            assert!(verify(&proof, Some(&receipt), Some(&key)).is_err());
+        }
+        receipt["terms"].as_object_mut().unwrap().remove("unit");
+        assert!(verify(&proof, Some(&receipt), Some(&key)).is_err());
+        receipt["terms"]["unit"] = json!("beans");
         receipt["client_seed"] = json!("22".repeat(32));
         assert!(verify(&proof, Some(&receipt), Some(&key)).is_err());
 
