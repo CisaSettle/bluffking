@@ -37,6 +37,7 @@ pub enum Game {
     ZjhJokers,
     Niuniu,
     Sangong,
+    Laoyancai,
     Shortdeck,
     Ddz,
     Guandan,
@@ -64,6 +65,7 @@ impl Game {
             Self::ZjhJokers => "zjh-jokers",
             Self::Niuniu => "niuniu",
             Self::Sangong => "sangong",
+            Self::Laoyancai => "laoyancai",
             Self::Shortdeck => "shortdeck",
             Self::Ddz => "ddz",
             Self::Guandan => "guandan",
@@ -81,6 +83,7 @@ impl Game {
             Self::ZjhJokers,
             Self::Niuniu,
             Self::Sangong,
+            Self::Laoyancai,
             Self::Shortdeck,
             Self::Ddz,
             Self::Guandan,
@@ -233,6 +236,9 @@ pub struct Verified {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commitments: Option<BTreeMap<u8, String>>,
     pub cards: BTreeMap<usize, u16>,
+    /// The tie-break order in games that choose it from the same exchange.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seat_order: Option<Vec<u8>>,
 }
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -302,11 +308,17 @@ fn commit_of_deck_hash(
 fn random(domain: &str, master: &[u8; 32], context: &Context) -> ChaCha20Rng {
     ChaCha20Rng::from_seed(ds_hash(domain, &[master, context.game.id().as_bytes()]))
 }
-fn order(
+/// The last Lao Yan Cai position is used only for banker priority. No
+/// participant's cards occupy it, and it is opened after settlement.
+pub const BANKER_ORDER_POSITION: usize = 51;
+
+fn exchange_rng(
+    domain: &str,
     context: &Context,
     commit: &[u8; 32],
     seeds: &BTreeMap<u8, [u8; 32]>,
-) -> Result<Vec<usize>, Error> {
+    marker: Option<u16>,
+) -> Result<ChaCha20Rng, Error> {
     if seeds.keys().any(|s| !context.seats.contains(s)) {
         return Err(Error::Context);
     }
@@ -314,13 +326,46 @@ fn order(
         .iter()
         .flat_map(|(seat, seed)| std::iter::once(*seat).chain(seed.iter().copied()))
         .collect();
-    let mut rng = ChaCha20Rng::from_seed(ds_hash(
-        "cards:order:v1",
-        &[&context.binding(), commit, &bytes],
-    ));
-    let mut positions: Vec<usize> = (0..context.size()).collect();
+    let binding = context.binding();
+    let base: [&[u8]; 3] = [&binding, commit, &bytes];
+    let seed = match marker {
+        Some(marker) => {
+            let [binding, commit, bytes] = base;
+            ds_hash(domain, &[binding, commit, bytes, &marker.to_le_bytes()])
+        }
+        None => ds_hash(domain, &base),
+    };
+    Ok(ChaCha20Rng::from_seed(seed))
+}
+
+fn order(
+    context: &Context,
+    commit: &[u8; 32],
+    seeds: &BTreeMap<u8, [u8; 32]>,
+) -> Result<Vec<usize>, Error> {
+    let mut rng = exchange_rng("cards:order:v1", context, commit, seeds, None)?;
+    let mut positions: Vec<_> = (0..context.size()).collect();
     positions.shuffle(&mut rng);
     Ok(positions)
+}
+
+/// Reproduce banker priority from the committed exchange and a reserved card.
+/// The marker keeps the exact priority hidden even when every seed is known.
+pub fn seat_order(
+    commitment: &Commitment,
+    seeds: &BTreeMap<u8, [u8; 32]>,
+    marker: u16,
+) -> Result<Vec<u8>, Error> {
+    let context = &commitment.context;
+    context.validate()?;
+    if context.game != Game::Laoyancai || usize::from(marker) >= context.size() {
+        return Err(Error::Context);
+    }
+    let commit = hex32(&commitment.commitment)?;
+    let mut rng = exchange_rng("cards:seat-order:v1", context, &commit, seeds, Some(marker))?;
+    let mut seats = context.seats.clone();
+    seats.shuffle(&mut rng);
+    Ok(seats)
 }
 impl LockedDeck {
     pub fn new(context: Context, master: &[u8; 32]) -> Result<Self, Error> {
@@ -507,11 +552,20 @@ pub fn verify(bundle: &Bundle) -> Result<Verified, Error> {
             return Err(Error::Position);
         }
     }
+    let seat_order = if context.game == Game::Laoyancai {
+        cards
+            .get(&BANKER_ORDER_POSITION)
+            .map(|&marker| seat_order(&bundle.commitment, &seeds, marker))
+            .transpose()?
+    } else {
+        None
+    };
     Ok(Verified {
         commitment: bundle.commitment.clone(),
         client_seeds: bundle.client_seeds.clone(),
         commitments: bundle.commitments.clone(),
         cards,
+        seat_order,
     })
 }
 
