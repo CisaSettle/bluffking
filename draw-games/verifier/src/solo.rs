@@ -1,9 +1,12 @@
 //! One commitment, reveal and receipt format for instant solo games.
-use crate::{claw, fruit, proof::Reveal, puzzle2048, roulette, slots};
+use crate::{bean_tools, claw, fruit, proof::Reveal, puzzle2048, roulette, slots};
 use serde_json::{json, Value};
 
 pub fn supports(game: &str) -> bool {
-    matches!(game, "roulette" | "slots" | "fruit" | "claw" | "2048")
+    matches!(
+        game,
+        "roulette" | "slots" | "fruit" | "claw" | "2048" | "call-fold" | "lucky-draw"
+    )
 }
 
 pub fn result(game: &str, detail: &Value) -> Value {
@@ -11,6 +14,11 @@ pub fn result(game: &str, detail: &Value) -> Value {
         "claw" => json!({"aim": detail["aim"], "caught": detail["caught"],
             "jackpot": detail["jackpot"], "payout": detail["payout"]}),
         "2048" => json!({"cost": detail["cost"], "seed": detail["seed"]}),
+        "call-fold" => {
+            json!({"cost": detail["cost"], "face": detail["face"], "reward": detail["reward"]})
+        }
+        "lucky-draw" => json!({"cost": detail["cost"], "roster": detail["roster"],
+            "index": detail["index"], "reward": detail["reward"]}),
         _ => detail.clone(),
     }
 }
@@ -45,6 +53,12 @@ pub(crate) fn verify(proof: &Value) -> Result<Value, String> {
                 .map_err(|error| error.to_string())?
         }
         "2048" => json!({"cost": puzzle2048::COST, "seed": puzzle2048::draw_seed(&mut entropy)}),
+        "call-fold" => bean_tools::call_fold(&mut entropy),
+        "lucky-draw" => {
+            let roster =
+                serde_json::from_value(claimed["roster"].clone()).map_err(|e| e.to_string())?;
+            bean_tools::lucky_draw(&roster, &mut entropy)?
+        }
         _ => return Err("Unsupported solo draw".into()),
     };
     if replayed != claimed {
@@ -58,7 +72,9 @@ pub(crate) fn match_terms(proof: &Value, terms: &Value) -> Result<(), String> {
         Some("roulette") => Some("wagers"),
         Some("fruit") => Some("play"),
         Some("claw") => Some("aim"),
-        Some("2048") => Some("cost"),
+        Some("2048" | "call-fold") => Some("cost"),
+        Some("lucky-draw") if proof["result"]["cost"] == terms["cost"] => Some("roster"),
+        Some("lucky-draw") => return Err("Lucky Draw price differs from the saved receipt".into()),
         _ => None,
     };
     let mismatch = match wager {
@@ -144,5 +160,61 @@ mod tests {
             json!({"cost":1}),
             json!({"cost":1,"seed":1693791216}),
         );
+    }
+}
+
+#[cfg(test)]
+mod tools_tests {
+    use crate::{
+        bean_tools, document,
+        proof::{commit, sha256_fields, Reveal},
+    };
+    use serde_json::json;
+
+    #[test]
+    fn lucky_draw_checks_receipt_and_optionally_opens_the_private_roster() {
+        let game = "lucky-draw";
+        let request_id = "00000000-0000-4000-8000-000000000002";
+        let server_seed = "ab".repeat(32);
+        let client_seed = "cd".repeat(32);
+        let commitment = commit(game, request_id, &server_seed).unwrap();
+        let reveal = Reveal {
+            commitment: commitment.clone(),
+            server_seed,
+            client_seed: client_seed.clone(),
+        };
+        let list = r#"["小林","Anne Marie","Maya"]"#;
+        let nonce = [0x42; 32];
+        let roster = bean_tools::Roster {
+            size: 3,
+            commitment: hex::encode(sha256_fields(&[
+                b"bluffking-lucky-roster-v1",
+                &nonce,
+                list.as_bytes(),
+            ])),
+        };
+        let settlement = bean_tools::lucky_draw(&roster, &mut reveal.entropy().unwrap()).unwrap();
+        let winner = ["小林", "Anne Marie", "Maya"][settlement["index"].as_u64().unwrap() as usize];
+        let mut bundle = json!({
+            "proof": {"kind":game, "request_id":request_id, "reveal":reveal, "result":settlement},
+            "receipt": {"protocol":"bluffking-receipt-v1", "commitment":commitment, "client_seed":client_seed,
+                "terms":{"kind":game, "request_id":request_id, "cost":2, "roster":roster}},
+        });
+        let public = document::verify_document(&bundle, None).unwrap();
+        assert_eq!(public["receipt_match"], "matched");
+        assert!(!public.to_string().contains(winner));
+
+        bundle["private_roster"] =
+            json!({"nonce":hex::encode(nonce), "list":list, "winner":winner});
+        let opened = document::verify_document(&bundle, None).unwrap();
+        assert_eq!(opened["result"]["verified_roster"]["winner"], winner);
+        let mut tampered = bundle.clone();
+        tampered["private_roster"]["winner"] = json!("Different winner");
+        assert!(document::verify_document(&tampered, None).is_err());
+        tampered = bundle.clone();
+        tampered["private_roster"]["list"] = json!(r#"["Anne Marie","小林","Maya"]"#);
+        assert!(document::verify_document(&tampered, None).is_err());
+        bundle["receipt"]["terms"]["roster"]["commitment"] = json!("0a".repeat(32));
+        assert!(document::verify_document(&bundle, None).is_err());
     }
 }

@@ -1,6 +1,7 @@
 //! Deterministic production rules and a network-free, independently runnable verifier.
 pub mod baccarat;
 pub mod beacon;
+pub mod bean_tools;
 pub mod board;
 pub mod claw;
 pub mod document;

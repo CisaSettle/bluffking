@@ -7,22 +7,13 @@
 //! request. Rule for an unfinished 2048 entry: the price is final (it bought
 //! the board; a refund would be a free retry), and the reward stays claimable
 //! with a valid replay of that board, exactly once, with no deadline.
-use draw_games::{proof::Entropy, puzzle2048};
-use rand::Rng;
+use draw_games::{bean_tools, proof::Entropy, puzzle2048};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::{Keep, Outcome, Refusal, SoloGame, Stake};
 
-/// The rare top result pays this multiple of the game's highest bean prize.
-const JACKPOT_MULTIPLE: i64 = 5;
-/// A winning Call returns twice its price. Call is drawn 49% of the time, so
-/// the house keeps 2% (RTP 98%); there is no jackpot on Call / Fold.
-const CALL_PRIZE: i64 = 2;
-const CALL_PERCENT: u32 = 49;
-/// Lucky Draw costs 2 so its smallest non-zero prize is a whole bean.
-const DRAW_TOP_PRIZE: i64 = 20;
 const NS: Uuid = Uuid::from_u128(0x5c737949_c677_4992_a296_349e3f68c568);
 
 #[derive(Deserialize)]
@@ -30,6 +21,7 @@ const NS: Uuid = Uuid::from_u128(0x5c737949_c677_4992_a296_349e3f68c568);
 pub struct Play {
     /// The price the client showed; a changed price is refused.
     cost: i64,
+    roster: Option<bean_tools::Roster>,
 }
 
 #[derive(Deserialize)]
@@ -64,11 +56,12 @@ fn entry(cost: i64, extra: Value, payout: i64, reward: Value) -> Outcome {
 
 fn reply(meta: &Value, balance: i64) -> Value {
     json!({"request_id": meta["request_id"], "cost": meta["cost"], "balance": balance,
-        "face": meta["face"], "seed": meta["seed"], "reward": meta["reward"]})
+        "face": meta["face"], "seed": meta["seed"], "reward": meta["reward"],
+        "roster": meta["roster"], "index": meta["index"]})
 }
 
 macro_rules! casual {
-    ($name:ident, $id:literal, $cost:expr, $fair:literal) => {
+    ($name:ident, $id:literal, $cost:expr) => {
         pub struct $name;
         impl $name {
             const COST: i64 = $cost;
@@ -76,7 +69,7 @@ macro_rules! casual {
         impl SoloGame for $name {
             const ID: &'static str = $id;
             const KEEP: Keep = Keep::Every;
-            const FAIR_DRAW: bool = $fair;
+            const FAIR_DRAW: bool = true;
             const OWNER_CHANGED: &'static str = "account_changed";
             const REQUEST_CONFLICT: &'static str = "request_conflict";
             const NOT_FOUND: &'static str = "entry_not_found";
@@ -85,29 +78,26 @@ macro_rules! casual {
                 record(user, request)
             }
             fn stake(play: &Play) -> Result<Stake, Refusal> {
+                if (Self::ID == "lucky-draw") != play.roster.is_some()
+                    || play.roster.as_ref().is_some_and(|roster| !roster.is_valid())
+                {
+                    return Err(Refusal::invalid("invalid_roster"));
+                }
                 stake(play, Self::COST)
             }
             fn same_play(play: &Play, meta: &Value) -> bool {
-                meta["cost"] == json!(play.cost)
-            }
-            fn draw(
-                _: &Play,
-                cost: i64,
-                _: Option<&Value>,
-                rng: &mut dyn rand::RngCore,
-            ) -> Result<Outcome, Refusal> {
-                Ok(Self::outcome(cost, rng))
+                meta["cost"] == json!(play.cost) && meta["roster"] == json!(play.roster)
             }
             fn committed_draw(
-                _: &Play,
+                play: &Play,
                 cost: i64,
                 _: Option<&Value>,
                 entropy: &mut Entropy,
             ) -> Result<Outcome, Refusal> {
-                if !Self::FAIR_DRAW {
-                    return Err(Refusal::invalid("invalid_bet"));
-                }
-                Ok(entry(cost, json!({"seed": puzzle2048::draw_seed(entropy)}), 0, Value::Null))
+                let settled = Self::outcome(play, entropy)?;
+                let reward = settled["reward"].clone();
+                let payout = reward["beans"].as_i64().unwrap_or_default();
+                Ok(entry(cost, settled, payout, reward))
             }
             fn reply(meta: &Value, balance: i64) -> Value {
                 reply(meta, balance)
@@ -122,20 +112,13 @@ macro_rules! casual {
     };
 }
 
-casual!(CallFold, "call-fold", 1, false);
-casual!(LuckyDraw, "lucky-draw", 2, false);
-casual!(Puzzle2048, "2048", puzzle2048::COST, true);
+casual!(CallFold, "call-fold", bean_tools::CALL_FOLD_COST);
+casual!(LuckyDraw, "lucky-draw", bean_tools::LUCKY_DRAW_COST);
+casual!(Puzzle2048, "2048", puzzle2048::COST);
 
 impl CallFold {
-    fn outcome(cost: i64, rng: &mut dyn rand::RngCore) -> Outcome {
-        let call = rng.gen_ratio(CALL_PERCENT, 100);
-        let payout = if call { CALL_PRIZE } else { 0 };
-        entry(
-            cost,
-            json!({"face": if call { "call" } else { "fold" }}),
-            payout,
-            json!({"beans": payout, "jackpot": false}),
-        )
+    fn outcome(_: &Play, entropy: &mut Entropy) -> Result<Value, Refusal> {
+        Ok(bean_tools::call_fold(entropy))
     }
     fn reward(_: &Value, _: Value) -> Result<(i64, Value), Refusal> {
         Err(not_found())
@@ -143,24 +126,12 @@ impl CallFold {
 }
 
 impl LuckyDraw {
-    fn outcome(cost: i64, rng: &mut dyn rand::RngCore) -> Outcome {
-        // Every paid draw has the same disclosed prize distribution.
-        let pick = rng.gen_range(0..10_000u32);
-        let payout = match pick {
-            0..=2999 => 0,
-            3000..=6999 => 1,
-            7000..=8999 => 2,
-            9000..=9899 => 4,
-            9900..=9998 => DRAW_TOP_PRIZE,
-            _ => JACKPOT_MULTIPLE * DRAW_TOP_PRIZE,
-        };
-        let jackpot = pick == 9999;
-        entry(
-            cost,
-            json!({}),
-            payout,
-            json!({"beans": payout, "jackpot": jackpot}),
-        )
+    fn outcome(play: &Play, entropy: &mut Entropy) -> Result<Value, Refusal> {
+        let roster = play
+            .roster
+            .as_ref()
+            .ok_or_else(|| Refusal::invalid("invalid_roster"))?;
+        bean_tools::lucky_draw(roster, entropy).map_err(|_| Refusal::invalid("invalid_roster"))
     }
     fn reward(_: &Value, _: Value) -> Result<(i64, Value), Refusal> {
         Err(not_found())
@@ -168,8 +139,8 @@ impl LuckyDraw {
 }
 
 impl Puzzle2048 {
-    fn outcome(_: i64, _: &mut dyn rand::RngCore) -> Outcome {
-        unreachable!("2048 draws from a committed seed")
+    fn outcome(_: &Play, entropy: &mut Entropy) -> Result<Value, Refusal> {
+        Ok(json!({"seed": puzzle2048::draw_seed(entropy)}))
     }
     /// A valid replay of the entry's board reaching 2048 earns the reward.
     fn reward(entry: &Value, body: Value) -> Result<(i64, Value), Refusal> {

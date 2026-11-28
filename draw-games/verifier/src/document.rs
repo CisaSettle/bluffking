@@ -37,7 +37,13 @@ pub fn verify_document_with_key(
         }
         crate::verify(proof)?
     };
-    let result = replay_completion(document, proof, result)?;
+    let mut result = replay_completion(document, proof, result)?;
+    if let Some(opening) = document.get("private_roster") {
+        if proof["kind"] != "lucky-draw" {
+            return Err("Private roster opening requires a Lucky Draw proof".into());
+        }
+        result["verified_roster"] = crate::bean_tools::open_roster(&result, opening)?;
+    }
     let observed_match = match_observed(proof, &result, document.get("observed"))?;
     let receipt = external_receipt
         .or_else(|| document.get("receipt"))
@@ -237,6 +243,8 @@ fn match_observed(proof: &Value, result: &Value, observed: Option<&Value>) -> Re
         "slots" => &["request_id", "reels", "bet", "payout", "jackpot_bonus"],
         "claw" => &["request_id", "aim", "caught", "jackpot", "payout"],
         "2048" => &["request_id", "cost", "seed"],
+        "call-fold" => &["request_id", "cost", "face", "reward"],
+        "lucky-draw" => &["request_id", "cost", "roster", "index", "reward"],
         "scratch" => &[
             "cost",
             "lucky",
