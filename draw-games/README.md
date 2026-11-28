@@ -26,3 +26,5 @@ cargo build --locked --manifest-path draw-games/verifier/Cargo.toml
 浏览器导出的 `{proof, receipt}` 文件可直接作为唯一参数。没有开奖前回执时仍能重算，但不能声称已与先前看到的承诺核对。验证器不联网，也不证明实际钱包入账、发布时间或部署身份。
 
 完整协议、无需服务器的定期开奖重算、保存期限与源码导航见 [index.html](index.html)，默认中文，可切换 English。
+
+A `board-replay-v1` document from a completed Gomoku, Xiangqi, or Chinese Checkers match can be checked with the same command. The verifier replays the public moves with the production rule code and compares the final board and rule-derived result. For endings based on a recorded event such as a timeout or draw agreement, the verification result identifies the supplied event as reported and confirms only the board, moves, and their consistency with it.

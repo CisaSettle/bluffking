@@ -1,4 +1,4 @@
-use super::rules::{Board, Mode, Move};
+use super::rules::{next_active, Board, Mode, Move};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -10,6 +10,10 @@ pub struct Match {
     pub turn: usize,
     pub revision: u64,
     pub moves: Vec<Move>,
+    #[serde(default)]
+    pub first: Option<usize>,
+    #[serde(default)]
+    pub resignations: Vec<[usize; 2]>,
     pub resigned: Vec<bool>,
     pub finished: bool,
     pub winner: Option<usize>,
@@ -28,6 +32,8 @@ impl Match {
             turn: first % players,
             revision: 0,
             moves: vec![],
+            first: Some(first % players),
+            resignations: vec![],
             resigned: vec![false; players],
             finished: false,
             winner: None,
@@ -37,13 +43,7 @@ impl Match {
     }
     fn next(&mut self) {
         self.passed = Some(self.turn);
-        for n in 1..=self.resigned.len() {
-            let seat = (self.turn + n) % self.resigned.len();
-            if !self.resigned[seat] {
-                self.turn = seat;
-                break;
-            }
-        }
+        self.turn = next_active(self.turn, &self.resigned);
     }
     pub fn play(&mut self, seat: usize, from: usize, to: usize) -> Result<(), &'static str> {
         if self.finished {
@@ -71,6 +71,7 @@ impl Match {
             return;
         }
         self.resigned[seat] = true;
+        self.resignations.push([self.moves.len(), seat]);
         self.revision += 1;
         // Retain marbles as bridges; an abandoned seat can never block a turn.
         let active: Vec<_> = (0..self.resigned.len())
