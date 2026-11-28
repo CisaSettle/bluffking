@@ -1,11 +1,10 @@
 //! Pure, serializable three-seat state machine; a hand deals in two or three
 //! of the seats. No clocks, sockets or database.
 use super::rules::{self, Meld, MeldKind, RuleOptions, Score, Tile, WinContext};
+use crate::mahjong::wall::WallDraws;
 use crate::mahjong::{
     claim_phase, copies, remove_tiles, ClaimWindow, Resolution, TileSeat, Transfer,
 };
-use rand::seq::SliceRandom;
-use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,6 +39,8 @@ pub type Winner = crate::mahjong::Winner<Score>;
 pub struct Game {
     pub seats: [Seat; 3],
     pub wall: Vec<Tile>,
+    #[serde(default)]
+    pub(crate) wall_draws: WallDraws,
     pub phase: Phase,
     pub dealer: usize,
     pub next_dealer: usize,
@@ -60,28 +61,27 @@ pub struct Game {
     pub passed_wins: Vec<(usize, usize)>,
 }
 impl Game {
-    pub fn with_players(
+    pub(crate) fn from_wall(
         dealer: usize,
         base: i64,
         rules: RuleOptions,
         active: [bool; 3],
-        rng: &mut impl Rng,
+        mut wall: Vec<Tile>,
     ) -> Self {
-        assert!(active[dealer], "dealer must be dealt in");
-        assert!(active.iter().filter(|&&a| a).count() >= 2, "need opponents");
-        let mut wall: Vec<Tile> = (0..21).flat_map(|t| [t; 4]).collect();
-        wall.shuffle(rng);
+        let mut wall_draws = WallDraws::default();
         let mut seats: [Seat; 3] = Default::default();
-        for (s, _) in seats.iter_mut().zip(active).filter(|&(_, a)| a) {
-            s.tiles = wall.split_off(wall.len() - 13);
-            s.tiles.sort_unstable();
+        for (seat, s) in seats.iter_mut().enumerate().filter(|(i, _)| active[*i]) {
+            s.tiles = wall_draws.initial(&mut wall, seat);
         }
-        let tile = wall.pop().expect("84 tiles minus at most 39");
+        let tile = wall_draws
+            .draw(&mut wall, Some(dealer), false)
+            .expect("84 tiles minus at most 39");
         seats[dealer].tiles.push(tile);
         seats[dealer].tiles.sort_unstable();
         Self {
             seats,
             wall,
+            wall_draws,
             phase: Phase::Turn {
                 seat: dealer,
                 drawn: Some(tile),
@@ -459,11 +459,7 @@ impl Game {
         if !kong {
             self.kong_chain = 0;
         }
-        let tile = if kong && !self.wall.is_empty() {
-            Some(self.wall.remove(0))
-        } else {
-            self.wall.pop()
-        };
+        let tile = self.wall_draws.draw(&mut self.wall, Some(seat), kong);
         if let Some(tile) = tile {
             self.seats[seat].tiles.push(tile);
             self.seats[seat].tiles.sort_unstable();
@@ -507,14 +503,16 @@ impl Game {
         // One shared, real wall tile per self-drawn win (full-point horse).
         // An exhausted wall awards no horse bonus.
         let horse = if self.rules.horse && from.is_none() {
-            self.wall.pop().map(|horse| {
-                self.horses.push(horse);
-                if horse < 18 {
-                    i64::from(horse % 9 + 1)
-                } else {
-                    10
-                }
-            })
+            self.wall_draws
+                .draw(&mut self.wall, None, false)
+                .map(|horse| {
+                    self.horses.push(horse);
+                    if horse < 18 {
+                        i64::from(horse % 9 + 1)
+                    } else {
+                        10
+                    }
+                })
         } else {
             None
         };

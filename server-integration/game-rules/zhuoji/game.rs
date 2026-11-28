@@ -3,9 +3,11 @@
 use super::rules::{self, Meld, MeldKind, Score, Tile, CHICKEN};
 use crate::game_hub::board::BoardMatchSeat;
 use crate::mahjong::event::{self, Moved, SeatTile};
+use crate::mahjong::wall::WallDraws;
 use crate::mahjong::{
     copies, remove_tiles, ClaimWindow, Decided, Resolution, TileMatch, TileSeat, Transfer,
 };
+#[cfg(test)]
 use rand::{seq::SliceRandom, Rng};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, value::RawValue, Value};
@@ -45,6 +47,8 @@ pub struct Match {
     pub revision: u64,
     pub seats: [Seat; 4],
     wall: Vec<Tile>,
+    #[serde(default)]
+    pub(crate) wall_draws: WallDraws,
     pub phase: Phase,
     pub dealer: usize,
     pub next_dealer: usize,
@@ -64,28 +68,34 @@ pub struct Match {
     pub(crate) moved: Option<Moved<usize>>,
 }
 impl Match {
+    #[cfg(test)]
     pub fn new(players: usize, dealer: usize) -> Option<Self> {
         if players != 4 || dealer >= 4 {
             return None;
         }
         Some(Self::deal(dealer, &mut rand::thread_rng()))
     }
+    #[cfg(test)]
     fn deal(dealer: usize, rng: &mut impl Rng) -> Self {
         let mut wall: Vec<Tile> = (0..27).flat_map(|t| [t; 4]).collect();
         wall.shuffle(rng);
+        Self::from_wall(Uuid::new_v4(), dealer, wall)
+    }
+    pub(crate) fn from_wall(id: Uuid, dealer: usize, mut wall: Vec<Tile>) -> Self {
+        let mut wall_draws = WallDraws::default();
         let mut seats: [Seat; 4] = Default::default();
-        for s in &mut seats {
-            s.tiles = wall.split_off(wall.len() - 13);
-            s.tiles.sort_unstable();
+        for (seat, s) in seats.iter_mut().enumerate() {
+            s.tiles = wall_draws.initial(&mut wall, seat);
         }
-        let tile = wall.pop().unwrap();
+        let tile = wall_draws.draw(&mut wall, Some(dealer), false).unwrap();
         seats[dealer].tiles.push(tile);
         seats[dealer].tiles.sort_unstable();
         Self {
-            id: Uuid::new_v4(),
+            id,
             revision: 0,
             seats,
             wall,
+            wall_draws,
             phase: Phase::Turn {
                 seat: dealer,
                 drawn: Some(tile),
@@ -375,11 +385,7 @@ impl Match {
         Ok(())
     }
     fn draw(&mut self, seat: usize, kong: bool) {
-        let tile = if kong && !self.wall.is_empty() {
-            Some(self.wall.remove(0))
-        } else {
-            self.wall.pop()
-        };
+        let tile = self.wall_draws.draw(&mut self.wall, Some(seat), kong);
         if let Some(tile) = tile {
             let s = &mut self.seats[seat];
             s.tiles.push(tile);
@@ -558,7 +564,7 @@ impl Match {
             }
         }
         self.win_from = from;
-        self.flip = self.wall.pop();
+        self.flip = self.wall_draws.draw(&mut self.wall, None, false);
         self.chicken = self.flip.map(rules::next_chicken);
         let ready = self.ready();
         let burn = if kong && !rob { from } else { None };

@@ -47,6 +47,10 @@ pub enum Game {
     Baccarat,
     Colorcards,
     Paigow,
+    Kwx,
+    Chengdu,
+    Shanghai,
+    Zhuoji,
 }
 impl Game {
     pub fn size(self) -> usize {
@@ -54,9 +58,23 @@ impl Game {
             Self::Shortdeck => 36,
             Self::Paigow => 32,
             Self::Ddz | Self::ZjhJokers => 54,
-            Self::Guandan | Self::Colorcards => 108,
+            Self::Guandan | Self::Colorcards | Self::Chengdu | Self::Zhuoji => 108,
+            Self::Kwx => 84,
+            Self::Shanghai => 144,
             Self::Baccarat => 416,
             _ => 52,
+        }
+    }
+    /// Maps a unique physical tile to the face shown by the rules.
+    pub fn tile_face(self, physical: u16) -> Option<u8> {
+        if usize::from(physical) >= self.size() {
+            return None;
+        }
+        match self {
+            Self::Kwx | Self::Chengdu | Self::Zhuoji => Some((physical / 4) as u8),
+            Self::Shanghai if physical < 136 => Some((physical / 4) as u8),
+            Self::Shanghai => Some((physical - 102) as u8),
+            _ => None,
         }
     }
     pub fn id(self) -> &'static str {
@@ -75,6 +93,10 @@ impl Game {
             Self::Baccarat => "baccarat",
             Self::Colorcards => "colorcards",
             Self::Paigow => "paigow",
+            Self::Kwx => "kwx",
+            Self::Chengdu => "chengdu",
+            Self::Shanghai => "shanghai",
+            Self::Zhuoji => "zhuoji",
         }
     }
     pub fn parse(id: &str) -> Option<Self> {
@@ -93,6 +115,10 @@ impl Game {
             Self::Baccarat,
             Self::Colorcards,
             Self::Paigow,
+            Self::Kwx,
+            Self::Chengdu,
+            Self::Shanghai,
+            Self::Zhuoji,
         ]
         .into_iter()
         .find(|g| g.id() == id)
@@ -121,8 +147,8 @@ impl Context {
         hex32(&self.roster)?;
         let max = match self.game {
             Game::Zjh | Game::ZjhJokers | Game::Colorcards => 10,
-            Game::Ddz => 3,
-            Game::Guandan | Game::Shisanshui => 4,
+            Game::Ddz | Game::Kwx => 3,
+            Game::Guandan | Game::Shisanshui | Game::Chengdu | Game::Shanghai | Game::Zhuoji => 4,
             Game::Baccarat => 1,
             Game::Tenhalf => 12,
             _ => 6,

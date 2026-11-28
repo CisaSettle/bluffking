@@ -1,9 +1,11 @@
 use super::rules::{self, Meld, MeldKind, Score, Tile};
 use crate::game_hub::board::BoardMatchSeat;
 use crate::mahjong::event::{self, Moved, SeatTile};
+use crate::mahjong::wall::WallDraws;
 use crate::mahjong::{
     copies, remove_tiles, ClaimWindow, Decided, Resolution, TileMatch, TileSeat, Transfer,
 };
+#[cfg(test)]
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, value::RawValue, Value};
@@ -48,6 +50,8 @@ pub struct Match {
     pub revision: u64,
     pub seats: [Seat; 4],
     pub wall: Vec<Tile>,
+    #[serde(default)]
+    pub(crate) wall_draws: WallDraws,
     pub phase: Phase,
     pub dealer: usize,
     pub finished: bool,
@@ -60,22 +64,27 @@ pub struct Match {
     pub(crate) moved: Option<Moved<[usize; 2]>>,
 }
 impl Match {
+    #[cfg(test)]
     pub fn new(players: usize, dealer: usize) -> Option<Self> {
         if players != 4 || dealer >= 4 {
             return None;
         }
         let mut wall: Vec<_> = (0..27).flat_map(|t| [t; 4]).collect();
         wall.shuffle(&mut rand::thread_rng());
+        Some(Self::from_wall(Uuid::new_v4(), dealer, wall))
+    }
+    pub(crate) fn from_wall(id: Uuid, dealer: usize, mut wall: Vec<Tile>) -> Self {
+        let mut wall_draws = WallDraws::default();
         let mut seats: [Seat; 4] = Default::default();
-        for s in &mut seats {
-            s.tiles = wall.split_off(wall.len() - 13);
-            s.tiles.sort_unstable();
+        for (seat, s) in seats.iter_mut().enumerate() {
+            s.tiles = wall_draws.initial(&mut wall, seat);
         }
-        Some(Self {
-            id: Uuid::new_v4(),
+        Self {
+            id,
             revision: 0,
             seats,
             wall,
+            wall_draws,
             phase: Phase::Missing,
             dealer,
             finished: false,
@@ -84,7 +93,7 @@ impl Match {
             winners: vec![],
             reason: String::new(),
             moved: None,
-        })
+        }
     }
     pub fn valid(&self) -> bool {
         self.dealer < 4
@@ -377,7 +386,7 @@ impl Match {
         Ok(())
     }
     fn draw(&mut self, s: usize, kong: bool) {
-        if let Some(tile) = self.wall.pop() {
+        if let Some(tile) = self.wall_draws.draw(&mut self.wall, Some(s), false) {
             self.seats[s].tiles.push(tile);
             self.seats[s].tiles.sort_unstable();
             self.seats[s].passed_hu = false;

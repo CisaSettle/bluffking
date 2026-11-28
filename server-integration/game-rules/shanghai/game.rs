@@ -1,6 +1,8 @@
 use super::rules::{self, count, remove, Kind, Meld, Score, Seat, Tile};
 use crate::game_hub::board::BoardMatchSeat;
 use crate::mahjong::event::{self, Moved, TileMatch};
+use crate::mahjong::wall::WallDraws;
+#[cfg(test)]
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, value::RawValue, Value};
@@ -45,6 +47,8 @@ pub struct Match {
     pub revision: u64,
     pub seats: [Seat; 4],
     pub wall: Vec<Tile>,
+    #[serde(default)]
+    pub(crate) wall_draws: WallDraws,
     pub turn: usize,
     pub phase: Phase,
     pub drawn: Option<Tile>,
@@ -58,17 +62,22 @@ pub struct Match {
     pub(crate) moved: Option<Moved<()>>,
 }
 impl Match {
+    #[cfg(test)]
     pub fn new(players: usize, dealer: usize) -> Option<Self> {
         if players != 4 || dealer >= 4 {
             return None;
         }
         let mut wall: Vec<_> = (0..34).flat_map(|t| [t; 4]).chain(34..42).collect();
         wall.shuffle(&mut rand::thread_rng());
+        Some(Self::from_wall(Uuid::new_v4(), dealer, wall))
+    }
+    pub(crate) fn from_wall(id: Uuid, dealer: usize, wall: Vec<Tile>) -> Self {
         let mut g = Self {
-            id: Uuid::new_v4(),
+            id,
             revision: 0,
             seats: Default::default(),
             wall,
+            wall_draws: WallDraws::default(),
             turn: dealer,
             phase: Phase::Turn,
             drawn: None,
@@ -85,7 +94,7 @@ impl Match {
             }
         }
         g.draw(dealer, false);
-        Some(g)
+        g
     }
     pub fn finished(&self) -> bool {
         self.phase == Phase::End
@@ -126,12 +135,7 @@ impl Match {
             })
     }
     fn take(&mut self, s: usize, mut replacement: bool) -> Option<Tile> {
-        while !self.wall.is_empty() {
-            let t = if replacement {
-                self.wall.pop().unwrap()
-            } else {
-                self.wall.remove(0)
-            };
+        while let Some(t) = self.wall_draws.draw(&mut self.wall, Some(s), !replacement) {
             if t >= 31 {
                 self.seats[s].flowers.push(t);
                 replacement = true;
@@ -719,6 +723,7 @@ mod clock_tests {
             revision: 0,
             seats: Default::default(),
             wall: vec![7],
+            wall_draws: Default::default(),
             turn: 2,
             phase: Phase::Turn,
             drawn: Some(3),
