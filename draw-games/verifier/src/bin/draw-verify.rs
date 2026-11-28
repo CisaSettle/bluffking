@@ -38,16 +38,22 @@ fn run() -> Result<Value, String> {
         )?;
         return serde_json::to_value(proof).map_err(|e| e.to_string());
     }
-    if args.len() != 1 && !(args.len() == 3 && args[1] == "--receipt") {
-        return Err("Usage: draw-verify proof.json [--receipt pre-draw-receipt.json]\n       draw-verify --derive-lottery GAME PERIOD beacon.json\n       draw-verify --verify-lottery-purchase receipt.json TRUSTED_KEY_HEX".into());
+    let usage = "Usage: draw-verify proof.json [--receipt pre-draw-receipt.json] [--evidence-key TRUSTED_KEY_HEX]\n       draw-verify --derive-lottery GAME PERIOD beacon.json\n       draw-verify --verify-lottery-purchase receipt.json TRUSTED_KEY_HEX";
+    let (path, options) = args.split_first().ok_or(usage)?;
+    if options.len() % 2 != 0 {
+        return Err(usage.into());
     }
-    let document = read(&args[0])?;
-    let external_receipt = if args.len() == 3 {
-        Some(read(&args[2])?)
-    } else {
-        None
-    };
-    draw_games::document::verify_document(&document, external_receipt.as_ref())
+    let mut external_receipt = None;
+    let mut pinned_key = None;
+    for pair in options.chunks_exact(2) {
+        match pair[0].as_str() {
+            "--receipt" if external_receipt.is_none() => external_receipt = Some(read(&pair[1])?),
+            "--evidence-key" if pinned_key.is_none() => pinned_key = Some(pair[1].as_str()),
+            _ => return Err(usage.into()),
+        }
+    }
+    let document = read(path)?;
+    draw_games::document::verify_document_with_key(&document, external_receipt.as_ref(), pinned_key)
 }
 
 fn main() {

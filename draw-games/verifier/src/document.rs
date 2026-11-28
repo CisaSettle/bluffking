@@ -1,4 +1,5 @@
 //! Shared, network-free document and pre-draw receipt verification.
+use crate::{evidence::SignedEvidence, sicbo};
 use serde_json::{json, Value};
 
 /// Accept a bare proof or the `{proof, receipt}` download envelope. A separately
@@ -8,23 +9,178 @@ pub fn verify_document(
     document: &Value,
     external_receipt: Option<&Value>,
 ) -> Result<Value, String> {
-    let proof = document.get("proof").unwrap_or(document);
-    let result = crate::verify(proof)?;
+    verify_document_with_key(document, external_receipt, None)
+}
+
+pub fn verify_document_with_key(
+    document: &Value,
+    external_receipt: Option<&Value>,
+    pinned_key: Option<&str>,
+) -> Result<Value, String> {
+    let recovery = is_wager_recovery(document);
+    let pending = (recovery && document["proof"].is_null()).then(|| {
+        if document["roster"].is_null() {
+            json!({"kind": sicbo::ACCEPTANCE_KIND, "acceptance": document["acceptance"]})
+        } else {
+            json!({"kind": sicbo::ROSTER_KIND, "roster": document["roster"]})
+        }
+    });
+    let proof = pending
+        .as_ref()
+        .unwrap_or_else(|| document.get("proof").unwrap_or(document));
+    let signed_sicbo = has_signed_sicbo(document);
+    let result = if signed_sicbo {
+        crate::sicbo::verify_with_key(proof, pinned_key)?
+    } else {
+        if pinned_key.is_some() {
+            return Err("Proof does not contain signed Sic Bo evidence".into());
+        }
+        crate::verify(proof)?
+    };
     let observed_match = match_observed(proof, &result, document.get("observed"))?;
     let receipt = external_receipt
         .or_else(|| document.get("receipt"))
         .filter(|r| !r.is_null());
-    let receipt_match = match receipt {
-        Some(receipt) => match_receipt(proof, receipt)?,
-        None => "not_provided",
+    let wager = if recovery {
+        if document.get("proof").is_none()
+            || document.get("roster").is_none()
+            || document["acceptance"].is_null()
+        {
+            return Err("Incomplete Sic Bo wager recovery document".into());
+        }
+        let roster = roster_evidence(proof);
+        if &document["roster"] != roster {
+            return Err("Recovered roster differs from the proof".into());
+        }
+        Some(verify_wager_status(
+            proof,
+            &document["acceptance"],
+            pinned_key,
+        )?)
+    } else {
+        None
     };
-    Ok(json!({
+    let receipt_match = match receipt {
+        Some(receipt) if receipt["kind"] == crate::sicbo::ACCEPTANCE_KIND => {
+            match_signed_wager(proof, receipt)?
+        }
+        Some(receipt) => match_receipt(proof, receipt)?,
+        None => wager
+            .as_ref()
+            .map_or("not_provided", |(_, status)| wager_match(status)),
+    };
+    let mut response = json!({
         "outcome": "replayed",
         "receipt_match": receipt_match,
         "observed_match": if observed_match { "matched" } else { "not_provided" },
         "result": result,
+        "evidence_key": if signed_sicbo {
+            if pinned_key.is_some() { "pinned" } else { "supplied_with_proof" }
+        } else { "not_applicable" },
         "scope": "Checks the published algorithm and supplied receipt. A local receipt is not a signed timestamp, ledger audit, availability guarantee, or proof of the deployed binary."
-    }))
+    });
+    if let Some((revision, status)) = wager {
+        response["wager_revision"] = json!(revision);
+        response["wager_status"] = json!(status);
+    }
+    Ok(response)
+}
+
+fn is_wager_recovery(document: &Value) -> bool {
+    document["kind"] == sicbo::RECOVERY_KIND
+        || (document.get("roster").is_some() && document.get("proof").is_some())
+}
+
+pub fn has_signed_sicbo(document: &Value) -> bool {
+    if is_wager_recovery(document) {
+        return true;
+    }
+    let proof = document.get("proof").unwrap_or(document);
+    let kind = proof["kind"].as_str();
+    matches!(
+        kind,
+        Some(crate::sicbo::VOID_KIND | crate::sicbo::ACCEPTANCE_KIND | crate::sicbo::ROSTER_KIND)
+    ) || kind == Some("sicbo-room") && proof.get("audit").is_some()
+}
+
+fn roster_evidence(proof: &Value) -> &Value {
+    match proof["kind"].as_str() {
+        Some("sicbo-room") => &proof["audit"]["roster"],
+        Some(sicbo::ROSTER_KIND | sicbo::VOID_KIND) => &proof["roster"],
+        _ => &Value::Null,
+    }
+}
+
+fn signed_evidence(value: &Value) -> Result<SignedEvidence, String> {
+    serde_json::from_value(value.clone()).map_err(|error| error.to_string())
+}
+
+fn verify_wager_status(
+    proof: &Value,
+    value: &Value,
+    pinned_key: Option<&str>,
+) -> Result<(u64, &'static str), String> {
+    let acceptance = signed_evidence(value)?;
+    let roster_value = roster_evidence(proof);
+    let proof_key = match proof["kind"].as_str() {
+        Some(sicbo::VOID_KIND) => proof["terminal"]["public_key"].as_str(),
+        Some(sicbo::ACCEPTANCE_KIND) => proof["acceptance"]["public_key"].as_str(),
+        _ => roster_value["public_key"].as_str(),
+    };
+    let key = pinned_key
+        .or(proof_key)
+        .ok_or("Missing Sic Bo evidence key")?;
+    let claim = sicbo::verify_acceptance(&acceptance, key)?;
+    if let Some(bettor) = proof["audit"]
+        .get("acceptance")
+        .filter(|bettor| !bettor.is_null())
+    {
+        if bettor != value {
+            return Err("Settled wager differs from the supplied signed acceptance".into());
+        }
+    }
+    if proof["kind"] == sicbo::VOID_KIND {
+        let terminal: sicbo::Terminal = signed_evidence(&proof["terminal"])?.verify(key)?;
+        if claim.round_id != terminal.round_id
+            || claim.commitment != terminal.commitment
+            || claim.accepted_at_ms > terminal.recorded_at_ms
+        {
+            return Err("Void differs from the signed acceptance".into());
+        }
+    }
+    let status = if !roster_value.is_null() {
+        let roster = sicbo::verify_roster(&signed_evidence(roster_value)?, key)?;
+        if sicbo::acceptance_in_roster(&acceptance, &claim, &roster)? {
+            "active"
+        } else if claim.wager.is_none() && claim.accepted_at_ms <= roster.locked_at_ms {
+            "accepted_cancellation"
+        } else {
+            "not_in_locked_roster"
+        }
+    } else if proof["kind"] == sicbo::VOID_KIND {
+        "void_without_roster"
+    } else if proof["kind"] == sicbo::ACCEPTANCE_KIND && proof["acceptance"] == *value {
+        "pending_roster"
+    } else {
+        return Err("Signed Sic Bo acceptance requires matching round evidence".into());
+    };
+    Ok((claim.revision, status))
+}
+
+fn wager_match(status: &str) -> &'static str {
+    if status == "active" {
+        "matched"
+    } else {
+        "commitment_only"
+    }
+}
+
+fn match_signed_wager(proof: &Value, receipt: &Value) -> Result<&'static str, String> {
+    let (_, status) = verify_wager_status(proof, &receipt["acceptance"], None)?;
+    if status == "not_in_locked_roster" {
+        return Err("Signed Sic Bo acceptance is absent from this roster".into());
+    }
+    Ok(wager_match(status))
 }
 
 /// Match the independently supplied game display against the replay.
@@ -102,6 +258,19 @@ fn match_receipt(proof: &Value, receipt: &Value) -> Result<&'static str, String>
     }
     let kind = proof["kind"].as_str().ok_or("Missing proof kind")?;
     let terms = &receipt["terms"];
+    if kind == crate::sicbo::VOID_KIND {
+        let terminal: crate::evidence::SignedEvidence =
+            serde_json::from_value(proof["terminal"].clone()).map_err(|error| error.to_string())?;
+        let claim: crate::sicbo::Terminal = terminal.verify(&terminal.public_key)?;
+        return if terms["kind"] == "sicbo-room"
+            && receipt["commitment"]["commitment"] == claim.commitment
+            && receipt["commitment"]["draw_id"] == claim.round_id
+        {
+            Ok("commitment_only")
+        } else {
+            Err("Void differs from the saved commitment".into())
+        };
+    }
     if terms["kind"] != kind {
         return Err("Saved receipt game does not match".into());
     }
@@ -236,6 +405,25 @@ fn match_receipt(proof: &Value, receipt: &Value) -> Result<&'static str, String>
             }
         }
         if kind == "sicbo-room" && proof.get("stake").is_some() {
+            if let Some(audit) = proof.get("audit") {
+                let acceptance = signed_evidence(&audit["acceptance"])?;
+                let key = audit["roster"]["public_key"]
+                    .as_str()
+                    .ok_or("Missing Sic Bo evidence key")?;
+                let claim = sicbo::verify_acceptance(&acceptance, key)?;
+                if terms["round_id"] != claim.round_id
+                    || terms["bet_revision"]
+                        .as_u64()
+                        .and_then(|revision| revision.checked_add(1))
+                        != Some(claim.revision)
+                    || terms["unit"] != json!(claim.unit)
+                    || receipt["client_seed"] != json!(claim.client_seed)
+                {
+                    return Err(
+                        "Sic Bo proof differs from the saved wager revision, unit or seed".into(),
+                    );
+                }
+            }
             match (
                 terms["unit"].as_str(),
                 proof.get("jackpot_seed"),
