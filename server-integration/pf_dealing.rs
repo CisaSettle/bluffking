@@ -21,19 +21,16 @@
 //!
 //! `mp_dealing` aborts the deal on timeout and falls back to `from_os()`.
 //! `pf_dealing` NEVER aborts: on timeout (or channel close) it returns whatever
-//! client seeds arrived (possibly none) and the caller deals with them. The
-//! worst case is a silent demotion from "anti-grind" to "server-commit-only"
-//! for that one hand — still fully verifiable. This protects the no-latency
-//! guarantee for old/mobile/bot/solo clients.
+//! client seeds arrived (possibly none) and the caller deals with them. A
+//! proof still checks the published deck and openings. The player-seed check
+//! depends on which seeds arrived.
 //!
 //! ## Capability gating
 //!
 //! There is no separate handshake. A web client signals participation simply by
 //! sending `ClientCmd::SubmitClientSeedCommit { hand_id: "" }` once per socket.
-//! The session task records the sender as
-//! pf-capable (additive, per-session) and remembers its latest seed. The
-//! bounded await only runs when ≥1 currently-connected pf-capable human is
-//! seated; otherwise it is skipped entirely (zero added latency).
+//! The server records participation on that connection. The bounded wait
+//! runs only if a dealt-in player has a participating connection.
 //!
 //! Pure data in/out — holds no `!Send` value across an `await` (session.rs
 //! discipline).
@@ -51,9 +48,8 @@ use uuid::Uuid;
 use crate::protocol::ClientCmd;
 use crate::session_registry::{SessionCtrl, WsSender};
 
-/// Bounded, NON-FATAL per-hand client-seed collection window. Short on purpose: a participating table adds at most this much
-/// pre-deal latency, and a slow/missing client only DOWNGRADES anti-grind — it
-/// never aborts the deal (unlike a failed mental-poker deal).
+/// Timeout for each round of the player-seed exchange. The commitment and
+/// reveal rounds can each wait this long. Missing inputs never abort the deal.
 pub const PF_SEED_DEADLINE: Duration = Duration::from_millis(1500);
 
 /// Cap on money/seat/squid commands (`ReBuy`/`CancelReBuy`/`ReBuyExplicit`,

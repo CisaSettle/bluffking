@@ -134,7 +134,7 @@ fn numbers(
     Ok(out)
 }
 
-/// DLT selections must be distinct; legacy games keep `numbers` deduplication.
+/// DLT selections must be distinct; other games deduplicate via `numbers`.
 fn distinct_numbers(
     value: &Value,
     min_len: usize,
@@ -159,7 +159,7 @@ fn object_keys(value: &Value, allowed: &[&str]) -> Result<(), Invalid> {
 }
 
 impl Entry {
-    /// Sorts one submitted entry; DLT rejects duplicates, legacy games deduplicate.
+    /// Sorts one submitted entry; DLT rejects duplicates, other games deduplicate.
     pub fn parse(game: Game, value: &Value) -> Result<Entry, Invalid> {
         let entry = match game {
             Game::Ssq => {
@@ -274,7 +274,7 @@ impl Entry {
             Entry::Dlt { .. } => DLT_PRIZE[1],
             Entry::Toto { .. } => TOTO_PRIZE[1],
             Entry::Happy8 { .. } | Entry::Straight(_) | Entry::Group3(_) | Entry::Group6(_) => {
-                return Some(0)
+                return Some(0);
             }
         };
         top.checked_mul(multiplier)?

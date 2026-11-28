@@ -36,10 +36,8 @@ pub struct Commitment {
 }
 
 pub fn commit(game: &str, draw_id: &str, server_seed: &str) -> Result<Commitment, String> {
-    if !(matches!(
-        game,
-        "scratch" | "sicbo" | "sicbo-room" | "yuxiaxie-room" | "zjh"
-    ) || crate::solo::supports(game))
+    if !(matches!(game, "scratch" | "sicbo" | "sicbo-room" | "yuxiaxie-room")
+        || crate::solo::supports(game))
         || draw_id.is_empty()
         || draw_id.len() > 128
         || !draw_id.is_ascii()
@@ -79,12 +77,7 @@ impl Reveal {
             return Err("Commitment does not match the revealed seed and context".into());
         }
         let server = seed_bytes(&self.server_seed)?;
-        let client = if self.commitment.game == "zjh" {
-            if !self.client_seed.is_empty() {
-                return Err("Room protocol does not accept a client seed".into());
-            }
-            Vec::new()
-        } else if matches!(
+        let client = if matches!(
             self.commitment.game.as_str(),
             "sicbo-room" | "yuxiaxie-room"
         ) && self.client_seed.is_empty()
@@ -152,8 +145,7 @@ impl Entropy {
 }
 
 /// Fold sorted, distinct bettor seeds into one room contribution. The two
-/// labels separate the games while keeping previously published Sic Bo
-/// proofs verifiable.
+/// domain labels give each game its own contribution stream.
 pub fn dealer_client_seed(game: &str, player_seeds: &[String]) -> Result<String, String> {
     let domain: &[u8] = match game {
         "sicbo-room" => b"bluffking-draw-v1/sicbo-room-players",

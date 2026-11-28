@@ -78,7 +78,7 @@ async fn refill(game: Game) {
             let context = Context {
                 game,
                 hand_id: Uuid::now_v7(),
-                seats: vec![0],
+                seats: if game == Game::Shisanshui { vec![0, 1] } else { vec![0] },
                 roster: "0".repeat(64),
                 epoch: 0,
                 previous: None,

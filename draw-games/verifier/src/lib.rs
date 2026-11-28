@@ -13,7 +13,6 @@ pub mod sicbo;
 pub mod slots;
 pub mod solo;
 pub mod yuxiaxie;
-pub mod zjh;
 
 pub fn verify(proof: &serde_json::Value) -> Result<serde_json::Value, String> {
     match proof.get("kind").and_then(serde_json::Value::as_str) {
@@ -22,7 +21,6 @@ pub fn verify(proof: &serde_json::Value) -> Result<serde_json::Value, String> {
         Some("sicbo" | "sicbo-room") => sicbo::verify(proof),
         Some("yuxiaxie-room") => yuxiaxie::verify(proof),
         Some(kind) if solo::supports(kind) => solo::verify(proof),
-        Some("zjh") => zjh::verify(proof),
-        _ => Err("Unknown proof kind or unsupported legacy record".into()),
+        _ => Err("Unknown proof kind".into()),
     }
 }
