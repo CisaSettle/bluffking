@@ -2,6 +2,7 @@
 pub mod beacon;
 pub mod claw;
 pub mod document;
+pub mod evidence;
 pub mod fruit;
 pub mod lottery;
 pub mod proof;

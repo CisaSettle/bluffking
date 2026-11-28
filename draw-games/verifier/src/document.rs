@@ -13,18 +13,19 @@ pub fn verify_document(
     let receipt = external_receipt
         .or_else(|| document.get("receipt"))
         .filter(|r| !r.is_null());
-    if let Some(receipt) = receipt {
-        match_receipt(proof, receipt)?;
-    }
+    let receipt_match = match receipt {
+        Some(receipt) => match_receipt(proof, receipt)?,
+        None => "not_provided",
+    };
     Ok(json!({
         "outcome": "replayed",
-        "receipt_match": if receipt.is_some() { "matched" } else { "not_provided" },
+        "receipt_match": receipt_match,
         "result": result,
         "scope": "Checks the published algorithm and supplied receipt. A local receipt is not a signed timestamp, ledger audit, availability guarantee, or proof of the deployed binary."
     }))
 }
 
-fn match_receipt(proof: &Value, receipt: &Value) -> Result<(), String> {
+fn match_receipt(proof: &Value, receipt: &Value) -> Result<&'static str, String> {
     if receipt["protocol"] != "bluffking-receipt-v1" {
         return Err("Unsupported saved receipt format".into());
     }
@@ -51,7 +52,29 @@ fn match_receipt(proof: &Value, receipt: &Value) -> Result<(), String> {
             let selections = terms["tickets"]
                 .as_array()
                 .ok_or("Missing saved selections")?;
-            if terms["all_in"].as_bool() == Some(true) {
+            // Purchase responses and retries preserve the server's entry order.
+            let saved_index = receipt
+                .get("ticket_ids")
+                .map(|ids| {
+                    let ids = ids
+                        .as_array()
+                        .filter(|ids| ids.len() == selections.len())
+                        .ok_or("Saved ticket IDs do not match the purchase size")?;
+                    let id = ticket["id"].as_str().ok_or("Missing ticket ID")?;
+                    let mut matches = ids
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, saved)| saved.as_str() == Some(id));
+                    let (index, _) = matches
+                        .next()
+                        .ok_or("Ticket ID was not saved with this purchase")?;
+                    if matches.next().is_some() {
+                        return Err("Ticket ID appears more than once in the saved purchase");
+                    }
+                    Ok(index)
+                })
+                .transpose()?;
+            let (base, remainder) = if terms["all_in"].as_bool() == Some(true) {
                 if !proof["plan"]["protocol"]
                     .as_str()
                     .is_some_and(crate::lottery::known_protocol)
@@ -87,19 +110,31 @@ fn match_receipt(proof: &Value, receipt: &Value) -> Result<(), String> {
                 if base + i64::from(remainder > 0) > crate::lottery::MAX_MULTIPLIER {
                     return Err("ALL-IN receipt exceeds ticket capacity".into());
                 }
-                let matches = selections.iter().enumerate().any(|(index, selection)| {
-                    *selection == ticket["entry"]
-                        && ticket["multiplier"].as_i64()
-                            == Some(base + i64::from((index as i64) < remainder))
-                });
-                if !matches {
-                    return Err("Ticket differs from saved ALL-IN selections or copies".into());
-                }
-            } else if ticket["multiplier"] != terms["multiplier"]
-                || !selections.contains(&ticket["entry"])
-            {
+                (base, remainder)
+            } else {
+                (
+                    terms["multiplier"]
+                        .as_i64()
+                        .ok_or("Missing saved multiplier")?,
+                    0,
+                )
+            };
+            let matches = selections.iter().enumerate().any(|(index, selection)| {
+                saved_index.is_none_or(|saved| saved == index)
+                    && *selection == ticket["entry"]
+                    && ticket["multiplier"].as_i64()
+                        == Some(base + i64::from((index as i64) < remainder))
+            });
+            if !matches {
                 return Err("Ticket differs from saved selections or multiplier".into());
             }
+            Ok(if saved_index.is_some() {
+                "matched"
+            } else {
+                "terms_only"
+            })
+        } else {
+            Ok("commitment_only")
         }
     } else {
         let reveal: crate::proof::Reveal =
@@ -120,26 +155,24 @@ fn match_receipt(proof: &Value, receipt: &Value) -> Result<(), String> {
         {
             return Err("Client seed differs from saved challenge".into());
         }
-        // A room wager's receipt keeps the seed the bettor's browser sent with
-        // it; a proof asserting a settled wager must list that seed among those
-        // it folded in. A room-wide proof (wager cancelled or refused) need not.
-        if matches!(kind, "sicbo-room" | "yuxiaxie-room") && proof.get("stake").is_some() {
-            let receipt_seed = receipt.get("client_seed").filter(|seed| !seed.is_null());
-            if kind == "yuxiaxie-room"
-                && proof.get("player_seeds").is_some()
-                && receipt_seed.is_none()
-            {
-                return Err("Saved wager receipt is missing its player contribution".into());
+        let mut receipt_match = "matched";
+        if matches!(kind, "sicbo-room" | "yuxiaxie-room") {
+            // A public proof has no wager to compare, including when one was refused.
+            if proof.get("stake").is_none() {
+                return Ok("commitment_only");
             }
-            if let Some(seed) = receipt_seed {
-                let listed = proof["player_seeds"]
-                    .as_array()
-                    .is_some_and(|seeds| seeds.contains(seed));
-                if !listed {
+            let seeds = proof["player_seeds"].as_array();
+            match receipt.get("client_seed").filter(|seed| !seed.is_null()) {
+                Some(seed) if !seeds.is_some_and(|seeds| seeds.contains(seed)) => {
                     return Err(
                         "Round does not include the player seed saved with the wager".into(),
                     );
                 }
+                None if seeds.is_some_and(|seeds| !seeds.is_empty()) => {
+                    return Err("Missing player seed saved with the wager".into());
+                }
+                None => receipt_match = "terms_only",
+                Some(_) => {}
             }
         }
         if kind == "sicbo-room" && proof.get("stake").is_some() {
@@ -190,6 +223,92 @@ fn match_receipt(proof: &Value, receipt: &Value) -> Result<(), String> {
                 return Err(format!("Saved wager parameter differs: {field}"));
             }
         }
+        Ok(receipt_match)
     }
-    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proof::{commit, Reveal};
+
+    #[test]
+    fn room_receipt_distinguishes_the_round_from_a_settled_wager() {
+        let player_seed = "22".repeat(32);
+        let server_seed = "11".repeat(32);
+        let commitment = commit("sicbo-room", "receipt-test", &server_seed).unwrap();
+        let mut proof = json!({
+            "kind": "sicbo-room",
+            "reveal": Reveal { commitment: commitment.clone(), server_seed, client_seed: String::new() },
+            "player_seeds": [player_seed],
+        });
+        let mut receipt = json!({
+            "protocol": "bluffking-receipt-v1",
+            "commitment": commitment,
+            "terms": {"kind": "sicbo-room", "side": "big", "stake": 20}
+        });
+        assert_eq!(match_receipt(&proof, &receipt).unwrap(), "commitment_only");
+
+        proof["side"] = json!("big");
+        proof["stake"] = json!(20);
+        assert!(match_receipt(&proof, &receipt).is_err());
+        receipt["client_seed"] = json!(player_seed);
+        assert_eq!(match_receipt(&proof, &receipt).unwrap(), "matched");
+        receipt["client_seed"] = json!("33".repeat(32));
+        assert!(match_receipt(&proof, &receipt).is_err());
+    }
+
+    #[test]
+    fn lottery_receipt_distinguishes_a_plan_terms_and_ticket_id() {
+        let plan = json!({"period": 1, "beacon_round": 1});
+        let entry = json!({"numbers": [1, 2, 3]});
+        let other_entry = json!({"numbers": [3, 4, 5]});
+        let mut proof = json!({"kind": "lottery", "plan": plan});
+        let mut receipt = json!({
+            "protocol": "bluffking-receipt-v1",
+            "commitment": plan,
+            "observed_at_ms": 1,
+            "terms": {"kind": "lottery", "period": 1, "tickets": [entry, other_entry], "multiplier": 1}
+        });
+        assert_eq!(match_receipt(&proof, &receipt).unwrap(), "commitment_only");
+
+        proof["ticket"] = json!({"id": "ticket-a", "entry": entry, "multiplier": 1});
+        assert_eq!(match_receipt(&proof, &receipt).unwrap(), "terms_only");
+        receipt["ticket_ids"] = json!(["ticket-b", "ticket-a"]);
+        assert!(match_receipt(&proof, &receipt).is_err());
+        receipt["ticket_ids"] = json!(["ticket-a", "ticket-b"]);
+        assert_eq!(match_receipt(&proof, &receipt).unwrap(), "matched");
+        proof["ticket"]["entry"] = other_entry;
+        assert!(match_receipt(&proof, &receipt).is_err());
+        proof["ticket"]["id"] = json!("ticket-b");
+        assert_eq!(match_receipt(&proof, &receipt).unwrap(), "matched");
+    }
+    #[test]
+    fn lottery_all_in_checks_the_multiplier_for_the_ticket_position() {
+        let plan = json!({
+            "period": 1,
+            "beacon_round": 1,
+            "game": "ssq",
+            "protocol": crate::lottery::PROTOCOL,
+        });
+        let entry = json!({"red": [1, 2, 3, 4, 5, 6], "blue": [7]});
+        let mut proof = json!({
+            "kind": "lottery",
+            "plan": plan,
+            "ticket": {"id": "ticket-0", "entry": entry, "multiplier": 2}
+        });
+        let receipt = json!({
+            "protocol": "bluffking-receipt-v1",
+            "commitment": plan,
+            "observed_at_ms": 1,
+            "ticket_ids": (0..10).map(|i| format!("ticket-{i}")).collect::<Vec<_>>(),
+            "terms": {"kind": "lottery", "period": 1, "tickets": vec![entry; 10],
+                       "multiplier": 1, "all_in": true, "expected_balance": 22}
+        });
+        assert_eq!(match_receipt(&proof, &receipt).unwrap(), "matched");
+        proof["ticket"]["id"] = json!("ticket-1");
+        assert!(match_receipt(&proof, &receipt).is_err());
+        proof["ticket"]["multiplier"] = json!(1);
+        assert_eq!(match_receipt(&proof, &receipt).unwrap(), "matched");
+    }
 }

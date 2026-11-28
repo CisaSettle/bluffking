@@ -19,6 +19,15 @@ pub struct Card {
 const RANKS: &[u8; 13] = b"23456789TJQKA";
 const SUITS: &[u8; 4] = b"shcd";
 impl Card {
+    /// Native id in the shared shuffle proof's 52-card manifest.
+    pub fn from_deck_id(id: u16) -> Option<Self> {
+        let id = u8::try_from(id).ok().filter(|id| *id < 52)?;
+        Some(Self {
+            rank: id % 13 + 2,
+            suit: id / 13,
+        })
+    }
+
     pub fn valid(self) -> bool {
         (2..=14).contains(&self.rank) && self.suit < 4
     }

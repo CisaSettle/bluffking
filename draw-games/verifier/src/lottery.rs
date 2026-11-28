@@ -733,6 +733,110 @@ impl Plan {
     }
 }
 
+pub const PURCHASE_RECEIPT_KIND: &str = "bluffking-lottery-purchase-v1";
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PurchasedTicket {
+    pub id: String,
+    pub entry: Value,
+    pub stakes: i64,
+    pub multiplier: i64,
+    pub cost: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PurchaseReceipt {
+    pub kind: String,
+    pub purchase_id: String,
+    pub accepted_at_ms: i64,
+    pub plan: Plan,
+    pub charged: i64,
+    pub tickets: Vec<PurchasedTicket>,
+}
+
+impl PurchaseReceipt {
+    pub fn verify(
+        evidence: &crate::evidence::SignedEvidence,
+        trusted_key: &str,
+    ) -> Result<Self, String> {
+        let receipt: Self = evidence.verify(trusted_key)?;
+        let game = receipt.plan.validate()?;
+        if receipt.kind != PURCHASE_RECEIPT_KIND
+            || !receipt_uuid(&receipt.purchase_id)
+            || receipt.accepted_at_ms < receipt.plan.sales_opens_at_ms()?
+            || receipt.accepted_at_ms >= receipt.plan.closes_at_ms
+            || receipt.tickets.is_empty()
+            || receipt.tickets.len() > MAX_TICKETS_PER_PURCHASE
+        {
+            return Err("invalid lottery purchase receipt".into());
+        }
+        let mut ids = std::collections::HashSet::new();
+        let mut charged = 0i64;
+        for ticket in &receipt.tickets {
+            let entry = Entry::parse(game, &ticket.entry).map_err(|_| "invalid receipt entry")?;
+            if !receipt_uuid(&ticket.id)
+                || !ids.insert(&ticket.id)
+                || ticket.entry != entry.to_value()
+                || entry.stakes() != ticket.stakes
+                || !(1..=MAX_MULTIPLIER).contains(&ticket.multiplier)
+                || ticket.cost != ticket.stakes * ticket.multiplier * game.unit()
+            {
+                return Err("invalid ticket in lottery purchase receipt".into());
+            }
+            charged += ticket.cost;
+        }
+        if charged != receipt.charged {
+            return Err("invalid total in lottery purchase receipt".into());
+        }
+        Ok(receipt)
+    }
+}
+
+fn receipt_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if [8, 13, 18, 23].contains(&index) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+        && value != "00000000-0000-0000-0000-000000000000"
+}
+
+#[cfg(test)]
+#[test]
+fn signed_purchase_receipt_checks_time_tickets_and_key() {
+    let signer = crate::evidence::EvidenceSigner::new(&[82; 32]);
+    let plan = Plan::new(Game::Toto, 1_781_234_567_000).unwrap();
+    let mut receipt = PurchaseReceipt {
+        kind: PURCHASE_RECEIPT_KIND.into(),
+        purchase_id: "b1a08a38-2cf7-4b6b-9781-f2de12586b45".into(),
+        accepted_at_ms: plan.closes_at_ms - 1,
+        plan,
+        charged: 1,
+        tickets: vec![PurchasedTicket {
+            id: "f7a08a38-2cf7-4b6b-9781-f2de12586b99".into(),
+            entry: json!({ "numbers": [1, 2, 3, 4, 5, 6] }),
+            stakes: 1,
+            multiplier: 1,
+            cost: 1,
+        }],
+    };
+    let key = signer.public_key();
+    let signed = signer.sign(&receipt).unwrap();
+    assert_eq!(PurchaseReceipt::verify(&signed, &key).unwrap(), receipt);
+    assert!(PurchaseReceipt::verify(&signed, &hex::encode([83; 32])).is_err());
+
+    receipt.accepted_at_ms = receipt.plan.closes_at_ms;
+    assert!(PurchaseReceipt::verify(&signer.sign(&receipt).unwrap(), &key).is_err());
+    receipt.accepted_at_ms -= 1;
+    receipt.tickets[0].cost = 2;
+    assert!(PurchaseReceipt::verify(&signer.sign(&receipt).unwrap(), &key).is_err());
+}
+
 /// Partial Fisher-Yates with rejection sampling through Entropy::below. TOTO
 /// preserves the seventh sampled ball as its additional number before sorting.
 fn sample(entropy: &mut Entropy, max: u8, count: usize, sorted: bool) -> Vec<i16> {

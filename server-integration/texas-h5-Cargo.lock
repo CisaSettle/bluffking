@@ -796,6 +796,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "drand-verify",
+ "ed25519-dalek",
  "hex",
  "serde",
  "serde_json",

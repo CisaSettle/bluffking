@@ -16,6 +16,11 @@ fn read(path: &str) -> Result<Value, String> {
 
 fn run() -> Result<Value, String> {
     let args: Vec<String> = env::args().skip(1).collect();
+    if args.len() == 3 && args[0] == "--verify-lottery-purchase" {
+        let evidence = serde_json::from_value(read(&args[1])?).map_err(|e| e.to_string())?;
+        let receipt = draw_games::lottery::PurchaseReceipt::verify(&evidence, &args[2])?;
+        return serde_json::to_value(receipt).map_err(|e| e.to_string());
+    }
     if args.len() == 4 && args[0] == "--derive-lottery" {
         let game = draw_games::lottery::Game::parse(&args[1]).ok_or("Unknown lottery game")?;
         let period: i64 = args[2].parse().map_err(|_| "Invalid period number")?;
@@ -34,7 +39,7 @@ fn run() -> Result<Value, String> {
         return serde_json::to_value(proof).map_err(|e| e.to_string());
     }
     if args.len() != 1 && !(args.len() == 3 && args[1] == "--receipt") {
-        return Err("Usage: draw-verify proof.json [--receipt pre-draw-receipt.json]\n       draw-verify --derive-lottery GAME PERIOD beacon.json".into());
+        return Err("Usage: draw-verify proof.json [--receipt pre-draw-receipt.json]\n       draw-verify --derive-lottery GAME PERIOD beacon.json\n       draw-verify --verify-lottery-purchase receipt.json TRUSTED_KEY_HEX".into());
     }
     let document = read(&args[0])?;
     let external_receipt = if args.len() == 3 {
