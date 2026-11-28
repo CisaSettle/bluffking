@@ -253,16 +253,6 @@ pub enum LogEntry {
         winner: usize,
         amount: u64,
     },
-    /// 孤注一掷: `seat` paid its remaining `amount` and compared with
-    /// `target`, the only other live player. No longer dealt (an all-in is
-    /// [`LogEntry::AllInShowdown`] since 2026-11-09); settled rounds saved
-    /// before then carry it, and history readers still read those logs.
-    AllIn {
-        seat: usize,
-        target: usize,
-        winner: usize,
-        amount: u64,
-    },
     AllInShowdown {
         seat: usize,
         amount: u64,

@@ -5,6 +5,16 @@ postflop solver endpoint, provided so the AGPL §13 "Corresponding Source" offer
 covers the *whole combined work reached over the network* (ADR-072 §3a), not
 just the library.
 
+## Game rules
+
+`game-rules/` contains the exact source for board moves, card ranking,
+hand state machines, and variant-specific scoring. Shared banker rules and
+mahjong claim resolution are included. Some files reference private server
+types and are published for inspection. The room runtime, bots and wallet
+storage are outside this source directory. The independently buildable
+[draw verifier](../draw-games/verifier) and [card proof library](../mental-poker)
+cover random draws and supported dealing transcripts respectively.
+
 ## Files
 
 - `gto_solve.rs` — the exact `POST /api/tools/poker/solve` axum handler as
@@ -63,6 +73,7 @@ just the library.
   `auth`, `protocol`, `session_registry`, the generic card-room hub that creates
   the pending deal, advances the exchange and takes the final deck order at deal
   time, and the ZJH room/bot modules, and the room clock).
+
 ### Game outcome source
 
 The files below are copied directly from the server at the source revision
@@ -78,20 +89,19 @@ an individual result or identify the binary running online.
 | Game / 游戏 | Server source / 服务端源码 |
 | --- | --- |
 | Baccarat / 百家乐 | [Rules](baccarat/rules.rs): eight-deck shuffle, burn, refill threshold, drawing tableau, hand result and payouts |
-| Roulette / 俄罗斯转盘 | [Rules](solo/roulette.rs): uniform pocket draw and payouts |
-| Slots / 老虎机 | [Rules](solo/slots.rs): reel draws, paytable and jackpot |
-| Fruit Machine / 水果机 | [Rules](solo/fruit.rs): weighted stops, bonus lights, double and payouts |
-| Claw Machine / 抓娃娃 | [Rules](solo/claw.rs): catch radius, catch chance and prizes |
-| Call/Fold, Lucky Draw, 2048 / 跟弃、幸运抽奖、2048 | [Draws and rewards](solo/casual.rs), [2048 board replay](puzzle2048.rs) |
+| Roulette / 俄罗斯转盘 | [Rules](../draw-games/verifier/src/roulette.rs): uniform pocket draw and payouts |
+| Slots / 老虎机 | [Rules](../draw-games/verifier/src/slots.rs): reel draws, paytable and jackpot |
+| Fruit Machine / 水果机 | [Rules](../draw-games/verifier/src/fruit.rs): weighted stops, bonus lights, double and payouts |
+| Claw Machine / 抓娃娃 | [Rules](../draw-games/verifier/src/claw.rs): catch radius, catch chance and prizes |
+| Call/Fold, Lucky Draw, 2048 / 跟弃、幸运抽奖、2048 | [Draws and rewards](solo/casual.rs), [2048 board replay](../draw-games/verifier/src/puzzle2048.rs) |
 | Blackjack / 21 点 | [Hand rules](blackjack/hand.rs), [shared deck proofs](card_proofs.rs) |
 | Ten and a Half / 十点半 | [Hand rules and opening dice](tenhalf/hand.rs), [shared deck proofs](card_proofs.rs) |
-| Big & Small / 押大小 | [Dice proofs and base payout](../draw-games/verifier/src/sicbo.rs), [bonus prize](sicbo/jackpot.rs) |
+| Big & Small / 押大小 | [Dice proof, payouts, and bonus prize](../draw-games/verifier/src/sicbo.rs) |
 | Fish Prawn Crab, scratch cards and number lotteries / 鱼虾蟹、刮刮乐和数字彩票 | [Draw rules and offline verifier](../draw-games/) |
 
-For the solo games, the private server play service supplies operating-system
-randomness to these draw rules. Baccarat shuffles with `OsRng` inside its rules
-module. The Big & Small bonus uses a separate deterministic stream for eligible
-winning wagers; the offline dice verifier checks the base payout.
+Solo rounds use the shared precommitted seed and player-seed protocol.
+Baccarat shuffles with `OsRng` inside its rules module. The Big & Small bonus
+is replayed from the wager seed using a separate deterministic stream.
 
 ## Deployed dependency reference
 

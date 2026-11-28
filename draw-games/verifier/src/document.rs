@@ -123,8 +123,15 @@ fn match_receipt(proof: &Value, receipt: &Value) -> Result<(), String> {
         // A room wager's receipt keeps the seed the bettor's browser sent with
         // it; a proof asserting a settled wager must list that seed among those
         // it folded in. A room-wide proof (wager cancelled or refused) need not.
-        if kind == "sicbo-room" && proof.get("stake").is_some() {
-            if let Some(seed) = receipt.get("client_seed").filter(|seed| !seed.is_null()) {
+        if matches!(kind, "sicbo-room" | "yuxiaxie-room") && proof.get("stake").is_some() {
+            let receipt_seed = receipt.get("client_seed").filter(|seed| !seed.is_null());
+            if kind == "yuxiaxie-room"
+                && proof.get("player_seeds").is_some()
+                && receipt_seed.is_none()
+            {
+                return Err("Saved wager receipt is missing its player contribution".into());
+            }
+            if let Some(seed) = receipt_seed {
                 let listed = proof["player_seeds"]
                     .as_array()
                     .is_some_and(|seeds| seeds.contains(seed));
@@ -134,6 +141,21 @@ fn match_receipt(proof: &Value, receipt: &Value) -> Result<(), String> {
                     );
                 }
             }
+        }
+        if kind == "sicbo-room" && proof.get("stake").is_some() {
+            match (
+                terms["unit"].as_str(),
+                proof.get("jackpot_seed"),
+                proof.get("jackpot_bonus"),
+            ) {
+                (Some("beans"), Some(seed), Some(_))
+                    if receipt.get("client_seed") == Some(seed) => {}
+                (unit, None, None) if unit != Some("beans") => {}
+                _ => return Err("Jackpot proof differs from the saved wager unit or seed".into()),
+            }
+        }
+        if crate::solo::supports(kind) {
+            crate::solo::match_terms(proof, terms)?;
         }
         if kind == "scratch" {
             if terms["reward_version"] != proof["reward_version"] {

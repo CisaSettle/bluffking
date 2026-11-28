@@ -80,3 +80,9 @@ pub fn completed(mut seed: u32, actions: &[String]) -> bool {
     }
     reached
 }
+
+pub const COST: i64 = 1;
+
+pub fn draw_seed(entropy: &mut crate::proof::Entropy) -> u32 {
+    entropy.below(1 << 32) as u32
+}

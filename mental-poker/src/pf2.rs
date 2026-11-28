@@ -51,7 +51,7 @@ use crate::hash::ds_hash;
 /// Bundle scheme identifier (wire `scheme`).
 pub const SCHEME: &str = "pf-shuffle-v2";
 /// Version byte prefixed to the master seed in `hands.server_seed`
-/// (33 bytes = `0x02 ‖ master_seed`; legacy v1 rows hold a bare 32-byte seed).
+/// (33 bytes = `0x02 ‖ master_seed` for Hold’em).
 pub const SEED_VERSION: u8 = 2;
 /// Party id bound into the shuffle proof and every DLEQ challenge.
 pub const DEALER_PARTY: &str = "pf2:dealer";
@@ -77,8 +77,7 @@ pub fn encode_stored_seed(master_seed: &[u8; 32], variant: PokerDeck) -> Vec<u8>
     out
 }
 
-/// Decode a `hands.server_seed` value. `None` for a legacy v1 (32-byte) or
-/// malformed value.
+/// Decode the deck variant and master seed from `hands.server_seed`.
 pub fn decode_stored_seed(stored: &[u8]) -> Option<([u8; 32], PokerDeck)> {
     let (&version, rest) = stored.split_first()?;
     let variant = match version {

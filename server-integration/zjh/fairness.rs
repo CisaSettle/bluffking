@@ -240,12 +240,6 @@ pub fn bundle(stored: Stored, players: Value) -> Result<zk::Bundle, String> {
             continue;
         }
         let cards = p["cards"].as_array().ok_or("invalid stored cards")?;
-        // Gold-bean rows written before bot cards were kept store a visible
-        // bot seat as `[]`; the deck itself is authoritative, so open it.
-        if cards.is_empty() {
-            positions.extend(slots);
-            continue;
-        }
         if cards.len() != 3 {
             return Err("invalid stored cards".into());
         }

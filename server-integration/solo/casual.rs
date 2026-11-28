@@ -7,6 +7,7 @@
 //! request. Rule for an unfinished 2048 entry: the price is final (it bought
 //! the board; a refund would be a free retry), and the reward stays claimable
 //! with a valid replay of that board, exactly once, with no deadline.
+use draw_games::{proof::Entropy, puzzle2048};
 use rand::Rng;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -73,7 +74,7 @@ fn reply(meta: &Value, balance: i64) -> Value {
 }
 
 macro_rules! casual {
-    ($name:ident, $id:literal, $cost:expr) => {
+    ($name:ident, $id:literal, $cost:expr, $fair:literal) => {
         pub struct $name;
         impl $name {
             const COST: i64 = $cost;
@@ -81,6 +82,7 @@ macro_rules! casual {
         impl SoloGame for $name {
             const ID: &'static str = $id;
             const KEEP: Keep = Keep::Every;
+            const FAIR_DRAW: bool = $fair;
             const OWNER_CHANGED: &'static str = "account_changed";
             const REQUEST_CONFLICT: &'static str = "request_conflict";
             const NOT_FOUND: &'static str = "entry_not_found";
@@ -102,6 +104,17 @@ macro_rules! casual {
             ) -> Result<Outcome, Refusal> {
                 Ok(Self::outcome(cost, rng))
             }
+            fn committed_draw(
+                _: &Play,
+                cost: i64,
+                _: Option<&Value>,
+                entropy: &mut Entropy,
+            ) -> Result<Outcome, Refusal> {
+                if !Self::FAIR_DRAW {
+                    return Err(Refusal::invalid("invalid_bet"));
+                }
+                Ok(entry(cost, json!({"seed": puzzle2048::draw_seed(entropy)}), 0, Value::Null))
+            }
             fn reply(meta: &Value, balance: i64) -> Value {
                 reply(meta, balance)
             }
@@ -115,9 +128,9 @@ macro_rules! casual {
     };
 }
 
-casual!(CallFold, "call-fold", 1);
-casual!(LuckyDraw, "lucky-draw", 2);
-casual!(Puzzle2048, "2048", 1);
+casual!(CallFold, "call-fold", 1, false);
+casual!(LuckyDraw, "lucky-draw", 2, false);
+casual!(Puzzle2048, "2048", puzzle2048::COST, true);
 
 impl CallFold {
     fn outcome(cost: i64, rng: &mut dyn rand::RngCore) -> Outcome {
@@ -161,8 +174,8 @@ impl LuckyDraw {
 }
 
 impl Puzzle2048 {
-    fn outcome(cost: i64, rng: &mut dyn rand::RngCore) -> Outcome {
-        entry(cost, json!({"seed": rng.gen::<u32>()}), 0, Value::Null)
+    fn outcome(_: i64, _: &mut dyn rand::RngCore) -> Outcome {
+        unreachable!("2048 draws from a committed seed")
     }
     /// A valid replay of the entry's board reaching 2048 earns the reward.
     fn reward(entry: &Value, body: Value) -> Result<(i64, Value), Refusal> {

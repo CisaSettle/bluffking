@@ -36,10 +36,11 @@ pub struct Commitment {
 }
 
 pub fn commit(game: &str, draw_id: &str, server_seed: &str) -> Result<Commitment, String> {
-    if !matches!(
+    if !(matches!(
         game,
         "scratch" | "sicbo" | "sicbo-room" | "yuxiaxie-room" | "zjh"
-    ) || draw_id.is_empty()
+    ) || crate::solo::supports(game))
+        || draw_id.is_empty()
         || draw_id.len() > 128
         || !draw_id.is_ascii()
     {
@@ -78,12 +79,16 @@ impl Reveal {
             return Err("Commitment does not match the revealed seed and context".into());
         }
         let server = seed_bytes(&self.server_seed)?;
-        let client = if matches!(self.commitment.game.as_str(), "yuxiaxie-room" | "zjh") {
+        let client = if self.commitment.game == "zjh" {
             if !self.client_seed.is_empty() {
                 return Err("Room protocol does not accept a client seed".into());
             }
             Vec::new()
-        } else if self.commitment.game == "sicbo-room" && self.client_seed.is_empty() {
+        } else if matches!(
+            self.commitment.game.as_str(),
+            "sicbo-room" | "yuxiaxie-room"
+        ) && self.client_seed.is_empty()
+        {
             // A round no player wagered on folds in no player seed.
             Vec::new()
         } else {
@@ -144,4 +149,43 @@ impl Entropy {
             }
         }
     }
+}
+
+/// Fold sorted, distinct bettor seeds into one room contribution. The two
+/// labels separate the games while keeping previously published Sic Bo
+/// proofs verifiable.
+pub fn dealer_client_seed(game: &str, player_seeds: &[String]) -> Result<String, String> {
+    let domain: &[u8] = match game {
+        "sicbo-room" => b"bluffking-draw-v1/sicbo-room-players",
+        "yuxiaxie-room" => b"bluffking-draw-v1/yuxiaxie-room-players",
+        _ => return Err("Unsupported seeded dealer room".into()),
+    };
+    if player_seeds.is_empty() {
+        return Ok(String::new());
+    }
+    if player_seeds.len() > 8 {
+        return Err("Too many dealer-room player seeds".into());
+    }
+    if !player_seeds.windows(2).all(|pair| pair[0] < pair[1]) {
+        return Err("Dealer-room player seeds must be sorted and distinct".into());
+    }
+    let seeds = player_seeds
+        .iter()
+        .map(|seed| seed_bytes(seed))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut fields = vec![domain];
+    fields.extend(seeds.iter().map(|seed| seed.as_slice()));
+    Ok(hex::encode(sha256_fields(&fields)))
+}
+
+pub(crate) fn dice(reveal: &Reveal, player_seeds: &[String]) -> Result<[u8; 3], String> {
+    if reveal.commitment.game == "sicbo" {
+        if !player_seeds.is_empty() {
+            return Err("Solo Sic Bo lists no room player seeds".into());
+        }
+    } else if reveal.client_seed != dealer_client_seed(&reveal.commitment.game, player_seeds)? {
+        return Err("Room contribution does not match the player seeds".into());
+    }
+    let mut entropy = reveal.entropy()?;
+    Ok(std::array::from_fn(|_| (entropy.below(6) + 1) as u8))
 }

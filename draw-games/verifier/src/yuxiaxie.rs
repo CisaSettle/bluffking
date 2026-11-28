@@ -6,10 +6,8 @@
 //! staked symbol that shows on `k >= 1` dice the bettor wins `k × stake`;
 //! a symbol that shows on no die loses its stake.
 //!
-//! A `yuxiaxie-room` draw uses an empty client seed so everyone at a table
-//! sees the same dice. The room's server therefore knows the result before
-//! betting; a commitment detects substitution but cannot prevent withholding.
-use crate::proof::Reveal;
+//! Room rounds mix all settled bettor seeds with the committed server seed.
+use crate::proof::{self, Reveal};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -61,15 +59,11 @@ pub fn total(bets: &Bets) -> Option<i64> {
 }
 
 /// Replays three uniform 1..=6 draws from the verified seed transcript.
-pub fn draw(reveal: &Reveal) -> Result<[u8; 3], String> {
+pub fn draw(reveal: &Reveal, player_seeds: &[String]) -> Result<[u8; 3], String> {
     if reveal.commitment.game != "yuxiaxie-room" {
         return Err("not a yuxiaxie reveal".into());
     }
-    if !reveal.client_seed.is_empty() {
-        return Err("yuxiaxie-room requires an empty client seed".into());
-    }
-    let mut entropy = reveal.entropy()?;
-    Ok(std::array::from_fn(|_| (entropy.below(6) + 1) as u8))
+    proof::dice(reveal, player_seeds)
 }
 
 /// How many of the three dice show `symbol`.
@@ -88,22 +82,31 @@ pub fn delta(dice: [u8; 3], bets: &Bets) -> i64 {
 }
 
 /// The room-wide proof contains no individual wager or account information.
-pub fn draw_proof(reveal: &Reveal, dice: [u8; 3]) -> Value {
+pub fn draw_proof(reveal: &Reveal, dice: [u8; 3], player_seeds: Option<&[String]>) -> Value {
     let faces: Vec<Symbol> = dice
         .iter()
         .filter_map(|die| Symbol::ALL.get(usize::from(*die).wrapping_sub(1)).copied())
         .collect();
-    json!({
+    let mut proof = json!({
         "kind": reveal.commitment.game,
         "reveal": reveal,
         "dice": dice,
         "faces": faces,
-    })
+    });
+    if let Some(seeds) = player_seeds {
+        proof["player_seeds"] = json!(seeds);
+    }
+    proof
 }
 
 /// Attaches the payout rule to a replayed draw for one bettor's wager.
-pub fn payout_proof(reveal: &Reveal, dice: [u8; 3], bets: &Bets) -> Value {
-    let mut proof = draw_proof(reveal, dice);
+pub fn payout_proof(
+    reveal: &Reveal,
+    dice: [u8; 3],
+    bets: &Bets,
+    player_seeds: Option<&[String]>,
+) -> Value {
+    let mut proof = draw_proof(reveal, dice, player_seeds);
     let delta = delta(dice, bets);
     proof["bets"] = json!(bets);
     proof["stake"] = json!(bets.values().sum::<i64>());
@@ -118,6 +121,7 @@ struct Proof {
     kind: String,
     reveal: Reveal,
     dice: [u8; 3],
+    player_seeds: Option<Vec<String>>,
     faces: Vec<Symbol>,
     bets: Option<Bets>,
     stake: Option<i64>,
@@ -132,8 +136,9 @@ pub fn verify(value: &Value) -> Result<Value, String> {
     if proof.kind != proof.reveal.commitment.game {
         return Err("yuxiaxie proof kind does not match the committed game".into());
     }
-    let dice = draw(&proof.reveal)?;
-    let expected = draw_proof(&proof.reveal, dice);
+    let seeds = proof.player_seeds.as_deref();
+    let dice = draw(&proof.reveal, seeds.unwrap_or_default())?;
+    let expected = draw_proof(&proof.reveal, dice, seeds);
     if proof.dice != dice || json!(proof.faces) != expected["faces"] {
         return Err("yuxiaxie draw does not match the reveal".into());
     }
@@ -146,9 +151,49 @@ pub fn verify(value: &Value) -> Result<Value, String> {
             if won != (actual > 0) || claimed_delta != actual {
                 return Err("yuxiaxie payout does not match the rules".into());
             }
-            Ok(payout_proof(&proof.reveal, dice, &bets))
+            if seeds.is_some_and(<[String]>::is_empty) {
+                return Err("A settled wager requires a player contribution".into());
+            }
+            Ok(payout_proof(&proof.reveal, dice, &bets, seeds))
         }
         (None, None, None, None) => Ok(expected),
         _ => Err("yuxiaxie payout proof must include bets, stake, won and delta".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{document::verify_document, proof::commit, proof::dealer_client_seed};
+
+    #[test]
+    fn bettor_receipt_checks_their_seed_and_payout() {
+        let game = "yuxiaxie-room";
+        let draw_id = "room-round-1";
+        let server_seed = "23".repeat(32);
+        let player_seeds = ["01".repeat(32), "02".repeat(32)];
+        let commitment = commit(game, draw_id, &server_seed).unwrap();
+        let reveal = Reveal {
+            commitment: commitment.clone(),
+            server_seed,
+            client_seed: dealer_client_seed(game, &player_seeds).unwrap(),
+        };
+        let dice = draw(&reveal, &player_seeds).unwrap();
+        let bets = Bets::from([(Symbol::Fish, 4), (Symbol::Crab, 1)]);
+        let mut proof = payout_proof(&reveal, dice, &bets, Some(&player_seeds));
+        let mut receipt = json!({
+            "protocol": "bluffking-receipt-v1",
+            "commitment": commitment,
+            "client_seed": player_seeds[0],
+            "terms": {"kind":game,"round_id":draw_id,"bets":bets,"stake":5}
+        });
+        assert_eq!(
+            verify_document(&proof, Some(&receipt)).unwrap()["receipt_match"],
+            "matched"
+        );
+        receipt["client_seed"] = json!("03".repeat(32));
+        assert!(verify_document(&proof, Some(&receipt)).is_err());
+        proof["player_seeds"] = json!([player_seeds[1]]);
+        assert!(verify_document(&proof, None).is_err());
     }
 }

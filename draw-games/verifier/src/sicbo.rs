@@ -3,13 +3,13 @@
 //! A `sicbo` draw mixes the committed server seed with the bettor's client
 //! seed. A `sicbo-room` draw commits the server seed before betting opens, then
 //! folds in a 32-byte seed from the browser of every player whose wager the
-//! round settles ([`room_client_seed`]), so everyone at a table sees the same
+//! round settles ([`crate::proof::dealer_client_seed`]), so everyone at a table sees the same
 //! dice and the server cannot know them before the last such seed arrives. A
 //! player confirms their own seed is listed; the server can still refuse a
 //! wager (and its seed) before accepting it. The verifier cannot tell a
 //! server-added seed from a bettor's, so players compare the listed count with
 //! the human bettors at the table.
-use crate::proof::{seed_bytes, sha256_fields, Reveal};
+use crate::proof::{self, sha256_fields, Reveal};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -18,6 +18,29 @@ use serde_json::{json, Value};
 pub const MIN_STAKE: i64 = 1;
 pub const MAX_STAKE: i64 = 1_000_000_000_000;
 
+/// A separate purpose-bound stream determines the fixed bean jackpot. The
+/// bettor's round seed identifies the wager without exposing an account ID.
+pub const JACKPOT_BONUS: i64 = 10;
+
+pub fn jackpot(reveal: &Reveal, player_seed: &str, won: bool) -> i64 {
+    if !won {
+        return 0;
+    }
+    let seed = sha256_fields(&[
+        b"bluffking-sicbo-jackpot-v2",
+        reveal.commitment.game.as_bytes(),
+        reveal.commitment.draw_id.as_bytes(),
+        reveal.server_seed.as_bytes(),
+        reveal.client_seed.as_bytes(),
+        player_seed.as_bytes(),
+    ]);
+    if proof::Entropy::new(seed).below(10_000) == 0 {
+        JACKPOT_BONUS
+    } else {
+        0
+    }
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Side {
@@ -25,47 +48,12 @@ pub enum Side {
     Big,
 }
 
-/// Room seats (humans and AI) bound how many player seeds a round can list.
-pub const MAX_ROOM_SEEDS: usize = 8;
-
-/// The room reveal's client seed: SHA-256 over the round's player seeds in
-/// ascending order, or empty when no player wagered. Seeds are 64 lowercase
-/// hex characters and distinct.
-pub fn room_client_seed(player_seeds: &[String]) -> Result<String, String> {
-    if player_seeds.is_empty() {
-        return Ok(String::new());
-    }
-    if player_seeds.len() > MAX_ROOM_SEEDS {
-        return Err("too many sicbo-room player seeds".into());
-    }
-    if !player_seeds.windows(2).all(|pair| pair[0] < pair[1]) {
-        return Err("sicbo-room player seeds must be sorted and distinct".into());
-    }
-    let seeds = player_seeds
-        .iter()
-        .map(|seed| seed_bytes(seed))
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut fields: Vec<&[u8]> = vec![b"bluffking-draw-v1/sicbo-room-players"];
-    fields.extend(seeds.iter().map(|seed| seed.as_slice()));
-    Ok(hex::encode(sha256_fields(&fields)))
-}
-
-/// Replays three uniform 1..=6 draws from the verified seed transcript. A room
-/// reveal's client seed must be [`room_client_seed`] of `player_seeds`; a solo
-/// reveal lists none.
+/// Replay the three dice from the verified seed transcript.
 pub fn draw(reveal: &Reveal, player_seeds: &[String]) -> Result<[u8; 3], String> {
-    match reveal.commitment.game.as_str() {
-        "sicbo" if player_seeds.is_empty() => {}
-        "sicbo" => return Err("solo sicbo lists no room player seeds".into()),
-        "sicbo-room" => {
-            if reveal.client_seed != room_client_seed(player_seeds)? {
-                return Err("sicbo-room client seed does not match the player seeds".into());
-            }
-        }
-        _ => return Err("not a sicbo reveal".into()),
+    if !matches!(reveal.commitment.game.as_str(), "sicbo" | "sicbo-room") {
+        return Err("Not a Sic Bo reveal".into());
     }
-    let mut entropy = reveal.entropy()?;
-    Ok(std::array::from_fn(|_| (entropy.below(6) + 1) as u8))
+    proof::dice(reveal, player_seeds)
 }
 
 pub fn wins(dice: [u8; 3], side: Side) -> bool {
@@ -120,6 +108,12 @@ pub fn payout_proof(
     proof
 }
 
+/// Attach the separately credited bean jackpot to the bettor's own proof.
+pub fn add_jackpot(proof: &mut Value, player_seed: &str, bonus: i64) {
+    proof["jackpot_seed"] = json!(player_seed);
+    proof["jackpot_bonus"] = json!(bonus);
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Proof {
@@ -135,6 +129,8 @@ struct Proof {
     stake: Option<i64>,
     won: Option<bool>,
     delta: Option<i64>,
+    jackpot_seed: Option<String>,
+    jackpot_bonus: Option<i64>,
 }
 
 /// Checks the commitment, exact dice, summary and (when present) payout.
@@ -159,17 +155,92 @@ pub fn verify(value: &Value) -> Result<Value, String> {
             if won != wins(dice, side) || claimed_delta != delta(dice, side, stake) {
                 return Err("sicbo payout does not match the rules".into());
             }
-            Ok(payout_proof(
-                &proof.reveal,
-                dice,
-                &proof.player_seeds,
-                side,
-                stake,
-            ))
+            let mut replayed = payout_proof(&proof.reveal, dice, &proof.player_seeds, side, stake);
+            match (proof.jackpot_seed, proof.jackpot_bonus) {
+                (None, None) => {}
+                (Some(seed), Some(bonus))
+                    if proof.kind == "sicbo-room"
+                        && proof.player_seeds.contains(&seed)
+                        && jackpot(&proof.reveal, &seed, won) == bonus =>
+                {
+                    add_jackpot(&mut replayed, &seed, bonus);
+                }
+                _ => {
+                    return Err(
+                        "The Sic Bo jackpot does not match the bettor seed and rules".into(),
+                    )
+                }
+            }
+            Ok(replayed)
         }
-        (None, None, None, None) if proof.kind == "sicbo-room" => {
+        (None, None, None, None)
+            if proof.kind == "sicbo-room"
+                && proof.jackpot_seed.is_none()
+                && proof.jackpot_bonus.is_none() =>
+        {
             Ok(draw_proof(&proof.reveal, dice, &proof.player_seeds))
         }
         _ => Err("sicbo payout proof must include side, stake, won and delta".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{document::verify_document, proof::commit, proof::dealer_client_seed};
+
+    #[test]
+    fn jackpot_uses_the_bean_bettors_saved_seed() {
+        let game = "sicbo-room";
+        let draw_id = "room-round-1";
+        let server_seed = format!("{:064x}", 0x267);
+        let seeds = ["01".repeat(32)];
+        let commitment = commit(game, draw_id, &server_seed).unwrap();
+        let reveal = Reveal {
+            commitment: commitment.clone(),
+            server_seed,
+            client_seed: dealer_client_seed(game, &seeds).unwrap(),
+        };
+        let dice = draw(&reveal, &seeds).unwrap();
+        assert_eq!(dice, [6, 6, 4]);
+        assert_eq!(jackpot(&reveal, &seeds[0], true), JACKPOT_BONUS);
+        let mut proof = payout_proof(&reveal, dice, &seeds, Side::Big, 5);
+        let receipt = json!({
+            "protocol":"bluffking-receipt-v1", "commitment":commitment, "client_seed":seeds[0],
+            "terms":{"kind":game,"round_id":draw_id,"unit":"beans","side":"big","stake":5}
+        });
+        assert!(verify_document(&proof, Some(&receipt)).is_err());
+        add_jackpot(&mut proof, &seeds[0], JACKPOT_BONUS);
+        assert_eq!(
+            verify_document(&proof, Some(&receipt)).unwrap()["receipt_match"],
+            "matched"
+        );
+        proof["jackpot_bonus"] = json!(0);
+        assert!(verify_document(&proof, Some(&receipt)).is_err());
+
+        let seeds = ["01".repeat(32), "02".repeat(32)];
+        let reveal = Reveal {
+            client_seed: dealer_client_seed(game, &seeds).unwrap(),
+            ..reveal
+        };
+        let dice = draw(&reveal, &seeds).unwrap();
+        let mut proof = payout_proof(&reveal, dice, &seeds, Side::Big, 5);
+        let mut receipt = receipt;
+        for unit in [Value::Null, json!("unknown"), json!("practice")] {
+            receipt["terms"]["unit"] = unit;
+            assert!(verify_document(&proof, Some(&receipt)).is_ok());
+        }
+        add_jackpot(
+            &mut proof,
+            &seeds[0],
+            jackpot(&reveal, &seeds[0], wins(dice, Side::Big)),
+        );
+        for unit in [Value::Null, json!("unknown"), json!("practice")] {
+            receipt["terms"]["unit"] = unit;
+            assert!(verify_document(&proof, Some(&receipt)).is_err());
+        }
+        receipt["terms"]["unit"] = json!("beans");
+        receipt["client_seed"] = json!(seeds[1]);
+        assert!(verify_document(&proof, Some(&receipt)).is_err());
     }
 }
