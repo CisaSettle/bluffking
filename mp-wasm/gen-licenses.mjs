@@ -71,7 +71,7 @@ const sections = [...linked]
     const crate = `${p.name} ${p.version}`
     let body = files
       .map((f) => {
-        const text = readFileSync(join(dir, f), 'utf8').replace(/\r\n/g, '\n').trim()
+        const text = readFileSync(join(dir, f), 'utf8').replace(/\r\n/g, '\n').replace(/[ \t]+$/gm, '').trim()
         const holder = firstHolder.get(text)
         if (!holder) firstHolder.set(text, `${crate} (${f})`)
         return `### ${f}\n\n${holder ? `Identical to the text of ${holder} above.` : text}`

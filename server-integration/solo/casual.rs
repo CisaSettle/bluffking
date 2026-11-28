@@ -23,12 +23,6 @@ const CALL_PRIZE: i64 = 2;
 const CALL_PERCENT: u32 = 49;
 /// Lucky Draw costs 2 so its smallest non-zero prize is a whole bean.
 const DRAW_TOP_PRIZE: i64 = 20;
-/// Reaching 2048 refunds the 1-bean entry. The board seed is client-visible
-/// and any 2048 bot wins most boards, so a prize above the entry would be a
-/// bean faucet. The rare draw pays the same refund, so RTP never exceeds 100%.
-const PUZZLE_PRIZE: i64 = 1;
-/// The rare 2048 reward replaces the normal one.
-const PUZZLE_JACKPOT_PRIZE: i64 = 1;
 const NS: Uuid = Uuid::from_u128(0x5c737949_c677_4992_a296_349e3f68c568);
 
 #[derive(Deserialize)]
@@ -194,14 +188,7 @@ impl Puzzle2048 {
                 "target_not_reached",
             ));
         }
-        // The rare draw only counts as a jackpot while it pays more than the refund.
-        let jackpot =
-            PUZZLE_JACKPOT_PRIZE > PUZZLE_PRIZE && rand::rngs::OsRng.gen_range(0..10_000u32) == 0;
-        let payout = if jackpot {
-            PUZZLE_JACKPOT_PRIZE
-        } else {
-            PUZZLE_PRIZE
-        };
-        Ok((payout, json!({"beans": payout, "jackpot": jackpot})))
+        let payout = puzzle2048::COMPLETION_REFUND;
+        Ok((payout, json!({"beans": payout, "jackpot": false})))
     }
 }

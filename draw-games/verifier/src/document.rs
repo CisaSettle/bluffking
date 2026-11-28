@@ -37,6 +37,7 @@ pub fn verify_document_with_key(
         }
         crate::verify(proof)?
     };
+    let result = replay_completion(document, proof, result)?;
     let observed_match = match_observed(proof, &result, document.get("observed"))?;
     let receipt = external_receipt
         .or_else(|| document.get("receipt"))
@@ -84,6 +85,39 @@ pub fn verify_document_with_key(
         response["wager_status"] = json!(status);
     }
     Ok(response)
+}
+
+fn replay_completion(document: &Value, proof: &Value, mut result: Value) -> Result<Value, String> {
+    let Some(completion) = document.get("completion") else {
+        return Ok(result);
+    };
+    if proof["kind"] != "2048" {
+        return Err("Completion replays require a 2048 proof".into());
+    }
+    let actions = completion["actions"]
+        .as_array()
+        .filter(|a| !a.is_empty() && a.len() <= 8192)
+        .ok_or("Invalid 2048 action count")?;
+    let actions: Vec<String> = actions
+        .iter()
+        .map(|a| a.as_str().map(str::to_owned).ok_or("Invalid 2048 action"))
+        .collect::<Result<_, _>>()?;
+    let seed = result["seed"]
+        .as_u64()
+        .and_then(|seed| u32::try_from(seed).ok())
+        .ok_or("Invalid 2048 seed")?;
+    if !crate::puzzle2048::completed(seed, &actions) {
+        return Err("The supplied 2048 replay did not validly reach its target".into());
+    }
+    if completion["refund"] != crate::puzzle2048::COMPLETION_REFUND {
+        return Err("Displayed refund differs from the 2048 rules".into());
+    }
+    result["completion"] = json!({
+        "target_reached": true,
+        "actions": actions.len(),
+        "expected_refund": crate::puzzle2048::COMPLETION_REFUND,
+    });
+    Ok(result)
 }
 
 fn is_wager_recovery(document: &Value) -> bool {
@@ -222,7 +256,10 @@ fn match_observed(proof: &Value, result: &Value, observed: Option<&Value>) -> Re
             "delta",
             "jackpot_bonus",
         ],
-        "yuxiaxie-room" => &["dice", "faces", "bets", "stake", "won", "delta"],
+        "yuxiaxie-room" | crate::yuxiaxie::BEACON_GAME => {
+            &["dice", "faces", "bets", "stake", "won", "delta"]
+        }
+        crate::baccarat::GAME => &["result", "wager"],
         _ => return Err("Unsupported displayed-outcome check".into()),
     };
     for &field in fields {
@@ -376,6 +413,36 @@ fn match_receipt(proof: &Value, receipt: &Value) -> Result<&'static str, String>
         } else {
             Ok("commitment_only")
         }
+    } else if matches!(kind, crate::yuxiaxie::BEACON_GAME | crate::baccarat::GAME) {
+        if receipt["commitment"] != proof["plan"] || terms["round_id"] != proof["plan"]["draw_id"] {
+            return Err("Round differs from the plan saved before betting".into());
+        }
+        if kind == crate::yuxiaxie::BEACON_GAME {
+            let observed = receipt["observed_at_ms"]
+                .as_i64()
+                .ok_or("Missing receipt time")?;
+            let round = proof["plan"]["beacon_round"]
+                .as_u64()
+                .ok_or("Missing beacon round")?;
+            if observed >= crate::beacon::round_time_ms(round) {
+                return Err("Receipt was saved after the beacon round was published".into());
+            }
+            if proof["stake"].as_i64().is_some() {
+                if terms["bets"] != proof["bets"] || terms["stake"] != proof["stake"] {
+                    return Err("Wager differs from the terms saved before betting".into());
+                }
+                return Ok("matched");
+            }
+        }
+        if kind == crate::baccarat::GAME {
+            if let Some(wager) = proof.get("wager").filter(|wager| wager.is_object()) {
+                if terms["bets"] != wager["bets"] || terms["stake"] != wager["stake"] {
+                    return Err("Wager differs from the terms saved before betting".into());
+                }
+                return Ok("matched");
+            }
+        }
+        Ok("commitment_only")
     } else {
         let reveal: crate::proof::Reveal =
             serde_json::from_value(proof["reveal"].clone()).map_err(|e| e.to_string())?;
@@ -479,6 +546,58 @@ fn match_receipt(proof: &Value, receipt: &Value) -> Result<&'static str, String>
 mod tests {
     use super::*;
     use crate::proof::{commit, Reveal};
+
+    #[test]
+    fn completion_replays_client_moves_and_checks_the_refund() {
+        // Winning sequence generated with the H5 engine on the proof's seed.
+        let moves = concat!(
+            "rrdudddrdddldlllldddldrlddlddldrdldldddrrdlddrlldldrddrdrrrddddllldrdldrlddrddlldddrdrrdrdddlldrddld",
+            "drdrldrdrrddrdddrdrrdllllldlddrdrdddlrrddlddrdldrldldddddldlddrdlrdrrdrddrrrddrrdllddldrdldddrdrdrdr",
+            "rrddrrdllddrdrrdrrrrdrdrrrddrlrrlldrdrdrrdldllddrdrldrdldlddrdrdrrrlddrrddldrlldlddrdlrrddddddrrdlld",
+            "dldrdldrdddllllrldrdrrrdllddrrddlldrrdddddrrrdrrrrdrrdrddlldlrddrdlldlddrdddddrdldlrdrrdrddddrrlrdrr",
+            "lldllddrrdlrdlrdddldrddlddlrrddrllddrdrrrrdrddrddldrdrdrrddrdldlddrrrdrldlrrdlllldlddddddrldlddddlll",
+            "drdlldddrldddrddrdlddrdldlrlddrdllllddrdrdrdldrdlrdldrdldlrdrrdrrddrrdrrrdrrldlddrdrlrddlldrddrddddl",
+            "lllddrdrrrdldrddrdrddrrrdrrrrrdddldrddldrrdldddrddrrdrrddddldrdddrrdlddrrdldrddrldrdldrdrrdrrdllddrr",
+            "ddddlrdrdrrrrddrldrdrdldrddlldrrdrdrdrrdllldrdlrddrdlllddddrrddrdrrdrrrddrlrrdrdldrrdddddddlldrlrddr",
+            "drdrddrddlddrdrddrddrddrrrddrlddrrdrrrrrlrrdrrdrdddllldlldrdldrrrdrrrrrrrrrdddrdldrdrdrdldrlrrddldld",
+            "rdlrdrldrddlrdlddldldrrrdlll"
+        );
+        let actions: Vec<_> = moves
+            .bytes()
+            .map(|step| match step {
+                b'u' => "up",
+                b'd' => "down",
+                b'l' => "left",
+                b'r' => "right",
+                _ => unreachable!(),
+            })
+            .collect();
+        let request_id = "00000000-0000-4000-8000-000000000001";
+        let server_seed = "00".repeat(32);
+        let client_seed = "01".repeat(32);
+        let commitment = commit("2048", request_id, &server_seed).unwrap();
+        let mut document = json!({
+            "proof": {
+                "kind": "2048", "request_id": request_id,
+                "reveal": Reveal { commitment: commitment.clone(), server_seed, client_seed: client_seed.clone() },
+                "result": {"cost": 1, "seed": 1693791216}
+            },
+            "receipt": {
+                "protocol": "bluffking-receipt-v1", "commitment": commitment, "client_seed": client_seed,
+                "terms": {"kind": "2048", "request_id": request_id, "cost": 1}
+            },
+            "completion": {"actions": actions, "refund": 1}
+        });
+        let checked = verify_document(&document, None).unwrap();
+        assert_eq!(checked["receipt_match"], "matched");
+        assert_eq!(checked["result"]["completion"]["target_reached"], true);
+
+        document["completion"]["refund"] = json!(2);
+        assert!(verify_document(&document, None).is_err());
+        document["completion"]["refund"] = json!(1);
+        document["completion"]["actions"][0] = json!("undo");
+        assert!(verify_document(&document, None).is_err());
+    }
 
     #[test]
     fn room_receipt_distinguishes_the_round_from_a_settled_wager() {

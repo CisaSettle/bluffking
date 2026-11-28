@@ -82,6 +82,7 @@ pub fn completed(mut seed: u32, actions: &[String]) -> bool {
 }
 
 pub const COST: i64 = 1;
+pub const COMPLETION_REFUND: i64 = COST;
 
 pub fn draw_seed(entropy: &mut crate::proof::Entropy) -> u32 {
     entropy.below(1 << 32) as u32

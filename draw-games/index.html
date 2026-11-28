@@ -29,8 +29,8 @@
     <main>
       <article id="zh" lang="zh-CN">
         <h1>彩票与骰宝：公开过程，独立复核</h1>
-        <p><code>draw-games/</code> 是现有 BluffKing 开源仓库的子目录。这里公开开奖输入、确定性抽样、中奖计算和购票封盘规则，并提供无需连接 BluffKing 的离线验证器。覆盖定期开奖、刮刮乐、骰宝、鱼虾蟹、俄罗斯转盘、老虎机、水果机、娃娃机和 2048；金豆无现金价值，刮刮乐还可赢取站内会员时长。</p>
-        <p class="notice"><strong>生产核实：2026-10-25，五种定期开奖公开证明均已可用。</strong>双色球、大乐透、TOTO、快乐8、福彩3D均返回 <code>proof_status=available</code> 和 <code>bluffking-lottery-drand-v2-minute</code>；<a href="https://app.bluffking.ai/api/draws/toto/29881827/proof">生产证明示例</a>。<a href="https://app.bluffking.ai/release-components.json">生产清单</a>当时标识 <code>web-2026.10.25.68</code> / <code>08305a4af48208bafb9d1553ba0f367e64e109fd</code>。该生产版本源码包含刮刮乐和骰宝的承诺/证明集成；本次没有新购卡或下注。源码和标签本身不证明运行二进制。当前开奖必须有预先公开的证明计划；缺失证明时报告不可用，不补造承诺。</p>
+        <p><code>draw-games/</code> 是现有 BluffKing 开源仓库的子目录。这里公开开奖输入、确定性抽样、中奖计算和购票封盘规则，并提供无需连接 BluffKing 的离线验证器。覆盖定期开奖、刮刮乐、骰宝、鱼虾蟹、百家乐、俄罗斯转盘、老虎机、水果机、娃娃机和 2048；金豆无现金价值，刮刮乐还可赢取站内会员时长。</p>
+        <p class="notice">定期开奖使用 <code>bluffking-lottery-drand-v5-instant</code>。开奖后可从「我的彩票」下载证明并与购票回执核对。线上组件版本与提交见<a href="https://app.bluffking.ai/release-components.json">发布清单</a>。</p>
         <p>代码采用根目录的 <a href="../LICENSE">AGPL-3.0-only 许可证</a>，品牌规则见 <a href="../TRADEMARKS.md">商标说明</a>。仓库不含玩家数据、运行密钥、未揭示种子或未来实际开奖结果。</p>
 
         <h2>三种开奖流程</h2>
@@ -38,7 +38,8 @@
           <thead><tr><th>游戏</th><th>开奖前</th><th>开奖后及边界</th></tr></thead>
           <tbody>
             <tr><td>骰宝房间</td><td>每轮先承诺服务器种子。下注确认时持久化签名接单凭证，封盘时保存签名名单并选定其后固定的 drand Quicknet 轮次。</td><td>用承诺种子、签名名单和经验证的信标复算骰点。本人可核对接单凭证与名单中的哈希，也可查询签名作废证明。运营方签名记录了接单和锁定时间，其他种子是否来自真人需额外证据。</td></tr>
-            <tr><td>鱼虾蟹房间</td><td>每轮固定服务器种子承诺，持久化后才能接受投注；投注请求绑定该承诺。成功的 HTTP 投注确认等待该投注持久化。</td><td>公布种子并重算三颗骰子。WebSocket 展示可能早于持久化确认；确认超时表示结果未知，不能当作撤销。新轮次还混入已结算投注的浏览器种子，可核对自己的种子。旧轮次使用原来的服务器种子证明。</td></tr>
+            <tr><td>鱼虾蟹房间</td><td>轮次开始时公布下注截止时间与预先选定的未来 drand 轮次，下注请求绑定这份计划。</td><td>封盘后等待原定轮次，验证签名并复算骰点与派彩。</td></tr>
+            <tr><td>百家乐</td><td>下注前公布牌靴的 Merkle 根和本轮起始位置。</td><td>用局后提供的已发牌索引、盐值和 Merkle 路径核对牌面，复算补牌和胜负。服务器持有整靴。</td></tr>
             <tr><td>标准炸金花</td><td>先锁定加密牌组和发牌座位，再由玩家随机数共同决定牌序。</td><td>局后用 <code>pf_verify</code> 核对 <code>zjh-pf-shuffle-v2</code> 证明。证明只打开请求者获准看到的牌，服务器在牌局中仍知道牌面。大小王和五选三使用桌内「发牌验证」。</td></tr>
             <tr><td>刮刮乐、单人骰宝</td><td>先取得持久化的服务器种子承诺，再由浏览器安全随机生成 32 字节玩家种子。请求绑定承诺、玩家种子和购买／投注条件，浏览器在请求前保存回执。</td><td>公布服务器种子后，可重算结果及兑奖。刮刮乐单张全部揭示后才公开完整种子；5／10 张批量购买直接揭示。服务器收到玩家种子后能够计算结果，承诺不能强制其继续服务或支付。</td></tr>
             <tr><td>双色球及其他定期开奖</td><td>游戏、期号（即开奖时间）、协议版本、停售时间、drand 链和未来轮次组成固定计划。服务器在接受彩票前固定该计划，购买回执与票据保存同一计划。</td><td>验证指定轮次的 BLS 签名，按公开算法生成号码。没有可选择的服务器种子；只等待已选轮次，不因服务异常换轮次或改用系统随机数。即使运营方不提供结果，持有相应公共信标仍可自行重算。</td></tr>
@@ -69,7 +70,7 @@
         <p>定期开奖的选号规范化、复式注数、倍数、成本和完整练习豆奖表都在 <a href="verifier/src/lottery.rs">lottery.rs</a>。这套库同时被本版本后台与离线验证器引用，避免各自维护一份计算代码。</p>
 
         <h2>独立复核</h2>
-        <p>俄罗斯转盘、老虎机、水果机、娃娃机和 2048 共用<a href="verifier/src/solo.rs">单人开奖协议</a>。浏览器在提交前保存服务器种子承诺、自己的随机种子和本轮输入，结算后可导出并离线复算。2048 的证明核对初始随机种子。运营方仍可拒绝或中止请求。</p>
+        <p>俄罗斯转盘、老虎机、水果机、娃娃机和 2048 共用<a href="verifier/src/solo.rs">单人开奖协议</a>。浏览器在提交前保存服务器种子承诺、自己的随机种子和本轮输入，结算后可导出并离线复算。2048 的证明核对初始随机种子。领取返还后，导出文件还可重放操作并核对按规则应得的返还。运营方仍可拒绝或中止请求。</p>
         <p>本版本在游戏内「工具 → 彩票公平性验证」提供证明与开奖前回执的上传、粘贴和核对；彩票记录中的「在工具中验证」可直接带入证明。在线工具把输入提交服务器，调用与命令行相同的 <a href="verifier/src/document.rs">文档及回执验证器</a>。需要独立验证时，可<a href="https://github.com/CisaSettle/bluffking/archive/refs/heads/main.zip">下载开源代码 ZIP</a>，解压后在仓库根目录执行以下命令（先安装 Rust/Cargo）；构建完成后的验证过程不联网。此说明描述当前源码功能，不代表生产部署状态。</p>
         <p>从公开仓库根目录构建独立验证器。首次构建可能下载锁定依赖；运行验证器不联网，不需要数据库或 BluffKing 账号。</p>
         <pre><code>cargo build --locked --manifest-path draw-games/verifier/Cargo.toml
@@ -89,19 +90,19 @@
 
         <h2>证据保存与保证范围</h2>
         <p>浏览器回执只存于当前用户、当前浏览器，最多保留 256 条、30 天；清理浏览器数据或更换设备会影响可用性，需要长期保留时请下载文件。后台彩票票据与开奖证明按现有 30 天策略清理；骰宝房间内历史最多 60 轮，账本沿用服务原有保留策略。这里没有永久保存承诺，也没有全局只追加的公开证明日志。</p>
-        <p>本地回执不是签名时间戳。验证器能检查提供的文件是否符合算法及已保存输入，不能单独证明回执何时出现、谁拥有账号、钱是否实际记入钱包、服务一定完成开奖，或线上运行了哪一个二进制。缺少开奖前回执时，只能复核文件内部的一致性；定期开奖仍可检查固定轮次签名并独立推导结果。骰宝房间在封盘后等候锁定的 drand 信标。服务器能拒收请求或中止一轮，已受理的作废轮次有签名记录。</p>
+        <p>本地回执不是签名时间戳。验证器能检查提供的文件是否符合算法及已保存输入，不能单独证明回执何时出现、谁拥有账号、钱是否实际记入钱包、服务一定完成开奖，或线上运行了哪一个二进制。缺少开奖前回执时，只能复核文件内部的一致性；定期开奖仍可检查固定轮次签名并独立推导结果。骰宝房间在封盘后等候锁定的 drand 信标。服务器能拒收请求或中止一轮，已受理的作废轮次有签名记录。鱼虾蟹等待原定信标轮次。百家乐证明只打开已发牌，服务器持有整靴。本人可从投注历史下载包含已结算投注的证明。</p>
         <p>老虎机判奖和娃娃机抓取资格、结果及派彩在公开规则库中计算。娃娃机浏览器物理动画用于展示开奖结果。名单抽奖在浏览器运行。</p>
 
         <h2>源码导航与构建范围</h2>
         <ul>
-          <li>可独立构建的共用规则库：<a href="verifier/Cargo.toml">Cargo.toml</a>、<a href="verifier/Cargo.lock">Cargo.lock</a>；<a href="verifier/src/proof.rs">承诺、揭示与抽样流</a>、<a href="verifier/src/beacon.rs">信标签名</a>、<a href="verifier/src/lottery.rs">定期开奖与奖表</a>、<a href="verifier/src/scratch.rs">刮刮乐</a>、<a href="verifier/src/sicbo.rs">骰宝</a>、<a href="verifier/src/yuxiaxie.rs">鱼虾蟹</a>、<a href="verifier/src/bin/draw-verify.rs">命令行验证器</a>。</li>
+          <li>可独立构建的共用规则库：<a href="verifier/Cargo.toml">Cargo.toml</a>、<a href="verifier/Cargo.lock">Cargo.lock</a>；<a href="verifier/src/proof.rs">承诺、揭示与抽样流</a>、<a href="verifier/src/beacon.rs">信标签名</a>、<a href="verifier/src/lottery.rs">定期开奖与奖表</a>、<a href="verifier/src/scratch.rs">刮刮乐</a>、<a href="verifier/src/sicbo.rs">骰宝</a>、<a href="verifier/src/yuxiaxie.rs">鱼虾蟹</a>、<a href="verifier/src/baccarat/mod.rs">百家乐发牌证明</a>、<a href="verifier/src/bin/draw-verify.rs">命令行验证器</a>。</li>
         </ul>
         <p><code>verifier/</code> 自带工作区，可按上面的命令单独构建；公开仓库根工作区的普通构建不包括它。</p>
       </article>
       <article id="en" lang="en" hidden>
         <h1>Lottery and Sicbo: public process, independent replay</h1>
-        <p><code>draw-games/</code> is a subdirectory of the existing BluffKing open-source repository. It publishes draw inputs, deterministic sampling, prize calculation and purchase cutoff rules, together with an offline verifier that needs no connection to BluffKing. It covers number lotteries, scratch cards, Sic Bo, Fish Prawn Crab, Roulette, Slots, Fruit Machine, Claw and 2048. Beans have no cash value; scratch cards can also award in-app membership time.</p>
-        <p class="notice"><strong>Production readback, 2026-10-25: all five scheduled games returned available public proofs.</strong> SSQ, Daletou, TOTO, Happy8 and Fucai3D returned <code>proof_status=available</code> and <code>bluffking-lottery-drand-v2-minute</code>; <a href="https://app.bluffking.ai/api/draws/toto/29881827/proof">production proof example</a>. The <a href="https://app.bluffking.ai/release-components.json">live manifest</a> identified <code>web-2026.10.25.68</code> / <code>08305a4af48208bafb9d1553ba0f367e64e109fd</code>. That deployed source also contains scratch and Sicbo commitment/proof integration; this inspection bought no card and placed no bet. Source and tags alone do not attest the running binary. Current draws require a previously published plan. Missing proofs are unavailable; retrospective commitments are never invented.</p>
+        <p><code>draw-games/</code> is a subdirectory of the existing BluffKing open-source repository. It publishes draw inputs, deterministic sampling, prize calculation and purchase cutoff rules, together with an offline verifier that needs no connection to BluffKing. It covers number lotteries, scratch cards, Sic Bo, Fish Prawn Crab, Baccarat, Roulette, Slots, Fruit Machine, Claw and 2048. Beans have no cash value; scratch cards can also award in-app membership time.</p>
+        <p class="notice">Scheduled draws use <code>bluffking-lottery-drand-v5-instant</code>. Download the proof after the draw from My tickets and compare it with your purchase receipt. See the <a href="https://app.bluffking.ai/release-components.json">live release manifest</a> for component versions and commits.</p>
         <p>Code uses the root <a href="../LICENSE">AGPL-3.0-only license</a>; see the <a href="../TRADEMARKS.md">trademark policy</a>. The repository contains no player data, runtime keys, unrevealed seeds or actual future draw results.</p>
 
         <h2>Three draw flows</h2>
@@ -109,7 +110,8 @@
           <thead><tr><th>Game</th><th>Before the draw</th><th>Afterwards and limitations</th></tr></thead>
           <tbody>
             <tr><td>Sicbo rooms</td><td>Each round commits to the server seed. A successful wager gets a durable signed acceptance. Closing betting saves the signed roster and fixes a later drand Quicknet round.</td><td>Replay the dice using the committed seed, signed roster and verified beacon. Compare your receipt with its roster hash, or recover a signed void by round ID. The operator signs the acceptance and lock times from its own clock. Other seeds still need separate evidence of their origin.</td></tr>
-            <tr><td>Fish Prawn Crab rooms</td><td>Each round fixes a server-seed commitment. It must be durable before a wager is accepted; the wager binds that commitment. A successful HTTP wager acknowledgement waits for that wager to become durable.</td><td>The seed is revealed to replay all three dice. WebSocket updates may precede durable acknowledgement; a timeout means unknown acknowledgement, not rollback. New rounds also use the browser seeds of settled bets. Each bettor can check their seed. Old rounds retain their original server-seed proofs.</td></tr>
+            <tr><td>Fish Prawn Crab rooms</td><td>The table publishes the betting cutoff and fixed future drand round before the first wager, and each wager names that plan.</td><td>After betting closes the table waits for the scheduled pulse, verifies its signature and derives the dice and payouts.</td></tr>
+            <tr><td>Baccarat</td><td>The table publishes the shoe Merkle root and round start position before betting.</td><td>Use the indexes, salts and Merkle paths for dealt cards to replay the deal and verify the winner. The server holds the shoe.</td></tr>
             <tr><td>Standard Zha Jin Hua</td><td>The dealer locks the encrypted deck and seat roster before player randomness sets the deal order.</td><td>After play, <code>pf_verify</code> checks the <code>zjh-pf-shuffle-v2</code> proof for cards the requester may see. The server still knows the cards. For Joker and Five Pick Three modes, use Verify dealing in the table menu.</td></tr>
             <tr><td>Scratch cards and solo Sicbo</td><td>Obtain a durable server-seed commitment first, then generate a 32-byte player seed with browser cryptographic randomness. The request binds the commitment, player seed and purchase/wager terms. The browser saves a receipt before sending it.</td><td>The revealed server seed reproduces the result and prize. A single scratch card reveals its full seed only after every spot is open; batches of 5/10 reveal immediately. The server can compute the outcome after receiving the player seed. A commitment cannot compel continued service or payment.</td></tr>
             <tr><td>SSQ and other scheduled lotteries</td><td>A fixed plan binds the game, period (the draw time), protocol version, sales cutoff, drand chain and future round. The server fixes the plan before accepting a ticket; the purchase receipt and ticket retain that plan.</td><td>Verify the selected round's BLS signature and derive numbers using the published algorithm. There is no selectable server seed. An outage waits for that exact round, with no substitute round or OS-random fallback. Anyone with its public beacon can reconstruct the result even if the operator withholds it.</td></tr>
@@ -142,7 +144,7 @@
         <h2>Independent verification</h2>
         <p>This version provides proof and pre-draw receipt import under Tools → Lottery fairness verification. “Verify in Tools” on a draw record carries its proof directly into the tool. Online verification sends the input to the server and calls the same <a href="verifier/src/document.rs">document and receipt verifier</a> as the CLI. For independent verification, <a href="https://github.com/CisaSettle/bluffking/archive/refs/heads/main.zip">download the source ZIP</a>, extract it, and run the following commands from the repository root with Rust/Cargo installed. Verification after building is network-free. This describes the source in this version, not its production deployment status.</p>
         <p>Build the independent verifier from the public repository root. An initial build may download locked dependencies; running the verifier is network-free and needs neither a database nor a BluffKing account.</p>
-        <p>Roulette, Slots, Fruit Machine, Claw and 2048 share the <a href="verifier/src/solo.rs">instant-draw protocol</a>. The app saves the server commitment, browser seed and play inputs before submission. Export the proof after settlement to replay it offline. For 2048 the proof covers the initial random seed. The operator can refuse or abort a request.</p>
+        <p>Roulette, Slots, Fruit Machine, Claw and 2048 share the <a href="verifier/src/solo.rs">instant-draw protocol</a>. The app saves the server commitment, browser seed and play inputs before submission. Export the proof after settlement to replay it offline. For 2048 the proof covers the initial random seed and, after the player claims a refund, replays moves to verify the target and expected refund. The operator can refuse or abort a request.</p>
         <pre><code>cargo build --locked --manifest-path draw-games/verifier/Cargo.toml
 ./draw-games/verifier/target/debug/draw-verify proof.json
 ./draw-games/verifier/target/debug/draw-verify proof.json --receipt pre-draw-receipt.json</code></pre>
@@ -160,12 +162,12 @@
 
         <h2>Evidence retention and guarantees</h2>
         <p>Browser receipts belong to the current user in that browser, with limits of 256 entries and 30 days. Clearing browser storage or changing devices affects availability; download files for longer retention. Server lottery tickets and draw proofs follow the existing 30-day cleanup policy. Sicbo room history retains up to 60 rounds; ledger records follow the service's existing retention policy. This is neither permanent evidence storage nor a global append-only public proof log.</p>
-        <p>Verification checks the supplied data against the algorithm and saved inputs. A signed Sicbo receipt attests to the operator's own acceptance time, and a separately saved pre-pulse roster supplies evidence of when you received it. The verifier checks a fixed post-lock Quicknet pulse. The operator may still refuse wagers or abort service. Accepted voided rounds have signed records. A replay alone cannot prove account ownership, wallet credit or the deployed binary.</p>
+        <p>Verification checks the supplied data against the algorithm and saved inputs. A signed Sicbo receipt attests to the operator's own acceptance time, and a separately saved pre-pulse roster supplies evidence of when you received it. The verifier checks a fixed post-lock Quicknet pulse. The operator may still refuse wagers or abort service. Accepted voided rounds have signed records. A replay alone cannot prove account ownership, wallet credit or the deployed binary. Fish Prawn Crab waits for its fixed beacon round. Baccarat proofs open only dealt cards while the server holds the shoe. Personal betting-history proofs also include the settled wager.</p>
         <p>The public library calculates slot prizes and claw eligibility, catches and payouts. The browser animates the claw result. The separate name picker runs in the browser.</p>
 
         <h2>Source navigation and build scope</h2>
         <ul>
-          <li>Independently buildable shared library: <a href="verifier/Cargo.toml">Cargo.toml</a>, <a href="verifier/Cargo.lock">Cargo.lock</a>; <a href="verifier/src/proof.rs">commitments, reveals and sampling stream</a>, <a href="verifier/src/beacon.rs">beacon signatures</a>, <a href="verifier/src/lottery.rs">lottery rules and prizes</a>, <a href="verifier/src/scratch.rs">scratch cards</a>, <a href="verifier/src/sicbo.rs">Sicbo</a>, <a href="verifier/src/yuxiaxie.rs">Fish Prawn Crab</a>, <a href="verifier/src/bin/draw-verify.rs">CLI verifier</a>.</li>
+          <li>Independently buildable shared library: <a href="verifier/Cargo.toml">Cargo.toml</a>, <a href="verifier/Cargo.lock">Cargo.lock</a>; <a href="verifier/src/proof.rs">commitments, reveals and sampling stream</a>, <a href="verifier/src/beacon.rs">beacon signatures</a>, <a href="verifier/src/lottery.rs">lottery rules and prizes</a>, <a href="verifier/src/scratch.rs">scratch cards</a>, <a href="verifier/src/sicbo.rs">Sicbo</a>, <a href="verifier/src/yuxiaxie.rs">Fish Prawn Crab</a>, <a href="verifier/src/baccarat/mod.rs">Baccarat card openings</a>, <a href="verifier/src/bin/draw-verify.rs">CLI verifier</a>.</li>
         </ul>
         <p><code>verifier/</code> has its own workspace and builds with the command above; a normal build of the public root workspace does not include it.</p>
       </article>
