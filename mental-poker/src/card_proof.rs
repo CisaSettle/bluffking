@@ -37,11 +37,11 @@ pub enum Game {
     ZjhJokers,
     Niuniu,
     Sangong,
+    Shisanshui,
     Shortdeck,
     Ddz,
     Guandan,
     Blackjack,
-    Shisanshui,
     Tenhalf,
     Baccarat,
     Colorcards,
@@ -64,11 +64,11 @@ impl Game {
             Self::ZjhJokers => "zjh-jokers",
             Self::Niuniu => "niuniu",
             Self::Sangong => "sangong",
+            Self::Shisanshui => "shisanshui",
             Self::Shortdeck => "shortdeck",
             Self::Ddz => "ddz",
             Self::Guandan => "guandan",
             Self::Blackjack => "blackjack",
-            Self::Shisanshui => "shisanshui",
             Self::Tenhalf => "tenhalf",
             Self::Baccarat => "baccarat",
             Self::Colorcards => "colorcards",
@@ -81,11 +81,11 @@ impl Game {
             Self::ZjhJokers,
             Self::Niuniu,
             Self::Sangong,
+            Self::Shisanshui,
             Self::Shortdeck,
             Self::Ddz,
             Self::Guandan,
             Self::Blackjack,
-            Self::Shisanshui,
             Self::Tenhalf,
             Self::Baccarat,
             Self::Colorcards,
@@ -125,7 +125,6 @@ impl Context {
             _ => 6,
         };
         if self.seats.is_empty()
-            || (self.game == Game::Shisanshui && self.seats.len() < 2)
             || self.seats.len() > max
             || self.seats.iter().any(|s| usize::from(*s) >= max)
             || self.seats.windows(2).any(|w| w[0] >= w[1])
