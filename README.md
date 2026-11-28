@@ -17,7 +17,7 @@ English · [中文](#中文)
 ## English
 
 > [!NOTE]
-> **This is the open-source subset of [BluffKing](https://bluffking.ai)** — a fair, **no-real-money** game center funded by memberships, offering Texas Hold'em alongside mahjong, card, board, dice and casual games on the web, Telegram, iOS and Android. These crates are the poker **engine**, the **verifiable ("mental poker") dealing**, and the **postflop CFR solver** behind its Texas Hold'em tables and public poker tools; the game server (except its sealed dealer, published as [`server-integration/sealed_dealer.rs`](server-integration/sealed_dealer.rs), its Zha Jin Hua dealer in [`server-integration/zjh/`](server-integration/zjh), plus [server game outcome rules](server-integration/#game-outcome-source) and the draw proof verifier in [`draw-games/`](draw-games)), web/mobile clients, and website stay closed-source. Running at **[bluffking.ai](https://bluffking.ai)**, which offers this repo as the AGPL §13 Corresponding Source for the solver it serves. Its real server-blind cryptography (`crypto_real`) is **live in production for opt-in all-human "engine-blind" tables** with player-held shares. See the historical cross-vendor review and the current limits in the audit notes below.
+> **This is the open-source subset of [BluffKing](https://bluffking.ai)** — a fair, **no-real-money** game center funded by memberships, offering Texas Hold'em alongside mahjong, card, board, dice and casual games on the web, Telegram, iOS and Android. These crates are the poker **engine**, the **verifiable ("mental poker") dealing**, and the **postflop CFR solver** behind its Texas Hold'em tables and public poker tools; the game server (except [the Hold’em bot strategy](server-integration/holdem-bots/), its sealed dealer, published as [`server-integration/sealed_dealer.rs`](server-integration/sealed_dealer.rs), its Zha Jin Hua dealer in [`server-integration/zjh/`](server-integration/zjh), plus [server game outcome rules](server-integration/#game-outcome-source) and the draw proof verifier in [`draw-games/`](draw-games)), web/mobile clients, and website stay closed-source. Running at **[bluffking.ai](https://bluffking.ai)**, which offers this repo as the AGPL §13 Corresponding Source for the solver it serves. Its real server-blind cryptography (`crypto_real`) is **live in production for opt-in all-human "engine-blind" tables** with player-held shares. See the historical cross-vendor review and the current limits in the audit notes below.
 
 ### What's here
 
@@ -78,7 +78,7 @@ against the running game.
 
 ### License, trademark, third-party
 
-- **Code:** AGPL-3.0-only — see [`LICENSE`](LICENSE).
+- **BluffKing code:** AGPL-3.0-only — see [`LICENSE`](LICENSE).
 - **Brand:** the **BluffKing** name, logo, and visual identity are **not**
   licensed with the code — see [`TRADEMARKS.md`](TRADEMARKS.md). Forks must rebrand.
 - **Dependencies:** mostly permissive (MIT / Apache-2.0 / BSD-3-Clause), with
@@ -87,9 +87,9 @@ against the running game.
   [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md).
 
 > The upstream service that uses these crates is a separate, **closed-source**
-> product. As the sole copyright holder, the project owner may use this code in
-> that closed product and may dual-license it; third parties receive only the
-> AGPL grant — and AGPL §13 means that if you run a modified version as a network
+> product. The project owner may dual-license its own code. The
+> [GTOpen training patch](server-integration/holdem-bots/scripts/gtopen/) carries
+> its Apache-2.0 license. For the AGPL-covered code, §13 means that if you run a modified version as a network
 > service, you must offer your users the corresponding source.
 
 ### Contributing &amp; security
@@ -103,7 +103,7 @@ section) and [`SECURITY.md`](SECURITY.md).
 ## 中文
 
 > [!NOTE]
-> **这是 [BluffKing](https://bluffking.ai) 的开源子集** —— BluffKing 是一个**不涉及真钱**、靠会员服务盈利的公平游戏中心,提供德州扑克以及麻将、棋牌、骰子与休闲游戏(网页、Telegram、iOS 与 Android)。这些 crate 是其德州扑克牌桌与公开扑克工具背后的扑克 **引擎**、**可验证("mental poker")发牌** 与 **翻后 CFR 求解器**;游戏服务器(其中的密封发牌进程除外,已作为 [`server-integration/sealed_dealer.rs`](server-integration/sealed_dealer.rs) 公开,炸金花发牌见 [`server-integration/zjh/`](server-integration/zjh),[服务端开奖核心](server-integration/#game-outcome-source)及 [`draw-games/`](draw-games) 的开奖证明验证器)、Web/移动客户端与官网保持闭源。线上运行于 **[bluffking.ai](https://bluffking.ai)**,该站将本仓库作为其求解器的 AGPL §13 对应源码对外提供。它的真实服务端盲发密码学(`crypto_real`)已在生产环境 **为可选的全真人「engine-blind」牌桌启用**，解密份额由玩家设备持有。下文链接的审计说明收录历史复核和当前机制的边界。
+> **这是 [BluffKing](https://bluffking.ai) 的开源子集** —— BluffKing 是一个**不涉及真钱**、靠会员服务盈利的公平游戏中心,提供德州扑克以及麻将、棋牌、骰子与休闲游戏(网页、Telegram、iOS 与 Android)。这些 crate 是其德州扑克牌桌与公开扑克工具背后的扑克 **引擎**、**可验证("mental poker")发牌** 与 **翻后 CFR 求解器**;游戏服务器(其中的[德州扑克 AI 策略](server-integration/holdem-bots/)及密封发牌进程除外,已作为 [`server-integration/sealed_dealer.rs`](server-integration/sealed_dealer.rs) 公开,炸金花发牌见 [`server-integration/zjh/`](server-integration/zjh),[服务端开奖核心](server-integration/#game-outcome-source)及 [`draw-games/`](draw-games) 的开奖证明验证器)、Web/移动客户端与官网保持闭源。线上运行于 **[bluffking.ai](https://bluffking.ai)**,该站将本仓库作为其求解器的 AGPL §13 对应源码对外提供。它的真实服务端盲发密码学(`crypto_real`)已在生产环境 **为可选的全真人「engine-blind」牌桌启用**，解密份额由玩家设备持有。下文链接的审计说明收录历史复核和当前机制的边界。
 
 ### 仓库内容
 
@@ -155,16 +155,16 @@ cargo deny check                         # 供应链门禁(漏洞 + 许可证)
 
 ### 许可证 / 商标 / 第三方
 
-- **代码:** AGPL-3.0-only,见 [`LICENSE`](LICENSE)。
+- **BluffKing 代码：** AGPL-3.0-only，见 [`LICENSE`](LICENSE)。
 - **品牌:** **BluffKing** 名称、logo 与视觉识别 **不** 随代码授权,见
   [`TRADEMARKS.md`](TRADEMARKS.md);fork 必须更名换标。
 - **依赖:** 大部分为宽松许可(MIT / Apache-2.0 / BSD-3-Clause),有一个 copyleft
   例外——`gto-solver` crate 依赖 **AGPL-3.0** 的 `postflop-solver`(固定 commit),这
   正是本仓库采用 AGPL-3.0 的原因。见 [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md)。
 
-> 使用这些 crate 的线上服务是 **闭源** 的独立产品。作为唯一版权持有者,作者可在该闭源
-> 产品中使用本代码并可双重授权;第三方仅获得 AGPL 授权——根据 AGPL §13,若你将修改版
-> 作为网络服务运行,必须向用户提供对应源码。
+> 使用这些 crate 的线上服务是 **闭源** 的独立产品。项目所有者可对自有代码双重授权。
+> [GTOpen 训练补丁](server-integration/holdem-bots/scripts/gtopen/) 随附 Apache-2.0 许可证。
+> 对于 AGPL 覆盖的代码，按第 13 节，将修改版作为网络服务运行时须向用户提供对应源码。
 
 ### 贡献与安全
 

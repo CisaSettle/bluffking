@@ -1,0 +1,102 @@
+--- a/crates/solver/src/preflop/multiway.rs
++++ b/crates/solver/src/preflop/multiway.rs
+@@ -9,6 +9,13 @@
+ use std::sync::{Arc, OnceLock};
+
+ pub const SAMPLES: usize = 1024;
++// Offline training selects a uniformly shifted subset of the same 1024 particles.
++use std::sync::atomic::{AtomicUsize, Ordering};
++static SAMPLE_WINDOW: AtomicUsize = AtomicUsize::new(SAMPLES);
++pub fn set_training_window(start: usize, count: usize) {
++    assert!((1..=SAMPLES).contains(&count));
++    SAMPLE_WINDOW.store((start % SAMPLES) * (SAMPLES + 1) + count, Ordering::Relaxed);
++}
+ pub const MODEL: &str = "coupled_deck_v1";
+ pub const QUAD_T: [f64; 5] = [
+     0.046910077030668,
+@@ -135,7 +142,11 @@
+     ) -> [f64; NUM_CLASSES] {
+         let mut sums = [0.0; NUM_CLASSES];
+         let mut cdfs = [[0.0f64; NUM_CLASSES + 1]; 8];
+-        for sample in 0..SAMPLES {
++        let window = SAMPLE_WINDOW.load(Ordering::Relaxed);
++        let count = window % (SAMPLES + 1);
++        let first = window / (SAMPLES + 1);
++        for index in 0..count {
++            let sample = if count == SAMPLES { index } else { (first + index * 397) % SAMPLES };
+             let base = sample * NUM_CLASSES;
+             for (q, dist) in opponents.iter().enumerate() {
+                 for i in 0..NUM_CLASSES {
+@@ -157,7 +168,7 @@
+             }
+         }
+         for x in &mut sums {
+-            *x /= SAMPLES as f64;
++            *x /= count as f64;
+         }
+         sums
+     }
+--- a/crates/solver/src/preflop/mod.rs
++++ b/crates/solver/src/preflop/mod.rs
+@@ -1652,6 +1652,61 @@
+         unsafe { (self.regrets.slice().to_vec(), self.strat_sum.slice().to_vec()) }
+     }
+
++    /// Initialize only the current action probabilities for offline training.
++    /// Old-game regrets and average strategy never enter the coupled-deck model.
++    pub fn initialize_shark_training(&mut self, seed: &Self) {
++        assert_eq!(self.iteration, 0);
++        assert_eq!(self.nodes.len(), seed.nodes.len());
++        assert!(!seed.has_overrides());
++        // Exclusive access to this fresh solver; no traversal is running.
++        let regrets = unsafe { self.regrets.slice_mut() };
++        for (index, node) in self.nodes.iter().enumerate() {
++            if node.actions.is_empty() { continue; }
++            let strategy = seed.average_strategy(index);
++            assert_eq!(node.data_off, seed.nodes[index].data_off);
++            assert_eq!(strategy.len(), node.actions.len() * NUM_CLASSES);
++            for (j, frequency) in strategy.into_iter().enumerate() {
++                regrets[node.data_off + j] = 0.1 * frequency;
++            }
++        }
++    }
++
++
++    /// Set one candidate average on a fresh tree. A matched public path
++    /// must have the same actor. Folds, checks, calls and jams retain their
++    /// meaning, while ordinary raises require the same BB amount. Unmapped
++    /// nodes retain the solver's uniform default. No seat or action is locked.
++    pub fn project_shark_average(&mut self, seed: &Self) {
++        assert_eq!(self.iteration, 0);
++        assert!(!self.has_overrides() && !seed.has_overrides());
++        assert_eq!(self.n, seed.n);
++        assert_eq!(self.multiway_equity_model(), seed.multiway_equity_model());
++        // Exclusive access to this new solver. No traversal runs during initialization.
++        let sums = unsafe { self.strat_sum.slice_mut() };
++        let mut paths = vec![(0, 0)];
++        while let Some((target_index, source_index)) = paths.pop() {
++            let target = &self.nodes[target_index];
++            let source = &seed.nodes[source_index];
++            if target.actions.is_empty() || source.actions.is_empty() || target.actor != source.actor {
++                continue;
++            }
++            let probabilities = seed.average_strategy(source_index);
++            for (index, action) in target.actions.iter().enumerate() {
++                let matches = |other: &PAction| action.kind == other.kind
++                    && (action.kind != "raise" || action.to == other.to);
++                if let Some(source_action) = source.actions.iter().position(matches) {
++                    let dest = target.data_off + index * NUM_CLASSES;
++                    let from = source_action * NUM_CLASSES;
++                    sums[dest..dest + NUM_CLASSES].copy_from_slice(&probabilities[from..from + NUM_CLASSES]);
++                    paths.push((self.child(target_index, index), seed.child(source_index, source_action)));
++                }
++            }
++        }
++        // One candidate average installed; loading this snapshot recomputes its
++        // leaf values. The exporter measures full BR in the unpatched target game.
++        self.iteration = 1;
++    }
++
+     /// Wipe the learning state so a changed table converges fresh. Frozen
+     /// seats keep their strategy sums — that average IS their play.
+     fn reset_learning(&mut self) {

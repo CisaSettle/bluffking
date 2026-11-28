@@ -10,10 +10,14 @@ just the library.
 `game-rules/` contains the exact source for board moves, card ranking,
 hand state machines, and variant-specific scoring. Shared banker rules and
 mahjong claim resolution are included. Some files reference private server
-types and are published for inspection. The room runtime, bots and wallet
-storage are outside this source directory. The independently buildable
+types and are published for inspection. The room runtime and wallet storage are outside the rules directory. The independently buildable
 [draw verifier](../draw-games/verifier) and [card proof library](../mental-poker)
 cover random draws and supported dealing transcripts respectively.
+
+## Texas Hold’em bot strategy
+
+[holdem-bots/](holdem-bots/) contains the table-bot decision code, frozen
+preflop policies, opponent adaptation, learning and policy export tools.
 
 ## Files
 
@@ -136,5 +140,4 @@ into a server crate that supplies those sibling modules and resolve it against
 `texas-h5-Cargo.lock` (which pins `gto-solver` + `postflop-solver` at the deployed
 versions). We intentionally do **not** vendor a synthetic wrapper crate around it
 here — that would ship a fork of the closed server's private module surface. The lottery and dice draw implementation is also published in
-[`draw-games/`](../draw-games). Other server integration modules, clients, and
-the website remain closed.
+[`draw-games/`](../draw-games). The site, clients and other server integration modules remain closed.
